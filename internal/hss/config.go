@@ -3,8 +3,6 @@ package hss
 import (
 	"cmp"
 	"encoding/base64"
-	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -50,7 +48,7 @@ type Config struct {
 	DynamoDBEndpoint string
 	KMSKeyID         string
 	// DataKey is the local data key (dev and test), nil with KMS.
-	DataKey secret
+	DataKey secretkey.Key
 	// KeyringBootstrap allows creating a first data key although
 	// subscriptions are stored (see openStore).
 	KeyringBootstrap bool
@@ -70,7 +68,7 @@ type Config struct {
 	SCSCFNames   []string
 
 	APIAddr  string
-	Tokens   secretTokens
+	Tokens   Tokens
 	ACSRate  int
 	ACSBurst int
 	// DefaultProfile is the profile of subscriptions created without one;
@@ -87,38 +85,6 @@ type Config struct {
 	PushTimeout  time.Duration
 }
 
-// secret holds a configuration secret so that printing a Config cannot
-// reveal it, under every verb: its text is in a secret.Key, which an
-// invalid verb, %p or %w, does not print either (#506).
-type secret struct{ k secretkey.Key }
-
-// newSecret is a secret of v.
-func newSecret(v string) secret { return secret{k: secretkey.NewString(v)} }
-
-// value is the secret's text.
-func (s secret) value() string { return s.k.RevealString() }
-
-func (secret) String() string             { return "[redacted]" }
-func (secret) GoString() string           { return "[redacted]" }
-func (secret) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "[redacted]") }
-
-// secretTokens are the API tokens, which print as "[redacted]" too, and
-// are kept sealed, as a secret's text is, for the verbs that call no
-// method (#506).
-type secretTokens struct{ t secretkey.Sealed[Tokens] }
-
-// tokens are the API tokens; the zero secretTokens has none.
-func (s secretTokens) tokens() Tokens {
-	if s.t == nil {
-		return Tokens{}
-	}
-	return *s.t()
-}
-
-func (secretTokens) String() string             { return "[redacted]" }
-func (secretTokens) GoString() string           { return "[redacted]" }
-func (secretTokens) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "[redacted]") }
-
 // Configure reads the HSS_ settings and refuses, in staging and prod, the
 // ones that are unsafe there (docs/architecture.md §8, ADR 0007).
 func Configure(s *runtime.Settings) Config {
@@ -130,7 +96,7 @@ func Configure(s *runtime.Settings) Config {
 		ProfilesTable:    e.String("PROFILES_TABLE", DefaultProfilesTable),
 		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
 		KMSKeyID:         e.String("KMS_KEY_ID", ""),
-		DataKey:          newSecret(e.String("DATA_KEY", "")),
+		DataKey:          secretkey.NewString(e.String("DATA_KEY", "")),
 		KeyringBootstrap: e.Bool("KEYRING_BOOTSTRAP", false),
 		IMSRealm:         e.String("IMS_REALM", domain),
 		FTRealm:          e.String("FT_REALM", ""),
@@ -222,10 +188,10 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("STORE", "not one of dynamodb, memory")
 	}
 	switch {
-	case c.KMSKeyID != "" && c.DataKey.value() != "":
+	case c.KMSKeyID != "" && c.DataKey.RevealString() != "":
 		e.Invalid("DATA_KEY", "not with HSS_KMS_KEY_ID: the data key comes from KMS")
-	case c.DataKey.value() != "":
-		if k, err := base64.StdEncoding.DecodeString(c.DataKey.value()); err != nil || len(k) != keyring.DataKeySize {
+	case c.DataKey.RevealString() != "":
+		if k, err := base64.StdEncoding.DecodeString(c.DataKey.RevealString()); err != nil || len(k) != keyring.DataKeySize {
 			e.Invalid("DATA_KEY", "not the base64 of "+strconv.Itoa(keyring.DataKeySize)+" bytes")
 		}
 	case c.KMSKeyID == "" && c.Store == StoreDynamoDB:
@@ -240,8 +206,7 @@ func Configure(s *runtime.Settings) Config {
 			"HSS_DIAMETER_PEER_NETWORKS holds a /0 prefix: it restricts no source address (ADR 0007 §6)")
 	}
 
-	tokens := readTokens(s)
-	c.Tokens = secretTokens{secretkey.Seal(&tokens)}
+	c.Tokens = readTokens(s)
 	return c
 }
 
@@ -288,13 +253,16 @@ func cutScheme(v string) (string, bool) {
 func readTokens(s *runtime.Settings) Tokens {
 	e := s.Env
 	read := func(name string) TokenPair {
-		p := TokenPair{e.String(name+"_TOKEN", ""), e.String(name+"_TOKEN_NEXT", "")}
-		for _, v := range []struct{ name, value string }{{name + "_TOKEN", p.Current}, {name + "_TOKEN_NEXT", p.Next}} {
-			if !printableToken(v.value) {
+		p := TokenPair{secretkey.NewString(e.String(name+"_TOKEN", "")), secretkey.NewString(e.String(name+"_TOKEN_NEXT", ""))}
+		for _, v := range []struct {
+			name  string
+			value secretkey.Key
+		}{{name + "_TOKEN", p.Current}, {name + "_TOKEN_NEXT", p.Next}} {
+			if !printableToken(v.value.RevealString()) {
 				e.Invalid(v.name, "has white space or characters outside printable ASCII")
 			}
 		}
-		s.ForbidInProduction(p.Current == "" && p.Next != "",
+		s.ForbidInProduction(p.Current.IsZero() && !p.Next.IsZero(),
 			"HSS_"+name+"_TOKEN_NEXT is set without HSS_"+name+"_TOKEN: the rotation is in an unexpected state")
 		return p
 	}
@@ -302,10 +270,11 @@ func readTokens(s *runtime.Settings) Tokens {
 	owner := map[string]string{}
 	weak, shared := false, false
 	for name, p := range map[string]TokenPair{"ADMIN": t.Admin, "ACS": t.ACS, "FT": t.FT} {
-		for _, v := range []string{p.Current, p.Next} {
-			if v == "" {
+		for _, k := range []secretkey.Key{p.Current, p.Next} {
+			if k.IsZero() {
 				continue
 			}
+			v := k.RevealString()
 			if !strongToken(v) {
 				weak = true
 			}
@@ -315,7 +284,7 @@ func readTokens(s *runtime.Settings) Tokens {
 			owner[v] = name
 		}
 	}
-	s.ForbidInProduction(t.Admin.Current == "", "HSS_ADMIN_TOKEN is unset: the provisioning API would answer 503 to operators")
+	s.ForbidInProduction(t.Admin.Current.IsZero(), "HSS_ADMIN_TOKEN is unset: the provisioning API would answer 503 to operators")
 	s.ForbidInProduction(weak, "an HSS API token holds less than 256 bits (64 hex digits or 43 base64url characters)")
 	s.ForbidInProduction(shared, "an HSS API token is shared between callers")
 	return t

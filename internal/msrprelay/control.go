@@ -19,6 +19,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/store"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // maxControlBody bounds a control request body. The largest valid one is two
@@ -44,11 +45,13 @@ type controlOptions struct {
 	CorePorts    []uint16
 	Namespace    string
 	MaxExpiresIn time.Duration
-	Tokens       []string
-	Clock        msrp.Clock
-	Rand         io.Reader
-	Log          *slog.Logger
-	Metrics      *counters
+	// Tokens are pcscf's control API tokens, kept as secret.Keys up to the
+	// authorizer, which keeps only their SHA-256 (#533).
+	Tokens  []secret.Key
+	Clock   msrp.Clock
+	Rand    io.Reader
+	Log     *slog.Logger
+	Metrics *counters
 }
 
 // control is the control API pcscf allocates bindings through (ADR 0004;

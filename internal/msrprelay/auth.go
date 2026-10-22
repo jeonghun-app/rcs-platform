@@ -5,6 +5,8 @@ import (
 	"crypto/subtle"
 	"net/http"
 	"strings"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Operations of the control API, the unit a caller's scope is made of
@@ -39,14 +41,14 @@ type authorizer struct {
 // newAuthorizer accepts pcscf's tokens for every binding operation, which
 // is all pcscf needs (ADR 0004). No token means no caller, and the API then
 // answers 503 rather than being open.
-func newAuthorizer(pcscfTokens []string) *authorizer {
+func newAuthorizer(pcscfTokens []secret.Key) *authorizer {
 	a := &authorizer{}
 	if len(pcscfTokens) == 0 {
 		return a
 	}
 	pcscf := caller{name: "pcscf", scope: map[string]bool{opCreate: true, opUpdate: true, opDelete: true}}
 	for _, t := range pcscfTokens {
-		pcscf.digests = append(pcscf.digests, sha256.Sum256([]byte(t)))
+		pcscf.digests = append(pcscf.digests, sha256.Sum256(t.Reveal()))
 	}
 	a.callers = append(a.callers, pcscf)
 	return a

@@ -11,8 +11,9 @@
 #   make down           stop and remove everything, data included
 #
 # Every service's environment follows its document (docs/hss.md,
-# docs/ft-server.md, docs/msrp-relay.md) and is the same contract the AWS
-# deployment (#56) sets, with local endpoints and dev-only choices marked.
+# docs/ft-server.md, docs/msrp-relay.md, docs/rcs-as.md) and is the same
+# contract the AWS deployment (#56) sets, with local endpoints and dev-only
+# choices marked.
 # make passes the project name (COMPOSE_PROJECT, default rcs-local).
 name: rcs-local
 
@@ -37,6 +38,29 @@ x-shared: &shared
   # pcscf's core listener port, which scscf sends a dialog's requests to a
   # P-CSCF on: one setting for both (docs/pcscf.md, docs/scscf.md).
   RCS_PCSCF_CORE_PORT: "5070"
+
+# rcs-as's settings, which every rcs-as task shares (docs/rcs-as.md,
+# Settings; the addressing of the D4 design on #121). Each task adds the
+# MSRP host of its own, a name in the namespace that only it has, and its
+# network aliases.
+x-rcs-as: &rcs-as
+  <<: *shared
+  # scscf.rcs.local for what it originates, and rcs-as.rcs.local, the AS
+  # URI hss gives scscf in the default profile (HSS_RCS_AS_URI's default),
+  # for what it takes as its own in a Route.
+  RCS_SERVICE_NAMESPACE: rcs.local
+  RCSAS_STORE: dynamodb
+  RCSAS_DYNAMODB_ENDPOINT: http://dynamodb:8000
+  # Every task listens on the same port, which the AS URI names. Its own
+  # SIP address, in its Via and owning its groups, is the one private
+  # IPv4 address it finds on its container: RCSAS_SIP_HOST stays unset,
+  # as staging and prod with group chat require.
+  RCSAS_SIP_LISTEN_ADDR: 0.0.0.0:5060
+  # Conference URIs are named in the namespace, which scscf and the
+  # resolvers look names up in, and every rcs-as task has it as an alias.
+  # Not RCS_IMS_DOMAIN, which rcs-as refuses. A compose-only name: a
+  # deployment sets its own.
+  RCSAS_CONFERENCE_HOST: conf.rcs.local
 
 # What the platform services share: the image, and starting once their
 # tables exist. Each one's health check runs its own binary with
@@ -200,6 +224,9 @@ services:
       # sends the client's path 300 ms after the client connects, and a
       # loaded laptop or CI runner has taken over 2 s (#204).
       RELAY_PATH_WAIT: 10s
+      # rcs-as tasks give a name in the namespace as the host of their
+      # a=path (RCSAS_MSRP_HOST), which core_path may then hold.
+      RCS_SERVICE_NAMESPACE: rcs.local
     networks:
       default:
         # The control API's name pcscf calls (msrp-relay.<namespace>).
@@ -237,10 +264,8 @@ services:
       retries: 60
 
   # The S-CSCF: the registrar, the reg event and iFC routing, its state in
-  # DynamoDB Local (docs/scscf.md). Without rcs-as in the stack, the
-  # default profile's criteria toward it fail over to their default
-  # handling: the REGISTER's and OPTIONS's go on, a chat INVITE's and a
-  # MESSAGE's end there (docs/local-stack.md).
+  # DynamoDB Local (docs/scscf.md). The default profile's criteria send
+  # what they match to rcs-as (rcs-as.rcs.local).
   scscf:
     <<: *platform
     command: ["scscf"]
@@ -293,15 +318,27 @@ services:
       timeout: 5s
       retries: 60
 
-  # ---- Later services: enable each in the pull request that adds it,
-  # with the environment its document gives (docs/local-stack.md, Adding a
-  # service). Each takes the platform image, the shared settings and the
-  # -healthcheck health check, like the services above.
-  #
-  # rcs-as:    chat and conferences; msrp-relay connects to it on
-  #            RELAY_CORE_PORTS (2855).
-  #   <<: *platform
-  #   command: ["rcs-as"]
+  # rcs-as, the application server: chat, pager messages and
+  # conferences, its queue and groups in DynamoDB Local (docs/rcs-as.md).
+  # scscf reaches it as the default profile's AS, and msrp-relay connects
+  # to it on RELAY_CORE_PORTS (2855). One task, rcs-as-a; a second one
+  # takes the same settings and aliases with an MSRP host of its own (#121).
+  rcs-as-a:
+    <<: *platform
+    command: ["rcs-as"]
+    environment:
+      <<: *rcs-as
+      RCSAS_MSRP_HOST: rcs-as-a.rcs.local
+    networks:
+      default:
+        # The AS URI and the conference host, which every task has, and
+        # this task's own MSRP host.
+        aliases: ["rcs-as.rcs.local", "conf.rcs.local", "rcs-as-a.rcs.local"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rcs-as", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
 
   # ---- acs, the pinned release (ADR 0006) -----------------------------
   acs:

@@ -15,6 +15,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // A request that holds a subscriber's lock for long, such as an API write
@@ -254,7 +255,7 @@ func TestContentionUntilTheAPIDeadlineIsBusyNotAStoreFailure(t *testing.T) {
 	cs := &losingStore{Store: store.NewMemory()}
 	e := newEnvWith(t, cs)
 	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
-		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		Tokens:         Tokens{Admin: TokenPair{Current: secret.NewString(adminToken)}, ACS: TokenPair{Current: secret.NewString(acsToken)}},
 		DefaultProfile: DefaultProfileID, StoreTimeout: 500 * time.Millisecond,
 	})}
 	a.create(impi1, true, impu1)
@@ -570,7 +571,7 @@ func TestASlowStoreWithoutALostWriteIsAStoreFailure(t *testing.T) {
 	q := &slowFirstStore{Store: store.NewMemory()}
 	e := newEnvWith(t, q)
 	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
-		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		Tokens:         Tokens{Admin: TokenPair{Current: secret.NewString(adminToken)}, ACS: TokenPair{Current: secret.NewString(acsToken)}},
 		DefaultProfile: DefaultProfileID, StoreTimeout: 300 * time.Millisecond,
 	})}
 	a.create(impi1, true, impu1)
@@ -631,7 +632,7 @@ func inflightAPI(t *testing.T, mode string, storeTimeout time.Duration) *apiEnv 
 	q := &qaInflight{Store: store.NewMemory(), mode: mode}
 	e := newEnvWith(t, q)
 	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
-		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
+		Tokens:         Tokens{Admin: TokenPair{Current: secret.NewString(adminToken)}, ACS: TokenPair{Current: secret.NewString(acsToken)}},
 		DefaultProfile: DefaultProfileID, StoreTimeout: storeTimeout,
 	})}
 	a.create(impi1, true, impu1)

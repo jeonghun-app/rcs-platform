@@ -21,6 +21,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -80,7 +81,7 @@ func newAPIEnv(t *testing.T, mutate ...func(*APIOptions)) *apiEnv {
 	t.Helper()
 	a := &apiEnv{env: newEnv(t), notifier: newRecorder(), now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	o := APIOptions{
-		Tokens:         Tokens{Admin: TokenPair{adminToken, adminTokenNext}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}},
+		Tokens:         Tokens{Admin: TokenPair{secret.NewString(adminToken), secret.NewString(adminTokenNext)}, ACS: TokenPair{Current: secret.NewString(acsToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}},
 		Notifier:       a.notifier,
 		DefaultProfile: DefaultProfileID,
 		Now:            func() time.Time { a.mu.Lock(); defer a.mu.Unlock(); return a.now },
@@ -160,7 +161,7 @@ func (a *apiEnv) create(impi string, managed bool, impus ...string) {
 }
 
 func TestAPIAnswers503WhenNoTokenIsConfigured(t *testing.T) {
-	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens = Tokens{FT: TokenPair{Current: ftToken}} })
+	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens = Tokens{FT: TokenPair{Current: secret.NewString(ftToken)}} })
 	for _, path := range []string{"/v1/subscriptions/" + impi1, "/v1/service-profiles/" + DefaultProfileID} {
 		code, body, h := a.do("GET", path, adminToken, "")
 		if code != http.StatusServiceUnavailable || body["error"] == nil || h.Get("Retry-After") == "" {
@@ -596,7 +597,7 @@ func TestFTCredentialFollowsFtServersContract(t *testing.T) {
 func TestFTCredentialsNeedAnFTRealm(t *testing.T) {
 	e := newEnv(t)
 	h := e.newHSS(func(o *Options) { o.FTRealm = "" })
-	a := &apiEnv{env: e, api: h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: adminToken}, FT: TokenPair{Current: ftToken}}, DefaultProfile: DefaultProfileID})}
+	a := &apiEnv{env: e, api: h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: secret.NewString(adminToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}}, DefaultProfile: DefaultProfileID})}
 	a.create(impi1, true, impu1)
 	if code, _, _ := a.do("POST", subPath(impi1, "/ft-credential"), adminToken, ""); code != http.StatusNotImplemented {
 		t.Errorf("issue = %d", code)
@@ -609,7 +610,7 @@ func TestFTCredentialsNeedAnFTRealm(t *testing.T) {
 func TestStoreFailuresAre503SoCallersRetry(t *testing.T) {
 	fs := &failingStore{Store: store.NewMemory()}
 	e := newEnvWith(t, fs)
-	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}}, DefaultProfile: DefaultProfileID})}
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: secret.NewString(adminToken)}, ACS: TokenPair{Current: secret.NewString(acsToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}}, DefaultProfile: DefaultProfileID})}
 	a.create(impi1, true, impu1)
 	fs.fail.Store(true)
 	for _, c := range []struct{ method, path, token, body string }{
@@ -995,7 +996,7 @@ func TestASlowAnswerLeavesTheNextPushItsOwnTime(t *testing.T) {
 	})
 	p := NewPusher(n.node, PusherOptions{SCSCFHostPattern: "scscf-*.rcs.local", Timeout: timeout, Metrics: a.metrics})
 	a.api = a.h.NewAPI(APIOptions{
-		Tokens:   Tokens{Admin: TokenPair{adminToken, adminTokenNext}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}},
+		Tokens:   Tokens{Admin: TokenPair{secret.NewString(adminToken), secret.NewString(adminTokenNext)}, ACS: TokenPair{Current: secret.NewString(acsToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}},
 		Notifier: p, DefaultProfile: DefaultProfileID, PushTimeout: timeout,
 	})
 	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, impu2, 1, impu1, 0, tel1, 0)); code != http.StatusCreated {
@@ -1117,7 +1118,7 @@ func TestReKeyingWithoutASequenceNumberKeepsTheCounter(t *testing.T) {
 // The audit slot comes from the variable a token was set in, so a rotation
 // that empties HSS_*_TOKEN first still shows the next token as "next".
 func TestAuditSlotFollowsTheTokenVariable(t *testing.T) {
-	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens.ACS = TokenPair{Next: acsToken} })
+	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens.ACS = TokenPair{Next: secret.NewString(acsToken)} })
 	a.create(impi1, true, impu1)
 	a.do("GET", subPath(impi1), acsToken, "")
 	var last map[string]any
