@@ -265,6 +265,16 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   distroless image can run an ECS container health check. A service whose
   start-up waits on remote services and ends at a start-up deadline (hss) sets
   `Service.LiveAfterReady`, so that `/healthz` fails until it is ready.
+  Behind an NLB whose target group has proxy protocol on, the admin port
+  takes a PROXY protocol v2 header from the networks in
+  `RCS_ADMIN_PROXY_NETWORKS`, IPv4 or IPv6 prefixes but no IPv4-mapped one,
+  and drops it, using nothing it names. A header from anywhere else, or one that does not
+  parse, closes the connection with no answer. Each is counted in
+  `admin.proxy_header_refused` and logged at most once a minute with the
+  peer's network only. Alarm on that count above zero: a check that gets no
+  answer fails, an NLB whose targets all fail routes to all of them, and so
+  a prefix that misses an NLB subnet turns the readiness gate off without
+  any other sign ([#230](https://github.com/jeonghun-app/rcs-platform/issues/230)).
 - **Parsing**: every parser is fuzzed (`go test -fuzz`), has a size limit, is
   linear in its input (a test parses a maximum-size adversarial input), and never
   repairs content it does not own: message bodies such as CPIM and MSRP payloads

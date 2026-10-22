@@ -134,7 +134,16 @@ func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
 		"：203.0.113.9":                           "：203.0.113.0/24",
 		"“203.0.113.9”":                          "“203.0.113.0/24”",
 		"udp/2001:db8:5:6::8 and ip/203.0.113.9": "udp/2001:db8:5::/48 and ip/203.0.113.0/24",
-		" :2001:db8:5:6::8 =:2001:db8:5:6::9":    " :2001:db8:5::/48 =:2001:db8:5::/48",
+		// After a word's colon, "/" and a length after an address keep the
+		// length.
+		"host:2001:db8::/48::1": "host:2001:db8::/48::1",
+		// After a "/" that follows no digit, the address is truncated
+		// (#528 security review).
+		"x::/3fff:5:6:7:8:9:a:b":              "x::/3fff:5:6::/48",
+		"x::/3fff:5:6:7::b":                   "x::/3fff:5:6::/48",
+		"10.0.0.0/8::/240e:5:6:7::1":          "10.0.0.0/8::/240e:5:6::/48",
+		"udp/3fff:5:6:7:8:9:a:b":              "udp/3fff:5:6::/48",
+		" :2001:db8:5:6::8 =:2001:db8:5:6::9": " :2001:db8:5::/48 =:2001:db8:5::/48",
 		// After a word's colon, whatever letter ends the word.
 		"remote:2001:db8:5:6::8 node:2001:db8:5:6::8":    "remote:2001:db8:5::/48 node:2001:db8:5::/48",
 		"ipv6:2001:db8:5:6::8 cafe:2001:db8:5:6:7:8:9:a": "ipv6:2001:db8:5::/48 cafe:2001:db8::/48",
@@ -154,6 +163,43 @@ func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
 	} {
 		if got := TruncateIPsIn(in); got != want {
 			t.Errorf("TruncateIPsIn(%q)\n = %q\nwant %q", in, got, want)
+		}
+	}
+}
+
+// TruncateIPsIn's output reads the same when truncated again (#512): its
+// rounds read the text the round before wrote until it is stable, so a
+// network written next to more of a token ("0.0.0.0/24::/48::") is read
+// within them.
+func TestTruncatedTextReadsTheSameAgain(t *testing.T) {
+	for _, in := range []string{
+		"0.0.0.0:1::0.0.0.0::",
+		"1::0.0.0.0::",
+		"::/48::",
+		"0.0.0.0/24::/48::",
+		"2001:db8:5::/48::1",
+		"[2001:db8::1]:443::",
+		".0.0.0.0::",
+		"::0.0.0.0A",
+		// A token longer than an address, whose start is one that ends at
+		// its dotted quad.
+		"1::1.0.0.0:" + strings.Repeat("0", 54),
+	} {
+		once := TruncateIPsIn(in)
+		if again := TruncateIPsIn(once); again != once {
+			t.Errorf("TruncateIPsIn(%q) = %q, and again %q", in, once, again)
+		}
+	}
+}
+
+// An address after a colon and a run of dots is truncated, however many
+// dots there are, the window of a long token's starts included (#520).
+func TestAnAddressAfterAColonAndDotsIsTruncated(t *testing.T) {
+	for n := range 101 {
+		in := ":" + strings.Repeat(".", n) + "2001:db8:5:6::8"
+		got := TruncateIPsIn(in)
+		if want := ":" + strings.Repeat(".", n) + "2001:db8:5::/48"; got != want {
+			t.Fatalf("%d dots: TruncateIPsIn(%q) = %q, want %q", n, in, got, want)
 		}
 	}
 }
@@ -189,10 +235,19 @@ func TestTruncateIPsInIsLinear(t *testing.T) {
 		"hex colons":   "a:",
 		"long token":   "a:b:c::4 " + strings.Repeat(".", 64),
 		"mixed":        "[1.2.3.4]:5 ::ffff:1.2.3.4/24 ",
+		// The most rounds a search of five million texts found any text
+		// to need (#528): the #512 seed.
+		"three rounds": "0.0.0.0:1::0.0.0.0:: ",
 	} {
 		t.Run(name, func(t *testing.T) {
 			small := strings.Repeat(unit, max(1, 1024/len(unit)))
 			large := strings.Repeat(small, 64)
+			if name == "three rounds" {
+				n := 0
+				if _, stable := truncateRounds(large, func(string) { n++ }); !stable || n != 3 {
+					t.Fatalf("the unit took %d rounds (stable %v), want 3", n, stable)
+				}
+			}
 			a := testing.AllocsPerRun(3, func() { _ = TruncateIPsIn(small) })
 			b := testing.AllocsPerRun(3, func() { _ = TruncateIPsIn(large) })
 			if b > 512*max(a, 1) {
