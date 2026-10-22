@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,20 +26,29 @@ type Notification struct {
 	// "terminated", with Reason for a terminated one ("deactivated",
 	// "rejected", "timeout", "noresource", ...).
 	State, Reason string
-	// Info is the body, read by internal/sip/reginfo, the parser scscf
-	// writes with and pcscf reads with; nil without one. Err says why a
-	// body could not be read, for the scenario to fail on: the NOTIFY is
-	// answered 200 still.
+	// ContentType and Body are the NOTIFY's body as it came, for an event
+	// package other than reg; empty without one.
+	ContentType string
+	Body        []byte
+	// Info is the body of a reg event NOTIFY, read by internal/sip/reginfo,
+	// the parser scscf writes with and pcscf reads with; nil without one.
+	// Err says why a body could not be read, for the scenario to fail on:
+	// the NOTIFY is answered 200 still.
 	Info *reginfo.Info
 	Err  error
 }
 
-// Subscription is this UA's subscription to the reg event of its own IMPU
-// (RFC 3680, TS 24.229 §5.1.1.3). Its methods are safe for concurrent use.
+// Subscription is this UA's subscription to an event package: the reg
+// event of its own IMPU (RFC 3680, TS 24.229 §5.1.1.3), or another one
+// Subscribe asks for. Its methods are safe for concurrent use.
 type Subscription struct {
 	ua            *UA
 	key           string
 	callID, local string
+	// event is the package the SUBSCRIBE named, and target the URI it was
+	// sent to, the remote target until a NOTIFY or the 2xx names another.
+	event         string
+	target        sip.URI
 	notifications chan Notification
 	// Dropped counts notifications that came while the queue was full.
 	Dropped atomic.Int64
@@ -80,58 +88,7 @@ func (s *Subscription) Done() <-chan struct{} { return s.done }
 // returns no subscription and a *StatusError. The first NOTIFY, with the
 // full state, may come before the 2xx or after it.
 func (ua *UA) SubscribeRegEvent(ctx context.Context) (*Subscription, *sip.Response, error) {
-	req, err := ua.NewRequest("SUBSCRIBE", ua.cfg.IMPU)
-	if err != nil {
-		return nil, nil, err
-	}
-	contact := sip.Contact{Address: sip.Address{URI: ua.contact.URI}}
-	contact.URI.Params = slices.Clone(ua.contact.URI.Params)
-	contact.URI.Params.SetFlag("ob")
-	add(req, &err, "Contact", contact.String())
-	add(req, &err, "Event", "reg")
-	add(req, &err, "Accept", reginfo.ContentType)
-	add(req, &err, "Expires", strconv.Itoa(RegEventExpires))
-	if err != nil {
-		return nil, nil, err
-	}
-	from, err := req.Header.From()
-	if err != nil {
-		return nil, nil, err
-	}
-	callID := req.Header.Get("Call-ID")
-	cseq, _ := req.Header.CSeq()
-	s := &Subscription{
-		ua: ua, key: subscriptionKey(callID, from.Tag()), callID: callID, local: req.Header.Get("From"),
-		notifications: make(chan Notification, queueLength), cseq: cseq.Seq, done: make(chan struct{}),
-	}
-	// Kept before the SUBSCRIBE goes, so a NOTIFY that overtakes its 2xx
-	// finds it.
-	ua.mu.Lock()
-	ua.subs[s.key] = s
-	ua.mu.Unlock()
-	res, err := ua.Send(ctx, req)
-	switch {
-	case err != nil:
-		ua.forgetSubscription(s)
-		return nil, nil, err
-	case res.StatusCode >= 300:
-		ua.forgetSubscription(s)
-		return nil, res, &StatusError{Method: "SUBSCRIBE", Code: res.StatusCode}
-	}
-	// The 2xx's Record-Route, reversed (§12.1.2), stands in as the route
-	// set until a NOTIFY gives its own.
-	var routes []string
-	if rr, err := res.Header.RecordRoute(); err == nil {
-		for _, a := range slices.Backward(rr) {
-			routes = append(routes, a.String())
-		}
-	}
-	s.mu.Lock()
-	if !s.notified {
-		s.remote, s.routes, s.remoteTarget = res.Header.Get("To"), routes, contactOr(res, ua.cfg.IMPU)
-	}
-	s.mu.Unlock()
-	return s, res, nil
+	return ua.Subscribe(ctx, ua.cfg.IMPU, "reg", reginfo.ContentType, RegEventExpires)
 }
 
 func subscriptionKey(callID, localTag string) string { return callID + "\x00" + localTag }
@@ -157,7 +114,7 @@ func (s *Subscription) fromNotify(req *sip.Request) {
 				s.routes = append(s.routes, a.String())
 			}
 		}
-		s.remoteTarget = s.ua.cfg.IMPU
+		s.remoteTarget = s.target
 	}
 	s.remoteTarget = contactOr(req, s.remoteTarget)
 }
@@ -203,7 +160,7 @@ func (s *Subscription) Unsubscribe(ctx context.Context) (*sip.Response, error) {
 	contact.URI.Params = slices.Clone(s.ua.contact.URI.Params)
 	contact.URI.Params.SetFlag("ob")
 	add(req, &err, "Contact", contact.String())
-	add(req, &err, "Event", "reg")
+	add(req, &err, "Event", s.event)
 	add(req, &err, "Expires", "0")
 	if err != nil {
 		return nil, err
@@ -267,15 +224,15 @@ func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	switch {
 	case err != nil || evErr != nil || stateErr != nil:
 		code = 400
-	case !strings.EqualFold(ev.Type, "reg"):
+	case !strings.EqualFold(ev.Type, s.event):
 		code = 489
 	case ev.ID() != "":
 		// The SUBSCRIBE had no id, and an event is matched by id too.
 		code = 481
 	case s.remoteTag != "" && fromTag(req) != s.remoteTag:
-		// Another dialog: reg event subscriptions do not fork (RFC 3680
-		// §4.9), and a NOTIFY that matches no subscription is 481
-		// (RFC 6665 §4.1.3).
+		// Another dialog: neither reg event subscriptions (RFC 3680 §4.9)
+		// nor a conference focus's (RFC 4575 §3.1, one focus) fork, and
+		// a NOTIFY that matches no subscription is 481 (RFC 6665 §4.1.3).
 		code = 481
 	case s.seenCSeq && cseq.Seq <= s.remoteCSeq:
 		code = 500
@@ -292,7 +249,7 @@ func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	if code != 200 {
 		return
 	}
-	n := notification(req, state)
+	n := notification(req, state, s.event)
 	select {
 	case s.notifications <- n:
 	default:
@@ -303,10 +260,20 @@ func (s *Subscription) receive(tx *transaction.ServerTransaction) {
 	}
 }
 
-// notification reads a NOTIFY's body, with its Subscription-State.
-func notification(req *sip.Request, state sip.SubscriptionState) Notification {
+// notification reads a NOTIFY's body, with its Subscription-State: a reg
+// event's by reginfo, any other package's as it came.
+func notification(req *sip.Request, state sip.SubscriptionState, event string) Notification {
 	n := Notification{State: strings.ToLower(state.State), Reason: strings.ToLower(state.Reason())}
 	if len(req.Body) == 0 {
+		return n
+	}
+	if !strings.EqualFold(event, "reg") {
+		ct, err := req.Header.ContentType()
+		if err != nil {
+			n.Err = errors.New("sipua: the NOTIFY's Content-Type does not parse")
+			return n
+		}
+		n.ContentType, n.Body = strings.ToLower(ct.Type+"/"+ct.Subtype), slices.Clone(req.Body)
 		return n
 	}
 	if ct, err := req.Header.ContentType(); err != nil || !strings.EqualFold(ct.Type+"/"+ct.Subtype, reginfo.ContentType) {
