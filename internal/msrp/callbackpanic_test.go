@@ -45,7 +45,7 @@ type panickingHandler struct {
 
 func (h *panickingHandler) HandleMessage(s *Session, m *Message) error {
 	if h.messages.Add(1) == 1 {
-		panic("message-secret " + string(m.Body))
+		panic("message-secret " + string(m.Body.Bytes()))
 	}
 	return h.recorder.HandleMessage(s, m)
 }
@@ -77,8 +77,8 @@ func TestAPanicInHandleMessageIsAnsweredAsAnError(t *testing.T) {
 	}
 	p.send(t, sendLines("m3ss2", "Message-ID: msg2", "Content-Type: text/plain", "", "again", "-------m3ss2$")...)
 	expectResponse(t, p, "m3ss2", StatusOK)
-	if m := h.message(t); string(m.Body) != "again" {
-		t.Fatalf("delivered %q", m.Body)
+	if m := h.message(t); string(m.Body.Bytes()) != "again" {
+		t.Fatalf("delivered %q", m.Body.Bytes())
 	}
 	if n := counts.get(MetricCallbackPanics); n != 1 {
 		t.Errorf("%s = %d, want 1", MetricCallbackPanics, n)

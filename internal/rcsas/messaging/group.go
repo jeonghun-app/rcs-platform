@@ -593,7 +593,7 @@ func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outco
 		dctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 		if i < len(send)-1 {
 			l.carried.Store(true)
-			_, err = l.session.Send(dctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: n.body, FailureReport: msrp.ReportNo})
+			_, err = l.session.Send(dctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf(n.body), FailureReport: msrp.ReportNo})
 			cancel()
 			if err != nil {
 				e.metrics.Count("delivery.msrp_failed", 1)
@@ -826,7 +826,7 @@ func (e *Engine) groupComposing(ctx context.Context, h GroupHandler, o GroupOrig
 		go func() {
 			ctx, cancel := e.withTimeout(e.ctx, e.cfg.DeliveryTimeout)
 			to.carried.Store(true)
-			_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, FailureReport: msrp.ReportNo})
+			_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf(body), FailureReport: msrp.ReportNo})
 			cancel()
 			to.composing.Store(false)
 			if err != nil {
@@ -859,7 +859,7 @@ func (e *Engine) othersHere(group, sender string) bool {
 // indication, which a client may also send there, is wrapped in CPIM so
 // that the others learn who is typing.
 func (e *Engine) groupReceived(l *Leg, m *msrp.Message) error {
-	body := m.Body
+	body := m.Body.Bytes()
 	switch m.MediaType() {
 	case cpim.ContentType:
 	case IsComposingType:

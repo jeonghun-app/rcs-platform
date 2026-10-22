@@ -18,7 +18,7 @@ import (
 // asSeen parses what a participant received.
 func asSeen(t *testing.T, m *msrp.Message) *cpim.Message {
 	t.Helper()
-	c, err := cpim.Parse(m.Body)
+	c, err := cpim.Parse(m.Body.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func expectNothing(t *testing.T, c *client, what string) {
 	t.Helper()
 	select {
 	case m := <-c.got:
-		t.Fatalf("%s: got %q", what, m.Body)
+		t.Fatalf("%s: got %q", what, m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 }

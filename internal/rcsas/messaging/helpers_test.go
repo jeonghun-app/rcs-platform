@@ -563,7 +563,7 @@ func (r *rig) idle() bool {
 
 func (c *client) send(t *testing.T, body []byte) {
 	t.Helper()
-	if _, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: cpim.ContentType, Body: body, SuccessReport: true}); err != nil {
+	if _, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf(body), SuccessReport: true}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -572,7 +572,7 @@ func (c *client) send(t *testing.T, body []byte) {
 // Send returned, or the code of the report about it.
 func (c *client) outcome(t *testing.T, contentType string, body []byte) int {
 	t.Helper()
-	id, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: contentType, Body: body, SuccessReport: true})
+	id, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(body), SuccessReport: true})
 	var se *msrp.StatusError
 	if errors.As(err, &se) {
 		return se.Code

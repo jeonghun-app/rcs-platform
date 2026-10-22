@@ -88,8 +88,9 @@ type Outgoing struct {
 	MessageID   string
 	ContentType string
 	// Header holds MIME headers such as Content-Disposition.
-	Header        []Field
-	Body          []byte
+	Header []Field
+	// Body is the content, which prints as "[redacted body]" (Body).
+	Body          Body
 	SuccessReport bool
 	// FailureReport unset means yes.
 	FailureReport ReportMode
@@ -436,7 +437,7 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 			return "", err
 		}
 	}
-	chunks, err := Split(out.Body, c.cfg.ChunkSize)
+	chunks, err := Split(out.Body.Bytes(), c.cfg.ChunkSize)
 	if err != nil {
 		return id, err
 	}
@@ -553,7 +554,7 @@ func (s *Session) chunk(id string, out Outgoing, sr ReportMode, r ByteRange, dat
 		FailureReport: out.FailureReport,
 		ContentType:   out.ContentType,
 		Header:        out.Header,
-		Body:          data,
+		Body:          BodyOf(data),
 		Continuation:  flag,
 	}
 }
@@ -899,7 +900,7 @@ func (s *Session) serve(c *Conn, m *Message) error {
 		s.reasm.Drop(m.MessageID)
 		return c.respond(m, StatusMessageTooLarge)
 	}
-	if err := checkBody(m, int64(len(m.Body))); err != nil {
+	if err := checkBody(m, int64(m.Body.Len())); err != nil {
 		return c.respond(m, StatusBadRequest)
 	}
 
@@ -959,7 +960,7 @@ func (s *Session) receiveSend(c *Conn, m *Message) error {
 	}
 	// The complete message waits for the handler charged to the session's
 	// Budget, like octets held for reassembly.
-	octets := int64(len(whole.Body))
+	octets := int64(whole.Body.Len())
 	if !s.budget.take(octets) {
 		return c.respond(m, StatusMessageTooLarge)
 	}

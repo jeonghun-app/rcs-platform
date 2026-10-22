@@ -816,7 +816,7 @@ var (
 // after TransactionTimeout. Every awaited request holds one of MaxInFlight
 // slots until then.
 func (c *Conn) sendRequest(ctx context.Context, m *Message, mode sendMode, onResult func(code int, comment string)) error {
-	tid, err := c.newTransactionID(m.Body)
+	tid, err := c.newTransactionID(m.Body.Bytes())
 	if err != nil {
 		return err
 	}

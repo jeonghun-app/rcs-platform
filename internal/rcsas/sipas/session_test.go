@@ -94,8 +94,8 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 		t.Fatalf("ACK for another dialog: %q", ack.Header.Get("Call-ID"))
 	}
 	relayB := r.connect(t, toBob, toLeg)
-	if m := relayB.next(t); !strings.Contains(string(m.Body), "hi bob") {
-		t.Fatalf("bob's leg got %q", m.Body)
+	if m := relayB.next(t); !strings.Contains(string(m.Body.Bytes()), "hi bob") {
+		t.Fatalf("bob's leg got %q", m.Body.Bytes())
 	}
 
 	// bob hangs up: his BYE comes in the dialog rcs-as started.
@@ -146,8 +146,8 @@ func TestReportsAreTakenWhileTheLegSends(t *testing.T) {
 	toLeg, _ := offered(t, inv)
 	relayB := r.connect(t, toBob, toLeg)
 	for i := range n {
-		if m := relayB.next(t); !strings.Contains(string(m.Body), "imdn.Message-ID: m") || len(m.Body) < 10_000 {
-			t.Fatalf("message %d: %d bytes", i, len(m.Body))
+		if m := relayB.next(t); !strings.Contains(string(m.Body.Bytes()), "imdn.Message-ID: m") || m.Body.Len() < 10_000 {
+			t.Fatalf("message %d: %d bytes", i, m.Body.Len())
 		}
 	}
 }
