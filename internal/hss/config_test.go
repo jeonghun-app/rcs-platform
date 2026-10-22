@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 var devEnv = map[string]string{
@@ -63,7 +64,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		c.SubscribersTable != "subscribers" || c.ProfilesTable != "service-profiles" || c.OriginHost != "" {
 		t.Fatalf("config = %+v", c)
 	}
-	if c.Tokens.tokens().Admin.Current != adminToken || c.Tokens.tokens().ACS.Current != acsToken || c.Tokens.tokens().FT.Current != ftToken || c.Tokens.tokens().Admin.Next != "" {
+	if c.Tokens.Admin.Current.RevealString() != adminToken || c.Tokens.ACS.Current.RevealString() != acsToken || c.Tokens.FT.Current.RevealString() != ftToken || !c.Tokens.Admin.Next.IsZero() {
 		t.Fatal("tokens not read")
 	}
 }
@@ -93,7 +94,7 @@ func TestConfigNeverPrintsItsSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []string{c.Tokens.String(), c.DataKey.String(), c.Tokens.GoString(), c.DataKey.GoString()} {
+	for _, s := range []string{c.Tokens.Admin.Current.String(), c.DataKey.String(), c.Tokens.ACS.Current.GoString(), c.DataKey.GoString()} {
 		if s != "[redacted]" {
 			t.Errorf("printed %q", s)
 		}
@@ -239,6 +240,26 @@ func TestProductionRefusesOpenNetworksAndHalfRotations(t *testing.T) {
 		code, out := startUp(c.env)
 		if code != runtime.ExitFailure || !strings.Contains(out, "configuration rejected") || !strings.Contains(out, c.want) {
 			t.Errorf("%s: exit %d\n%s", name, code, out)
+		}
+	}
+}
+
+// The API's options, which run hands the tokens to, print none of them
+// either, under any verb, as the Config they come from (#533).
+func TestAPIOptionsNeverPrintTheirTokens(t *testing.T) {
+	o := APIOptions{Tokens: Tokens{
+		Admin: TokenPair{secret.NewString(adminToken), secret.NewString(adminTokenNext)},
+		ACS:   TokenPair{Current: secret.NewString(acsToken)},
+		FT:    TokenPair{Current: secret.NewString(ftToken)},
+	}}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{o, &o, o.Tokens, o.Tokens.Admin} {
+			out := fmt.Sprintf(verb, v)
+			for _, tok := range []string{adminToken[:12], adminTokenNext[:12], acsToken[:12], ftToken[:12], fmt.Sprintf("%x", adminToken[:6])} {
+				if strings.Contains(out, tok) {
+					t.Errorf("%s printed a token: %s", verb, out)
+				}
+			}
 		}
 	}
 }

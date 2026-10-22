@@ -69,10 +69,6 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	rt.Admin.AddReadinessCheck("binding store", st.Ready)
 
 	m := newCounters()
-	tokens := make([]string, len(cfg.Tokens))
-	for i, t := range cfg.Tokens {
-		tokens[i] = t.value()
-	}
 	relay, err := newRelay(relayOptions{
 		Store:                   st,
 		StoreTimeout:            cfg.StoreTimeout,
@@ -106,7 +102,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		CorePorts:    cfg.CorePorts,
 		Namespace:    cfg.Namespace,
 		MaxExpiresIn: cfg.MaxExpiresIn,
-		Tokens:       tokens,
+		Tokens:       cfg.Tokens,
 		Clock:        d.clock,
 		Rand:         d.rand,
 		Log:          rt.Logger,
