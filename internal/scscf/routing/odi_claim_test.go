@@ -278,6 +278,47 @@ func TestTheFarEndsAnswerStandsWhenTheReturnCameFirst(t *testing.T) {
 	}
 }
 
+// switchedClaims fails every claim of an iFC position once fail is set.
+type switchedClaims struct {
+	*state.Memory
+	fail atomic.Bool
+}
+
+func (s *switchedClaims) ClaimODI(ctx context.Context, scope, side string, now, expires time.Time) (string, error) {
+	if s.fail.Load() {
+		return "", errors.New("throttled")
+	}
+	return s.Memory.ClaimODI(ctx, scope, side, now, expires)
+}
+
+// A store that fails failed's own claim, after the server sent the request
+// back first, does not make the far end's 403 the timeout's: the request
+// is not sent on a second time (code review of #443).
+func TestAStoreErrorOnTheReclaimIsNotTheTimeouts(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), ifc.SessionContinued))
+	st := &switchedClaims{Memory: e.store}
+	r := fromUser(t, "OPTIONS", impu2)
+	d := e.router(st).Initial(bg, r)
+	tg := d.Targets[0]
+	if got := serverOf(t, e.router(nil).Initial(bg, backFrom(t, r, d, 0))); got != "icscf.rcs.local" {
+		t.Fatalf("the copy sent back went to %s", got)
+	}
+	if tg.OnTimeout(bg) {
+		t.Fatal("the timeout applies to a request the server sent back")
+	}
+	st.fail.Store(true)
+	refused := &sip.Response{StatusCode: 403, Reason: "Forbidden"}
+	if more := d.OnBranchFailure(bg, proxy.BranchFailure{Target: tg, Response: refused}); len(more) != 0 {
+		t.Errorf("a second copy went to %v", uris(more))
+	}
+	d.OnFinal(bg, refused)
+	if refused.StatusCode != 403 {
+		t.Errorf("the caller gets %d, want the far end's 403", refused.StatusCode)
+	}
+}
+
 // failingClaims fails every claim of an iFC position, as a throttled store.
 type failingClaims struct{ *state.Memory }
 
