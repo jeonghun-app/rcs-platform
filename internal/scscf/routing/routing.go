@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -100,6 +101,10 @@ type Config struct {
 	Rand    io.Reader
 	Logger  *slog.Logger
 	Metrics Metrics
+	// Panics recovers a panic in the work this package runs on goroutines
+	// of its own, which ends that work only and releases what it held
+	// (#488). Nil only recovers.
+	Panics *panics.Guard
 	// Resolver, if set, gives every address of an application server, so
 	// that a request goes on to the next when one cannot be reached, before
 	// the criterion's default handling applies (RFC 3263 §4.3, #574).

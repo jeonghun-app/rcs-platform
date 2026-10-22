@@ -205,7 +205,8 @@ func (rt *Router) repair(ctx context.Context, id *state.Identity, set *state.Reg
 		defer rt.repairs.Done()
 		ctx, cancel := rt.bounded(ctx, rt.cfg.RepairTimeout)
 		defer cancel()
-		if _, err := rt.cfg.Store.SaveIdentity(ctx, &want, rt.cfg.Now()); err != nil {
+		var err error
+		if !rt.cfg.Panics.Run("routing: identity repair", func() { _, err = rt.cfg.Store.SaveIdentity(ctx, &want, rt.cfg.Now()) }) || err != nil {
 			rt.count("routing.identity_repair_failed")
 			return
 		}

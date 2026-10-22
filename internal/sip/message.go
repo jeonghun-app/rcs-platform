@@ -29,7 +29,7 @@ type Request struct {
 	// URI is the Request-URI.
 	URI    URI
 	Header Header
-	Body   []byte
+	Body   Body
 }
 
 // Response is a SIP response (RFC 3261 §7.2).
@@ -37,7 +37,7 @@ type Response struct {
 	StatusCode int
 	Reason     string
 	Header     Header
-	Body       []byte
+	Body       Body
 }
 
 // Headers returns the header fields.

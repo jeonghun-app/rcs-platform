@@ -3,6 +3,8 @@ package sip
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"strconv"
@@ -14,8 +16,8 @@ import (
 // The values below carry subscriber identities (a SIP user part or tel number is
 // an MSISDN or IMSI-based identity) and credentials, which docs/architecture.md
 // §8 keeps out of logs. A service that passes one to log/slog gets these
-// redacted forms instead of the exported fields, the same line of defence as
-// messages having no String method.
+// redacted forms instead of the exported fields. Request and Response print
+// the same way under fmt (their String and Format).
 //
 // slog applies LogValue only to the value it is handed. A plain slice of these
 // values, or a struct of the service's own that holds one, reaches the JSON
@@ -280,6 +282,36 @@ func (r Response) LogValue() slog.Value {
 		slog.Int("headers", r.Header.Len()),
 		slog.Int("body_bytes", len(r.Body)),
 	)
+}
+
+// String, GoString and Format print a request as its LogValue logs it:
+// method, redacted Request-URI and sizes, without header values or the
+// body. Body redacts itself too, but fmt calls no method below the top
+// level under a verb a pointer has no meaning for (%s, %q, ...), so a
+// struct holding a *Request would otherwise show the body octets (#573).
+// Format has a pointer receiver: on a value it would turn off go vet's
+// verb check, and %p of a value would then pass vet and print the fields.
+// String and GoString, on values too, cover %v, %s and %#v of a value.
+func (r Request) String() string { return r.summary() }
+
+func (r Request) GoString() string { return r.summary() }
+
+func (r *Request) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, r.summary()) }
+
+func (r Request) summary() string {
+	return fmt.Sprintf("%s %s (%d headers, %d body octets)", r.Method, r.URI.redacted(), r.Header.Len(), len(r.Body))
+}
+
+// String, GoString and Format print a response as its LogValue logs it,
+// as Request's do, with Format on the pointer for the same reason.
+func (r Response) String() string { return r.summary() }
+
+func (r Response) GoString() string { return r.summary() }
+
+func (r *Response) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, r.summary()) }
+
+func (r Response) summary() string {
+	return fmt.Sprintf("%d %s (%d headers, %d body octets)", r.StatusCode, loggedReason(r.StatusCode, r.Reason), r.Header.Len(), len(r.Body))
 }
 
 // loggedReason is a reason phrase as it may be logged: the peer's text,
