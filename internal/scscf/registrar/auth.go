@@ -241,13 +241,13 @@ func (g *Registrar) digestChallenges(ctx context.Context, r *register, d *cx.Dig
 	}
 	type option struct {
 		alg digest.Algorithm
-		ha1 string
+		ha1 secretkey.Key
 	}
 	var options []option
-	if d.AlternateAlgorithm == string(digest.SHA256) && d.AlternateHA1 != "" {
+	if d.AlternateAlgorithm == string(digest.SHA256) && !d.AlternateHA1.IsZero() {
 		options = append(options, option{digest.SHA256, d.AlternateHA1})
 	}
-	if d.Algorithm == string(digest.MD5) && d.HA1 != "" {
+	if d.Algorithm == string(digest.MD5) && !d.HA1.IsZero() {
 		options = append(options, option{digest.MD5, d.HA1})
 	}
 	f := &failure{code: 401}
@@ -260,7 +260,7 @@ func (g *Registrar) digestChallenges(ctx context.Context, r *register, d *cx.Dig
 			return nil, err
 		}
 		err = g.store(ctx, r, ch.Nonce, &state.Challenge{Digest: &state.DigestChallenge{
-			Realm: ch.Realm, Algorithm: string(o.alg), QoP: digest.QOPAuth, Opaque: ch.Opaque, HA1: secretkey.NewString(o.ha1),
+			Realm: ch.Realm, Algorithm: string(o.alg), QoP: digest.QOPAuth, Opaque: ch.Opaque, HA1: o.ha1,
 		}})
 		if err != nil {
 			return nil, err

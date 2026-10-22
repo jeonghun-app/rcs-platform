@@ -54,14 +54,14 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 	add(mar, nil)
 	add((&MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), NumberAuthItems: 2, AuthDataItems: []AuthDataItem{
 		{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5, Authenticate: seq(32, 0), Authorization: secret.NewKey(seq(8, 0)), ConfidentialityKey: secret.NewKey(seq(16, 0)), IntegrityKey: secret.NewKey(seq(16, 0))},
-		{ItemNumber: 2, Scheme: SchemeSIPDigest, Digest: &DigestAuthenticate{Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: "00"}},
+		{ItemNumber: 2, Scheme: SchemeSIPDigest, Digest: &DigestAuthenticate{Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: secret.NewString("00")}},
 	}}).Message(hss, mar))
 	rtr := must((&RTR{Request: Request{DestinationHost: scscfHost, DestinationRealm: realm}, UserName: impi, PublicIdentities: []string{impu},
 		DeregistrationReason: DeregistrationReason{Code: ServerChange, Info: "moved"}}).Message(hss))
 	add(rtr, nil)
 	add((&RTA{Answer: answer(ResultCode(diameter.ResultSuccess)), AssociatedIdentities: []string{}}).Message(scscf, rtr))
 	ppr := must((&PPR{Request: Request{DestinationHost: scscfHost, DestinationRealm: realm}, UserName: impi, UserData: []byte("x"),
-		AuthDataItem: &AuthDataItem{Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: "00"}}}).Message(hss))
+		AuthDataItem: &AuthDataItem{Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: secret.NewString("00")}}}).Message(hss))
 	add(ppr, nil)
 	add((&PPA{Answer: answer(ExperimentalResult(ErrorNotSupportedUserData))}).Message(scscf, ppr))
 	return seeds
