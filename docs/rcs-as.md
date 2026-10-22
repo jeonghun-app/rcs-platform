@@ -1235,6 +1235,10 @@ transaction, so each copy costs about 2 more write units. A copy is queued
 only while the owner item still names the task that queues it, so a task that
 lost the group queues none (the fan-out stops at the first refused copy,
 `group.fanout.not_owner`, and the sender is answered as for a store failure).
+The copies queued before the refused one stay. When the sender's client sends
+the message again, now to the new owner, those recipients get it twice, as
+after a fan-out that ran past `FanoutTimeout`: the clients drop the repeat by
+its Message-ID (the lead's decision on #440).
 The other group-mode items are not fenced, as two tasks cannot both queue one:
 a participant's notification for the author is queued once its mark is
 stored, which only one writer does (`MarkNotified`); a summary has an ID
