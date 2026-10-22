@@ -225,8 +225,12 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 	odi := rt.signODI(pos, requestOf(req), expires)
 	back.Params.Set(odiParam, odi)
 	t := proxy.Target{URI: req.URI, Routes: []sip.Address{{URI: server}, {URI: back}}}
-	// timedOut is set once the timeout has taken the position (OnTimeout).
-	var timedOut atomic.Bool
+	// fired is set as OnTimeout starts, timedOut once the timeout has taken
+	// the position. The branch lives on while OnTimeout waits on the store,
+	// so it may end meanwhile, with the 403 the server relays for a copy it
+	// sent back late: failed then asks the store itself (code review of
+	// #443).
+	var fired, timedOut atomic.Bool
 	if req.Method != "INVITE" {
 		// An INVITE's branch may ring for long, and Timeout would cancel
 		// it: the server's silence is Timer B's to find (RFC 3261 §17.1.1).
@@ -238,6 +242,7 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 		// the timeout takes the position unless the return did, so a copy
 		// sent back after it is refused as late.
 		t.OnTimeout = func(ctx context.Context) bool {
+			fired.Store(true)
 			taken, err := rt.takeUp(ctx, odi, state.ODIDefault, expires)
 			switch {
 			case err != nil:
@@ -258,6 +263,15 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 			return b.Header.Set("P-Served-User", servedUser(pos))
 		},
 		failed: func(ctx context.Context, f proxy.BranchFailure) step {
+			if fired.Load() && !timedOut.Load() {
+				// The claim is the same side's again, so it is safe to
+				// repeat: true if OnTimeout's took the position. If the
+				// return took it, or the store fails, the branch's
+				// failure is handled as any other below.
+				if taken, err := rt.takeUp(ctx, odi, state.ODIDefault, expires); err == nil && taken {
+					timedOut.Store(true)
+				}
+			}
 			if timedOut.Load() {
 				// The timeout took the position, whatever the branch ended
 				// with meanwhile: a 403 the server relayed for a copy it

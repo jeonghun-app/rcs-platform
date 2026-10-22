@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -178,11 +179,31 @@ func TestASTimeoutBoundsOnlyTheWaitForTheServer(t *testing.T) {
 	}
 }
 
+// heldClaim applies the first default-handling claim of an iFC position to
+// the store and then holds its answer until release closes, as a slow
+// store or a retried put whose answer was lost.
+type heldClaim struct {
+	*state.Memory
+	held             atomic.Bool
+	applied, release chan struct{}
+}
+
+func (s *heldClaim) ClaimODI(ctx context.Context, scope, side string, now, expires time.Time) (string, error) {
+	recorded, err := s.Memory.ClaimODI(ctx, scope, side, now, expires)
+	// Not a sync.Once, whose other callers would wait for the held one.
+	if side == state.ODIDefault && s.held.CompareAndSwap(false, true) {
+		close(s.applied)
+		<-s.release
+	}
+	return recorded, err
+}
+
 // A copy the server sends back after the timeout took the position is
-// refused 403, and the server may relay that 403 on the branch before the
-// proxy ends it: the default handling still applies, as the timeout's
-// (code review of #443). SESSION_CONTINUED goes on to the next hop,
-// SESSION_TERMINATED answers 504, not the 403.
+// refused 403, and the server may relay that 403 on the branch while
+// OnTimeout still waits for the store's answer, the branch alive meanwhile:
+// the default handling still applies, as the timeout's (code review of
+// #443). SESSION_CONTINUED goes on to the next hop, SESSION_TERMINATED
+// answers 504, not the 403.
 func TestTheTimeoutsPositionStandsAgainstTheRelayedLateRefusal(t *testing.T) {
 	for _, handling := range []ifc.DefaultHandling{ifc.SessionContinued, ifc.SessionTerminated} {
 		name := map[ifc.DefaultHandling]string{ifc.SessionContinued: "SESSION_CONTINUED", ifc.SessionTerminated: "SESSION_TERMINATED"}[handling]
@@ -190,17 +211,25 @@ func TestTheTimeoutsPositionStandsAgainstTheRelayedLateRefusal(t *testing.T) {
 			e := newEnv(t)
 			e.registered(binding(1, 0, time.Hour))
 			e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), handling))
+			held := &heldClaim{Memory: e.store, applied: make(chan struct{}), release: make(chan struct{})}
 			r := fromUser(t, "OPTIONS", impu2)
-			d := e.router(nil).Initial(bg, r)
+			d := e.router(held).Initial(bg, r)
 			tg := d.Targets[0]
-			if !tg.OnTimeout(bg) {
-				t.Fatal("the timeout did not apply to a server that had not sent the request back")
-			}
+			applies := make(chan bool, 1)
+			go func() { applies <- tg.OnTimeout(bg) }()
+			<-held.applied
+			defer func() {
+				close(held.release)
+				if !<-applies {
+					t.Error("the timeout did not apply to a server that had not sent the request back")
+				}
+			}()
 			late := e.router(nil).Initial(bg, backFrom(t, r, d, 0))
 			if late.Status != 403 {
 				t.Fatalf("the copy sent back after the timeout got %+v, want 403", late)
 			}
-			// The server relays that 403 on its branch.
+			// The server relays that 403 on its branch before OnTimeout
+			// has its answer.
 			relayed := &sip.Response{StatusCode: 403, Reason: "Forbidden"}
 			more := d.OnBranchFailure(bg, proxy.BranchFailure{Target: tg, Response: relayed})
 			if handling == ifc.SessionContinued {
@@ -217,6 +246,35 @@ func TestTheTimeoutsPositionStandsAgainstTheRelayedLateRefusal(t *testing.T) {
 				t.Errorf("the caller gets %d, want the timeout's 504", relayed.StatusCode)
 			}
 		})
+	}
+}
+
+// When the server sent the request back before the timeout, the far end's
+// answer comes along the branch even after OnTimeout ran: failed asks the
+// store again and finds the return's claim, so a 403 from the far end is
+// passed on, not taken for the timeout's (code review of #443).
+func TestTheFarEndsAnswerStandsWhenTheReturnCameFirst(t *testing.T) {
+	for _, handling := range []ifc.DefaultHandling{ifc.SessionContinued, ifc.SessionTerminated} {
+		e := newEnv(t)
+		e.registered(binding(1, 0, time.Hour))
+		e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), handling))
+		r := fromUser(t, "OPTIONS", impu2)
+		d := e.router(nil).Initial(bg, r)
+		tg := d.Targets[0]
+		if got := serverOf(t, e.router(nil).Initial(bg, backFrom(t, r, d, 0))); got != "icscf.rcs.local" {
+			t.Fatalf("the copy sent back went to %s", got)
+		}
+		if tg.OnTimeout(bg) {
+			t.Fatal("the timeout applies to a request the server sent back")
+		}
+		refused := &sip.Response{StatusCode: 403, Reason: "Forbidden"}
+		if more := d.OnBranchFailure(bg, proxy.BranchFailure{Target: tg, Response: refused}); len(more) != 0 {
+			t.Errorf("handling %v: the far end's 403 sent the request on to %v", handling, uris(more))
+		}
+		d.OnFinal(bg, refused)
+		if refused.StatusCode != 403 {
+			t.Errorf("handling %v: the caller gets %d, want the far end's 403", handling, refused.StatusCode)
+		}
 	}
 }
 
