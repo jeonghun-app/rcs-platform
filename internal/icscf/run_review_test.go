@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -598,26 +599,34 @@ func TestARequestPastTheTransactionCapGets503(t *testing.T) {
 	hss := startHSS(t)
 	scscf := startSCSCF(t)
 	held, release := make(chan struct{}), make(chan struct{})
-	var once sync.Once
+	var releaseOnce sync.Once
+	letGo := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(letGo)
+	// Only the first answer is held, and the ones after it are not queued
+	// behind it, as a sync.Once around the hold would queue them (#477).
+	var holding atomic.Bool
 	hss.answer = func(uint32) (cx.Result, string) {
-		once.Do(func() { close(held); <-release })
+		if holding.CompareAndSwap(false, true) {
+			close(held)
+			<-release
+		}
 		return cx.ResultCode(diameter.ResultSuccess), scscf.uri()
 	}
 	r := startICSCF(t, hss, []SCSCF{{URI: mustURI(scscf.uri())}}, func(c *ServiceConfig, _ *deps) {
 		c.MaxServerTransactions = 1
+		// Only the test lets the first request go: with the harness's 2 s,
+		// a loaded host turned it into a 480 before the second arrived,
+		// which freed the cap (#477).
+		c.CxTimeout = time.Minute
 	})
 	r.waitReady(t)
 	first := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
-	select {
-	case <-held:
-	case <-time.After(realWait):
-		t.Fatal("the first request never reached the HSS")
-	}
+	before(t, "the first request reaching the HSS", held, first)
 	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f2", "To: <"+tel1+">")
 	if res.StatusCode != 503 || res.Header.Get("Retry-After") == "" {
 		t.Errorf("past the cap: %d with Retry-After %q, want 503 with one", res.StatusCode, res.Header.Get("Retry-After"))
 	}
-	close(release)
+	letGo()
 	if got := <-first; got != "200" {
 		t.Fatalf("the request in progress got %s, want 200", got)
 	}

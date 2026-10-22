@@ -97,7 +97,14 @@ func TestALockWaitEndsOnlyWithItsContext(t *testing.T) {
 		}
 		got <- err
 	}()
-	<-waiting
+	// The lock's own result ends the wait too, so that a lock that never
+	// waits fails here with a message rather than at the package's timeout
+	// (#480).
+	select {
+	case <-waiting:
+	case err := <-got:
+		t.Fatalf("the lock returned %v without waiting for its holder", err)
+	}
 	time.Sleep(DefaultCxTimeout + 500*time.Millisecond)
 	unlock()
 	if err := <-got; err != nil {
@@ -181,7 +188,11 @@ func TestAnUpdateThatWaitedForTheLockReadsTheSubscriptionAgain(t *testing.T) {
 		})
 		done <- err
 	}()
-	<-waiting
+	select {
+	case <-waiting:
+	case err := <-done:
+		t.Fatalf("the update returned %v without waiting for the lock", err)
+	}
 	// What the lock's holder writes before it lets go.
 	e.modify(impi1, func(s *store.Subscription) { s.ServerName = "sip:scscf-1.rcs.local" })
 	unlock()

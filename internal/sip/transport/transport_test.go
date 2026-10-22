@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -479,18 +480,64 @@ func TestListenerIdleTimeoutOverridesTheTransportDefault(t *testing.T) {
 	eventually(t, "an idle timeout", func() bool { return server.Stats().IdleTimeouts == 1 })
 }
 
+// An accepted connection that sends only keep-alives is closed by the read
+// timeout, which runs from the accept: a keep-alive is answered but is no
+// first message, so it neither moves the deadline nor turns it into the idle
+// timeout of an hour. The connection records its read deadlines and applies
+// none, and the test makes the one it got pass once the keep-alive is
+// answered, so no order depends on a loaded host's timing (#463).
 func TestAcceptedConnectionThatSendsNoMessageIsClosedAfterTheReadTimeout(t *testing.T) {
-	// The idle timeout is an hour, and keep-alives do not count as a first
-	// message, so only the read timeout can free this slot.
-	server, _ := newTransport(t, Config{IdleTimeout: time.Hour, ReadTimeout: 50 * time.Millisecond})
-	addr := listen(t, server, ListenerConfig{Network: TCP})
-	c := dialRaw(t, addr)
-	c.Write([]byte("\r\n\r\n"))
-	waitClosed(t, c)
-	eventually(t, "a read timeout", func() bool { return server.Stats().ReadTimeouts == 1 })
-	if s := server.Stats(); s.IdleTimeouts != 0 || s.KeepAlives != 1 {
+	const readTimeout = 50 * time.Millisecond
+	server, _ := newTransport(t, Config{IdleTimeout: time.Hour, ReadTimeout: readTimeout})
+	listen(t, server, ListenerConfig{Network: TCP})
+	near, peer := net.Pipe()
+	t.Cleanup(func() { peer.Close() })
+	_ = peer.SetDeadline(time.Now().Add(waitFor))
+	conn := &acceptedConn{readDeadlines: readDeadlines{Conn: near}}
+	server.mu.Lock()
+	l := server.listeners[0]
+	server.mu.Unlock()
+	before := time.Now()
+	l.take(conn)
+	if _, err := peer.Write([]byte("\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	pong := make([]byte, 2)
+	if _, err := io.ReadFull(peer, pong); err != nil || string(pong) != "\r\n" {
+		t.Fatalf("pong %q, %v", pong, err)
+	}
+	after := time.Now()
+	// The deadline passes, at the next read after the keep-alive at the
+	// latest, which sets any deadline of its own first.
+	_ = near.SetReadDeadline(time.Unix(1, 0))
+	eventually(t, "the connection to close", func() bool { s := server.Stats(); return s.ReadTimeouts+s.IdleTimeouts == 1 })
+	if s := server.Stats(); s.ReadTimeouts != 1 || s.IdleTimeouts != 0 || s.KeepAlives != 1 {
 		t.Fatalf("stats = %+v", s)
 	}
+	// The accept clears any deadline (time.Time{}) before the stream sets its
+	// own, at the first read, which came after the take and before the pong:
+	// ReadTimeout from then (QA of #481).
+	got := slices.DeleteFunc(conn.all(), time.Time.IsZero)
+	if len(got) != 1 {
+		t.Fatalf("read deadlines %v, want only the one set at the first read", got)
+	}
+	if got[0].Before(before.Add(readTimeout)) || got[0].After(after.Add(readTimeout)) {
+		t.Fatalf("read deadline %v after the take, want ReadTimeout %v from the first read, between %v and %v", got[0].Sub(before), readTimeout, readTimeout, after.Sub(before)+readTimeout)
+	}
+}
+
+// acceptedConn is a connection handed to a listener as if accepted from a
+// client at 192.0.2.10: it records its read deadlines and applies none.
+type acceptedConn struct{ readDeadlines }
+
+func (c *acceptedConn) all() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.deadlines)
+}
+
+func (c *acceptedConn) RemoteAddr() net.Addr {
+	return &net.TCPAddr{IP: net.IPv4(192, 0, 2, 10), Port: 5060}
 }
 
 func TestTrickledHeaderIsCutOffByTheReadTimeout(t *testing.T) {

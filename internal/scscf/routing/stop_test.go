@@ -21,7 +21,7 @@ func TestAStopThatRunsOutGivesUpOnTheThirdPartyREGISTERs(t *testing.T) {
 	e := newEnv(t)
 	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionTerminated))
 	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 4)}
-	rt := e.router(nil, withSender(s), func(c *Config) { c.MaxThirdParty = 1 })
+	rt := e.router(nil, withSender(s), holdingLong, func(c *Config) { c.MaxThirdParty = 1 })
 	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
 	recv(t, s.inside)
 	rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
