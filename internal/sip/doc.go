@@ -29,7 +29,8 @@
 // that breaks them.
 //
 // Errors never contain message bytes: header values carry subscriber identities
-// and an error is likely to be logged. For the same reason messages have no
-// String method, and the value types implement slog.LogValuer with identities
-// and credentials left out.
+// and an error is likely to be logged. For the same reason a message prints
+// under fmt as it logs, its method or status and sizes without header values
+// or the body (String, Format), its Body prints as redacted, and the value
+// types implement slog.LogValuer with identities and credentials left out.
 package sip

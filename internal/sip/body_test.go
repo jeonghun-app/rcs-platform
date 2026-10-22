@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -68,6 +69,26 @@ func TestAMessagePrintsAsItLogs(t *testing.T) {
 	}
 	if strings.Contains(fmt.Sprintf("%+v %#v", req, res), "secret") || strings.Contains(fmt.Sprint(res), "Alice") {
 		t.Error("a header value or a custom reason was printed")
+	}
+}
+
+// Format is on the pointers alone, String and GoString on both: a Format
+// on a value would turn off go vet's verb check for message values, and %p
+// of a value would then pass vet and print the fields (#573).
+func TestTheMessagesMethodSets(t *testing.T) {
+	for _, v := range []any{Request{}, Response{}} {
+		value, pointer := reflect.TypeOf(v), reflect.PointerTo(reflect.TypeOf(v))
+		if _, ok := value.MethodByName("Format"); ok {
+			t.Errorf("%v has Format on the value", value)
+		}
+		if _, ok := pointer.MethodByName("Format"); !ok {
+			t.Errorf("%v has no Format", pointer)
+		}
+		for _, name := range []string{"String", "GoString"} {
+			if _, ok := value.MethodByName(name); !ok {
+				t.Errorf("%v has no %s", value, name)
+			}
+		}
 	}
 }
 

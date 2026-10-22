@@ -238,8 +238,12 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   logged. Chat content is held in `content.Body` (MSRP bodies and chunks,
   CPIM bodies, rcs-as's queued and in-flight CPIM), which no `fmt` verb,
   slog record or JSON encoding shows, and keys in `secret.Key`, so a stray
-  log line or `%v` cannot print them either (#530, #547). SIP message
-  bodies log only their length so far (#573).
+  log line or `%v` cannot print them either (#530, #547). A SIP message
+  body is a `sip.Body`, a `[]byte` that prints as redacted under every
+  valid `fmt` verb and logs and encodes as its length, and a SIP request
+  or response prints as it logs, without header values or the body; the
+  cases `fmt` still prints field by field are listed, with their guards,
+  in `sip.Body`'s documentation (#573, #599).
 - **Metrics**: CloudWatch Embedded Metric Format lines on stdout, so no agent is
   needed. They are aggregated in memory and written once a minute, when
   shutdown starts and when it ends, one line per metric, so log volume does

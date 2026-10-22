@@ -32,8 +32,12 @@ import (
 // Not guarded (#599): %t, %c, %U and %e on a struct with an unexported
 // *Request or *Response field, which vet accepts since the message has a
 // Format of its own; an unexported field of type Message or any holding a
-// message, which vet accepts under any verb; a format that is not a
-// constant; and a wrapper vet does not recognise as printf-like. fmt
+// message, which vet accepts under any verb; a Request or Response value
+// printed with a format that is not a constant, under a verb String does
+// not serve (%t, %d, %c, ...; String serves %v, %s, %q, %x and %X), where
+// fmt prints its fields (the body stays hidden, the
+// URI's user part and header values do not); any other format that is not
+// a constant; and a wrapper vet does not recognise as printf-like. fmt
 // prints the message field by field in these cases. internal/content
 // holds the module's other chat content behind a pointer, which closes
 // these cases too; a SIP body is read and written as bytes throughout the
