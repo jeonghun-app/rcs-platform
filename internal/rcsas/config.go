@@ -132,6 +132,11 @@ func Configure(s *runtime.Settings) Config {
 			MSRP: msrp.Config{
 				// ADR 0003: below the NLB's fixed 350 s TLS idle timeout.
 				KeepAliveInterval: e.Duration("MSRP_KEEPALIVE", msrp.DefaultKeepAliveInterval),
+				// rcs-as's MSRP connections all come from msrp-relay and
+				// carry many sessions each: one is probed when a request
+				// on it times out (#517).
+				ProbeOnTimeout: true,
+				ProbeTimeout:   e.Duration("MSRP_PROBE_TIMEOUT", msrp.DefaultProbeTimeout),
 			},
 		},
 	}

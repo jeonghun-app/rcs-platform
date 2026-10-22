@@ -105,7 +105,7 @@ func startHSSOf(t *testing.T, aka *milenage.Milenage) *diameterHSS {
 			return nil, err
 		}
 		return (&cx.MAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, UserName: impi, AuthDataItems: []cx.AuthDataItem{{
-			Scheme: cx.SchemeSIPDigest, Digest: &cx.DigestAuthenticate{Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: ha1},
+			Scheme: cx.SchemeSIPDigest, Digest: &cx.DigestAuthenticate{Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: secret.NewString(ha1)},
 		}}}).Message(n, req)
 	})
 	n.HandleFunc(cx.ApplicationID, cx.CodeServerAssignment, func(_ context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {

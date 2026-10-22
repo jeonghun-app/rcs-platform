@@ -85,6 +85,8 @@ func guard(t *testing.T) time.Duration {
 // and transactions ended either way.
 type burstProgress struct {
 	submitted, final, failed atomic.Int64
+	// bound, when set, replaces guard as the burst's bound.
+	bound time.Duration
 }
 
 func (p *burstProgress) moved() int64 { return p.submitted.Load() + p.final.Load() + p.failed.Load() }
@@ -98,6 +100,9 @@ func (p *burstProgress) await(t *testing.T, want int64, sendersDone <-chan struc
 	t.Helper()
 	start := time.Now()
 	bound := guard(t)
+	if p.bound > 0 {
+		bound = p.bound
+	}
 	last, lastAt := p.moved(), start
 	var samples []string
 	nextSample := start
@@ -150,7 +155,7 @@ func TestInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 			var stop []func()
 			mk := func(code int) (*transport.Transport, *Layer, netip.AddrPort) {
 				var layer *Layer
-				tr, err := transport.New(transport.Config{WriteTimeout: burstWriteTimeout}, func(in transport.Inbound) { layer.Receive(in) })
+				tr, err := transport.New(transport.Config{WriteTimeout: burstWriteTimeout, Dialer: linkDialer()}, func(in transport.Inbound) { layer.Receive(in) })
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -226,7 +231,10 @@ func (*sourceTU) ServerFailed(*ServerTransaction, error) {}
 // QA regression (PR #35 re-verification): both ends of one TCP connection send
 // a burst of large INVITEs to each other at once, A to B's address and B back
 // over A's flow, so each side's reading goroutine answers while its own writer
-// is busy with the other burst.
+// is busy with the other burst. The connection has a real link's segment
+// size (linkDialer): on loopback's 64 KiB one, a receive buffer that shrinks
+// mid-burst stalls it in the kernel, which no network the services run on
+// can do (#616).
 func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 	total := 1200
 	if raceEnabled {
@@ -234,80 +242,106 @@ func TestTwoWayInviteBurstOverOneTCPConnectionCompletes(t *testing.T) {
 	}
 	for _, code := range []int{200, 486} {
 		t.Run(strconv.Itoa(code), func(t *testing.T) {
-			var stop []func()
-			mk := func() (*transport.Transport, *Layer, *sourceTU, netip.AddrPort) {
-				tu := &sourceTU{code: code, first: make(chan transport.Source, 1)}
-				var layer *Layer
-				tr, err := transport.New(transport.Config{WriteTimeout: burstWriteTimeout}, func(in transport.Inbound) { layer.Receive(in) })
-				if err != nil {
-					t.Fatal(err)
-				}
-				layer = mustNew(t, tr, tu, Config{T1: burstT1})
-				a, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
-				if err != nil {
-					t.Fatal(err)
-				}
-				t.Cleanup(func() { layer.Close(); tr.Close() })
-				stop = append(stop, func() { layer.Close(); tr.Close() })
-				return tr, layer, tu, a
-			}
-			atr, al, _, _ := mk()
-			btr, bl, btu, baddr := mk()
-			body := []byte(strings.Repeat("a=x\r\n", 32<<10/5)) // 32 KiB
+			twoWayBurst(t, code, total, linkDialer(), 0, nil)
+		})
+	}
+}
 
-			var p burstProgress
-			final, failed := &p.final, &p.failed
-			var why failures
-			collect := func(res *sip.Response, err error) {
-				if err != nil {
-					failed.Add(1)
-					why.add(err)
-				} else if res.StatusCode >= 200 {
-					final.Add(1)
-				}
-			}
-			invite := func(side string, i int) *sip.Request {
-				req := newOutgoing(t, transport.TCP, "INVITE", fmt.Sprintf("z9hG4bK-%s-%d", side, i), "", 1)
-				req.Header.Set("Call-ID", fmt.Sprintf("%s-%d@example.com", side, i))
-				req.Header.Add("Contact", "<sip:x@127.0.0.1>")
-				req.Header.Add("Content-Type", "application/sdp")
-				req.Body = body
-				return req
-			}
-			// The first INVITE opens the connection and tells B its flow.
-			if _, err := al.Request(invite("a", 0), transport.Destination{Network: transport.TCP, Addr: baddr}, collect); err != nil {
-				t.Fatal(err)
+// twoWayBurst runs the two-way burst of total INVITEs a side, answered
+// code, with A dialling B through dialer. bound, when set, replaces the
+// guard. midway, when set, runs once a tenth of the transactions have
+// ended, while the burst goes on.
+func twoWayBurst(t *testing.T, code, total int, dialer transport.Dialer, bound time.Duration, midway func()) {
+	t.Helper()
+	var stop []func()
+	mk := func(d transport.Dialer) (*transport.Transport, *Layer, *sourceTU, netip.AddrPort) {
+		tu := &sourceTU{code: code, first: make(chan transport.Source, 1)}
+		var layer *Layer
+		tr, err := transport.New(transport.Config{WriteTimeout: burstWriteTimeout, Dialer: d}, func(in transport.Inbound) { layer.Receive(in) })
+		if err != nil {
+			t.Fatal(err)
+		}
+		layer = mustNew(t, tr, tu, Config{T1: burstT1})
+		a, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { layer.Close(); tr.Close() })
+		stop = append(stop, func() { layer.Close(); tr.Close() })
+		return tr, layer, tu, a
+	}
+	atr, al, _, _ := mk(dialer)
+	btr, bl, btu, baddr := mk(nil)
+	body := []byte(strings.Repeat("a=x\r\n", 32<<10/5)) // 32 KiB
+
+	p := burstProgress{bound: bound}
+	final, failed := &p.final, &p.failed
+	var why failures
+	collect := func(res *sip.Response, err error) {
+		if err != nil {
+			failed.Add(1)
+			why.add(err)
+		} else if res.StatusCode >= 200 {
+			final.Add(1)
+		}
+	}
+	invite := func(side string, i int) *sip.Request {
+		req := newOutgoing(t, transport.TCP, "INVITE", fmt.Sprintf("z9hG4bK-%s-%d", side, i), "", 1)
+		req.Header.Set("Call-ID", fmt.Sprintf("%s-%d@example.com", side, i))
+		req.Header.Add("Contact", "<sip:x@127.0.0.1>")
+		req.Header.Add("Content-Type", "application/sdp")
+		req.Body = body
+		return req
+	}
+	// The first INVITE opens the connection and tells B its flow.
+	if _, err := al.Request(invite("a", 0), transport.Destination{Network: transport.TCP, Addr: baddr}, collect); err != nil {
+		t.Fatal(err)
+	}
+	p.submitted.Add(1)
+	toA := transport.Destination{Flow: (<-btu.first).Flow}
+
+	var wg sync.WaitGroup
+	send := func(l *Layer, side string, dst transport.Destination, from int) {
+		defer wg.Done()
+		for i := from; i < total; i += 4 {
+			if _, err := l.Request(invite(side, i), dst, collect); err != nil {
+				failed.Add(1)
+				why.add(err)
 			}
 			p.submitted.Add(1)
-			toA := transport.Destination{Flow: (<-btu.first).Flow}
-
-			var wg sync.WaitGroup
-			send := func(l *Layer, side string, dst transport.Destination, from int) {
-				defer wg.Done()
-				for i := from; i < total; i += 4 {
-					if _, err := l.Request(invite(side, i), dst, collect); err != nil {
-						failed.Add(1)
-						why.add(err)
-					}
-					p.submitted.Add(1)
+		}
+	}
+	for w := range 4 {
+		wg.Add(2)
+		go send(al, "a", transport.Destination{Network: transport.TCP, Addr: baddr}, 1+w)
+		go send(bl, "b", toA, w)
+	}
+	want := int64(2 * total) // each side sends total INVITEs, A's first included
+	if midway != nil {
+		// The burst may end, or fail, first: midway then does not run, and
+		// it never runs after the test.
+		quit, ran := make(chan struct{}), make(chan struct{})
+		defer func() { close(quit); <-ran }()
+		go func() {
+			defer close(ran)
+			for final.Load()+failed.Load() < want/10 {
+				select {
+				case <-quit:
+					return
+				case <-time.After(time.Millisecond):
 				}
 			}
-			for w := range 4 {
-				wg.Add(2)
-				go send(al, "a", transport.Destination{Network: transport.TCP, Addr: baddr}, 1+w)
-				go send(bl, "b", toA, w)
-			}
-			want := int64(2 * total) // each side sends total INVITEs, A's first included
-			if !p.await(t, want, wgDone(&wg), func() string { return fmt.Sprintf("A %+v; B %+v", atr.Stats(), btr.Stats()) }) {
-				stopBurst(t, stop, &wg)
-				return
-			}
-			as, bs := atr.Stats(), btr.Stats()
-			if failed.Load() > 0 || final.Load() != want || as.Dialed != 1 || bs.Dialed != 0 ||
-				as.QueueOverflows+bs.QueueOverflows+as.WriteErrors+bs.WriteErrors > 0 {
-				t.Errorf("final=%d failed=%d of %d (%s); A %+v; B %+v", final.Load(), failed.Load(), want, &why, as, bs)
-			}
-		})
+			midway()
+		}()
+	}
+	if !p.await(t, want, wgDone(&wg), func() string { return fmt.Sprintf("A %+v; B %+v", atr.Stats(), btr.Stats()) }) {
+		stopBurst(t, stop, &wg)
+		return
+	}
+	as, bs := atr.Stats(), btr.Stats()
+	if failed.Load() > 0 || final.Load() != want || as.Dialed != 1 || bs.Dialed != 0 ||
+		as.QueueOverflows+bs.QueueOverflows+as.WriteErrors+bs.WriteErrors > 0 {
+		t.Errorf("final=%d failed=%d of %d (%s); A %+v; B %+v", final.Load(), failed.Load(), want, &why, as, bs)
 	}
 }
 

@@ -142,9 +142,9 @@ func TestMultimediaAuthRoundTripCarriesAKAAndDigestVectors(t *testing.T) {
 					Realm:              realm,
 					Algorithm:          "MD5",
 					QoP:                "auth",
-					HA1:                "0123456789abcdef0123456789abcdef",
+					HA1:                secret.NewString("0123456789abcdef0123456789abcdef"),
 					AlternateAlgorithm: "SHA-256",
-					AlternateHA1:       "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+					AlternateHA1:       secret.NewString("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"),
 				},
 			},
 		},
@@ -191,7 +191,7 @@ func TestPushProfileRoundTripCarriesNewDigestData(t *testing.T) {
 		UserData:            []byte("<IMSSubscription/>"),
 		ChargingInformation: &ChargingInformation{SecondaryEventChargingFunctionName: "aaas://ocs2.ims.mnc001.mcc001.3gppnetwork.org"},
 		AuthDataItem: &AuthDataItem{Scheme: SchemeSIPDigest, Digest: &DigestAuthenticate{
-			Realm: realm, QoP: "auth", HA1: "fedcba9876543210fedcba9876543210",
+			Realm: realm, QoP: "auth", HA1: secret.NewString("fedcba9876543210fedcba9876543210"),
 		}},
 	}
 	req := transmit(t, must(ppr.Message(hss)))
