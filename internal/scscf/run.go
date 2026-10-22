@@ -61,8 +61,15 @@ type deps struct {
 	allow  func(netip.Addr) bool
 	// sipDialer, if set, opens the transport's connections.
 	sipDialer transport.Dialer
-	// writeTimeout replaces the transport's WriteTimeout when set.
-	writeTimeout time.Duration
+	// writeTimeout replaces the transport's WriteTimeout when set, and
+	// sendQueueBytes its SendQueueBytes.
+	writeTimeout   time.Duration
+	sendQueueBytes int
+	// dialTimeout replaces coreDialTimeout when set; it must stay below
+	// closeMargin.
+	dialTimeout time.Duration
+	// router, if set, routes in place of the dispatcher.
+	router proxy.Router
 	// transportMade, if set, hears of the transport once it is made.
 	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
@@ -82,6 +89,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	}
 	if d.now == nil {
 		d.now = time.Now
+	}
+	if d.dialTimeout == 0 {
+		d.dialTimeout = coreDialTimeout
 	}
 	store, err := openStore(ctx, cfg, d)
 	if err != nil {
@@ -104,7 +114,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 
 	resolver := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Logger: rt.Logger}
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, WriteTimeout: d.writeTimeout, Dialer: d.sipDialer, Logger: rt.Logger}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{
+		DialTimeout: d.dialTimeout, WriteTimeout: d.writeTimeout, SendQueueBytes: d.sendQueueBytes, Dialer: d.sipDialer, Logger: rt.Logger,
+	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}
@@ -173,16 +185,23 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	third.router.Store(router)
 
 	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger}
+	var pr proxy.Router = disp
+	if d.router != nil {
+		pr = d.router
+	}
 	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
 		Self:            self,
-		Router:          disp,
+		Router:          pr,
 		Resolver:        resolver,
 		Supported:       []string{"path"},
 		Logger:          rt.Logger,
 		Transaction:     tcfg,
 		MaxContexts:     maxContexts,
 		MaxContextBytes: maxContextBytes,
+		// The panics recovered from the hooks, as the other services count
+		// them (#428).
+		Metrics: rt.Metrics,
 	})
 	if err != nil {
 		return err
@@ -204,7 +223,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 
 	// The listener stays open while the drain runs, as Cloud Map's answers
 	// name this task for their TTL after it is deregistered.
-	stopBy := time.Now().Add(cfg.DrainTimeout + stopMargin)
+	stopBy := time.Now().Add(cfg.DrainTimeout + stopMargin - returnMargin)
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.DrainTimeout)
 	defer cancelDrain()
 	if n := px.Drain(drainCtx); n > 0 {
@@ -217,24 +236,33 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// The router, the first NOTIFYs and the notifier's queue share what is
 	// left of the budget but closeMargin: an application server or a P-CSCF
 	// that does not answer holds none of them past it (#439 QA and code
-	// review).
+	// review). Each is waited for, the last ones even once the deadline has
+	// passed, which they then report at once.
 	waitCtx, cancelWait := context.WithDeadline(context.Background(), stopBy.Add(-closeMargin))
 	defer cancelWait()
-	if !router.StopBy(waitCtx) {
+	routed := router.StopBy(waitCtx)
+	firsts := disp.firsts.wait(waitCtx)
+	queued := notifier.WaitFor(waitCtx)
+	if !routed {
 		rt.Logger.Info("gave up on third-party REGISTERs at the stop")
 	}
-	if !disp.firsts.wait(waitCtx) || !notifier.WaitFor(waitCtx) {
+	if !firsts || !queued {
 		rt.Logger.Info("left NOTIFYs to the sweeps of the other tasks")
 	}
 	// The transport closes before the proxy does (the deferred Close), as
 	// pcscf's (#366): a peer that stopped reading leaves senders waiting for
 	// room in its connection's queue, and the proxy's Close waits for them,
 	// for up to WriteTimeout, past the budget; closing the connections
-	// releases them at once; a second Close does nothing. The Cx client
+	// releases them at once; a second Close does nothing. The sends the
+	// router gave up on are released with them, but for one still opening
+	// its connection, which ends within closeMargin. Then the Cx client
 	// says goodbye to the HSS tasks (DPR) by the deadline.
 	_ = tr.Close()
 	closeCtx, cancelClose := context.WithDeadline(context.Background(), stopBy)
 	defer cancelClose()
+	if !routed && !router.WaitFor(closeCtx) {
+		rt.Logger.Warn("third-party REGISTERs still under way at the end of the stop")
+	}
 	closeCx(closeCtx)
 	return nil
 }

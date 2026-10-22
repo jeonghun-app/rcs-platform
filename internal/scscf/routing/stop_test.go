@@ -2,11 +2,13 @@ package routing
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // TestAStopThatRunsOutGivesUpOnTheThirdPartyREGISTERs (#439 QA): with one
@@ -29,6 +31,8 @@ func TestAStopThatRunsOutGivesUpOnTheThirdPartyREGISTERs(t *testing.T) {
 	if rt.StopBy(ctx) {
 		t.Error("StopBy says it waited for all, with a REGISTER held at the server")
 	}
+	// What it gave up on returns once cut short.
+	rt.WaitFor(bg)
 	if got := len(s.got()); got != 1 {
 		t.Errorf("%d REGISTERs sent, want only the one under way at the stop", got)
 	}
@@ -99,7 +103,41 @@ func TestAStopThatRunsOutGivesUpOnTheRepairs(t *testing.T) {
 	if rt.StopBy(ctx) {
 		t.Error("StopBy says it waited for all, with a repair held")
 	}
+	rt.WaitFor(bg)
 	if got := e.metrics.get("routing.identity_repair_failed"); got != 1 {
 		t.Errorf("%d repairs failed, want the held one", got)
+	}
+}
+
+// TestWaitForSaysWhetherWhatAStopGaveUpOnHasReturned: a send that does not
+// return when its context ends, as one still opening its connection does
+// not, keeps WaitFor from saying it is done until it returns.
+func TestWaitForSaysWhetherWhatAStopGaveUpOnHasReturned(t *testing.T) {
+	e := newEnv(t)
+	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+	inside, release := make(chan struct{}, 1), make(chan struct{})
+	rt := e.router(nil, withSender(senderFunc(func(context.Context, *sip.Request) (*sip.Response, error) {
+		inside <- struct{}{}
+		<-release
+		return nil, errors.New("the dial timed out")
+	})))
+	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+	recv(t, inside)
+	ctx, cancel := context.WithCancel(bg)
+	cancel()
+	if rt.StopBy(ctx) {
+		t.Fatal("StopBy says it waited for all, with a send held")
+	}
+	short, cancelShort := context.WithTimeout(bg, 50*time.Millisecond)
+	defer cancelShort()
+	if rt.WaitFor(short) {
+		t.Fatal("WaitFor says all returned, with a send held")
+	}
+	close(release)
+	if !rt.WaitFor(bg) {
+		t.Fatal("WaitFor gave up with no deadline")
+	}
+	if got := e.metrics.get("routing.third_party.dropped_at_stop"); got != 1 {
+		t.Errorf("%d dropped at the stop, want the held one", got)
 	}
 }

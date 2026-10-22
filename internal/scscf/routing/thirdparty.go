@@ -16,7 +16,9 @@ import (
 
 // Sender sends a request in a client transaction to the next hop its
 // Request-URI names and returns the final response, or an error when there
-// is none (a timeout, a transport failure).
+// is none (a timeout, a transport failure). The request comes without a
+// Via: the Sender adds the one it has (RFC 3261 §8.1.1.7), with its own
+// branch and the address it sends from.
 type Sender interface {
 	Send(ctx context.Context, req *sip.Request) (*sip.Response, error)
 }
@@ -256,10 +258,6 @@ func (rt *Router) registerWith(ctx context.Context, r registrar.ThirdPartyRegist
 // criterion asks, the UE's REGISTER and the 200 for it in a message/sip
 // body each, both in a multipart/mixed one.
 func (rt *Router) thirdPartyRequest(r registrar.ThirdPartyRegistration, as sip.URI, server ifc.ApplicationServer) (*sip.Request, error) {
-	branch, err := rt.ids.Branch()
-	if err != nil {
-		return nil, err
-	}
 	tag, err := rt.ids.Tag()
 	if err != nil {
 		return nil, err
@@ -274,7 +272,6 @@ func (rt *Router) thirdPartyRequest(r registrar.ThirdPartyRegistration, as sip.U
 	from.Params.Set("tag", tag)
 	req := &sip.Request{Method: "REGISTER", URI: as}
 	fields := [][2]string{
-		{"Via", "SIP/2.0/TCP invalid;branch=" + branch},
 		{"Max-Forwards", "70"},
 		{"From", from.String()},
 		{"To", "<" + r.IMPU + ">"},

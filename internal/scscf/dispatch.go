@@ -37,12 +37,17 @@ func (d *dispatcher) Route(ctx context.Context, r *proxy.Request) proxy.Decision
 	case m.Method == "SUBSCRIBE" && isRegEvent(m):
 		return proxy.Decision{Serve: func(ctx context.Context, u *proxy.UAS) {
 			res, after := d.notifier.Subscribe(ctx, m)
-			d.respond(u, res)
-			if after != nil {
-				// The NOTIFY the SUBSCRIBE set up goes once the 200 is on
-				// its way (RFC 6665 §4.2.1.2), under a context of its own.
-				d.firsts.start(func() { after(context.WithoutCancel(ctx)) })
+			if after == nil {
+				d.respond(u, res)
+				return
 			}
+			// The NOTIFY the SUBSCRIBE set up goes once the 200 is on its
+			// way (RFC 6665 §4.2.1.2), under a context of its own. It is
+			// counted for the stop first: the drain takes the SUBSCRIBE
+			// for done once the 200 is written (#439 code review).
+			run := d.firsts.hold()
+			d.respond(u, res)
+			run(func() { after(context.WithoutCancel(ctx)) })
 		}}
 	case r.Initial():
 		return d.router.Initial(ctx, r)
@@ -60,20 +65,26 @@ type firstNotifies struct {
 	wg      sync.WaitGroup
 }
 
-// start runs a first NOTIFY, counted for wait until wait has begun: a
-// WaitGroup takes no Add once its Wait may be waiting. One started after
-// that, from a request the drain gave up on, is not waited for.
-func (f *firstNotifies) start(run func()) {
+// hold counts a first NOTIFY for wait, unless wait has begun: a WaitGroup
+// takes no Add once its Wait may be waiting. It returns what runs the
+// NOTIFY on a goroutine of its own. One held after wait has begun, from a
+// request the drain gave up on, is not waited for.
+func (f *firstNotifies) hold() func(run func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.waiting {
-		go run()
-		return
+		return func(run func()) { go run() }
 	}
-	f.wg.Go(run)
+	f.wg.Add(1)
+	return func(run func()) {
+		go func() {
+			defer f.wg.Done()
+			run()
+		}()
+	}
 }
 
-// wait waits for the NOTIFYs start ran, until ctx ends, and reports whether
+// wait waits for the NOTIFYs hold counted, until ctx ends, and reports whether
 // they were all done.
 func (f *firstNotifies) wait(ctx context.Context) bool {
 	f.mu.Lock()

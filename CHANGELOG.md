@@ -7,9 +7,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 No release has been tagged yet, so nothing below breaks an existing deployment.
-The IMS core (`hss`, `pcscf`, `icscf`, `scscf`), `ft-server` and `msrp-relay`
-run as services, and the local stack runs them together. `rcs-as` runs on its
-own and is not in the local stack yet.
+Two services can run today, `ft-server` and `msrp-relay`; the IMS core
+(`pcscf`, `icscf`, `scscf`, `hss`) and `rcs-as` are not built yet.
 
 ### Added
 
@@ -71,20 +70,6 @@ own and is not in the local stack yet.
   per-source limits. See [docs/msrp-relay.md](docs/msrp-relay.md). (#52)
 - PROXY protocol v2 parser (`internal/proxyproto`), shared by the services
   behind the NLB. (#52)
-- `scscf`: the Serving-CSCF as a service (`cmd/scscf`). It wires the
-  registrar, the reg event notifier and the iFC router to the shared state
-  in DynamoDB, the Cx client and one SIP core listener. It names itself to
-  the HSS by its service name, and stops in order within the shutdown. See
-  [docs/scscf.md](docs/scscf.md). (#14)
-- The local stack runs `pcscf` and `scscf` with the rest of the IMS core.
-  `stack-init tables` creates `scscf`'s three tables, and `make up` generates
-  its keys. `make e2e-compose` now has both test subscribers register with
-  IMS AKA through `pcscf`, `icscf` and `scscf`, follow the reg event, and
-  reach each other with OPTIONS, to the tel URI and as a capability query
-  through the iFC chains. See [docs/local-stack.md](docs/local-stack.md).
-  (#14)
-- `rcs-sim`: the `options` scenario, and its clients answer an OPTIONS 200
-  with their feature tags. See [docs/rcs-sim.md](docs/rcs-sim.md). (#14)
 
 ### Changed
 
@@ -114,12 +99,6 @@ own and is not in the local stack yet.
   a real failure still fails because it leaves a corpus entry. (#31)
 - The MSRP loopback TCP tests wait on progress rather than fixed deadlines, so
   slow CI runners no longer fail them. (#55)
-- `HSS_RCS_AS_URI` defaults to `sip:rcs-as.<namespace>;transport=tcp`, as
-  rcs-as listens on TCP only, and takes at most a `transport` parameter of
-  `tcp` or `tls`. `pcscf`'s core port comes from the shared
-  `RCS_PCSCF_CORE_PORT` (default 5070), which `scscf` also reads. (#14)
-- A reg event SUBSCRIBE whose dialog's first hop is not the P-CSCF of a live
-  binding of the set is refused 403. (#14)
 
 ### Security
 

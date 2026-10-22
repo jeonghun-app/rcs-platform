@@ -2,9 +2,9 @@ package scscf
 
 import (
 	"cmp"
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -57,9 +57,18 @@ const (
 	// notifier's queues, the Cx client and the transport, inside
 	// RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
-	// closeMargin is the end of stopMargin kept for the closes: the
-	// transport's, the proxy's and the Cx client's goodbye to the HSS.
-	closeMargin = time.Second
+	// returnMargin is the end of stopMargin Run keeps for returning, the
+	// proxy's Close above all, so that it ends before the runtime's own
+	// deadline, which the default drain puts at the end of stopMargin
+	// (#439 QA).
+	returnMargin = 500 * time.Millisecond
+	// closeMargin is the part of stopMargin before returnMargin kept for
+	// the closes: the transport's, the sends the router gave up on, and the
+	// Cx client's goodbye to the HSS. It is longer than coreDialTimeout, so
+	// that a send that began to open its connection just before the waits
+	// ended, which neither its context nor the transport's Close ends, is
+	// done within it (#439 code review; #462).
+	closeMargin = 3 * time.Second
 	// coreDialTimeout bounds opening a connection to a P-CSCF, an
 	// application server or the I-CSCF: inside the VPC, where a stopped
 	// task drops the SYN, as icscf's.
@@ -99,7 +108,8 @@ type ServiceConfig struct {
 	SubscriptionsTable string
 	DynamoDBEndpoint   string
 	// ChallengeKeys seal the challenges in DynamoDB, SealKeyID naming the
-	// one that seals (dynamostore.Config).
+	// one that seals, the current; the previous one only opens
+	// (dynamostore.Config).
 	ChallengeKeys []dynamostore.ChallengeKey
 	SealKeyID     string
 	// NonceKey authenticates Digest nonces, and DialogKeys sign the
@@ -135,7 +145,7 @@ type ServiceConfig struct {
 	MaxServerTransactionBytes int64
 }
 
-// A ServiceConfig prints as a placeholder, whatever the verb, under fmt,
+// A ServiceConfig prints as a placeholder, under every valid verb of fmt,
 // log/slog and encoding/json: it holds NonceKey, the dialog keys and the
 // challenge keys, which must never reach an output. The key types redact
 // themselves too, for when one is printed on its own.
@@ -168,7 +178,6 @@ func Configure(s *runtime.Settings) ServiceConfig {
 		ChallengesTable:    e.String("CHALLENGES_TABLE", dynamostore.DefaultChallengesTable),
 		SubscriptionsTable: e.String("SUBSCRIPTIONS_TABLE", dynamostore.DefaultSubscriptionsTable),
 		DynamoDBEndpoint:   e.String("DYNAMODB_ENDPOINT", ""),
-		SealKeyID:          e.String("CHALLENGE_SEAL_KEY_ID", ""),
 
 		PCSCFCorePort:        s.Shared.Int("PCSCF_CORE_PORT", DefaultPCSCFCorePort),
 		EdgeProxyPublicHosts: e.List("EDGE_PROXY_PUBLIC_HOSTS", nil),
@@ -242,30 +251,25 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	}
 	s.ForbidInProduction(c.DynamoDBEndpoint != "", "SCSCF_DYNAMODB_ENDPOINT points the store away from DynamoDB")
 
-	if keys, err := parseKeys(e.String("CHALLENGE_KEYS", "")); err != nil {
-		e.Invalid("CHALLENGE_KEYS", err.Error())
-	} else {
-		for _, k := range keys {
-			c.ChallengeKeys = append(c.ChallengeKeys, dynamostore.ChallengeKey{ID: k.id, Key: k.key})
+	// The keys are plain secrets, as CloudFormation's GenerateSecretString
+	// writes them, each with an optional previous one for a rotation; an
+	// ID drawn from each names it in what it seals or signs.
+	if current, previous := readKeyPair(e, "CHALLENGE_KEY", c.Store == StoreDynamoDB,
+		"required with SCSCF_STORE=dynamodb: challenges are sealed in the table"); current != nil {
+		for _, k := range [][]byte{current, previous} {
+			if k != nil {
+				c.ChallengeKeys = append(c.ChallengeKeys, dynamostore.ChallengeKey{ID: keyID(k), Key: challengeSealKey(k)})
+			}
 		}
+		c.SealKeyID = keyID(current)
 	}
-	if c.Store == StoreDynamoDB && len(c.ChallengeKeys) == 0 {
-		e.Invalid("CHALLENGE_KEYS", "required with SCSCF_STORE=dynamodb: challenges are sealed in the table")
-	}
-	if v := e.String("NONCE_KEY", ""); v == "" {
-		e.Invalid("NONCE_KEY", "required: every task authenticates the Digest nonces of the others")
-	} else if k, err := base64.StdEncoding.DecodeString(v); err != nil {
-		e.Invalid("NONCE_KEY", "not base64")
-	} else {
-		c.NonceKey = k
-	}
-	if keys, err := parseKeys(e.String("DIALOG_KEYS", "")); err != nil {
-		e.Invalid("DIALOG_KEYS", err.Error())
-	} else if len(keys) == 0 {
-		e.Invalid("DIALOG_KEYS", "required: the current key, and at most the previous one")
-	} else {
-		for _, k := range keys {
-			c.DialogKeys = append(c.DialogKeys, routing.DialogKey{ID: k.id, Key: k.key})
+	c.NonceKey = readKey(e, "NONCE_KEY", true, "required: every task authenticates the Digest nonces of the others")
+	if current, previous := readKeyPair(e, "DIALOG_KEY", true,
+		"required: it signs the Record-Route values and iFC positions"); current != nil {
+		for _, k := range [][]byte{current, previous} {
+			if k != nil {
+				c.DialogKeys = append(c.DialogKeys, routing.DialogKey{ID: keyID(k), Key: k})
+			}
 		}
 	}
 
@@ -306,31 +310,59 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	return c
 }
 
-// keyPair is one key of a key list setting.
-type keyPair struct {
-	id  string
-	key []byte
+// minKeyBytes is the shortest key setting.
+const minKeyBytes = 32
+
+// readKey reads the key setting name, its value used as raw bytes, at
+// least minKeyBytes of them; nil when unset, which why explains when the
+// key is required. A refusal names the variable, never the value.
+func readKey(e *runtime.Env, name string, required bool, why string) []byte {
+	v := e.String(name, "")
+	switch {
+	case v == "" && required:
+		e.Invalid(name, why)
+		return nil
+	case v == "":
+		return nil
+	case len(v) < minKeyBytes:
+		e.Invalid(name, "shorter than "+strconv.Itoa(minKeyBytes)+" bytes")
+		return nil
+	}
+	return []byte(v)
 }
 
-// parseKeys reads a key list setting: id:base64 pairs, comma separated,
-// the first the one that signs or seals.
-func parseKeys(v string) ([]keyPair, error) {
-	if strings.TrimSpace(v) == "" {
+// readKeyPair reads name, the current key, and name_PREVIOUS, the one it
+// replaced, which is kept during a rotation so that what it sealed or
+// signed still opens. The previous key needs a current one, and must
+// differ from it.
+func readKeyPair(e *runtime.Env, name string, required bool, why string) (current, previous []byte) {
+	current = readKey(e, name, required, why)
+	previous = readKey(e, name+"_PREVIOUS", false, "")
+	switch {
+	case previous != nil && current == nil:
+		e.Invalid(name+"_PREVIOUS", "set without SCSCF_"+name)
+		return nil, nil
+	case previous != nil && string(previous) == string(current):
+		e.Invalid(name+"_PREVIOUS", "the same key as SCSCF_"+name)
 		return nil, nil
 	}
-	var out []keyPair
-	for _, p := range strings.Split(v, ",") {
-		id, b64, ok := strings.Cut(strings.TrimSpace(p), ":")
-		if !ok || id == "" {
-			return nil, errors.New("not a list of id:base64")
-		}
-		k, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			return nil, errors.New("a key is not base64")
-		}
-		out = append(out, keyPair{id: id, key: k})
-	}
-	return out, nil
+	return current, previous
+}
+
+// keyID names a key in what it seals or signs: the first 8 hex digits of
+// its SHA-256, the same on every task, which tells nothing of the key.
+func keyID(key []byte) string {
+	sum := sha256.Sum256(key)
+	return hex.EncodeToString(sum[:4])
+}
+
+// challengeSealKey is the AES-256 key a challenge key setting gives: the
+// SHA-256 of the secret under a label of its own, as AES-256 takes 32
+// bytes whatever the secret's length, and as the ID, a SHA-256 of the
+// secret itself, must tell nothing of the key that seals.
+func challengeSealKey(secret []byte) []byte {
+	sum := sha256.Sum256(append([]byte("rcs-platform scscf challenge seal v1|"), secret...))
+	return sum[:]
 }
 
 // drainTimeout reads SCSCF_DRAIN_TIMEOUT, by default RCS_SHUTDOWN_TIMEOUT

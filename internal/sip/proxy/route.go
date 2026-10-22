@@ -316,7 +316,11 @@ func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Targ
 		return nil, transport.Destination{}, err
 	}
 	if d.Prepare != nil {
-		if err := d.Prepare(ctx, t, fwd); err != nil {
+		var err error
+		if !p.hook("Prepare", func() { err = d.Prepare(ctx, t, fwd) }) {
+			err = errHookPanic
+		}
+		if err != nil {
 			return nil, transport.Destination{}, fmt.Errorf("%w: %w", errPrepare, err)
 		}
 	}
@@ -337,7 +341,10 @@ func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Targ
 	if len(routes) > 0 && !strict {
 		next = routes[0].URI
 	}
-	dst, err := p.resolver.Resolve(ctx, next)
+	var dst transport.Destination
+	if !p.hook("Resolver", func() { dst, err = p.resolver.Resolve(ctx, next) }) {
+		return nil, transport.Destination{}, errHookPanic
+	}
 	if err != nil {
 		return nil, transport.Destination{}, err
 	}
