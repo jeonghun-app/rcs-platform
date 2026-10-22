@@ -34,6 +34,14 @@ import (
 // The retry timer starts at RetryInterval and doubles up to
 // MaxRetryInterval while a queue stays held, so a recipient that never
 // comes back costs a read an hour, not one per message sent to it.
+//
+// A hold is this task's own: another task may take the recipient's
+// registration, or the session its invitation brought, and deliver the
+// queue meanwhile. Each task that delivers to a recipient marks it
+// reached in the store (markReached), and a task holding the queue reads
+// that mark when a new message comes in (probe): a mark since its hold
+// began counts as a registration on a new flow here, which clears the
+// hold and this task's marks for the recipient (#605).
 type hold uint8
 
 const (
@@ -66,7 +74,27 @@ type recipient struct {
 	// arrived notes a message queued while a pass ran with the queue
 	// blocked (see hold).
 	arrived bool
+	// probe asks for the store's reached mark to be read before the next
+	// pass, for a message that came in while the queue was held, and
+	// heldSince is when the last pass that left it held began.
+	probe     bool
+	heldSince time.Time
+	// reread asks for the queue to be read again once the running pass
+	// ends, unless the recipient could not be reached in it (markReached).
+	reread bool
 }
+
+// reachedEvery spaces one task's reached marks for one recipient, so that
+// a conversation costs a write a minute, not one per message. reachedSlack
+// is how long before a hold's pass a mark still counts against it: a mark
+// left out within reachedEvery leaves the stored one up to that much older
+// than the delivery it stands for, and the tasks' clocks may differ by
+// RCSAS_TASK_SKEW's default. A mark that counts when it need not costs one
+// more attempt.
+const (
+	reachedEvery = time.Minute
+	reachedSlack = reachedEvery + 2*time.Second
+)
 
 // state needs e.mu.
 func (e *Engine) state(user string) *recipient {
@@ -113,6 +141,9 @@ func (e *Engine) kickNew(m store.Message) {
 		return
 	}
 	r := e.state(m.Recipient)
+	if r.hold != holdNone {
+		r.probe = true
+	}
 	switch r.hold {
 	case holdNone:
 		r.full = true
@@ -130,12 +161,81 @@ func (e *Engine) kickNew(m store.Message) {
 			r.waiting[m.Sender] = true
 		}
 	case holdBlocked:
+		// It waits, unless the probe finds the recipient reached
+		// elsewhere.
 		if r.run == running {
 			r.arrived = true
 		}
-		return
 	}
 	e.schedule(m.Recipient, r)
+}
+
+// markReached records in the store that a delivery reached user, at most
+// once every reachedEvery from this task, for the tasks that hold user's
+// queue (see hold). Once the mark is stored the whole queue is read once
+// more, after the pass it came from: another task may have queued a
+// message this task's pass did not read, a pass of single messages or one
+// that had read past where it sorts, and looked for a mark just before
+// this one, so that it left the message to this task (#605). A pass that
+// then found the recipient unreachable has no reason to read it again.
+func (e *Engine) markReached(user string) {
+	now := e.clock.Now()
+	e.mu.Lock()
+	if last, ok := e.reachedAt[user]; e.closed || ok && now.Sub(last) < reachedEvery {
+		e.mu.Unlock()
+		return
+	}
+	if len(e.reachedAt) >= e.cfg.MaxTracked {
+		clear(e.reachedAt)
+	}
+	e.reachedAt[user] = now
+	e.mu.Unlock()
+	ctx, cancel := e.recordCtx()
+	// A hold that began within reachedSlack of the mark is probed until
+	// its retry timer fires, MaxRetryInterval after it at most.
+	err := e.store.MarkReached(ctx, user, e.cfg.InstanceID, now, now.Add(reachedSlack+e.cfg.MaxRetryInterval))
+	cancel()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err != nil {
+		// The next delivery tries again.
+		delete(e.reachedAt, user)
+		e.storeFailed("mark reached", user, err)
+		return
+	}
+	e.metrics.Count("delivery.reached_marked", 1)
+	if e.closed {
+		return
+	}
+	r := e.state(user)
+	if r.run == running {
+		r.reread = true
+		return
+	}
+	r.full = true
+	e.schedule(user, r)
+}
+
+// reachedSince reports whether another task's reached mark of user counts
+// against a hold whose pass began at since (reachedSlack). This task's
+// own marks do not: it knows what its deliveries did. Marks it cannot
+// read do not either.
+func (e *Engine) reachedSince(user string, since time.Time) bool {
+	ctx, cancel := e.withTimeout(e.ctx, e.cfg.StoreTimeout)
+	marks, err := e.store.Reached(ctx, user, e.clock.Now())
+	cancel()
+	if err != nil {
+		if e.ctx.Err() == nil {
+			e.storeFailed("reached", user, err)
+		}
+		return false
+	}
+	for task, at := range marks {
+		if task != e.cfg.InstanceID && at.After(since.Add(-reachedSlack)) {
+			return true
+		}
+	}
+	return false
 }
 
 // kickRetry is the retry timer.
@@ -168,9 +268,26 @@ func (e *Engine) work() {
 		e.queue = e.queue[1:]
 		r := e.recipients[user]
 		r.run = running
-		for r.full || len(r.single) > 0 {
+		for r.full || len(r.single) > 0 || r.probe {
+			if r.probe && !r.full {
+				// A pass over the whole queue reads it anyway.
+				r.probe = false
+				since := r.heldSince
+				e.mu.Unlock()
+				if e.reachedSince(user, since) {
+					// As if the registration had come here: it clears
+					// the hold, the invitations asked for and the
+					// pager-only marker, and has the queue read.
+					e.metrics.Count("delivery.reached_elsewhere", 1)
+					e.UserRegistered(user, true)
+				}
+				e.mu.Lock()
+				continue
+			}
+			r.probe = false
 			full, single, waiting := r.full, r.single, maps.Clone(r.waiting)
 			r.full, r.single = false, nil
+			started := e.clock.Now()
 			e.mu.Unlock()
 			var res passResult
 			if full {
@@ -193,7 +310,13 @@ func (e *Engine) work() {
 					r.waiting[s] = true
 				}
 			}
-			e.settle(user, r, res, full)
+			e.settle(user, r, res, full, started)
+			if r.reread {
+				r.reread = false
+				if !res.stopped {
+					r.full = true
+				}
+			}
 			if r.arrived {
 				// A pass that stopped leaves it to wait like the rest. One
 				// that got through, full or of single messages, has the
@@ -232,14 +355,14 @@ type passResult struct {
 	waited                  map[string]bool
 }
 
-// settle needs e.mu. It records what a pass found and arms the retry timer
-// of a queue left held.
-func (e *Engine) settle(user string, r *recipient, res passResult, full bool) {
+// settle needs e.mu. It records what a pass that began at started found
+// and arms the retry timer of a queue left held.
+func (e *Engine) settle(user string, r *recipient, res passResult, full bool, started time.Time) {
 	switch {
 	case res.stopped:
-		r.hold = holdBlocked
+		r.hold, r.heldSince = holdBlocked, started
 	case res.skipped:
-		r.hold = holdWaiting
+		r.hold, r.heldSince = holdWaiting, started
 	case full:
 		// The whole queue went: nothing is held.
 		r.hold = holdNone
@@ -625,6 +748,7 @@ func (e *Engine) sendClaimedThen(ctx context.Context, l *Leg, m store.Message, o
 	case err == nil && code == msrp.StatusOK:
 		e.metrics.Count("delivery.msrp", 1)
 		e.remove(m)
+		e.markReached(m.Recipient)
 		return done
 	case err == nil && permanent(code):
 		e.giveUp(m, "delivery.refused")
@@ -670,6 +794,7 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 	case err == nil:
 		e.metrics.Count("delivery.pager", 1)
 		e.remove(m)
+		e.markReached(m.Recipient)
 		return done
 	case errors.Is(err, ErrUndeliverable):
 		e.giveUp(m, "delivery.undeliverable")

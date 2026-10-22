@@ -7,11 +7,12 @@
 // # Table layout
 //
 // One table, partition key pk and sort key sk (both strings), TTL attribute
-// ttl, holds three kinds of item:
+// ttl, holds four kinds of item:
 //
 //	pk q#<len(recipient)>#<recipient>  sk <message id>   a queued message
 //	pk c#<len(recipient)>#<recipient>  sk n              the queue's size
 //	pk s#<len(sender)>#<sender>        sk <Message-ID>   a sent-message record
+//	pk r#<len(recipient)>#<recipient>  sk t#<len(task)>#<task>  when the task's delivery last reached the recipient
 //
 // The length prefix keeps one identity from being a prefix-collision of
 // another. A recipient's queue is one partition, read in sort-key order,

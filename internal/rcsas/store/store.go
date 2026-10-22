@@ -340,4 +340,14 @@ type Store interface {
 	// mark stood for could not be done. Without such a mark it does
 	// nothing.
 	UnmarkNotified(ctx context.Context, sender, messageID, key, token string) error
+
+	// MarkReached records that a delivery by task got through to
+	// recipient at at, kept until expires: what tells the other tasks that
+	// a queue they hold, after a failed attempt, has a recipient that can
+	// be reached again (#605). Each task has a mark of its own, which this
+	// replaces, so that no task's mark hides another's.
+	MarkReached(ctx context.Context, recipient, task string, at, expires time.Time) error
+	// Reached returns recipient's marks that have not expired at now, by
+	// task; none is an empty map.
+	Reached(ctx context.Context, recipient string, now time.Time) (map[string]time.Time, error)
 }

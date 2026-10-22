@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -84,8 +85,8 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 			return nil, errCondition
 		}
 	case "":
-		// A task's heartbeat.
-		if sOf(in.Item[attrSK]) != taskSK {
+		// A task's heartbeat, or its reached mark of a recipient.
+		if sk := sOf(in.Item[attrSK]); sk != taskSK && !strings.HasPrefix(sk, reachedSK) {
 			f.t.Errorf("PutItem without a condition of %v", in.Item[attrSK])
 		}
 	default:
@@ -471,6 +472,20 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 			}
 		}
 		items, last := f.page(rows, indexOrder, in.ExclusiveStartKey, func(r map[string]dtypes.AttributeValue) bool { return free(r, vals[":now"]) }, indexKey)
+		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
+	}
+	if strings.HasPrefix(sOf(vals[":pk"]), reachedPrefix) {
+		// Reached: the recipient's marks, whole.
+		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil || in.ProjectionExpression != nil {
+			f.t.Errorf("reached query %+v", in)
+		}
+		var rows []map[string]dtypes.AttributeValue
+		for _, r := range f.rows {
+			if sOf(r[attrPK]) == sOf(vals[":pk"]) {
+				rows = append(rows, maps.Clone(r))
+			}
+		}
+		items, last := f.page(rows, rowKey, in.ExclusiveStartKey, func(map[string]dtypes.AttributeValue) bool { return true }, tableKey)
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
 	if aws.ToString(in.ProjectionExpression) == "#sender, #author, #mode, #size, #notification, #summary" {

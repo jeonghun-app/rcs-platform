@@ -241,6 +241,9 @@ type Engine struct {
 	// summaries remembers group notification summaries between their
 	// deliveries (sendSummary), up to MaxTracked.
 	summaries map[legKey]*summaryState
+	// reachedAt is when this task last marked each recipient reached
+	// (markReached), up to MaxTracked.
+	reachedAt map[string]time.Time
 	lastID    int64
 	sweepAt   string
 }
@@ -282,6 +285,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		wokeFlow: map[legKey]uint64{}, wakeRetries: map[string]bool{},
 		groupLegs: map[string]int{},
 		summaries: map[legKey]*summaryState{},
+		reachedAt: map[string]time.Time{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {

@@ -59,6 +59,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 	t.Run("ASummaryGoesOnlyOnceItsMarksAreSent", func(t *testing.T) { summaries(t, newStore(t)) })
+	t.Run("EachTasksReachedMarkIsItsOwnAndExpires", func(t *testing.T) { reached(t, newStore(t)) })
 }
 
 func pendingOrder(t *testing.T, s store.Store) {
@@ -766,4 +767,61 @@ func groupMessage(t *testing.T, s store.Store) {
 	if got.Sender != m.Sender || got.Author != alice || got.Mode != store.Group || store.Group.String() != "group" {
 		t.Fatalf("Claim = %+v", got)
 	}
+}
+
+// reached: each task's reached mark of a recipient is its own, replaced
+// by its next, never hides another task's, and is gone once it expires
+// (#605).
+func reached(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	if got, err := s.Reached(ctx, bob, t0); err != nil || len(got) != 0 {
+		t.Fatalf("Reached before any mark = %v, %v; want none", got, err)
+	}
+	soon, later := t0.Add(time.Hour), t0.Add(2*time.Hour)
+	marks := []struct {
+		task    string
+		at      time.Time
+		expires time.Time
+	}{
+		{"task-1", t0.Add(time.Second), soon},
+		{"task-2", t0.Add(3 * time.Second), later},
+		// task-1's next replaces its first, though task-2's is later.
+		{"task-1", t0.Add(2 * time.Second), later},
+		// A repeat, as an SDK retry would send, changes nothing.
+		{"task-1", t0.Add(2 * time.Second), later},
+	}
+	for _, m := range marks {
+		if err := s.MarkReached(ctx, bob, m.task, m.at, m.expires); err != nil {
+			t.Fatalf("MarkReached(%s, %v): %v", m.task, m.at, err)
+		}
+	}
+	if err := s.MarkReached(ctx, carol, "task-3", t0, later); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]time.Time{"task-1": t0.Add(2 * time.Second), "task-2": t0.Add(3 * time.Second)}
+	if got, err := s.Reached(ctx, bob, t0); err != nil || !equalMarks(got, want) {
+		t.Fatalf("Reached = %v, %v; want %v", got, err, want)
+	}
+	// Neither the queue nor its bounds see the marks.
+	if ms, err := s.Pending(ctx, bob, "", t0, 10); err != nil || len(ms) != 0 {
+		t.Fatalf("Pending after the marks = %v, %v; want an empty queue", idsOf(ms), err)
+	}
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), store.Limit{Count: 1}); err != nil {
+		t.Fatalf("Enqueue into a one-message queue beside the marks: %v", err)
+	}
+	if got, err := s.Reached(ctx, bob, later); err != nil || len(got) != 0 {
+		t.Fatalf("Reached once every mark expired = %v, %v; want none", got, err)
+	}
+}
+
+func equalMarks(a, b map[string]time.Time) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if w, ok := b[k]; !ok || !w.Equal(v) {
+			return false
+		}
+	}
+	return true
 }

@@ -69,6 +69,7 @@ const (
 	attrSize       = "size"
 	attrRecounted  = "recounted_at"
 	attrBytes      = "bytes"
+	attrReached    = "reached_at"
 )
 
 // MaxCPIMSize is the largest message body the table takes. A DynamoDB item
@@ -84,7 +85,12 @@ const (
 	sizePrefix  = "c#"
 	sentPrefix  = "s#"
 	sizeSK      = "n"
-	senderSK    = "s#"
+	// reachedPrefix keys a recipient's reached marks (#605), in a
+	// partition of their own, so that neither the queue's reads nor its
+	// recounts meet them; reachedSK prefixes each task's.
+	reachedPrefix = "r#"
+	reachedSK     = "t#"
+	senderSK      = "s#"
 )
 
 const conditionFailed = "ConditionalCheckFailedException"
@@ -1110,4 +1116,51 @@ func getTime(item map[string]types.AttributeValue, name string, dst *time.Time) 
 	}
 	*dst = time.Unix(0, n).UTC()
 	return nil
+}
+
+// MarkReached implements store.Store. A task's mark is an item of its
+// own, put over its last one.
+func (s *Store) MarkReached(ctx context.Context, recipient, task string, at, expires time.Time) error {
+	item := key(identityKey(reachedPrefix, recipient), identityKey(reachedSK, task))
+	item[attrTask] = str(task)
+	item[attrReached] = stamp(at)
+	item[attrExpires] = stamp(expires)
+	item[attrTTL] = ttlOf(expires)
+	if _, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(s.table), Item: item}); err != nil {
+		return sanitize("mark reached", err)
+	}
+	return nil
+}
+
+// Reached implements store.Store: a consistent query of the recipient's
+// marks, one item per task that delivered to it lately.
+func (s *Store) Reached(ctx context.Context, recipient string, now time.Time) (map[string]time.Time, error) {
+	out := map[string]time.Time{}
+	in := &dynamodb.QueryInput{
+		TableName:                 aws.String(s.table),
+		KeyConditionExpression:    aws.String("#pk = :pk"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(identityKey(reachedPrefix, recipient))},
+		ConsistentRead:            aws.Bool(true),
+	}
+	for {
+		page, err := s.api.Query(ctx, in)
+		if err != nil {
+			return nil, sanitize("query reached", err)
+		}
+		for _, item := range page.Items {
+			var task string
+			var at, expires time.Time
+			if err := errors.Join(getString(item, attrTask, &task, true), getTime(item, attrReached, &at), getTime(item, attrExpires, &expires)); err != nil {
+				return nil, fmt.Errorf("awsstore: query reached: %w", err)
+			}
+			if expires.After(now) {
+				out[task] = at
+			}
+		}
+		if len(page.LastEvaluatedKey) == 0 {
+			return out, nil
+		}
+		in.ExclusiveStartKey = page.LastEvaluatedKey
+	}
 }
