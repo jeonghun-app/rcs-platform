@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
@@ -189,6 +190,18 @@ func (s *Subscription) end() {
 // longer exists, 481 among them (§4.1.2.2), ends it at once. Before any
 // NOTIFY it goes in the dialog the 2xx described.
 func (s *Subscription) Unsubscribe(ctx context.Context) (*sip.Response, error) {
+	return s.Refresh(ctx, 0)
+}
+
+// Refresh sends a SUBSCRIBE in the subscription's dialog asking for
+// expires, whole seconds of it (RFC 6665 §4.1.2.1); zero is Unsubscribe.
+// It goes along the first NOTIFY's route set to the latest one's Contact,
+// as every request in the dialog does, and returns its final response, a
+// non-2xx with a *StatusError, as Unsubscribe does.
+func (s *Subscription) Refresh(ctx context.Context, expires time.Duration) (*sip.Response, error) {
+	if expires < 0 {
+		return nil, errors.New("sipua: a negative expiry")
+	}
 	s.mu.Lock()
 	if s.ended {
 		s.mu.Unlock()
@@ -204,7 +217,7 @@ func (s *Subscription) Unsubscribe(ctx context.Context) (*sip.Response, error) {
 	contact.URI.Params.SetFlag("ob")
 	add(req, &err, "Contact", contact.String())
 	add(req, &err, "Event", "reg")
-	add(req, &err, "Expires", "0")
+	add(req, &err, "Expires", strconv.Itoa(int(expires/time.Second)))
 	if err != nil {
 		return nil, err
 	}

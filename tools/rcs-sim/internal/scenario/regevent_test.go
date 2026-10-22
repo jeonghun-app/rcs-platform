@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,7 +28,15 @@ func TestTheRegEventFollowsTheClientsRegistration(t *testing.T) {
 			t.Fatalf("%s: %+v", s, steps[s])
 		}
 	}
-	// A second subscription, its own versions from 0: 0, then the
+	// #563: a subscription of its own refreshed and then ended, each
+	// answered 200.
+	if d := steps["refresh"]; !d.OK || d.Detail["status"] != 200 || d.Detail["version"] != 0 {
+		t.Fatalf("refresh %+v", d)
+	}
+	if d := steps["unsubscribe"]; !d.OK || d.Detail["status"] != 200 {
+		t.Fatalf("unsubscribe %+v", d)
+	}
+	// Another subscription of its own, its versions from 0: 0, then the
 	// deregistration's 1.
 	if d := steps["network-deregister"]; !d.OK || d.Detail["version"] != 1 || d.Detail["others"] != 0 {
 		t.Fatalf("network-deregister %+v", d)
@@ -129,8 +140,9 @@ func TestARegEventPassesWhatTheRFCsAllow(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg, core := sipStack(t)
+			main := mainSubscription()
 			core.Rewrite = func(req *sip.Request) {
-				if req.Method == "NOTIFY" {
+				if req.Method == "NOTIFY" && main(req) {
 					rewrite(req)
 				}
 			}
@@ -272,8 +284,18 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 			// before the one a case checks, which a loaded host can take
 			// seconds for (#387, #396).
 			cfg, core := sipStack(t)
+			// A case with a CSeq rewrites that NOTIFY of the first
+			// subscription, and one without, every NOTIFY. The one
+			// rewritten is kept to know its answer by, as its Call-ID may
+			// be what the case changes.
+			main := mainSubscription()
+			var rewritten atomic.Pointer[sip.Request]
 			core.Rewrite = func(req *sip.Request) {
-				if req.Method == "NOTIFY" && (tc.cseq == "" || req.Header.Get("CSeq") == tc.cseq) {
+				if req.Method != "NOTIFY" {
+					return
+				}
+				if first := main(req); tc.cseq == "" || first && req.Header.Get("CSeq") == tc.cseq {
+					rewritten.Store(req)
 					tc.rewrite(req)
 				}
 			}
@@ -286,7 +308,7 @@ func TestARegEventTheClientCannotTrustFailsItsStep(t *testing.T) {
 			dropped := make(chan int, 1)
 			if tc.err == "no NOTIFY came" {
 				core.NotifyAnswered = func(req *sip.Request, res *sip.Response, err error) {
-					if req.Header.Get("CSeq") == tc.cseq {
+					if req == rewritten.Load() {
 						code := 0
 						if err == nil {
 							code = res.StatusCode
@@ -353,8 +375,9 @@ func TestRegEventChecksQARound2Pins(t *testing.T) {
 				cfg.Deregister = tc.dereg
 			}
 			if tc.rewrite != nil {
+				main := mainSubscription()
 				core.Rewrite = func(req *sip.Request) {
-					if req.Method == "NOTIFY" && req.Header.Get("CSeq") == tc.cseq {
+					if req.Method == "NOTIFY" && main(req) && req.Header.Get("CSeq") == tc.cseq {
 						tc.rewrite(req)
 					}
 				}
@@ -415,5 +438,62 @@ func TestTheRegEventToleratesARepeatedFullNotify(t *testing.T) {
 	}
 	if got := byStep(results)["re-register"].Detail["skipped"]; got != 1 {
 		t.Errorf("re-register skipped %d NOTIFYs, want the repeated one", got)
+	}
+}
+
+// mainSubscription reports whether a NOTIFY is of the scenario's first
+// subscription, the one its steps follow up to the unregister: the refresh
+// and unsubscribe steps have a subscription of their own (#563), whose
+// NOTIFYs number their CSeq from 1 as well. The first NOTIFY it sees names
+// it, so it must see every NOTIFY, before any other test on it.
+func mainSubscription() func(*sip.Request) bool {
+	var mu sync.Mutex
+	first := ""
+	return func(req *sip.Request) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if first == "" {
+			first = req.Header.Get("Call-ID")
+		}
+		return req.Header.Get("Call-ID") == first
+	}
+}
+
+// #563: the refresh and unsubscribe steps judge their own subscription,
+// the second the run makes, by the NOTIFY each SUBSCRIBE brings: a refresh
+// must leave it active (RFC 6665 §4.2.1.2), an unsubscribe end it
+// (§4.2.1.4).
+func TestARefreshOrUnsubscribeTheNotifierMisreadsFailsItsStep(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cseq, state, step, err string
+	}{
+		"refresh ended":    {"2 NOTIFY", "terminated;reason=timeout", "refresh", "the subscription is not active after its refresh"},
+		"unsubscribe kept": {"3 NOTIFY", "active;expires=600000", "unsubscribe", "the subscription did not end at its unsubscribe"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			var mu sync.Mutex
+			var callIDs []string
+			core.Rewrite = func(req *sip.Request) {
+				if req.Method != "NOTIFY" {
+					return
+				}
+				mu.Lock()
+				id := req.Header.Get("Call-ID")
+				if !slices.Contains(callIDs, id) {
+					callIDs = append(callIDs, id)
+				}
+				second := len(callIDs) > 1 && callIDs[1] == id
+				mu.Unlock()
+				if second && req.Header.Get("CSeq") == tc.cseq {
+					_ = req.Header.Set("Subscription-State", tc.state)
+				}
+			}
+			ok, results := runAll(t, cfg, "reg-event")
+			last := results[len(results)-1]
+			if ok || last.Step != tc.step || last.Error != tc.err || last.Detail["status"] != 200 {
+				t.Fatalf("results %+v", results)
+			}
+		})
 	}
 }

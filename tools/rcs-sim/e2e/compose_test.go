@@ -146,7 +146,8 @@ func TestE2EComposeStack(t *testing.T) {
 		t.Errorf("rcs-sim over SIP: %v", err)
 	}
 	sipResults := checkResults(t, sipOut.String(), sipErr.String(), []string{
-		"reg-event/register", "reg-event/subscribe", "reg-event/re-register", "reg-event/unregister",
+		"reg-event/register", "reg-event/subscribe", "reg-event/re-register", "reg-event/refresh", "reg-event/unsubscribe",
+		"reg-event/unregister",
 		"options/register", "options/tel-uri", "options/capabilities",
 		"pager-message/register", "pager-message/message", "pager-message/receive",
 		"pager-message/delivery-notification", "pager-message/peer-offline",
@@ -156,6 +157,14 @@ func TestE2EComposeStack(t *testing.T) {
 	// the peer's own client never does (it answers 200), so a MESSAGE that
 	// went to the peer past rcs-as would have the peer's 200. The second,
 	// to the peer unregistered, reached it once it registered again.
+	// #563: a subscriber that takes its route set from the first NOTIFY
+	// (RFC 6665 §4.4.1), as sipua does, refreshes and ends its subscription
+	// along it, through pcscf and scscf, each answered 200.
+	for _, step := range []string{"reg-event/refresh", "reg-event/unsubscribe"} {
+		if r := sipResults[step]; r.Detail["status"] != 200 {
+			t.Errorf("%s was answered %d, not 200", step, r.Detail["status"])
+		}
+	}
 	if r := sipResults["pager-message/message"]; r.Detail["status"] != 202 {
 		t.Errorf("the MESSAGE was answered %d, not rcs-as's 202", r.Detail["status"])
 	}

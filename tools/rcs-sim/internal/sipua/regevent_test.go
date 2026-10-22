@@ -290,6 +290,43 @@ func TestUnsubscribeSendsExpiresZeroInTheDialog(t *testing.T) {
 	}
 }
 
+func TestARefreshGoesInTheDialogOfTheFirstNotify(t *testing.T) {
+	// #563: a refresh is a SUBSCRIBE in the dialog with the expiry asked
+	// for (RFC 6665 §4.1.2.1), along the first NOTIFY's route set to the
+	// latest NOTIFY's Contact, and the subscription goes on; the
+	// unsubscribe after it comes next in CSeq.
+	s, n, _, sub := subscribed(t)
+	first := s.nextMethod(t, "SUBSCRIBE").req
+	n.mu.Lock()
+	n.contact, n.recordRoute = "<sip:scscf2.example.com:5060;transport=tcp>", "<sip:pcscf-notify.example.com;lr>"
+	n.mu.Unlock()
+	n.notify(t, "active;expires=600000", "")
+	nextNotification(t, sub)
+	if res, err := sub.Refresh(context.Background(), 10*time.Minute); err != nil || res.StatusCode != 200 {
+		t.Fatalf("Refresh = %v, %v", res, err)
+	}
+	re := s.nextMethod(t, "SUBSCRIBE").req
+	to, _ := re.Header.To()
+	fc, _ := first.Header.CSeq()
+	rc, _ := re.Header.CSeq()
+	if re.Header.Get("Expires") != "600" || re.Header.Get("Event") != "reg" || to.Tag() != n.tag || rc.Seq != fc.Seq+1 ||
+		re.URI.String() != mustURI(t, "sip:scscf2.example.com:5060;transport=tcp").String() || routeHosts(t, re) != "pcscf-notify.example.com" {
+		t.Fatalf("refresh %s Expires %q To tag %q CSeq %v Route %s", re.URI, re.Header.Get("Expires"), to.Tag(), rc, routeHosts(t, re))
+	}
+	select {
+	case <-sub.Done():
+		t.Fatal("the subscription ended at its refresh")
+	default:
+	}
+	if res, err := sub.Unsubscribe(context.Background()); err != nil || res.StatusCode != 200 {
+		t.Fatalf("Unsubscribe = %v, %v", res, err)
+	}
+	un := s.nextMethod(t, "SUBSCRIBE").req
+	if uc, _ := un.Header.CSeq(); un.Header.Get("Expires") != "0" || uc.Seq != rc.Seq+1 {
+		t.Fatalf("unsubscribe Expires %q CSeq %v", un.Header.Get("Expires"), uc)
+	}
+}
+
 func TestUnsubscribeBeforeAnyNotifyGoesInTheDialogOfThe2xx(t *testing.T) {
 	s, _, _, sub := subscribed(t)
 	s.nextMethod(t, "SUBSCRIBE")
