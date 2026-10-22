@@ -238,7 +238,9 @@ func (s *Server) groupSubscribe(ctx context.Context, u *proxy.UAS) {
 	if err != nil {
 		return // the proxy answers 500
 	}
-	focus, err := sip.ParseURI(uri)
+	// The dialog's local target, the Contact of every message in it, the
+	// NOTIFYs and the refreshes' 200s too (focusContact).
+	focus, err := sip.ParseURI(focusContact(uri))
 	if err != nil {
 		s.respond(u, req, 404)
 		return
@@ -274,7 +276,7 @@ func (s *Server) groupSubscribe(ctx context.Context, u *proxy.UAS) {
 	res, err := dialogResponse(req, 200, tag)
 	if err == nil {
 		err = errors.Join(res.Header.Add("Expires", strconv.Itoa(int(expires))),
-			res.Header.Add("Contact", "<"+focusContact(focus.String())+">"))
+			res.Header.Add("Contact", sip.Address{URI: focus}.String()))
 	}
 	if err == nil {
 		err = u.Respond(res)

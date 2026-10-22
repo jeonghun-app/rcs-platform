@@ -115,10 +115,11 @@ func TestARequestInsideADialogGoesOnlyToAHopItsRouteSigned(t *testing.T) {
 
 // TestAGroupsDialogReachesRcsAsAtTheConferenceContact (code review on #542):
 // in a session with a group, and in a subscription to its roster, rcs-as's
-// Contact is the conference URI (internal/rcsas/sipas focusContact), which
-// the S-CSCF signed as the dialog's hop at the 2xx. With transport=tcp it is
-// an application server's listener, so a BYE in the session and a SUBSCRIBE
-// refreshing the roster go on. Without a transport it reads as UDP on 5060,
+// Contact, in every message of the dialog, is the conference URI
+// (internal/rcsas/sipas focusContact), which the S-CSCF signed as the
+// dialog's hop at the 2xx. With transport=tcp it is an application
+// server's listener, so a BYE in the session, and a SUBSCRIBE refreshing
+// or ending the roster subscription, go on. Without a transport it reads as UDP on 5060,
 // where no application server listens, and both are refused 403.
 func TestAGroupsDialogReachesRcsAsAtTheConferenceContact(t *testing.T) {
 	e := newEnv(t)
@@ -131,12 +132,20 @@ func TestAGroupsDialogReachesRcsAsAtTheConferenceContact(t *testing.T) {
 		"without a transport":           {"sip:chat-00112233445566778899aabbccddeeff@conf.rcs.local", false},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, method := range []string{"BYE", "SUBSCRIBE"} {
+			// A BYE in the session; a SUBSCRIBE refreshing the roster,
+			// and one ending it (Expires: 0), at the Contact every
+			// message of the dialog carries.
+			for _, method := range []string{"BYE", "SUBSCRIBE", "unsubscribe"} {
 				r := inDialog(t, c.contact, "", signedFor(rt, c.contact, pcscfUE))
-				if method == "SUBSCRIBE" {
+				if method != "BYE" {
+					expires := "600"
+					if method == "unsubscribe" {
+						expires = "0"
+					}
 					r.Message.Method = "SUBSCRIBE"
 					_ = r.Message.Header.Set("CSeq", "2 SUBSCRIBE")
 					_ = r.Message.Header.Set("Event", "conference")
+					_ = r.Message.Header.Set("Expires", expires)
 				}
 				d := rt.InDialog(bg, r)
 				if got := d.Status == 0 && len(d.Targets) == 1; got != c.allowed {
