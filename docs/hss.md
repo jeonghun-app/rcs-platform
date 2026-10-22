@@ -228,14 +228,19 @@ no answer, are marked stale on the subscription, in the last second the budget
 keeps for it (`push.stale_marked`). Every SAR of a stale set that may carry
 User-Data gets it, even when the S-CSCF says it already has it
 (`USER_DATA_ALREADY_AVAILABLE`, which §6.6 lets the HSS override). The repair
-happens at the set's next REGISTRATION or RE_REGISTRATION SAR, whose User-Data
-our S-CSCF applies: the set leaves the stale list in that SAR's write. An
-UNREGISTERED_USER or NO_ASSIGNMENT SAR leaves it stale, as our S-CSCF drops
-the User-Data of those answers (#536). An emptied set's `PERMANENT_TERMINATION` RTR needs no repair: its
-refreshes are refused, and it ends at the S-CSCF within a registration
-period. A shared profile's fan-out answers no request and has no budget:
-each of its pushes has `HSS_PUSH_TIMEOUT`. When identities move between implicit sets, the
-sets losing them go first (§6.5.2.1):
+happens at the set's next REGISTRATION or RE_REGISTRATION SAR, the answers whose
+User-Data our S-CSCF applies when a UE registers or re-registers: the set leaves
+the stale list in that SAR's write. An UNREGISTERED_USER or NO_ASSIGNMENT SAR
+leaves it stale. Until #536, our S-CSCF drops the User-Data of an
+UNREGISTERED_USER answer, and of the REGISTRATION SARs it sends itself to
+re-assert a set or to take it over after an unregistered-user SAR; such a
+REGISTRATION still clears the mark, and the set then keeps its old data until
+a later change reaches it. An emptied set's
+`PERMANENT_TERMINATION` RTR needs no repair: its refreshes are refused, and it
+ends at the S-CSCF within a registration period. A shared profile's fan-out
+answers no request and has no budget: each of its pushes has
+`HSS_PUSH_TIMEOUT`. When identities move between implicit sets, the sets losing
+them go first (§6.5.2.1):
 - first the RTRs of the sets that lose one: an RTR only takes identities away,
   and the S-CSCF finds the set an RTR names by its identities, so after a PPR
   that moved one of them it would end the set gaining it as well;
