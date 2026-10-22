@@ -256,9 +256,13 @@ request is left unanswered, so its sender's own transaction times out (RFC
 4320 §4.2, #363); a request whose far end's flow is gone, before it was sent
 or while it waited, gets 480 (the P-CSCF's 430 as an endpoint sees it, RFC
 5626 §5.3.1, #414), and one it fails to pass on otherwise 500 (RFC 3261 §16.7).
-The binding stays until it expires or is removed. A CANCEL is answered 200
-and passed on to the far end (§16.10); a cancelled INVITE that ends without
-the far end's answer, its flow gone or its timer out, gets 487.
+The binding stays until it expires or is removed. A CANCEL that matches an
+INVITE transaction still live, answered or not, is answered 200, and one
+that matches none 481 (§9.2). It is passed on to the far end (§16.10) once
+the far end has answered the INVITE provisionally (§9.1); a cancelled INVITE
+that the far end does not end within 64×T1 of that CANCEL, or that ends
+without its answer, its flow gone or its timer out, gets 487, as on the
+platform.
 
 ## Running it
 

@@ -1,6 +1,7 @@
 package icscf
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -59,10 +60,19 @@ type deps struct {
 	transport func(*transport.Transport)
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
+	// metricsEvery is how often the proxy's counts are recorded; zero is
+	// metricsInterval.
+	metricsEvery time.Duration
+	// proxy, if set, gets the proxy once it is made.
+	proxy func(*proxy.Proxy)
 	// draining, if set, hears that the stop has begun, just before the
 	// drain.
 	draining func()
 }
+
+// metricsInterval is how often icscf records the proxy's counts, well
+// within the runtime's minute between flushes.
+const metricsInterval = 15 * time.Second
 
 // Run serves cfg until ctx ends.
 func Run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig) error {
@@ -135,6 +145,33 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	}
 	defer px.Close()
 	p.Store(px)
+	if d.proxy != nil {
+		d.proxy(px)
+	}
+	// sip.overloaded, the one overload counter of #56's alarm (#467), as
+	// it rises, and once more after the drain.
+	var om proxy.OverloadMeter
+	report := func() {
+		if rt.Metrics != nil {
+			om.Record(rt.Metrics, px)
+		}
+	}
+	defer report()
+	every := cmp.Or(d.metricsEvery, metricsInterval)
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	tickDone := make(chan struct{})
+	defer close(tickDone)
+	go func() {
+		for {
+			select {
+			case <-tick.C:
+				report()
+			case <-tickDone:
+				return
+			}
+		}
+	}()
 	rt.Logger.Info("serving SIP", slog.String("core_addr", coreAddr.String()),
 		slog.String("origin_host", host), slog.Int("scscfs", len(cfg.SCSCFs)))
 	rt.Ready()
