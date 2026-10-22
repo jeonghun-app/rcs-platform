@@ -757,8 +757,18 @@ func TestAReferredInviteNamesTheReferrerNotTheCreator(t *testing.T) {
 
 // A NOTIFY that is not answered, as when the subscriber's flow is gone,
 // ends the subscription at the transaction's timeout (RFC 6665 §4.2.2).
+// txClock is a fakeClock as a transaction layer's Clock: its timers run
+// only when the test says, so no ACK wait or safety net of a short T1
+// expires under load before the timeout a test is about (#430).
+type txClock struct{ *fakeClock }
+
+func (c txClock) AfterFunc(d time.Duration, f func()) transaction.Timer {
+	return c.fakeClock.AfterFunc(d, f)
+}
+
 func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
-	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{T1: 5 * time.Millisecond} })
+	txc := newFakeClock()
+	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{Clock: txClock{txc}} })
 	r.core.setAnswer(func(req *sip.Request) int {
 		switch req.Method {
 		case "INVITE":
@@ -770,13 +780,20 @@ func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
 	})
 	p := r.a.dial(t)
 	uri, s := r.create(t, p, relayPath(), bob, carol)
-	r.core.nextOf(t, "INVITE")
-	r.core.nextOf(t, "INVITE")
+	// Both INVITEs, and the ACKs of their 486s, in whatever order: the
+	// transactions are done with their Timer B before the mark below
+	// (#430).
+	r.core.nextOfEach(t, "INVITE", "INVITE", "ACK", "ACK")
 	g := &groupRig{chatRig: r, p: p, uri: uri, s: s}
+	since := txc.mark()
 	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 200 {
 		t.Fatalf("SUBSCRIBE answered %d", res.StatusCode)
 	}
 	g.nextNotify(t)
+	// Timer F of the NOTIFY, the one 64*T1 timer set since the SUBSCRIBE
+	// (#430: a T1 of 5 ms, for a quick Timer F, left the creator's ACK
+	// 320 ms, which a loaded host passed, and the group invited no one).
+	txc.fireSince(t, since, 64*transaction.DefaultT1)
 	waitUntil(t, "the subscription removed at the NOTIFY's timeout", func() bool {
 		g.a.srv.mu.Lock()
 		defer g.a.srv.mu.Unlock()
@@ -793,7 +810,8 @@ func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
 // its timeout on, as a refused one does: with the removal held back, a
 // roster change right after sends nothing.
 func TestAChangeRightAfterATimedOutNotifySendsNothing(t *testing.T) {
-	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{T1: 5 * time.Millisecond} })
+	txc := newFakeClock()
+	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{Clock: txClock{txc}} })
 	r.core.setAnswer(func(req *sip.Request) int {
 		switch req.Method {
 		case "INVITE":
@@ -805,14 +823,18 @@ func TestAChangeRightAfterATimedOutNotifySendsNothing(t *testing.T) {
 	})
 	p := r.a.dial(t)
 	uri, s := r.create(t, p, relayPath(), bob, carol)
-	r.core.nextOf(t, "INVITE")
-	r.core.nextOf(t, "INVITE")
+	// Both INVITEs, and the ACKs of their 486s, in whatever order: the
+	// transactions are done with their Timer B before the mark below
+	// (#430).
+	r.core.nextOfEach(t, "INVITE", "INVITE", "ACK", "ACK")
 	g := &groupRig{chatRig: r, p: p, uri: uri, s: s}
 	release := holdRefusals(t)
+	since := txc.mark()
 	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 200 {
 		t.Fatalf("SUBSCRIBE answered %d", res.StatusCode)
 	}
 	g.nextNotify(t)
+	txc.fireSince(t, since, 64*transaction.DefaultT1) // its Timer F (#430)
 	waitUntil(t, "the NOTIFY's timeout", func() bool { return g.metrics.get("sip.subscription.notify_failed") == 1 })
 	g.rejoin(t, bob)
 	g.dropsNotify(t, "right after a timed-out NOTIFY")
