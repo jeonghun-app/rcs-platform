@@ -213,7 +213,9 @@ func FuzzTruncateIPsIn(f *testing.F) {
 	}
 	run := regexp.MustCompile(`[0-9A-Fa-f:.]+`)
 	ipv4Port := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24(:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
-	bracketPort := regexp.MustCompile(`\[[0-9A-Fa-f:.]+/[0-9]+\](:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
+	// A bracketed address's port followed by a colon is out of scope
+	// (see TruncateIPsIn's doc), and not looked for (#500).
+	bracketPort := regexp.MustCompile(`\[[0-9A-Fa-f:.]+/[0-9]+\](:[0-9]{1,5})([^0-9.:]|\.[^0-9]|\.$|$)`)
 	// letter is what makes a run part of a longer word: an ASCII letter
 	// past f, or "_" (digits and hex letters are in the run itself).
 	letter := func(c byte) bool { return 'g' <= c && c <= 'z' || 'G' <= c && c <= 'Z' || c == '_' }
@@ -241,9 +243,28 @@ func FuzzTruncateIPsIn(f *testing.F) {
 			if (m[0] == 0 || !letter(got[m[0]-1])) && !afterLength {
 				cands = append(cands, r)
 			}
+			// A part after a colon is an address of its own only when no
+			// longer reading of the run is one: of the run itself and its
+			// parts after a colon, the longest that reads as an address is
+			// the address, as the first start that holds one is in the
+			// code. "0:2002:1::" is one address, whose /48 shows no more than
+			// any /48 does, though its part "2002:1::" reads as a 6to4
+			// address, whose network would be its /16; and a part of
+			// "00:0:0:0:0:ffff::/0", a network written out, is none (#500).
+			reads := func(v string) bool {
+				v = strings.Trim(v, ".")
+				for _, w := range []string{v, strings.TrimRight(v, ":"), strings.TrimPrefix(v, ":")} {
+					if _, err := netip.ParseAddr(w); err == nil {
+						return true
+					}
+				}
+				return false
+			}
+			read := reads(r)
 			for k := 0; k < len(r); k++ {
-				if r[k] == ':' {
+				if r[k] == ':' && !read {
 					cands = append(cands, r[k+1:])
+					read = reads(r[k+1:])
 				}
 			}
 			// An address may be followed by dots (the end of a sentence) and

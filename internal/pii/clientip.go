@@ -129,9 +129,12 @@ func parseDottedQuad(s string) (netip.Addr, bool) {
 // configured.
 //
 // Out of scope, as net/http and Go's net errors never write them: an
-// address with percent-encoded delimiters (%5B2001:db8::1%5D, %3A), an
-// unbracketed IPv6 address with a port (2001:db8::1:443 reads as one
-// address), and the inet_aton forms (0xcb.0.113.5, 3405803781).
+// address with percent-encoded delimiters (%5B2001:db8::1%5D, %3A); an
+// unbracketed IPv6 address with a port, which is read as one address when
+// the port has at most four digits (2001:db8::1:443) and left whole
+// otherwise (2001:db8::1:51234); a bracketed address whose port is followed
+// by a colon ("[::1]:0:1::"), whose port stays, since net/http writes ": "
+// after one; and the inet_aton forms (0xcb.0.113.5, 3405803781).
 //
 // Some text that is no address reads as one and is rewritten: a four-part
 // number such as a version or an OID part (1.2.3.4), an EUI-64
@@ -347,11 +350,10 @@ func truncateIPv4In(s string) string {
 			i = j
 			continue
 		}
+		// After trimmed dots, s[end] is a dot, and no port follows.
 		n := len(run)
-		if end == j {
-			if p, ok := portAt(s, end); ok {
-				n = p - i
-			}
+		if p, ok := portAt(s, end); ok {
+			n = p - i
 		}
 		i = t.address(i, n)
 	}
