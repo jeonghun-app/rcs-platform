@@ -202,6 +202,25 @@ func (n *Notifier) count(name string) { n.cfg.Metrics.Count(name, 1) }
 // subscription has run, its NOTIFY answered: for a shutdown, and for tests.
 func (n *Notifier) Wait() { n.wg.Wait() }
 
+// WaitFor waits as Wait does, but no longer than ctx lasts, for a shutdown
+// with a deadline, once the registrar tells it of no more changes; it
+// reports whether everything was done. What a stop leaves undone is a
+// sweep's: every end is saved before its NOTIFY is queued, and a change's
+// NOTIFY that is lost is made good by the next.
+func (n *Notifier) WaitFor(ctx context.Context) bool {
+	done := make(chan struct{})
+	go func() {
+		n.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // subscriptionID is the store key of the subscription of a dialog: a digest
 // of its identifier (dialog.Dialog.ID), so that any instance finds it from
 // an in-dialog SUBSCRIBE and the key is short whatever the Call-ID.
