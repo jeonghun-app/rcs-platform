@@ -2,6 +2,7 @@ package msrprelay
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"slices"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Defaults of the RELAY_ settings; docs/msrp-relay.md has the full table.
@@ -138,11 +140,20 @@ type Config struct {
 	UserTimeout             time.Duration
 }
 
-// secret holds a token so that printing a Config cannot reveal it.
-type secret struct{ v string }
+// secret holds a configuration secret so that printing a Config cannot
+// reveal it, under every verb: its text is in a secret.Key, which an
+// invalid verb, %p or %w, does not print either (#506).
+type secret struct{ k secretkey.Key }
 
-func (secret) String() string   { return "[redacted]" }
-func (secret) GoString() string { return "[redacted]" }
+// newSecret is a secret of v.
+func newSecret(v string) secret { return secret{k: secretkey.NewString(v)} }
+
+// value is the secret's text.
+func (s secret) value() string { return s.k.RevealString() }
+
+func (secret) String() string             { return "[redacted]" }
+func (secret) GoString() string           { return "[redacted]" }
+func (secret) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "[redacted]") }
 
 // interfaceAddrs finds this task's addresses; tests replace it.
 var interfaceAddrs = net.InterfaceAddrs
@@ -337,7 +348,7 @@ func tokens(s *runtime.Settings) []secret {
 		}
 		s.ForbidInProduction(len(t.v) < minTokenLength, fmt.Sprintf(
 			"RELAY_%s is shorter than %d characters (ADR 0007 §4: at least 256 random bits, e.g. 32 bytes in base64)", t.name, minTokenLength))
-		out = append(out, secret{t.v})
+		out = append(out, newSecret(t.v))
 	}
 	return out
 }

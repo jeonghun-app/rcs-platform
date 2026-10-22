@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -256,7 +257,7 @@ func TestACoreRequestInsideADialogNeedsThatDialogsRecordRoute(t *testing.T) {
 		"another dialog's":    entry(p.dialogMAC("FLOW-A", "term-2", "")),
 		"another flow's":      entry(p.dialogMAC("FLOW-B", "term-1", "")),
 		"a changed MAC":       entry(strings.Repeat("0", 32)),
-		"another start's key": entry((&pcscf{dialogKey: []byte("another key")}).dialogMAC("FLOW-A", "term-1", "")),
+		"another start's key": entry((&pcscf{dialogKey: secret.NewString("another key")}).dialogMAC("FLOW-A", "term-1", "")),
 		// The MAC covers the icid too (review of #221).
 		"an icid added":  {"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + coreICID + ";dlg=" + p.dialogMAC("FLOW-A", "term-1", ""), client},
 		"a changed icid": {"sip:FLOW-A@10.0.2.9:5070;transport=tcp;lr;icid=" + strings.ToUpper(coreICID) + ";dlg=" + p.dialogMAC("FLOW-A", "term-1", coreICID), client},

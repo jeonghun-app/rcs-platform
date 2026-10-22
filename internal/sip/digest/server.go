@@ -8,10 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"io"
 	"strings"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Verification outcomes. Callers answer ErrStaleNonce with a new challenge
@@ -128,7 +129,7 @@ type ServerConfig struct {
 // it holds the nonce key.
 type Server struct {
 	realm    string
-	key      sealed[[]byte] // sealed so that a *Server nested anywhere cannot print it
+	key      secret.Sealed[[]byte] // sealed so that a *Server nested anywhere cannot print it
 	lifetime time.Duration
 	counts   NonceCountStore
 	now      func() time.Time
@@ -153,7 +154,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	key := bytes.Clone(cfg.NonceKey.Reveal())
 	s := &Server{
 		realm:    cfg.Realm,
-		key:      seal(&key),
+		key:      secret.Seal(&key),
 		lifetime: cfg.NonceLifetime,
 		counts:   cfg.NonceCounts,
 		now:      cfg.Now,

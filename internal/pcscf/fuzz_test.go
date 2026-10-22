@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -96,7 +97,7 @@ func FuzzRouteICID(f *testing.F) {
 	} {
 		f.Add(seed.icid, seed.raw)
 	}
-	p := &pcscf{cfg: Config{CoreHost: netip.MustParseAddr("10.0.2.9"), PublicHost: "pcscf.rcs.example.net"}, corePort: 5070, dialogKey: []byte("fuzz key")}
+	p := &pcscf{cfg: Config{CoreHost: netip.MustParseAddr("10.0.2.9"), PublicHost: "pcscf.rcs.example.net"}, corePort: 5070, dialogKey: secret.NewString("fuzz key")}
 	f.Fuzz(func(t *testing.T, icid, raw string) {
 		written := p.recordRoute("FLOW-A", false, icid, "call-1")[0]
 		back, err := sip.ParseAddress(written.String())

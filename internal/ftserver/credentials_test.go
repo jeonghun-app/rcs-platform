@@ -161,10 +161,18 @@ func TestUnreachableHSSIsAnErrorWithoutTheURL(t *testing.T) {
 }
 
 func TestSecretsDoNotPrint(t *testing.T) {
-	c := Config{HSSToken: secret{"token-value"}, NonceKey: secret{"nonce-key"}, StaticUsers: map[string]secret{"u": {"pw"}}}
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
-		if out := fmt.Sprintf(verb, c); strings.Contains(out, "token-value") || strings.Contains(out, "nonce-key") || strings.Contains(out, "pw}") {
-			t.Fatalf("%s printed a secret: %s", verb, out)
+	c := Config{HSSToken: newSecret("token-value"), NonceKey: newSecret("nonce-key"), StaticUsers: map[string]secret{"u": newSecret("static-password")}}
+	// Every verb, valid or not: an invalid one, %p or %w, calls no method
+	// and prints the fields (#506).
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{c, &c} {
+			out := fmt.Sprintf(verb, v)
+			// The secrets as text, as %d writes bytes and in hex.
+			for _, leak := range []string{"token-value", "nonce-key", "static-password", "116 111 107", fmt.Sprintf("%x", "token")} {
+				if strings.Contains(out, leak) {
+					t.Errorf("%s printed a secret (%q): %s", verb, leak, out)
+				}
+			}
 		}
 	}
 }
