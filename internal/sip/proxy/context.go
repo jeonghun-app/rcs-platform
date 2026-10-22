@@ -573,7 +573,7 @@ func (c *respContext) startBranches(targets []Target) []func() {
 		// Each branch holds a copy of the header (the body is shared) and its
 		// CANCEL.
 		cost := 2 * c.header
-		if !c.p.reserve(cost) {
+		if !c.p.reserve(cost, c.tx.Source().ClientFacing) {
 			c.p.stats.overloaded.Add(1)
 			acts = append(acts, c.branchEnded(b, c.failureResponse(errOverload), errOverload)...)
 			continue
