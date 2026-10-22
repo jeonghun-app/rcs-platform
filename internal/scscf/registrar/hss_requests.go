@@ -78,7 +78,8 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 				// version may still read one. A listing with nothing
 				// readable answers UNABLE_TO_COMPLY, as an invalid read
 				// does (#422), once the other private identities' sets
-				// have ended (#478 QA).
+				// have ended, unless one of those may still end on a
+				// resend (#478 QA).
 				n := unreadableItems(err)
 				g.log.Error("registrar: RTR: unreadable registration items", slog.Int("items", n))
 				g.cfg.Metrics.Count("registrar.rtr_unreadable", int64(n))
@@ -117,22 +118,22 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 		}
 	}
 	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(ended))
-	if unreadable {
+	// A read that may pass comes first: the HSS sends a DIAMETER_TOO_BUSY
+	// RTR again, which can end the set it left, and answers the unreadable
+	// listing then (#478 QA).
+	if unreadable && result == resultSuccess {
 		result = resultUnableToComply
 	}
 	return result
 }
 
 // unreadableItems is how many items err, a listing's ErrInvalid, says did
-// not decode: the store joins one error for each, which this counts however
-// the joins nest.
+// not decode: the store joins one error for each, once. Only that join is
+// counted: an item's own error may wrap several, as one with an invalid
+// IMPI does (#478 QA).
 func unreadableItems(err error) int {
 	if j, ok := err.(interface{ Unwrap() []error }); ok {
-		n := 0
-		for _, e := range j.Unwrap() {
-			n += unreadableItems(e)
-		}
-		return n
+		return len(j.Unwrap())
 	}
 	return 1
 }

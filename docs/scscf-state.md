@@ -152,7 +152,11 @@ additionally sealed (below).
   deploy a task of the older version may still read, and route, an item a
   new validation rule refuses, until its bindings expire. A listing with
   nothing readable still answers DIAMETER_UNABLE_TO_COMPLY, once the other
-  private identities' sets have ended, and is counted too (#478). The lease
+  private identities' sets have ended, and is counted too (#478). If one of
+  those sets could not end for a reason that may pass, the answer is
+  DIAMETER_TOO_BUSY first: the HSS sends the RTR again, the resend can end
+  that set, and it answers DIAMETER_UNABLE_TO_COMPLY for the unreadable
+  listing. The lease
   of an RTR that ended the set for good is marked `rejected`, and stays so
   whatever RTR comes after, so that the sweep's NOTIFY says
   `reason=rejected` as the RTR's would have (#334); the lease holds no
