@@ -95,8 +95,8 @@ func TestPagerAndLargeModeShareThePipeline(t *testing.T) {
 		t.Fatalf("invitation %+v", inv)
 	}
 	b, leg := r.largeMode(t, l, inv)
-	if got := b.next(t); !bytes.Equal(got.Body, large) {
-		t.Fatalf("large-mode delivery of %d bytes", len(got.Body))
+	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), large) {
+		t.Fatalf("large-mode delivery of %d bytes", got.Body.Len())
 	}
 	waitDone(t, leg.Finished())
 	// Both were recorded as sent, so both can be answered.

@@ -69,7 +69,15 @@ func (r *chatRig) create(t *testing.T, p *peer, path msrp.URI, invitees ...strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	return contact.URI.String(), s
+	return groupURIOf(contact), s
+}
+
+// groupURIOf is the group's conference URI, its identity, from the
+// Contact rcs-as answers with, which adds a transport (focusContact).
+func groupURIOf(contact sip.Address) string {
+	u := contact.URI
+	u.Params = nil
+	return u.String()
 }
 
 // focusInvites are the next n INVITEs the focus sent the core, by
@@ -148,7 +156,7 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 		for name, want := range map[string]string{
 			"P-Asserted-Identity": "<" + uri + ">",
 			"P-Served-User":       "<" + who + ">;sescase=term",
-			"Contact":             "<" + uri + ">;isfocus;" + chatTag + ";" + omaIMTag,
+			"Contact":             "<" + uri + ";transport=tcp>;isfocus;" + chatTag + ";" + omaIMTag,
 			"Referred-By":         "<" + alice + ">",
 			"Subject":             "Lunch",
 			"Conversation-ID":     g.Conversation,
@@ -179,7 +187,7 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 		t.Fatalf("alice's message reported %d", code)
 	}
 	for who, relay := range map[string]*relayEnd{bob: relayB, carol: relayC} {
-		c, err := cpim.Parse(relay.next(t).Body)
+		c, err := cpim.Parse(relay.next(t).Body.Bytes())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,7 +264,7 @@ func TestAnInviteToTheConferenceURIJoinsOrIsRefused(t *testing.T) {
 		return p.send(m)
 	}
 	s := answeredBy(t, rejoin(bob))
-	if c := s.res.Header.Get("Contact"); c != "<"+uri+">;isfocus;"+chatTag {
+	if c := s.res.Header.Get("Contact"); c != "<"+uri+";transport=tcp>;isfocus;"+chatTag {
 		t.Fatalf("Contact %q", c)
 	}
 	// bob's ACK, in his dialog, which stops the 2xx's retransmissions.
@@ -437,7 +445,7 @@ func TestAContributionIDNamesOneGroup(t *testing.T) {
 	s := answeredBy(t, p.send(m))
 	p.ack(s)
 	contact, _ := sip.ParseAddress(s.res.Header.Get("Contact"))
-	uri := contact.URI.String()
+	uri := groupURIOf(contact)
 	r.core.nextOf(t, "INVITE")
 	g, err := r.groups.Get(t.Context(), uri)
 	if err != nil || g.Conversation != "given1" {

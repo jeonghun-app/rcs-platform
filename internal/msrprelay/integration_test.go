@@ -67,8 +67,8 @@ func TestIntegrationTwoRelayTasksShareBindingsInDynamoDB(t *testing.T) {
 		t.Fatalf("Open = %v", err)
 	}
 	send(t, s, "via dynamodb")
-	if m := asH.message(t); string(m.Body) != "via dynamodb" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "via dynamodb" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 
 	// The race.

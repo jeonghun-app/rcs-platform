@@ -473,6 +473,10 @@ func TestRunServesGroupChatsAtTheConferenceFactory(t *testing.T) {
 		t.Fatal(err)
 	}
 	deadline := time.After(waitFor)
+	// The focus's From is the conference URI; the Contact adds rcs-as's
+	// transport to it.
+	conference := contact.URI
+	conference.Params = nil
 invited:
 	for {
 		select {
@@ -480,7 +484,7 @@ invited:
 			if req.Method != "INVITE" {
 				continue
 			}
-			if from, err := req.Header.From(); err != nil || from.URI.String() != contact.URI.String() || req.URI.String() != "tel:+15550100002" {
+			if from, err := req.Header.From(); err != nil || from.URI.String() != conference.String() || req.URI.String() != "tel:+15550100002" {
 				t.Fatalf("INVITE %s from %q", req.URI, req.Header.Get("From"))
 			}
 			break invited

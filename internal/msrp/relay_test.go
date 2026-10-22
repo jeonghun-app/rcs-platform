@@ -97,7 +97,7 @@ func (r *relayRig) asSentinel(t *testing.T) {
 	t.Helper()
 	r.client.send(t, clientSend("as3ntnl", "Message-ID: as3ntnl", "Content-Type: text/plain", "", "sentinel", "-------as3ntnl$")...)
 	m := r.as.next(t)
-	if string(m.Body) != "sentinel" {
+	if string(m.Body.Bytes()) != "sentinel" {
 		t.Fatalf("rcs-as got %s %v before the sentinel", m.Method, m.ByteRange)
 	}
 	r.as.respond(t, m, StatusOK)
@@ -144,13 +144,13 @@ func TestRelayCarriesAMessageBetweenTwoEndpoints(t *testing.T) {
 	}
 
 	body := bodyOf(5000)
-	id, err := alice.Send(context.Background(), Outgoing{ContentType: "message/cpim", Body: body, SuccessReport: true})
+	id, err := alice.Send(context.Background(), Outgoing{ContentType: "message/cpim", Body: BodyOf(body), SuccessReport: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := bobH.message(t)
-	if !equalBodies(m.Body, body) || m.MessageID != id || m.FromPath[0].String() != relayInternalURI {
-		t.Fatalf("rcs-as got %d octets from %v", len(m.Body), m.FromPath)
+	if !equalBodies(m.Body.Bytes(), body) || m.MessageID != id || m.FromPath[0].String() != relayInternalURI {
+		t.Fatalf("rcs-as got %d octets from %v", m.Body.Len(), m.FromPath)
 	}
 	r := aliceH.report(t)
 	if r.MessageID != id || r.Code != StatusOK || r.Range != (ByteRange{1, 5000, 5000}) {
@@ -158,11 +158,11 @@ func TestRelayCarriesAMessageBetweenTwoEndpoints(t *testing.T) {
 	}
 
 	// And the other way.
-	if _, err := bob.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("back")}); err != nil {
+	if _, err := bob.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("back"))}); err != nil {
 		t.Fatal(err)
 	}
-	if m := aliceH.message(t); string(m.Body) != "back" || m.FromPath[0].String() != relayPublicURI {
-		t.Fatalf("client got %q from %v", m.Body, m.FromPath)
+	if m := aliceH.message(t); string(m.Body.Bytes()) != "back" || m.FromPath[0].String() != relayPublicURI {
+		t.Fatalf("client got %q from %v", m.Body.Bytes(), m.FromPath)
 	}
 }
 
@@ -181,7 +181,7 @@ func TestRelayRewritesPathsAndTransactionIDsForTheNextHop(t *testing.T) {
 	if len(fwd.ToPath) != 1 || fwd.ToPath[0].String() != asURI || len(fwd.FromPath) != 1 || fwd.FromPath[0].String() != relayInternalURI {
 		t.Fatalf("forwarded paths %v %v", fwd.ToPath, fwd.FromPath)
 	}
-	if fwd.MessageID != "msg1" || *fwd.ByteRange != (ByteRange{1, 5, 5}) || string(fwd.Body) != "hello" || fwd.Continuation != FlagEnd ||
+	if fwd.MessageID != "msg1" || *fwd.ByteRange != (ByteRange{1, 5, 5}) || string(fwd.Body.Bytes()) != "hello" || fwd.Continuation != FlagEnd ||
 		fwd.SuccessReport != ReportYes || fwd.FailureReport != ReportYes || fwd.ContentType != "text/plain" {
 		t.Fatalf("forwarded %+v", fwd)
 	}
@@ -207,17 +207,17 @@ func TestRelayForwardsALargeChunkInPiecesAsItArrives(t *testing.T) {
 	}
 	// The first piece leaves while the rest of the chunk is still to come.
 	first := r.as.next(t)
-	if *first.ByteRange != (ByteRange{1, 2048, 5000}) || first.Continuation != FlagMore || !equalBodies(first.Body, body[:2048]) {
+	if *first.ByteRange != (ByteRange{1, 2048, 5000}) || first.Continuation != FlagMore || !equalBodies(first.Body.Bytes(), body[:2048]) {
 		t.Fatalf("first piece %v %q", first.ByteRange, first.Continuation)
 	}
 	if _, err := r.client.nc.Write(append(append([]byte{}, body[2049:]...), "\r\n-------b1gchunk$\r\n"...)); err != nil {
 		t.Fatal(err)
 	}
 	second, third := r.as.next(t), r.as.next(t)
-	if *second.ByteRange != (ByteRange{2049, 4096, 5000}) || second.Continuation != FlagMore || !equalBodies(second.Body, body[2048:4096]) {
+	if *second.ByteRange != (ByteRange{2049, 4096, 5000}) || second.Continuation != FlagMore || !equalBodies(second.Body.Bytes(), body[2048:4096]) {
 		t.Fatalf("second piece %v %q", second.ByteRange, second.Continuation)
 	}
-	if *third.ByteRange != (ByteRange{4097, 5000, 5000}) || third.Continuation != FlagEnd || !equalBodies(third.Body, body[4096:]) {
+	if *third.ByteRange != (ByteRange{4097, 5000, 5000}) || third.Continuation != FlagEnd || !equalBodies(third.Body.Bytes(), body[4096:]) {
 		t.Fatalf("third piece %v %q", third.ByteRange, third.Continuation)
 	}
 	for _, m := range []*Message{first, second, third} {
@@ -235,7 +235,7 @@ func TestRelayKeepsAnInterruptedChunkInterrupted(t *testing.T) {
 	}
 	r.client.send(t, clientSend("1ntrpt2", "Message-ID: msg1", "Byte-Range: 4-*/*", "Content-Type: text/plain", "", "", "-------1ntrpt2#")...)
 	expectResponse(t, r.client, "1ntrpt2", StatusOK)
-	if m := r.as.next(t); *m.ByteRange != (ByteRange{4, 3, Unknown}) || m.Continuation != FlagAbort || len(m.Body) != 0 {
+	if m := r.as.next(t); *m.ByteRange != (ByteRange{4, 3, Unknown}) || m.Continuation != FlagAbort || m.Body.Len() != 0 {
 		t.Fatalf("forwarded %v %q", m.ByteRange, m.Continuation)
 	}
 }
@@ -358,7 +358,7 @@ func TestRelayRefusesMessagesOverItsSizeLimit(t *testing.T) {
 		t.Fatalf("first piece %+v", first.ByteRange)
 	}
 	abort := r.as.next(t)
-	if abort.MessageID != "msg2" || abort.Continuation != FlagAbort || len(abort.Body) != 0 || abort.Range().Start != 2049 {
+	if abort.MessageID != "msg2" || abort.Continuation != FlagAbort || abort.Body.Len() != 0 || abort.Range().Start != 2049 {
 		t.Fatalf("abort %v %q", abort.ByteRange, abort.Continuation)
 	}
 	expectResponse(t, r.client, "gr0wing", StatusMessageTooLarge)
@@ -387,7 +387,7 @@ func TestRelayForwardsSendsFromRcsAsToTheClient(t *testing.T) {
 		"Message-ID: msg8", "Byte-Range: 1-2/2", "Content-Type: message/cpim", "", "yo", "-------fr0mas$")
 	expectResponse(t, r.as, "fr0mas", StatusOK)
 	m := r.client.next(t)
-	if m.Method != MethodSend || string(m.Body) != "yo" || m.ToPath[0].String() != clientURI || m.FromPath[0].String() != relayPublicURI {
+	if m.Method != MethodSend || string(m.Body.Bytes()) != "yo" || m.ToPath[0].String() != clientURI || m.FromPath[0].String() != relayPublicURI {
 		t.Fatalf("client got %+v", m)
 	}
 	r.client.respond(t, m, StatusOK)

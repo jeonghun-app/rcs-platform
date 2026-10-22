@@ -110,7 +110,7 @@ func (m Message) LogValue() slog.Value {
 		attrs = append(attrs, slog.String("headers", strings.Join(names, ",")))
 	}
 	attrs = append(attrs,
-		slog.Int("body_octets", len(m.Body)),
+		slog.Int("body_octets", m.Body.Len()),
 		slog.String("flag", string(m.flag())))
 	return slog.GroupValue(attrs...)
 }

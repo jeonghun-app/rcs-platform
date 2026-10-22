@@ -191,8 +191,8 @@ func TestChatInviteConversationShapes(t *testing.T) {
 			if code := relayA.send(t, chatCPIM("m2", "follow-up")); code != 200 {
 				t.Fatalf("follow-up reported %d", code)
 			}
-			if got := relayB.next(t); !strings.Contains(string(got.Body), "follow-up") {
-				t.Fatalf("bob got %q", got.Body)
+			if got := relayB.next(t); !strings.Contains(string(got.Body.Bytes()), "follow-up") {
+				t.Fatalf("bob got %q", got.Body.Bytes())
 			}
 			select {
 			case req := <-r.core.got:

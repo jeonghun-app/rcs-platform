@@ -174,7 +174,7 @@ func TestPassiveSideBindsASessionOnItsFirstRequest(t *testing.T) {
 
 	p.send(t, sendLines("tr2x", "Message-ID: msg2", "Byte-Range: 1-5/5", "Content-Type: text/plain", "", "hello", "-------tr2x$")...)
 	expectResponse(t, p, "tr2x", StatusOK)
-	if m := h.message(t); string(m.Body) != "hello" || m.MessageID != "msg2" {
+	if m := h.message(t); string(m.Body.Bytes()) != "hello" || m.MessageID != "msg2" {
 		t.Fatalf("delivered %+v", m)
 	}
 }
@@ -247,13 +247,13 @@ func TestPassiveSessionWaitsForTheFirstRequestBeforeSending(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: []byte("early")}); !errors.Is(err, context.Canceled) {
+	if _, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("early"))}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Send before binding = %v", err)
 	}
 
 	sent := make(chan error, 1)
 	go func() {
-		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("later")})
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("later"))})
 		sent <- err
 	}()
 	p.send(t, sendLines("b1nd", "Message-ID: b1nd", "-------b1nd$")...)
@@ -263,7 +263,7 @@ func TestPassiveSessionWaitsForTheFirstRequestBeforeSending(t *testing.T) {
 		switch {
 		case !m.IsRequest() && m.TransactionID == "b1nd":
 			gotResponse = true
-		case m.Method == MethodSend && string(m.Body) == "later":
+		case m.Method == MethodSend && string(m.Body.Bytes()) == "later":
 			gotSend = true
 			if m.ToPath[0].String() != clientURI || m.FromPath[0].String() != asURI {
 				t.Fatalf("paths %v %v", m.ToPath, m.FromPath)
@@ -297,7 +297,7 @@ func TestSeveralSessionsShareOneConnection(t *testing.T) {
 	if resp.FromPath[0].SessionID != "as9two" {
 		t.Fatalf("answered from %v", resp.FromPath)
 	}
-	if string(h1.message(t).Body) != "for one" || string(h2.message(t).Body) != "for two" {
+	if string(h1.message(t).Body.Bytes()) != "for one" || string(h2.message(t).Body.Bytes()) != "for two" {
 		t.Fatal("messages crossed sessions")
 	}
 }
@@ -332,15 +332,15 @@ func TestChunkedMessagesAreReassembledAndConfirmed(t *testing.T) {
 	alice, _ := endpoints(t, Config{Clock: newFakeClock()}, aliceH, bobH)
 	body := bodyOf(5000)
 	id, err := alice.Send(context.Background(), Outgoing{
-		ContentType: "message/cpim", Body: body, SuccessReport: true,
+		ContentType: "message/cpim", Body: BodyOf(body), SuccessReport: true,
 		Header: []Field{{"Content-Disposition", "render"}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := bobH.message(t)
-	if !equalBodies(m.Body, body) || m.MessageID != id || m.ContentType != "message/cpim" {
-		t.Fatalf("delivered %d octets of %q", len(m.Body), m.MessageID)
+	if !equalBodies(m.Body.Bytes(), body) || m.MessageID != id || m.ContentType != "message/cpim" {
+		t.Fatalf("delivered %d octets of %q", m.Body.Len(), m.MessageID)
 	}
 	if v, _ := m.Get("Content-Disposition"); v != "render" {
 		t.Fatal("MIME header lost")
@@ -362,7 +362,7 @@ func TestHandlerErrorsBecomeFailureReports(t *testing.T) {
 		aliceH, bobH := newRecorder(), newRecorder()
 		bobH.failWith(tt.err)
 		alice, _ := endpoints(t, Config{Clock: newFakeClock()}, aliceH, bobH)
-		id, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("hi")})
+		id, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("hi"))})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -377,13 +377,13 @@ func TestNoReportsWhenTheSenderAsksForNone(t *testing.T) {
 	aliceH, bobH := newRecorder(), newRecorder()
 	bobH.failWith(errors.New("refused"))
 	alice, _ := endpoints(t, Config{Clock: newFakeClock()}, aliceH, bobH)
-	if _, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("hi"), FailureReport: ReportNo}); err != nil {
+	if _, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("hi")), FailureReport: ReportNo}); err != nil {
 		t.Fatal(err)
 	}
 	bobH.message(t)
 	// The next report alice sees is for a later message, not the first.
 	bobH.failWith(nil)
-	id, _ := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("again"), SuccessReport: true})
+	id, _ := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("again")), SuccessReport: true})
 	bobH.message(t)
 	if r := aliceH.report(t); r.MessageID != id || r.Code != StatusOK {
 		t.Fatalf("report %+v", r)
@@ -518,7 +518,7 @@ func TestUnansweredRequestsTimeOutWith408(t *testing.T) {
 	c, p := activeWithPeer(t, Config{Clock: clock})
 	s := newTestSession(t, clientURI, asURI, h)
 	openWithPeer(t, c, p, s)
-	id, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("hi")})
+	id, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("hi"))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +543,7 @@ func TestPartialRequestsRunNoTimer(t *testing.T) {
 	c, p := activeWithPeer(t, Config{Clock: clock})
 	s := newTestSession(t, clientURI, asURI, h)
 	openWithPeer(t, c, p, s)
-	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("hi"), FailureReport: ReportPartial}); err != nil {
+	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("hi")), FailureReport: ReportPartial}); err != nil {
 		t.Fatal(err)
 	}
 	chunk := p.next(t)
@@ -562,7 +562,7 @@ func TestPartialRequestsStillReportFailures(t *testing.T) {
 	c, p := activeWithPeer(t, Config{Clock: newFakeClock()})
 	s := newTestSession(t, clientURI, asURI, h)
 	openWithPeer(t, c, p, s)
-	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("hi"), FailureReport: ReportPartial}); err != nil {
+	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("hi")), FailureReport: ReportPartial}); err != nil {
 		t.Fatal(err)
 	}
 	chunk := p.next(t)
@@ -605,7 +605,7 @@ func TestSendStopsAfterThePeerRefusesAChunk(t *testing.T) {
 	s, p := activeWithSyncPeer(t, Config{Clock: newFakeClock(), ChunkSize: 4}, h)
 	result := make(chan error, 1)
 	go func() {
-		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("abcdefghijkl")})
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("abcdefghijkl"))})
 		result <- err
 	}()
 	first := p.next(t)
@@ -631,7 +631,7 @@ func TestSendStopsAfterThePeerRefusesAChunk(t *testing.T) {
 	if err := <-result; statusCode(err) != StatusMessageTooLarge {
 		t.Fatalf("Send = %v, want 413", err)
 	}
-	newID, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("new")})
+	newID, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("new"))})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +651,7 @@ func TestCancelledSendEndsTheMessageWithAnAbortChunk(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: []byte("abcdefghijklmnop")})
+		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("abcdefghijklmnop"))})
 		result <- err
 	}()
 	last := p.next(t)
@@ -659,7 +659,7 @@ func TestCancelledSendEndsTheMessageWithAnAbortChunk(t *testing.T) {
 	for {
 		m := p.next(t)
 		if m.Continuation == FlagAbort {
-			if len(m.Body) != 0 || m.Range().Start != last.Range().End+1 || m.MessageID != last.MessageID {
+			if m.Body.Len() != 0 || m.Range().Start != last.Range().End+1 || m.MessageID != last.MessageID {
 				t.Fatalf("abort chunk %+v after %v", m.ByteRange, last.ByteRange)
 			}
 			break
@@ -676,7 +676,7 @@ func TestCancelledSendEndsTheMessageWithAnAbortChunk(t *testing.T) {
 
 func TestSendNeedsAContentType(t *testing.T) {
 	s := newTestSession(t, clientURI, asURI, newRecorder())
-	if _, err := s.Send(context.Background(), Outgoing{Body: []byte("x")}); err == nil {
+	if _, err := s.Send(context.Background(), Outgoing{Body: BodyOf([]byte("x"))}); err == nil {
 		t.Fatal("sent content without a Content-Type")
 	}
 }
@@ -688,7 +688,7 @@ func TestKeepAliveSendsABodilessSendAfterAQuietInterval(t *testing.T) {
 	openWithPeer(t, c, p, s)
 
 	clock.Advance(DefaultKeepAliveInterval - time.Second)
-	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("x")}); err != nil {
+	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("x"))}); err != nil {
 		t.Fatal(err)
 	}
 	if m := p.next(t); !m.HasBody() {
@@ -703,10 +703,10 @@ func TestKeepAliveSendsABodilessSendAfterAQuietInterval(t *testing.T) {
 		FromPath: []URI{mustURI(t, asURI)}, MessageID: "fr0mpeer"})
 	expectResponse(t, p, "fr0mpeer", StatusOK)
 	clock.Advance(DefaultKeepAliveInterval - time.Second)
-	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("y")}); err != nil {
+	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("y"))}); err != nil {
 		t.Fatal(err)
 	}
-	if m := p.next(t); string(m.Body) != "y" {
+	if m := p.next(t); string(m.Body.Bytes()) != "y" {
 		t.Fatalf("got %+v, want the y chunk first", m)
 	} else {
 		p.respond(t, m, StatusOK)
@@ -764,10 +764,10 @@ func TestKeepAlivesCanBeTurnedOff(t *testing.T) {
 	s := newTestSession(t, clientURI, asURI, newRecorder())
 	openWithPeer(t, c, p, s)
 	clock.Advance(10 * DefaultKeepAliveInterval)
-	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("x")}); err != nil {
+	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("x"))}); err != nil {
 		t.Fatal(err)
 	}
-	if m := p.next(t); string(m.Body) != "x" {
+	if m := p.next(t); string(m.Body.Bytes()) != "x" {
 		t.Fatalf("got %+v", m)
 	}
 }
@@ -1068,7 +1068,7 @@ func TestBothSidesSendingAtOnceDoNotStallEachOther(t *testing.T) {
 	for _, s := range []*Session{alice, bob} {
 		go func() {
 			for range 50 {
-				if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: bodyOf(3000)}); err != nil {
+				if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf(bodyOf(3000))}); err != nil {
 					errs <- err
 					return
 				}

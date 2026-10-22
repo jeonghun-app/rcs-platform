@@ -1,6 +1,8 @@
 /bin/
 /tmp/
 *.test
+# Race-enabled test binaries built for repeat runs (go test -race -c).
+*.race
 *.out
 coverage.*
 .env

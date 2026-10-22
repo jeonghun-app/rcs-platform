@@ -192,11 +192,11 @@ func (b *blackholeDialer) DialContext(ctx context.Context, network, address stri
 // TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling (#439
 // code review): a set's third-party REGISTERs go one after the other to a
 // server whose address drops the SYN, each dial lasting the dial timeout.
-// The one dialling when the stop gives up neither ends with its context nor
-// with the transport's Close (#462); closeMargin is longer than the dial
-// timeout, so it still ends before the stop's deadline. The stop is timed
-// so that, with a closeMargin of 1 s, a dial would begin just before the
-// waits end and run 1.8 s past the deadline.
+// The one dialling when the stop gives up does not end with its context
+// (#462), but the transport's Close cuts it (#474), so the stop ends before
+// its deadline although the dial timeout, 2.5 s, is longer than the 2 s
+// step 5 waits for the sends. The stop is timed so that, with a
+// closeMargin of 1 s, a dial would begin just before the waits end.
 func TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling(t *testing.T) {
 	const dialTimeout = 2500 * time.Millisecond
 	hss := startHSS(t)
@@ -357,5 +357,68 @@ func TestTheWorstStopEndsBeforeTheRuntimesDeadline(t *testing.T) {
 	}
 	if dprs.Load() == 0 {
 		t.Error("no DPR was written: the Cx client was closed with no time left")
+	}
+}
+
+// stubbornDialer opens connections, but one to addr ignores its context,
+// even once the transport's Close cancels it, and returns only when
+// released: the slowest return a send the router gave up on can have.
+type stubbornDialer struct {
+	addr     string
+	dialling chan struct{}
+	release  chan struct{}
+}
+
+func (s *stubbornDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if address != s.addr {
+		var d net.Dialer
+		return d.DialContext(ctx, network, address)
+	}
+	s.dialling <- struct{}{}
+	<-s.release
+	return nil, errors.New("the dial timed out")
+}
+
+// TestTheCxGoodbyeHasItsTimeWhateverTheRouterWaitsFor (#502): a
+// third-party REGISTER whose dial returns only past the stop's deadline
+// holds the router's wait to its end, which comes goodbyeMargin before the
+// deadline, so the Cx client still says goodbye (DPR). The dial returns
+// within the budget, so the stop ends within it.
+func TestTheCxGoodbyeHasItsTimeWhateverTheRouterWaitsFor(t *testing.T) {
+	hss := startHSS(t)
+	dialer := &stubbornDialer{addr: "127.0.0.1:9", dialling: make(chan struct{}, 1), release: make(chan struct{})}
+	uri := "sip:" + dialer.addr + ";transport=tcp"
+	hss.asURI.Store(&uri)
+	var dprs atomic.Int64
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+		d.sipDialer = dialer
+		d.dial = dprDial(hss, false, &dprs)
+	})
+	p := dialSCSCF(t, r)
+	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
+	recv(t, dialer.dialling)
+	// Past the stop's deadline, budget less returnMargin, and within the
+	// budget: the router's wait, ended at the deadline, would leave the
+	// Cx client no time.
+	budget := testConfig().DrainTimeout + stopMargin
+	start := time.Now()
+	release := time.AfterFunc(budget-returnMargin/2, func() { close(dialer.release) })
+	defer release.Stop()
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	checkStopTook(t, time.Since(start))
+	if dprs.Load() == 0 {
+		t.Error("no DPR went to the HSS: the router's wait took the Cx client's time")
+	}
+}
+
+// TestTheCloseMarginHoldsADialAndTheGoodbye: what step 5 of the stop has
+// after the waits holds a dial begun as they ended, and then the goodbye
+// (docs/scscf.md, Stop).
+func TestTheCloseMarginHoldsADialAndTheGoodbye(t *testing.T) {
+	if closeMargin < coreDialTimeout+goodbyeMargin || returnMargin+closeMargin >= stopMargin {
+		t.Errorf("closeMargin %v, coreDialTimeout %v, goodbyeMargin %v, returnMargin %v, stopMargin %v",
+			closeMargin, coreDialTimeout, goodbyeMargin, returnMargin, stopMargin)
 	}
 }

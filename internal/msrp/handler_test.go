@@ -56,7 +56,7 @@ func TestAHandlerMaySendOnASessionThatIsNotBoundYet(t *testing.T) {
 		switch {
 		case !m.IsRequest() && m.TransactionID == "b1ndtw0":
 			gotBind = true
-		case m.Method == MethodSend && string(m.Body) == "to two" && m.FromPath[0].SessionID == "as9two":
+		case m.Method == MethodSend && string(m.Body.Bytes()) == "to two" && m.FromPath[0].SessionID == "as9two":
 			gotSend = true
 			p.respond(t, m, StatusOK)
 		}
@@ -95,7 +95,7 @@ func TestAHandlerFansOutToEverySessionOnTheConnection(t *testing.T) {
 	seen := map[string]bool{}
 	for range 2 {
 		m := p.next(t)
-		if m.Method != MethodSend || string(m.Body) != "hello all" {
+		if m.Method != MethodSend || string(m.Body.Bytes()) != "hello all" {
 			t.Fatalf("got %+v", m)
 		}
 		seen[m.FromPath[0].SessionID] = true
@@ -497,7 +497,7 @@ func TestEveryRefusalOfASentMessageReachesHandleReport(t *testing.T) {
 	}
 	const n = 200
 	for i := range n {
-		if _, err := alice.Send(context.Background(), Outgoing{ContentType: "image/png", Body: []byte("x")}); err != nil {
+		if _, err := alice.Send(context.Background(), Outgoing{ContentType: "image/png", Body: BodyOf([]byte("x"))}); err != nil {
 			t.Fatalf("Send %d: %v", i, err)
 		}
 		if waiting := alice.undeliveredReports(); waiting > cfg.SendWindow {
