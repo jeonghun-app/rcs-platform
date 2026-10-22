@@ -319,7 +319,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, 488)
 		return
 	}
-	res, err := sip.NewResponse(req, 200, "", tag)
+	res, err := dialogResponse(req, 200, tag)
 	if err == nil {
 		err = s.sessionHeaders(res, ss.contact(), ss.sdp, interval)
 	}

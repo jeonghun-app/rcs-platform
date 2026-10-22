@@ -265,6 +265,12 @@ always answers `passive` and listens: `msrp-relay` connects to
 `RCSAS_MSRP_LISTEN_ADDR`, where the engine's `Serve` binds the connection to
 the leg its To-Path names.
 
+The 2xx with which rcs-as sets up a dialog carries the request's
+`Record-Route` in order: the 200 to a chat, large-mode or group INVITE and to
+a roster SUBSCRIBE (RFC 3261 §12.1.1, RFC 6665 §4.1.2.1). It is the client's
+route set. `pcscf` refuses a client's request in a dialog on any other route,
+so without it the client could not send its BYE (#541).
+
 A client's INVITE (the originating session):
 
 | Check | Refused with |

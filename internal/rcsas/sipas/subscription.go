@@ -271,7 +271,7 @@ func (s *Server) groupSubscribe(ctx context.Context, u *proxy.UAS) {
 		s.refuseGroup(u, req, err)
 		return
 	}
-	res, err := sip.NewResponse(req, 200, "", tag)
+	res, err := dialogResponse(req, 200, tag)
 	if err == nil {
 		err = errors.Join(res.Header.Add("Expires", strconv.Itoa(int(expires))),
 			res.Header.Add("Contact", sip.Address{URI: focus}.String()))
