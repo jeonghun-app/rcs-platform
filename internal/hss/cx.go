@@ -528,8 +528,8 @@ func (h *HSS) digestItem(s *store.Subscription) (cx.AuthDataItem, error) {
 	return cx.AuthDataItem{
 		Scheme: cx.SchemeSIPDigest,
 		Digest: &cx.DigestAuthenticate{
-			Realm: d.Realm, Algorithm: string(digest.MD5), QoP: digest.QOPAuth, HA1: md5,
-			AlternateAlgorithm: string(digest.SHA256), AlternateHA1: sha,
+			Realm: d.Realm, Algorithm: string(digest.MD5), QoP: digest.QOPAuth, HA1: secret.NewString(md5),
+			AlternateAlgorithm: string(digest.SHA256), AlternateHA1: secret.NewString(sha),
 		},
 	}, nil
 }
