@@ -35,6 +35,15 @@ import (
 // balancer is refused on its first bytes.
 var signature = []byte("\r\n\r\n\x00\r\nQUIT\n")
 
+// SignatureLen is the length of the signature that starts every version 2
+// header.
+const SignatureLen = 12
+
+// HasSignature reports whether b starts with the version 2 signature: a
+// listener that also takes connections without a header looks at a
+// connection's first SignatureLen bytes to tell the two apart.
+func HasSignature(b []byte) bool { return bytes.HasPrefix(b, signature) }
+
 const (
 	fixedLen = 16
 	// MaxPayload bounds the address block and TLVs. The NLB sends 12 or 36
