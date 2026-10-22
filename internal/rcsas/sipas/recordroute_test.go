@@ -97,9 +97,38 @@ func TestAGroupsDialogsNameTheConferenceOverTCP(t *testing.T) {
 	checkFocusContact(t, "the 200 to the factory's INVITE", s.res.Header.Get("Contact"))
 	inv := r.core.nextOf(t, "INVITE")
 	checkFocusContact(t, "the focus's INVITE", inv.Header.Get("Contact"))
+	// Every message of a dialog carries the same Contact, not only the
+	// first: NOTIFY and SUBSCRIBE are target refreshes (RFC 6665 §3.1,
+	// §3.2), so a subscriber retargets to each one's Contact (code review
+	// round 2 on #542).
 	g := newGroupRig(t, bob)
-	res, _ := g.subscribe(t, alice, "600")
+	res, sub := g.subscribe(t, alice, "600")
 	checkFocusContact(t, "the 200 to a SUBSCRIBE to the roster", res.Header.Get("Contact"))
+	checkFocusContact(t, "the first NOTIFY", g.nextNotify(t).req.Header.Get("Contact"))
+	for i, expires := range []string{"600", "600", "0"} {
+		what := "a refresh"
+		if expires == "0" {
+			what = "an unsubscribe"
+		}
+		res := g.again(t, &sub, expires)
+		if res.StatusCode != 200 {
+			t.Fatalf("%s (%d) answered %d", what, i, res.StatusCode)
+		}
+		checkFocusContact(t, "the 200 to "+what, res.Header.Get("Contact"))
+		checkFocusContact(t, "the NOTIFY after "+what, g.nextNotify(t).req.Header.Get("Contact"))
+	}
+	// The NOTIFYs of a REFER's implicit subscription, in the creator's
+	// session with the group.
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	for {
+		n := g.core.nextOf(t, "NOTIFY")
+		if strings.HasPrefix(n.Header.Get("Event"), "refer") {
+			checkFocusContact(t, "a REFER's NOTIFY", n.Header.Get("Contact"))
+			break
+		}
+	}
 	// A client rejoins at the Contact it was given, transport and all, as
 	// rcsjta stores it: still this group.
 	g.uri += ";transport=tcp"

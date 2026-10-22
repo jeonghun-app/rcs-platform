@@ -321,7 +321,9 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	ss.group = g.URI
 	conv.ID = g.Conversation
 	ss.conversation = conv
-	if d.LocalTarget, err = sip.ParseURI(g.URI); err != nil {
+	// The Contact of what rcs-as sends in the session later, a REFER's
+	// NOTIFYs among them (focusContact).
+	if d.LocalTarget, err = sip.ParseURI(focusContact(g.URI)); err != nil {
 		s.respond(u, req, 500)
 		return
 	}
