@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
@@ -472,12 +473,32 @@ func (s *Server) failUpload(w http.ResponseWriter, err error) {
 	}
 }
 
-// uploadFailed counts the failure under reason and answers status.
+// uploadFailed counts the failure under reason and answers status. The
+// answer is written and flushed here, under a write deadline of IdleTimeout
+// from just before the write (extendWrite), rather than left to net/http
+// once the handler returns: a deadline set first, as before, could pass
+// while a loaded host kept the handler from returning, and net/http then
+// closed the connection with no answer at all (#211). The whole flush is
+// bounded: net/http reads and discards a body the handler left unread
+// before it writes the header, so the read deadline is set in the past
+// first, and that read ends at once; the connection is not reused anyway.
 func (s *Server) uploadFailed(w http.ResponseWriter, reason string, status int) {
 	s.metrics.Count("upload.failed."+reason, 1)
+	if f := answeringFailure.Load(); f != nil {
+		(*f)()
+	}
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Unix(1, 0))
 	s.extendWrite(w)
 	http.Error(w, http.StatusText(status), status)
+	_ = rc.Flush()
 }
+
+// answeringFailure, empty but in tests, runs in uploadFailed before the
+// answer is written, so that a test can keep the handler from returning
+// for as long as a loaded host might (#211). It is atomic since a server
+// may outlive the test that set it.
+var answeringFailure atomic.Pointer[func()]
 
 // sweepBatch bounds the records one sweep handles.
 const sweepBatch = 100

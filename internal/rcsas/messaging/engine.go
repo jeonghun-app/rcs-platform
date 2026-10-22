@@ -217,6 +217,18 @@ type Engine struct {
 	// unreachable for good (InviteFailed with ErrUndeliverable), until
 	// when their copies could still be queued: those are given up.
 	unreachable map[legKey]time.Time
+	// woken marks the participants whose group's owner this task asked to
+	// read their queue (GroupHandler.WakeOwner), until when it does not
+	// ask again.
+	woken map[legKey]time.Time
+	// wokeFlow is the user's registration on a new flow (flows) the last
+	// wake for a participant told the owner of, and wakesOut the wakes on
+	// their way, at most maxWakesOut.
+	wokeFlow map[legKey]uint64
+	wakesOut int
+	// wakeRetries are the users whose queue is to be read again for a
+	// wake that found no room (wakeOwner).
+	wakeRetries map[string]bool
 	// groupLegs counts the open group legs of each group on this task.
 	groupLegs map[string]int
 	// summaries remembers group notification summaries between their
@@ -259,7 +271,8 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		invites:    map[inviteKey]inviteMark{},
 		pagerOnly:  map[string]struct{}{},
 		flows:      map[string]uint64{},
-		departed:   map[legKey]time.Time{}, unreachable: map[legKey]time.Time{},
+		departed:   map[legKey]time.Time{}, unreachable: map[legKey]time.Time{}, woken: map[legKey]time.Time{},
+		wokeFlow: map[legKey]uint64{}, wakeRetries: map[string]bool{},
 		groupLegs: map[string]int{},
 		summaries: map[legKey]*summaryState{},
 	}
@@ -573,6 +586,13 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 		for k := range e.invites {
 			if k.user == user {
 				delete(e.invites, k)
+			}
+		}
+		// The owners of the user's groups hear of the registration with
+		// the next wake, at once (wakeOwner).
+		for k := range e.woken {
+			if k.user == user {
+				delete(e.woken, k)
 			}
 		}
 	} else if r := e.recipients[user]; r != nil && r.hold == holdWaiting {

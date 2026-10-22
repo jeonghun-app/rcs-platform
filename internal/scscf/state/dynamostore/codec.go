@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // The documents stored in the doc attributes. They are separate from the state
@@ -169,10 +170,10 @@ type digestDoc struct {
 func encodeChallenge(c *state.Challenge) ([]byte, error) {
 	doc := challengeDoc{IMPU: c.IMPU, Issued: c.Issued.UTC(), Expires: c.Expires.UTC(), Resync: c.Resynchronised, Flow: c.Flow}
 	if v := c.AKA; v != nil {
-		doc.AKA = &akaDoc{RAND: v.RAND, AUTN: v.AUTN, XRES: v.XRES, CK: v.CK, IK: v.IK}
+		doc.AKA = &akaDoc{RAND: v.RAND.Reveal(), AUTN: v.AUTN.Reveal(), XRES: v.XRES.Reveal(), CK: v.CK.Reveal(), IK: v.IK.Reveal()}
 	}
 	if g := c.Digest; g != nil {
-		doc.Digest = &digestDoc{Realm: g.Realm, Algorithm: g.Algorithm, QoP: g.QoP, Opaque: g.Opaque, HA1: g.HA1}
+		doc.Digest = &digestDoc{Realm: g.Realm, Algorithm: g.Algorithm, QoP: g.QoP, Opaque: g.Opaque, HA1: g.HA1.RevealString()}
 	}
 	return json.Marshal(doc)
 }
@@ -184,10 +185,12 @@ func decodeChallenge(b []byte, impi, nonce string) (*state.Challenge, error) {
 	}
 	c := &state.Challenge{IMPI: impi, Nonce: nonce, IMPU: doc.IMPU, Issued: doc.Issued, Expires: doc.Expires, Resynchronised: doc.Resync, Flow: doc.Flow}
 	if v := doc.AKA; v != nil {
-		c.AKA = &state.AKAVector{RAND: v.RAND, AUTN: v.AUTN, XRES: v.XRES, CK: v.CK, IK: v.IK}
+		c.AKA = &state.AKAVector{
+			RAND: secret.NewKey(v.RAND), AUTN: secret.NewKey(v.AUTN), XRES: secret.NewKey(v.XRES), CK: secret.NewKey(v.CK), IK: secret.NewKey(v.IK),
+		}
 	}
 	if g := doc.Digest; g != nil {
-		c.Digest = &state.DigestChallenge{Realm: g.Realm, Algorithm: g.Algorithm, QoP: g.QoP, Opaque: g.Opaque, HA1: g.HA1}
+		c.Digest = &state.DigestChallenge{Realm: g.Realm, Algorithm: g.Algorithm, QoP: g.QoP, Opaque: g.Opaque, HA1: secret.NewString(g.HA1)}
 	}
 	if err := c.Validate(); err != nil {
 		return nil, err

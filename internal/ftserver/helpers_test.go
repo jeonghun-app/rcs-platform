@@ -94,7 +94,7 @@ func newEnv(t *testing.T, change ...func(*Options)) *env {
 		UploadURI:               mustURL("https://ft.example.test/ft"),
 		DownloadURI:             mustURL("https://ft.example.test/dl"),
 		Digest:                  ds,
-		Credentials:             NewStaticCredentials(map[string]string{alice: password, bob: password}),
+		Credentials:             NewStaticCredentials(map[string]secretkey.Key{alice: secretkey.NewString(password), bob: secretkey.NewString(password)}),
 		Metadata:                e.meta,
 		Blobs:                   e.blobs,
 		Logger:                  h.Runtime.Logger,

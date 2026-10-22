@@ -35,14 +35,17 @@ var (
 type sipClient struct {
 	ua       *sipua.UA
 	self     cpim.Address
+	contact  sip.Contact
 	messages chan *sip.Request
+	options  chan *sip.Request
 }
 
 // newSIPClient dials and registers cfg as self. Every MESSAGE the network
 // sends it is answered 200 at once and queued for the scenario, as a
-// device's messaging stack accepts a message before the user sees it.
+// device's messaging stack accepts a message before the user sees it, and
+// so is every OPTIONS, a capability query a device answers itself.
 func (r *run) newSIPClient(ctx context.Context, cfg sipua.Config, self cpim.Address) (*sipClient, error) {
-	c := &sipClient{self: self, messages: make(chan *sip.Request, queueLength)}
+	c := &sipClient{self: self, messages: make(chan *sip.Request, queueLength), options: make(chan *sip.Request, queueLength)}
 	ids := sip.IDGenerator{Rand: r.cfg.Rand}
 	cfg.OnRequest = func(tx *transaction.ServerTransaction) {
 		if res := c.answer(tx.Request(), ids); res != nil {
@@ -57,7 +60,7 @@ func (r *run) newSIPClient(ctx context.Context, cfg sipua.Config, self cpim.Addr
 		return nil, err
 	}
 	r.onEnd(func() { ua.Close() })
-	c.ua = ua
+	c.ua, c.contact = ua, ua.Contact()
 	if _, err := ua.Register(ctx); err != nil {
 		return nil, err
 	}
@@ -71,9 +74,11 @@ func (r *run) newSIPClient(ctx context.Context, cfg sipua.Config, self cpim.Addr
 }
 
 // answer answers a request outside any dialog sipua knows: a MESSAGE with
-// 200, once queued (486 when the queue is full); one with a To tag, in a
-// dialog the client does not have, with 481 (RFC 3261 §12.2.2); any other
-// with 405 and the Allow it requires (§8.2.1).
+// 200, once queued (486 when the queue is full); an OPTIONS the same way,
+// its 200 naming the client's Contact and so its feature tags (RCC.07
+// capability discovery); one with a To tag, in a dialog the client does not
+// have, with 481 (RFC 3261 §12.2.2); any other with 405 and the Allow it
+// requires (§8.2.1).
 func (c *sipClient) answer(req *sip.Request, ids sip.IDGenerator) *sip.Response {
 	code := 200
 	to, err := req.Header.To()
@@ -82,14 +87,12 @@ func (c *sipClient) answer(req *sip.Request, ids sip.IDGenerator) *sip.Response 
 		code = 400
 	case to.Tag() != "":
 		code = 481
-	case req.Method != "MESSAGE":
-		code = 405
+	case req.Method == "MESSAGE":
+		code = queued(c.messages, req)
+	case req.Method == "OPTIONS":
+		code = queued(c.options, req)
 	default:
-		select {
-		case c.messages <- req:
-		default:
-			code = 486
-		}
+		code = 405
 	}
 	tag, err := ids.Tag()
 	if err != nil {
@@ -99,10 +102,23 @@ func (c *sipClient) answer(req *sip.Request, ids sip.IDGenerator) *sip.Response 
 	if err != nil {
 		return nil
 	}
-	if code == 405 && res.Header.Add("Allow", "MESSAGE") != nil {
+	switch {
+	case code == 405 && res.Header.Add("Allow", "MESSAGE, OPTIONS") != nil:
+		return nil
+	case code == 200 && req.Method == "OPTIONS" && res.Header.Add("Contact", c.contact.String()) != nil:
 		return nil
 	}
 	return res
+}
+
+// queued puts req on q and is 200, or 486 when q is full.
+func queued(q chan *sip.Request, req *sip.Request) int {
+	select {
+	case q <- req:
+		return 200
+	default:
+		return 486
+	}
 }
 
 // await waits for the MESSAGE whose CPIM message has the IMDN Message-ID
@@ -278,11 +294,11 @@ func pagerMessage(r *run) error {
 		return err
 	}
 	return r.step("peer-offline", func(ctx context.Context) (map[string]int64, error) {
-		// #135 AC 5: B is not registered. Today the platform answers 480
-		// (TS 24.229 §5.4.3.3): pager mode has no store-and-forward yet,
-		// which comes with rcs-as's SIP side. A network that stores the
-		// message instead (200 or 202) passes only if it delivers it once
-		// B registers again; one that accepts it and drops it fails.
+		// #135 AC 5: B is not registered. A network without
+		// store-and-forward, as the unit tests' stand-in core, answers 480
+		// (TS 24.229 §5.4.3.3). One that stores the message (200 or 202),
+		// as rcs-as does, passes only if it delivers it once B registers
+		// again; one that accepts it and drops it fails.
 		if _, err := b.ua.Unregister(ctx); err != nil {
 			return nil, fmt.Errorf("peer: %w", sipError(err))
 		}

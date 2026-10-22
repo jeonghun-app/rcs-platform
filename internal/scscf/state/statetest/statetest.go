@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Test identities: MCC 001 / MNC 01 and the fictional +1 555 0100 range, as
@@ -391,11 +392,11 @@ func testInvalid(t *testing.T, a, _ state.Store, _ Options) {
 	}
 	resyncDigest := &state.Challenge{
 		IMPI: IMPI1, Nonce: "n", IMPU: IMPU1, Issued: T0, Expires: T0.Add(time.Minute), Resynchronised: true,
-		Digest: &state.DigestChallenge{Realm: Domain, Algorithm: "MD5", QoP: "auth", HA1: "0123456789abcdef0123456789abcdef"},
+		Digest: &state.DigestChallenge{Realm: Domain, Algorithm: "MD5", QoP: "auth", HA1: secret.NewString("0123456789abcdef0123456789abcdef")},
 	}
 	wantErr(t, a.AddChallenge(ctx(t), resyncDigest), state.ErrInvalid)
 	both := Challenge(IMPI1, "n", time.Minute)
-	both.Digest = &state.DigestChallenge{Realm: Domain, HA1: "00"}
+	both.Digest = &state.DigestChallenge{Realm: Domain, HA1: secret.NewString("00")}
 	wantErr(t, a.AddChallenge(ctx(t), both), state.ErrInvalid)
 	noDialog := Subscription("s1", IMPU1, time.Hour)
 	noDialog.Dialog.CallID = ""
@@ -422,8 +423,8 @@ func Challenge(impi, nonce string, ttl time.Duration) *state.Challenge {
 		IMPI: impi, Nonce: nonce, IMPU: IMPU1, Issued: T0.Add(ttl - time.Minute), Expires: T0.Add(ttl),
 		Flow: state.FlowScope("flow-token"),
 		AKA: &state.AKAVector{
-			RAND: []byte("0123456789abcdef"), AUTN: []byte("fedcba9876543210"),
-			XRES: []byte("xres0123"), CK: []byte("ck-0123456789abc"), IK: []byte("ik-0123456789abc"),
+			RAND: secret.NewString("0123456789abcdef"), AUTN: secret.NewString("fedcba9876543210"),
+			XRES: secret.NewString("xres0123"), CK: secret.NewString("ck-0123456789abc"), IK: secret.NewString("ik-0123456789abc"),
 		},
 	}
 }
@@ -435,7 +436,7 @@ func testChallengeRoundTrip(t *testing.T, a, b state.Store, _ Options) {
 	}
 	digest := &state.Challenge{
 		IMPI: IMPI1, Nonce: "nonce-digest", IMPU: IMPU1, Issued: T0, Expires: T0.Add(time.Minute),
-		Digest: &state.DigestChallenge{Realm: Domain, Algorithm: "MD5", QoP: "auth", Opaque: "op", HA1: "0123456789abcdef0123456789abcdef"},
+		Digest: &state.DigestChallenge{Realm: Domain, Algorithm: "MD5", QoP: "auth", Opaque: "op", HA1: secret.NewString("0123456789abcdef0123456789abcdef")},
 	}
 	if err := a.AddChallenge(ctx(t), digest); err != nil {
 		t.Fatal(err)

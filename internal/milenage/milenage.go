@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Sizes in bytes of the MILENAGE inputs and outputs (TS 35.206 §4).
@@ -51,7 +53,7 @@ const (
 // concurrent use. The zero value is not usable; build one with New or
 // NewWithOP.
 type Milenage struct {
-	s sealed[subscriber]
+	s secret.Sealed[subscriber]
 }
 
 type subscriber struct {
@@ -63,7 +65,7 @@ type subscriber struct {
 // HSS stores OPc rather than OP (TS 35.206 allows either), so this is the
 // constructor production code uses.
 func New(k, opc [KeySize]byte) Milenage {
-	return Milenage{s: seal(&subscriber{block: kernel(k), opc: opc})}
+	return Milenage{s: secret.Seal(&subscriber{block: kernel(k), opc: opc})}
 }
 
 // NewWithOP returns the functions for subscriber key k and operator variant

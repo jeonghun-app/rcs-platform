@@ -64,6 +64,20 @@ func (l *limiter) allowN(key string, now time.Time, n int) bool {
 	return true
 }
 
+// would is allowN without taking the tokens.
+func (l *limiter) would(key string, now time.Time, n int) bool {
+	if l.interval == 0 || n <= 0 {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	full := l.full[key]
+	if full.Before(now) {
+		full = now
+	}
+	return full.Sub(now)+time.Duration(n-1)*l.interval <= l.tolerance
+}
+
 // evictScan bounds the buckets evict looks at, so that a full map costs a
 // new sender a constant amount of work rather than a pass over every key.
 const evictScan = 64
@@ -101,3 +115,7 @@ func NewLimiter(r Rate, maxKeys int) *Limiter { return &Limiter{newLimiter(r, ma
 
 // Allow takes n tokens from key's bucket at now, all or none.
 func (l *Limiter) Allow(key string, now time.Time, n int) bool { return l.l.allowN(key, now, n) }
+
+// Would reports whether Allow would take n tokens from key's bucket at
+// now, taking none.
+func (l *Limiter) Would(key string, now time.Time, n int) bool { return l.l.would(key, now, n) }

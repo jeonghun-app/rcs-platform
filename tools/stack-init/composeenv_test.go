@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,8 +57,15 @@ func TestComposeEnvGeneratesEverySecretOnce(t *testing.T) {
 			t.Errorf("%s = %q, want 64 hex digits", k, first[k])
 		}
 	}
-	if len(first["HSS_DATA_KEY"]) != 44 {
-		t.Errorf("HSS_DATA_KEY is not base64 of 32 bytes")
+	b64Keys := map[string]bool{}
+	for _, k := range []string{"HSS_DATA_KEY", "SCSCF_NONCE_KEY", "SCSCF_DIALOG_KEY", "SCSCF_CHALLENGE_KEY"} {
+		if b, err := base64.StdEncoding.DecodeString(first[k]); err != nil || len(b) != 32 {
+			t.Errorf("%s is not base64 of 32 bytes", k)
+		}
+		b64Keys[first[k]] = true
+	}
+	if len(b64Keys) != 4 {
+		t.Error("two base64 keys are equal")
 	}
 	if first["HSS_ADMIN_TOKEN"] == first["HSS_FT_TOKEN"] {
 		t.Error("two secrets are equal")

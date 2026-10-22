@@ -410,6 +410,11 @@ func hostOf(a netip.Addr) string {
 	return a.String()
 }
 
+// Contact is the Contact the UA registers, with its feature tags. It is
+// set when the UA dials and never changes, so an answer the UA gives, such
+// as a capability query's 200, can name the device with it.
+func (ua *UA) Contact() sip.Contact { return ua.contact }
+
 // Done is closed when the UA has failed or been closed; Err then says which.
 func (ua *UA) Done() <-chan struct{} { return ua.done }
 

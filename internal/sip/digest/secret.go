@@ -7,6 +7,8 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // ErrNoSecret means Verify was given the zero Secret.
@@ -23,7 +25,7 @@ var ErrSecretAlgorithm = errors.New("digest: HA1 is for another algorithm")
 // The value is sealed (see sealed), so a Secret held in an unexported field of
 // another struct, where fmt cannot call Format, still prints only an address.
 type Secret struct {
-	s sealed[secretValue]
+	s secret.Sealed[secretValue]
 }
 
 type secretValue struct {
@@ -34,7 +36,7 @@ type secretValue struct {
 
 // Password returns a Secret holding a password. The bytes are copied.
 func Password(p []byte) Secret {
-	return Secret{s: seal(&secretValue{password: append([]byte{}, p...)})}
+	return Secret{s: secret.Seal(&secretValue{password: append([]byte{}, p...)})}
 }
 
 // HA1 returns a Secret holding a stored H(username:realm:password) for alg, so
@@ -50,7 +52,7 @@ func HA1(alg Algorithm, hexDigest string) (Secret, error) {
 	if _, err := hex.DecodeString(hexDigest); err != nil {
 		return Secret{}, errors.New("digest: HA1 is not hex")
 	}
-	return Secret{s: seal(&secretValue{ha1: strings.ToLower(hexDigest), ha1Alg: alg})}, nil
+	return Secret{s: secret.Seal(&secretValue{ha1: strings.ToLower(hexDigest), ha1Alg: alg})}, nil
 }
 
 // ComputeHA1 returns H(username:realm:password) in hex, the value an operator

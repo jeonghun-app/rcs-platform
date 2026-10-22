@@ -125,7 +125,9 @@ func (m Message) MarshalJSON() ([]byte, error) {
 }
 
 // Format implements fmt.Formatter with the same content as LogValue, so
-// printing a Message with any verb never shows its body or session-ids.
+// printing a Message with any valid verb never shows its body or
+// session-ids. fmt calls no method for an invalid verb, such as %p of a
+// Message or %w, and prints the fields, the body among them (#506).
 func (m Message) Format(f fmt.State, _ rune) { formatGroup(f, m.LogValue()) }
 
 // The connection-layer types hold URIs in unexported fields, which fmt

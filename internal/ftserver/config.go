@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -60,12 +61,12 @@ type Config struct {
 	BrandedURI  *url.URL
 
 	Realm    string
-	NonceKey secret // empty: a random key per start (dev and test only)
+	NonceKey secretkey.Key // empty: a random key per start (dev and test only)
 
 	Credentials string
-	StaticUsers map[string]secret
+	StaticUsers map[string]secretkey.Key
 	HSSURL      *url.URL
-	HSSToken    secret
+	HSSToken    secretkey.Key
 	HSSTimeout  time.Duration
 
 	Store string
@@ -116,9 +117,9 @@ func Configure(s *runtime.Settings) Config {
 	c := Config{
 		ListenAddr:              e.String("LISTEN_ADDR", DefaultListenAddr),
 		Realm:                   e.RequiredString("REALM"),
-		NonceKey:                secret{e.String("NONCE_KEY", "")},
+		NonceKey:                secretkey.NewString(e.String("NONCE_KEY", "")),
 		Credentials:             e.String("CREDENTIALS", CredentialsHSS),
-		HSSToken:                secret{e.String("HSS_TOKEN", "")},
+		HSSToken:                secretkey.NewString(e.String("HSS_TOKEN", "")),
 		HSSTimeout:              e.Duration("HSS_TIMEOUT", DefaultHSSTimeout),
 		Store:                   e.String("STORE", StoreAWS),
 		MaxSize:                 int64(e.Int("MAX_SIZE", DefaultMaxSize)),
@@ -181,10 +182,10 @@ func Configure(s *runtime.Settings) Config {
 		}
 	}
 
-	if k := c.NonceKey.v; k != "" && len(k) < digest.MinNonceKeySize {
+	if k := c.NonceKey.RevealString(); k != "" && len(k) < digest.MinNonceKeySize {
 		e.Invalid("NONCE_KEY", "shorter than "+strconv.Itoa(digest.MinNonceKeySize)+" bytes")
 	}
-	s.ForbidInProduction(c.NonceKey.v == "",
+	s.ForbidInProduction(c.NonceKey.RevealString() == "",
 		"FT_NONCE_KEY is unset: every task would issue nonces the others reject")
 
 	switch c.Credentials {
@@ -193,13 +194,13 @@ func Configure(s *runtime.Settings) Config {
 		s.ForbidInProduction(true, "FT_CREDENTIALS=static authenticates against fixed test passwords")
 	case CredentialsHSS:
 		c.HSSURL = absoluteURL(e, "HSS_URL", true)
-		if c.HSSToken.v == "" {
+		if c.HSSToken.RevealString() == "" {
 			e.Invalid("HSS_TOKEN", "required with FT_CREDENTIALS=hss")
 		}
 		// ADR 0007 §4: service tokens carry at least 256 bits. The length of
 		// 32 random bytes in base64 (43 characters) is the shortest encoded
 		// form; a shorter token cannot hold that much.
-		s.ForbidInProduction(c.HSSToken.v != "" && len(c.HSSToken.v) < minTokenLength,
+		s.ForbidInProduction(c.HSSToken.RevealString() != "" && len(c.HSSToken.RevealString()) < minTokenLength,
 			"FT_HSS_TOKEN is shorter than "+strconv.Itoa(minTokenLength)+" characters (ADR 0007: at least 256 random bits, e.g. 32 bytes in base64)")
 		// ADR 0007: plain http to an internal API only for a private host
 		// (an RFC 1918 or ULA address, or a name in the Cloud Map
@@ -331,15 +332,15 @@ func absoluteURL(e *runtime.Env, name string, required bool) *url.URL {
 const minTokenLength = 43
 
 // staticUsers reads FT_STATIC_USERS: comma-separated user=password pairs.
-func staticUsers(e *runtime.Env) map[string]secret {
-	users := map[string]secret{}
+func staticUsers(e *runtime.Env) map[string]secretkey.Key {
+	users := map[string]secretkey.Key{}
 	for i, item := range e.List("STATIC_USERS", nil) {
 		name, password, ok := strings.Cut(item, "=")
 		if !ok || name == "" || password == "" {
 			e.Invalid("STATIC_USERS", "item "+strconv.Itoa(i+1)+" is not user=password")
 			continue
 		}
-		users[name] = secret{password}
+		users[name] = secretkey.NewString(password)
 	}
 	if len(users) == 0 {
 		e.Invalid("STATIC_USERS", "required with FT_CREDENTIALS=static")
