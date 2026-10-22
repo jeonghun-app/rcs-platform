@@ -123,9 +123,14 @@ On `SIGTERM`, `scscf` keeps its listener open and runs these steps in order:
 5. It closes the transport, disconnects from the HSS tasks (DPR), and closes
    the proxy.
 
-Steps 3 and 4 end 1 s before the budget does, which is `SCSCF_DRAIN_TIMEOUT`
-plus 5 s from the `SIGTERM`, within `RCS_SHUTDOWN_TIMEOUT`. Step 5 has the
-last second.
+The stop ends by its deadline, `SCSCF_DRAIN_TIMEOUT` plus 4.5 s from the
+`SIGTERM`: half a second inside `RCS_SHUTDOWN_TIMEOUT` at the default drain,
+for the proxy's Close and the return. Steps 3 and 4 end 3 s before that
+deadline, and step 5 has those 3 s. That is longer than a connection to a
+peer takes to open or fail (2 s), so a REGISTER or NOTIFY that began to open
+one as the waits ended is done within it. In step 5, the third-party
+REGISTERs given up on in step 3 are waited for once the transport has
+closed, and then the Cx client says goodbye.
 
 An application server that missed a third-party REGISTER at a stop hears of
 the registration at its next refresh. What the stop leaves undone is the other

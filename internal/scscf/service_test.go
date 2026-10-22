@@ -133,10 +133,12 @@ func (p *pcscfConn) subscribeReg(t *testing.T, path, contact, callID string) {
 	}
 }
 
-// silentPeer is a SIP peer that reads what it is sent and never answers.
+// silentPeer is a SIP peer that reads what it is sent and never answers,
+// keeping the first request.
 type silentPeer struct {
-	addr string
-	got  atomic.Int64
+	addr  string
+	got   atomic.Int64
+	first atomic.Pointer[sip.Request]
 }
 
 func startSilentPeer(t *testing.T) *silentPeer {
@@ -157,8 +159,12 @@ func startSilentPeer(t *testing.T) *silentPeer {
 				defer c.Close()
 				r := sip.NewReader(bufio.NewReader(c), sip.Limits{})
 				for {
-					if _, err := r.ReadMessage(); err != nil {
+					m, err := r.ReadMessage()
+					if err != nil {
 						return
+					}
+					if req, ok := m.(*sip.Request); ok {
+						s.first.CompareAndSwap(nil, req)
 					}
 					s.got.Add(1)
 				}
@@ -295,24 +301,34 @@ func TestAStopLeavesNOTIFYsToAPCSCFThatDoesNotAnswer(t *testing.T) {
 	checkStopTook(t, time.Since(start))
 }
 
-// checkStopTook fails the test if a stop took past its budget, with room
-// for a loaded host, but far from the minute a peer could hold it.
+// stopSlack is what a loaded host may add to a stop measured from outside
+// run: the stop itself ends returnMargin before its budget.
+const stopSlack = 500 * time.Millisecond
+
+// checkStopTook fails the test if a stop took past its budget,
+// DrainTimeout plus stopMargin, by more than stopSlack (#439 QA).
 func checkStopTook(t *testing.T, took time.Duration) {
 	t.Helper()
-	if budget := testConfig().DrainTimeout + stopMargin; took > 2*budget {
-		t.Errorf("the stop took %v, past twice its budget of %v", took, budget)
+	if budget := testConfig().DrainTimeout + stopMargin; took > budget+stopSlack {
+		t.Errorf("the stop took %v, past its budget of %v", took, budget)
 	}
 }
 
 // TestAStopGivesUpOnAThirdPartyREGISTERToAServerThatDoesNotAnswer: a
 // third-party REGISTER at a server that does not answer, and may wait a
-// minute, holds the stop no longer than its budget, and is counted.
+// minute, holds the stop no longer than its budget, and is counted; the
+// Cx client still has time for its DPR (#439 QA). The REGISTER has the one
+// Via its sender gave it (RFC 3261 §8.1.1.7, #439 code review).
 func TestAStopGivesUpOnAThirdPartyREGISTERToAServerThatDoesNotAnswer(t *testing.T) {
 	hss := startHSS(t)
 	as := startSilentPeer(t)
 	uri := "sip:" + as.addr + ";transport=tcp"
 	hss.asURI.Store(&uri)
-	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, _ *deps) { c.ThirdPartyTimeout = time.Minute })
+	var dprs atomic.Int64
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
+		c.ThirdPartyTimeout = time.Minute
+		d.dial = dprDial(hss, false, &dprs)
+	})
 	p := dialSCSCF(t, r)
 	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
 	waitFor(t, "third-party REGISTER at the server", func() bool { return as.got.Load() > 0 })
@@ -323,6 +339,12 @@ func TestAStopGivesUpOnAThirdPartyREGISTERToAServerThatDoesNotAnswer(t *testing.
 	checkStopTook(t, time.Since(start))
 	if got, _ := r.h.Metric("routing.third_party.dropped_at_stop"); got != 1 {
 		t.Errorf("%v dropped at the stop, want the one at the server", got)
+	}
+	if dprs.Load() == 0 {
+		t.Error("no DPR went to the HSS: the Cx client was closed with no time left")
+	}
+	if vias := as.first.Load().Header.Values("Via"); len(vias) != 1 {
+		t.Errorf("the third-party REGISTER has %d Vias", len(vias))
 	}
 }
 
@@ -514,18 +536,21 @@ func recv[T any](t *testing.T, ch <-chan T) T {
 	panic("unreachable")
 }
 
-// TestAStopDoesNotWaitOnAPeerThatStoppedReading (#439 code review, after
-// pcscf's for #366): a core peer that stops reading while the S-CSCF
-// answers it does not hold the stop, nor fail a write on its deadline,
-// which is long here so that filling the queue on a loaded host cannot
-// trip it. The answers come from the proxy's goroutines, so they overflow
-// the connection's queue, and the transport closes the connection; the
-// transport also closes before the proxy at the stop, as pcscf's does.
+// TestAStopDoesNotWaitOnAPeerThatStoppedReading (#439 code review and QA,
+// after pcscf's for #366): a core peer stops reading while the S-CSCF's
+// own handlers answer its SUBSCRIBEs, which wait for room in its
+// connection's queue. Closing the transport first releases them; the
+// proxy's Close would otherwise wait for them, up to WriteTimeout, which
+// is long here so that filling the queue on a loaded host cannot trip it.
+// The queue is small, so that it fills fast, and the wait for it to fill
+// fails only when it stops filling.
 func TestAStopDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
 	const writeTimeout = time.Minute
+	const queueBytes = 256 << 10
 	var tr *transport.Transport
-	r := startSCSCFWith(t, startHSS(t), state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+	r := startSCSCFWith(t, startHSS(t), state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
 		d.writeTimeout = writeTimeout
+		d.sendQueueBytes = queueBytes
 		d.transportMade = func(made *transport.Transport) { tr = made }
 	})
 	c, err := net.DialTimeout("tcp", r.core.String(), realWait)
@@ -536,28 +561,32 @@ func TestAStopDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetReadBuffer(4096)
 	}
-	// Each request is in a dialog the S-CSCF never signed a route for, which
-	// the router refuses 403 at once, from a goroutine the proxy's Close
-	// waits for; its long Via makes the answer large. They are sent until
-	// the stop closes the connection, so the queue stays full.
+	// A reg event SUBSCRIBE for a user with no registration is refused by
+	// the notifier, on a handler goroutine, whose answer waits for room;
+	// its long Via makes the answer large. They are sent until the stop
+	// closes the connection, so the queue stays full.
 	pad := strings.Repeat("z", 3000)
 	_ = c.SetWriteDeadline(time.Now().Add(writeTimeout))
 	go func() {
 		for i := 0; ; i++ {
 			text := strings.Join([]string{
-				"MESSAGE sip:ue1@192.0.2.11:5060;transport=tcp SIP/2.0",
+				"SUBSCRIBE " + impu + " SIP/2.0",
 				fmt.Sprintf("Via: SIP/2.0/TCP 127.0.0.1:5070;branch=z9hG4bK-stall%d;p=%s", i, pad),
 				"Max-Forwards: 69",
-				"From: <" + impu + ">;tag=stall", "To: <" + impu + ">;tag=dialog",
-				fmt.Sprintf("Call-ID: stall-%d", i), "CSeq: 1 MESSAGE", "Content-Length: 0",
+				fmt.Sprintf("From: <sip:pcscf.rcs.local>;tag=stall%d", i), "To: <" + impu + ">",
+				fmt.Sprintf("Call-ID: stall-%d", i), "CSeq: 1 SUBSCRIBE",
+				"Contact: <sip:sub@127.0.0.1:5070;transport=tcp>",
+				"Event: reg", "Expires: 600", "Content-Length: 0",
 			}, "\r\n") + "\r\n\r\n"
 			if _, err := io.WriteString(c, text); err != nil {
 				return
 			}
 		}
 	}()
-	full := int64(transport.DefaultSendQueueBytes - 64<<10)
-	waitFor(t, "full send queue", func() bool { return int64(tr.Stats().QueuedBytes) >= full })
+	full := int64(queueBytes - 16<<10)
+	waitForProgress(t, "the send queue to fill", func() int64 { return int64(tr.Stats().QueuedBytes) }, func(v int64) bool { return v >= full })
+	// More answers pile up behind the full queue, waiting for room.
+	time.Sleep(200 * time.Millisecond)
 	failed := tr.Stats().WriteErrors
 	start := time.Now()
 	if err := r.stop(); err != nil {
@@ -566,5 +595,21 @@ func TestAStopDoesNotWaitOnAPeerThatStoppedReading(t *testing.T) {
 	checkStopTook(t, time.Since(start))
 	if n := tr.Stats().WriteErrors - failed; n != 0 {
 		t.Errorf("%d writes to the peer failed on their deadline during the stop, which waited for them", n)
+	}
+}
+
+// waitForProgress polls value until done holds, and fails the test only
+// when value has not changed for realWait: a loaded host is slow, not
+// stuck.
+func waitForProgress(t *testing.T, what string, value func() int64, done func(int64) bool) {
+	t.Helper()
+	last, since := value(), time.Now()
+	for !done(last) {
+		time.Sleep(10 * time.Millisecond)
+		if v := value(); v != last {
+			last, since = v, time.Now()
+		} else if time.Since(since) > realWait {
+			t.Fatalf("waited for %s, with no progress for %v at %d", what, realWait, v)
+		}
 	}
 }
