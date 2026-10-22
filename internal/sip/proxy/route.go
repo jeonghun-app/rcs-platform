@@ -210,7 +210,7 @@ func (p *Proxy) toTag(req *sip.Request) string {
 }
 
 func (p *Proxy) newHash(purpose string) hash.Hash {
-	h := hmac.New(sha256.New, p.key)
+	h := hmac.New(sha256.New, p.key.Reveal())
 	write(h, purpose)
 	return h
 }

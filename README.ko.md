@@ -23,13 +23,14 @@ I-CSCF, S-CSCF, HSS), RCS 메시징 애플리케이션 서버, MSRP 릴레이, H
   ([문서](docs/scscf.md))와, `ft-server`([문서](docs/ft-server.md)),
   `msrp-relay`([문서](docs/msrp-relay.md)).
 - **진행 중**: `rcs-as`([문서](docs/rcs-as.md))는 로컬 스택에서 IMS 코어의
-  application server로 실행됩니다. 로컬 스택에서 pager 메시지는 끝까지 돌지만,
-  채팅은 아직 돌지 않습니다. `rcs-sim`에 SIP 채팅이 없기 때문입니다.
+  application server로 실행됩니다. 로컬 스택에서 1:1 채팅과 pager 메시지는
+  끝까지 돌지만, 그룹 채팅은 아직 돌지 않습니다.
 - **도구**: 클라이언트 시뮬레이터 `rcs-sim`([문서](docs/rcs-sim.md))과 로컬 스택
   ([문서](docs/local-stack.md)). 로컬 스택에서 단말은 IMS AKA로 IMS 코어를 거쳐
   등록하고, 자기 등록 상태를 구독(reg event)하고, OPTIONS로 다른 단말에 닿습니다.
-  `rcs-as`를 거쳐 다른 단말에 pager 메시지를 보내고, 등록되지 않은 단말에게 보낸
-  메시지는 `rcs-as`가 저장해 두었다가 전달합니다.
+  `msrp-relay`와 `rcs-as`를 거쳐 다른 단말과 MSRP로 채팅합니다. `rcs-as`를 거쳐
+  다른 단말에 pager 메시지도 보내고, 등록되지 않은 단말에게 보낸 메시지는
+  `rcs-as`가 저장해 두었다가 전달합니다.
 - **결정 기록**: ADR 0001–0007과 [위협 모델](docs/threat-model.md).
 
 아직 릴리스는 없습니다.

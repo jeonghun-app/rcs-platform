@@ -1,15 +1,15 @@
 package cx
 
 import (
-	"reflect"
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 func check[T any](t *testing.T, what string, got, want T) {
 	t.Helper()
-	if !reflect.DeepEqual(got, want) {
+	if !deepEqual(got, want) {
 		t.Errorf("%s after the round trip:\n got %+v\nwant %+v", what, got, want)
 	}
 }
@@ -111,7 +111,7 @@ func TestMultimediaAuthRoundTripCarriesAKAAndDigestVectors(t *testing.T) {
 		AuthDataItem: AuthDataItem{
 			Scheme: SchemeDigestAKAv1MD5,
 			// RAND‖AUTS for a resynchronisation.
-			Authorization: append(seq(16, 0x10), seq(14, 0x40)...),
+			Authorization: secret.NewKey(append(seq(16, 0x10), seq(14, 0x40)...)),
 		},
 		NumberAuthItems: 1,
 		ServerName:      scscfName,
@@ -131,9 +131,9 @@ func TestMultimediaAuthRoundTripCarriesAKAAndDigestVectors(t *testing.T) {
 				ItemNumber:         1,
 				Scheme:             SchemeDigestAKAv1MD5,
 				Authenticate:       seq(32, 0x01),
-				Authorization:      seq(8, 0x81),
-				ConfidentialityKey: seq(16, 0xa0),
-				IntegrityKey:       seq(16, 0xc0),
+				Authorization:      secret.NewKey(seq(8, 0x81)),
+				ConfidentialityKey: secret.NewKey(seq(16, 0xa0)),
+				IntegrityKey:       secret.NewKey(seq(16, 0xc0)),
 			},
 			{
 				ItemNumber: 2,

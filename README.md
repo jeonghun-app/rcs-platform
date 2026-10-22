@@ -23,13 +23,14 @@ Built and merged on `main` (details in [CHANGELOG.md](CHANGELOG.md)):
   ([docs](docs/scscf.md)), and `ft-server` ([docs](docs/ft-server.md)) and
   `msrp-relay` ([docs](docs/msrp-relay.md)).
 - **In progress**: `rcs-as` ([docs](docs/rcs-as.md)) runs in the local stack
-  as the IMS core's application server. Pager messages run end to end there;
-  chat does not yet, since `rcs-sim` has no chat over SIP.
+  as the IMS core's application server. 1-to-1 chat and pager messages run
+  end to end there; group chat does not yet.
 - **Tools**: the client simulator `rcs-sim` ([docs](docs/rcs-sim.md)) and the
   local stack ([docs](docs/local-stack.md)). In the local stack a client
   registers through the IMS core with IMS AKA, follows its registration (reg
-  event), reaches another client with OPTIONS, and sends it pager messages
-  through `rcs-as`, which stores one for a client that is not registered.
+  event), reaches another client with OPTIONS, chats with it over MSRP
+  through `msrp-relay` and `rcs-as`, and sends it pager messages through
+  `rcs-as`, which stores one for a client that is not registered.
 - **Decisions**: ADRs 0001–0007 and the [threat model](docs/threat-model.md).
 
 There is no release yet.

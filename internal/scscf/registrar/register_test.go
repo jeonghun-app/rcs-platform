@@ -126,7 +126,7 @@ func TestASynchronisationFailureGetsAVectorFromTheResynchronisedHSS(t *testing.T
 	e.hss.mu.Lock()
 	resync := e.hss.mars[len(e.hss.mars)-1]
 	e.hss.mu.Unlock()
-	if got := resync.AuthDataItem.Authorization; len(got) != 30 || [16]byte(got[:16]) != rnd || [14]byte(got[16:]) != auts {
+	if got := resync.AuthDataItem.Authorization.Reveal(); len(got) != 30 || [16]byte(got[:16]) != rnd || [14]byte(got[16:]) != auts {
 		t.Errorf("resynchronisation MAR carried %x", got)
 	}
 	nrand, nautn, _ := digest.ParseAKANonce(next.Nonce)

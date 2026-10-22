@@ -196,7 +196,7 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 			q.unwait(p)
 			r, server := p.r, p.server
 			rt.tp.mu.Unlock()
-			rt.registerWith(ctx, r, server)
+			rt.cfg.Panics.Run("routing: third-party REGISTER", func() { rt.registerWith(ctx, r, server) })
 			rt.tp.mu.Lock()
 			q.release(p)
 			rt.tp.mu.Unlock()

@@ -138,7 +138,7 @@ func (f *fakeHSS) MAR(_ context.Context, r *cx.MAR) (*cx.MAA, error) {
 	}
 	switch {
 	case r.AuthDataItem.Scheme == cx.SchemeDigestAKAv1MD5 && s.aka != nil:
-		if auth := r.AuthDataItem.Authorization; len(auth) > 0 {
+		if auth := r.AuthDataItem.Authorization.Reveal(); len(auth) > 0 {
 			ms, err := s.aka.VerifyAUTS([16]byte(auth[:16]), [14]byte(auth[16:]))
 			if err == nil {
 				s.sqn = milenage.Resynchronise(s.sqn, ms)
@@ -156,7 +156,7 @@ func (f *fakeHSS) MAR(_ context.Context, r *cx.MAR) (*cx.MAA, error) {
 		xres, ck, ik := v.XRES(), v.CK(), v.IK()
 		return &cx.MAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, AuthDataItems: []cx.AuthDataItem{{
 			Scheme: cx.SchemeDigestAKAv1MD5, Authenticate: append(rnd[:], autn[:]...),
-			Authorization: xres[:], ConfidentialityKey: ck[:], IntegrityKey: ik[:],
+			Authorization: secret.NewKey(xres[:]), ConfidentialityKey: secret.NewKey(ck[:]), IntegrityKey: secret.NewKey(ik[:]),
 		}}}, nil
 	case r.AuthDataItem.Scheme == cx.SchemeSIPDigest && s.password != nil:
 		md5, _ := digest.ComputeHA1(digest.MD5, s.impi, realm, s.password)
