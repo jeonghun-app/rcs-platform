@@ -435,7 +435,10 @@ func TestConnectionThatNeverNamesASessionIsClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer nc.Close()
-	eventually(t, "the connection to be admitted", func() bool { return r.metrics.conns.Load() == 1 })
+	// The first-bind timer is armed: advancing before it would leave it
+	// due at now+30 s, never to fire. The connection is counted before
+	// either timer is armed (#586), so the count shows nothing here.
+	r.clock.waitTimer(t, msrp.DefaultUnboundTimeout)
 	r.clock.Advance(msrp.DefaultUnboundTimeout)
 	_ = nc.SetReadDeadline(time.Now().Add(5 * time.Second))
 	if _, err := nc.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {

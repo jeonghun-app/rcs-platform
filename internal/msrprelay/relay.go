@@ -308,9 +308,9 @@ func (r *Relay) handle(nc net.Conn) {
 	// own goroutines at once, and a client already relaying must not be
 	// missing from the gauge while this one has yet to run (#586).
 	r.o.Metrics.conns.Add(1)
+	defer r.o.Metrics.conns.Add(-1)
 	c, err := msrp.NewPassiveConn(mc, b, r.o.Edge)
 	if err != nil {
-		r.o.Metrics.conns.Add(-1)
 		return
 	}
 	// The active side sends its first SEND at once (RFC 4975 §5.4); a
@@ -324,7 +324,6 @@ func (r *Relay) handle(nc net.Conn) {
 	})
 	defer first.Stop()
 	<-c.Done()
-	r.o.Metrics.conns.Add(-1)
 	// A connection is counted for the reason it ended with. One that a
 	// refusal was delivering answers for (internal/msrp, #219) ends with
 	// that reason whatever closed it meanwhile, and is counted there
