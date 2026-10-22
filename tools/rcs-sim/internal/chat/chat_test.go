@@ -171,8 +171,8 @@ func TestLargeMessagesTravelChunkedAndWhole(t *testing.T) {
 func TestContentThatIsNotChatIsCountedAndRefused(t *testing.T) {
 	_, cs, core, _ := pair(t)
 	for _, out := range []msrp.Outgoing{
-		{ContentType: "text/plain", Body: []byte("not cpim")},
-		{ContentType: cpim.ContentType, Body: []byte("no headers at all")},
+		{ContentType: "text/plain", Body: msrp.BodyOf([]byte("not cpim"))},
+		{ContentType: cpim.ContentType, Body: msrp.BodyOf([]byte("no headers at all"))},
 	} {
 		if _, err := cs.Send(ctx(t), out); err != nil {
 			t.Fatal(err)

@@ -112,7 +112,7 @@ func mustMSRP(t *testing.T, s string) msrp.URI {
 type recorded struct{ msgs chan string }
 
 func (h *recorded) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
-	h.msgs <- string(m.Body)
+	h.msgs <- string(m.Body.Bytes())
 	return nil
 }
 func (h *recorded) HandleReport(*msrp.Session, msrp.Report) {}
@@ -248,7 +248,7 @@ func sendMSRP(t *testing.T, s *msrp.Session, body string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
 	defer cancel()
-	if _, err := s.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: []byte(body)}); err != nil {
+	if _, err := s.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: msrp.BodyOf([]byte(body))}); err != nil {
 		t.Fatalf("Send: %v", err)
 	}
 }

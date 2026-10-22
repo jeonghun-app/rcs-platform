@@ -25,7 +25,7 @@ func (m *Message) Marshal() ([]byte, error) {
 		return nil, err
 	}
 	var b bytes.Buffer
-	b.Grow(256 + len(m.Body))
+	b.Grow(256 + m.Body.Len())
 	b.WriteString("MSRP ")
 	b.WriteString(m.TransactionID)
 	b.WriteByte(' ')
@@ -71,7 +71,7 @@ func (m *Message) Marshal() ([]byte, error) {
 	if m.HasBody() {
 		writeHeader(&b, hdrContentType, m.ContentType)
 		b.WriteString("\r\n")
-		b.Write(m.Body)
+		b.Write(m.Body.Bytes())
 		b.WriteString("\r\n")
 	}
 	b.WriteString(endLinePrefix)
@@ -126,7 +126,7 @@ func (m *Message) check() error {
 		if m.StatusCode < 0 || m.StatusCode > 999 || !validText(m.Comment) {
 			return invalid("response start line")
 		}
-		if m.HasBody() || len(m.Body) > 0 || m.flag() != FlagEnd {
+		if m.HasBody() || m.Body.Len() > 0 || m.flag() != FlagEnd {
 			return invalid("a response has no body and is never continued (§7.2)")
 		}
 	}
@@ -160,7 +160,7 @@ func (m *Message) check() error {
 		if m.flag() != FlagEnd {
 			return invalid("only SEND requests are chunked (§7.1)")
 		}
-		if len(m.Body) > maxNonSendBody {
+		if m.Body.Len() > maxNonSendBody {
 			return invalid("%s body larger than %d octets (§7.1)", m.Method, maxNonSendBody)
 		}
 	}
@@ -184,10 +184,10 @@ func (m *Message) check() error {
 		if !validContentType(m.ContentType) {
 			return invalid("Content-Type %q", m.ContentType)
 		}
-		if bodyHasBoundary(m.Body, m.TransactionID) {
+		if bodyHasBoundary(m.Body.Bytes(), m.TransactionID) {
 			return invalid("body contains the end-line of transaction %s (§7.1)", m.TransactionID)
 		}
-	} else if len(m.Body) > 0 {
+	} else if m.Body.Len() > 0 {
 		return invalid("a body needs a Content-Type (§7.1)")
 	}
 	return nil
