@@ -44,19 +44,22 @@ func regEvent(r *run) error {
 		return err
 	}
 	if err := r.step("re-register", func(ctx context.Context) (map[string]int64, error) {
-		if _, err := c.ua.Register(ctx); err != nil {
+		reg, err := c.ua.Register(ctx)
+		if err != nil {
 			return nil, sipError(err)
 		}
-		n, own, err := w.next(ctx)
+		n, own, skipped, err := w.untilChanged(ctx, refreshedBy(reg))
+		detail := map[string]int64{"skipped": int64(skipped)}
 		switch {
 		case err != nil:
-			return nil, err
+			return detail, err
 		case n.State != "active":
-			return nil, errors.New("the subscription is not active after the refresh")
+			return detail, errors.New("the subscription is not active after the refresh")
 		case !own.Active():
-			return nil, errors.New("the client's contact is not active after the refresh")
+			return detail, errors.New("the client's contact is not active after the refresh")
 		}
-		return map[string]int64{"version": int64(n.Info.Version)}, nil
+		detail["version"] = int64(n.Info.Version)
+		return detail, nil
 	}); err != nil {
 		return err
 	}
@@ -145,6 +148,52 @@ func (r *run) subscribeRegEvent(ctx context.Context, c *sipClient) (*regWatch, m
 	return w, detail, nil
 }
 
+// untilChanged waits for the NOTIFY that tells of the change a REGISTER
+// made, and returns it with the client's contact and how many came before
+// it. A network may first send a NOTIFY of a state it has told already,
+// the client's contact as it was and the version raised (#473 QA): one
+// that refreshed does not accept and that repeats the last NOTIFY's
+// contact is skipped, checked as next checks every NOTIFY. Any other is
+// returned for the step to judge.
+func (w *regWatch) untilChanged(ctx context.Context, refreshed func(reginfo.Contact) bool) (sipua.Notification, reginfo.Contact, int, error) {
+	for skipped := 0; ; skipped++ {
+		before := w.last
+		n, own, err := w.next(ctx)
+		if err != nil || refreshed(own) || !sameContact(own, before) {
+			return n, own, skipped, err
+		}
+	}
+}
+
+// refreshedBy accepts the client's contact as the refresh reg made it: by
+// the CSeq of the REGISTER that last changed it, when the NOTIFY gives one
+// (RFC 3680 §5.1), or else by its "refreshed" event.
+func refreshedBy(reg *sipua.Registration) func(reginfo.Contact) bool {
+	var seq uint64
+	if cseq, err := reg.Response.Header.CSeq(); err == nil {
+		seq = uint64(cseq.Seq)
+	}
+	return func(own reginfo.Contact) bool {
+		if own.CSeq != nil && seq != 0 {
+			return own.Active() && *own.CSeq >= seq
+		}
+		return own.Active() && own.Event == reginfo.Refreshed
+	}
+}
+
+// sameContact reports whether a and b tell the same of the client's
+// contact: its state, its event and the CSeq of the REGISTER that last
+// changed it.
+func sameContact(a, b reginfo.Contact) bool {
+	cseq := func(c reginfo.Contact) int64 {
+		if c.CSeq == nil {
+			return -1
+		}
+		return int64(*c.CSeq)
+	}
+	return a.State == b.State && a.Event == b.Event && cseq(a) == cseq(b)
+}
+
 // regWatch follows the NOTIFYs of one subscription. instance is the
 // client's +sip.instance, as a contact parameter writes it.
 type regWatch struct {
@@ -153,6 +202,8 @@ type regWatch struct {
 	sub           *sipua.Subscription
 	version       uint32
 	seen          bool
+	// last is the client's contact as the last NOTIFY told it.
+	last reginfo.Contact
 }
 
 // next waits for the next NOTIFY and returns it with the client's contact
@@ -191,6 +242,7 @@ func (w *regWatch) next(ctx context.Context) (sipua.Notification, reginfo.Contac
 	case own.Active() && reg.State != reginfo.Active:
 		return n, own, errors.New("the client's active contact is in a registration that is not active")
 	}
+	w.last = own
 	return n, own, nil
 }
 

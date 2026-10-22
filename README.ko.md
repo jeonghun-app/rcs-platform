@@ -18,12 +18,18 @@ I-CSCF, S-CSCF, HSS), RCS 메시징 애플리케이션 서버, MSRP 릴레이, H
 - **라이브러리**: 서비스 런타임, 식별자 마스킹, SIP 메시지, SIP/HTTP Digest와 AKA,
   Milenage, SDP, Diameter 기본 프로토콜, Cx와 Sh, iFC, MSRP, CPIM, IMDN,
   conference-info, PROXY protocol v2.
-- **서비스**: `ft-server`([문서](docs/ft-server.md))와 `msrp-relay`
-  ([문서](docs/msrp-relay.md)). 둘 다 단독으로 실행되며, 아직 호출하는 서비스는 없습니다.
+- **서비스**: IMS 코어인 `hss`([문서](docs/hss.md)), `pcscf`
+  ([문서](docs/pcscf.md)), `icscf`([문서](docs/icscf.md)), `scscf`
+  ([문서](docs/scscf.md))와, `ft-server`([문서](docs/ft-server.md)),
+  `msrp-relay`([문서](docs/msrp-relay.md)).
+- **진행 중**: `rcs-as`([문서](docs/rcs-as.md))는 단독으로 실행됩니다. 아직 로컬
+  스택에 들어가지 않아서, 로컬 스택에서는 채팅과 메시지가 끝까지 돌지 않습니다.
+- **도구**: 클라이언트 시뮬레이터 `rcs-sim`([문서](docs/rcs-sim.md))과 로컬 스택
+  ([문서](docs/local-stack.md)). 로컬 스택에서 단말은 IMS AKA로 IMS 코어를 거쳐
+  등록하고, 자기 등록 상태를 구독(reg event)하고, OPTIONS로 다른 단말에 닿습니다.
 - **결정 기록**: ADR 0001–0007과 [위협 모델](docs/threat-model.md).
 
-아직 만들지 않은 것: SIP 전송 계층과 트랜잭션, `hss`, `pcscf`, `icscf`, `scscf`,
-`rcs-as`, 클라이언트 시뮬레이터, 로컬 스택, AWS 인프라. 아직 릴리스는 없습니다.
+아직 릴리스는 없습니다.
 
 ## 서비스
 

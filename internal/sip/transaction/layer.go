@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
@@ -292,10 +293,10 @@ type Layer struct {
 	absorbed    atomic.Uint64
 	// maxBytes bounds the request bytes of the server transactions; the
 	// client limits are ClientShare of the bounds. tagKey keys the 503's To
-	// tags.
+	// tags; a secret.Key so that no verb prints it with the layer (#506).
 	maxBytes                   int64
 	clientServers, clientBytes int64
-	tagKey                     []byte
+	tagKey                     secret.Key
 	// nonInviteFinal and inviteFinal are the safety timeouts; timedOut and
 	// lateFinals count what they did.
 	nonInviteFinal, inviteFinal time.Duration
@@ -346,7 +347,7 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 		maxBytes:      cfg.MaxServerTransactionBytes,
 		clientServers: ClientShareOf(int64(cfg.MaxServerTransactions), cfg.ClientShare),
 		clientBytes:   ClientShareOf(cfg.MaxServerTransactionBytes, cfg.ClientShare),
-		tagKey:        key,
+		tagKey:        secret.NewKey(key),
 		retryAfter:    strconv.FormatInt(int64((cfg.RetryAfter+time.Second-1)/time.Second), 10),
 		ids:           cfg.IDs,
 		sender:        s,
@@ -571,7 +572,7 @@ func (l *Layer) refusalTag(req *sip.Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	m := hmac.New(sha256.New, l.tagKey)
+	m := hmac.New(sha256.New, l.tagKey.Reveal())
 	m.Write([]byte(key))
 	return hex.EncodeToString(m.Sum(nil)[:8]), nil
 }

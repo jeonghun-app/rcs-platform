@@ -262,7 +262,7 @@ func TestNonceNotIssuedByThisServerIsInvalid(t *testing.T) {
 
 	other := newHarness(t)
 	otherKey := bytes.Repeat([]byte{0x55}, 32)
-	other.server.key = seal(&otherKey)
+	other.server.key = secret.Seal(&otherKey)
 	foreign := other.challenge(t, MD5)
 
 	otherRealm, err := NewServer(ServerConfig{Realm: "other.example", NonceKey: secret.NewKey(testKey), NonceCounts: h.counts, Now: h.clock.now})

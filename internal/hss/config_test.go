@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -62,7 +63,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		c.SubscribersTable != "subscribers" || c.ProfilesTable != "service-profiles" || c.OriginHost != "" {
 		t.Fatalf("config = %+v", c)
 	}
-	if c.Tokens.t.Admin.Current != adminToken || c.Tokens.t.ACS.Current != acsToken || c.Tokens.t.FT.Current != ftToken || c.Tokens.t.Admin.Next != "" {
+	if c.Tokens.tokens().Admin.Current != adminToken || c.Tokens.tokens().ACS.Current != acsToken || c.Tokens.tokens().FT.Current != ftToken || c.Tokens.tokens().Admin.Next != "" {
 		t.Fatal("tokens not read")
 	}
 }
@@ -95,6 +96,19 @@ func TestConfigNeverPrintsItsSecrets(t *testing.T) {
 	for _, s := range []string{c.Tokens.String(), c.DataKey.String(), c.Tokens.GoString(), c.DataKey.GoString()} {
 		if s != "[redacted]" {
 			t.Errorf("printed %q", s)
+		}
+	}
+	// Every verb, valid or not, over the whole Config: an invalid one, %p
+	// or %w, calls no method and prints the fields (#506).
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{c, &c} {
+			out := fmt.Sprintf(verb, v)
+			for _, secret := range []string{adminToken[:12], acsToken[:12], ftToken[:12], key[:12], strings.Trim(fmt.Sprint([]byte(adminToken[:6])), "[]"), fmt.Sprintf("%x", adminToken[:6])} {
+				if strings.Contains(out, secret) {
+					t.Errorf("%s printed a secret: %s", verb, out)
+				}
+			}
 		}
 	}
 }

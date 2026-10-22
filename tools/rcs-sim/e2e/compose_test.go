@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // The compose stack as deploy/docker-compose.yml names it: the test runs on
@@ -42,7 +44,7 @@ func TestE2EComposeStack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf"} {
+	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf", "scscf", "pcscf"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
 	waitReady(ctx, t, acsURL+"/readyz")
@@ -70,8 +72,7 @@ func TestE2EComposeStack(t *testing.T) {
 
 	// hss: the number's SIP and tel IMPUs in one implicit registration set
 	// (docs/architecture.md §4, #282), so a terminating request to the tel
-	// form reaches the client. Routing one needs scscf in the stack; until
-	// then this checks what it would route by.
+	// form reaches the client, which the options scenario sends below.
 	// Both subscribers stack-seed provisions, the client and the peer.
 	for _, sub := range []struct{ imsi, msisdn string }{{composeIMSI, composeMSISDN}, {composePeerIMSI, composePeerMSISDN}} {
 		checkImplicitSet(ctx, t, sub.imsi+"@"+domain, "sip:"+sub.msisdn+"@"+domain, "tel:"+sub.msisdn)
@@ -115,6 +116,69 @@ func TestE2EComposeStack(t *testing.T) {
 		"chat-client-originated/client-to-core", "chat-client-originated/keep-alive", "chat-client-originated/release",
 		"chat-core-originated/connect-then-answer", "chat-core-originated/core-sends-first", "chat-core-originated/release",
 	}, issued.Password, env(t, "RELAY_PCSCF_TOKEN"), impi, self)
+
+	// rcs-sim over SIP (#14 PR F2): both subscribers register with IMS AKA,
+	// with the keys stack-seed gave hss, at the P-CSCF acs provisions,
+	// through pcscf, icscf and scscf. reg-event watches the client's own
+	// registration; options sends the peer a query to its tel URI and a
+	// capability query, both through scscf's originating and terminating
+	// iFC chains, where the default profile's criterion toward rcs-as,
+	// absent from the stack, goes on by its default handling. pager-message
+	// is left out: the default profile ends a MESSAGE at rcs-as.
+	// The client's default profile first: a run cut short before it put
+	// it back would leave the stub's, whose AS is gone, and fail the
+	// first OPTIONS with a 500 that says nothing of why (#473 code review).
+	putProfile(ctx, t, impi, "")
+	pcscf := doc.value("LBO_P-CSCF_Address", "Address")
+	sipCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
+		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
+		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
+		"reg-event", "options")
+	var sipOut, sipErr bytes.Buffer
+	sipCmd.Stdout, sipCmd.Stderr = &sipOut, &sipErr
+	err = sipCmd.Run()
+	t.Logf("rcs-sim SIP output:\n%s%s", sipOut.String(), sipErr.String())
+	if err != nil {
+		t.Errorf("rcs-sim over SIP: %v", err)
+	}
+	checkResults(t, sipOut.String(), sipErr.String(), []string{
+		"reg-event/register", "reg-event/subscribe", "reg-event/re-register", "reg-event/unregister",
+		"options/register", "options/tel-uri", "options/capabilities",
+	}, env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
+		composeIMSI, composePeerIMSI)
+
+	// The originating iFC chain through an application server (#14 PR F2):
+	// rcs-as is not in the stack, so a stub on this container takes the
+	// client's OPTIONS, as an AS acting as a proxy does, and sends them back
+	// to scscf, which goes on along the chain to icscf and the peer.
+	as := startStubAS(t, self, stubASPort, "")
+	next := startStubAS(t, self, nextStubASPort, stubASPort)
+	throughStubAS(ctx, t, []sip.URI{as.uri, next.uri}, impi)
+	asCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
+		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
+		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
+		"options")
+	var asOut, asErr bytes.Buffer
+	asCmd.Stdout, asCmd.Stderr = &asOut, &asErr
+	err = asCmd.Run()
+	t.Logf("rcs-sim through the stub AS:\n%s%s", asOut.String(), asErr.String())
+	if err != nil {
+		t.Errorf("rcs-sim through the stub AS: %v", err)
+	}
+	checkResults(t, asOut.String(), asErr.String(), []string{"options/register", "options/tel-uri", "options/capabilities"},
+		env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
+		composeIMSI, composePeerIMSI)
+	// Both OPTIONS went through the stub, each with scscf's iFC position.
+	if n, odi := as.requests.Load(), as.withODI.Load(); n != 2 || odi != 2 {
+		t.Errorf("the stub AS took %d requests, %d with an iFC position; want both OPTIONS with one", n, odi)
+	}
+	// And scscf went on from that position to the next criterion: the
+	// second stub took both, each after the first. A request whose
+	// position scscf ignored would have been routed as terminating, past
+	// the second stub (#473 QA).
+	if n, odi, after := next.requests.Load(), next.withODI.Load(), next.afterPrev.Load(); n != 2 || odi != 2 || after != 2 {
+		t.Errorf("the second stub AS took %d requests, %d with an iFC position, %d after the first; want both OPTIONS so", n, odi, after)
+	}
 }
 
 // checkImplicitSet checks that hss lists sip and tel in one implicit

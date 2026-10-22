@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // ErrMACFailure means a MAC-A in AUTN or a MAC-S in AUTS did not verify: the
@@ -25,7 +27,7 @@ var resyncAMF = [AMFSize]byte{}
 // the parts are sealed, read through methods, and the type formats as a fixed
 // placeholder. The zero Vector holds all zeros.
 type Vector struct {
-	p sealed[vectorParts]
+	p secret.Sealed[vectorParts]
 }
 
 type vectorParts struct {
@@ -79,7 +81,7 @@ func (m Milenage) Vector(rand [RANDSize]byte, sqn SQN, amf [AMFSize]byte) Vector
 	}
 	copy(p.autn[SQNSize:SQNSize+AMFSize], amf[:])
 	copy(p.autn[SQNSize+AMFSize:], out1[:MACSize])
-	return Vector{p: seal(p)}
+	return Vector{p: secret.Seal(p)}
 }
 
 // CheckAUTN does the card's half of TS 33.102 §6.3.3: it recovers SQN from
