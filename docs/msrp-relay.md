@@ -194,18 +194,25 @@ succeeds. The task role needs
   more.
 - **A stalled connection toward rcs-as is ended.** Whatever stalls it, a
   shrunk window as above or a path that drops everything, the relay notices
-  once a request on it times out: it sends a probe, a bodiless SEND that
-  `rcs-as` answers itself, at once, and ends the connection if the probe is
-  not answered within `RELAY_CORE_PROBE_TIMEOUT` (10 s). Every session on
+  once a request on it sent with `Failure-Report: yes` times out (one sent
+  `partial` is never answered on success, RFC 4975 §7.1.4): it sends a
+  probe, a bodiless SEND that `rcs-as` answers itself, at once, and ends
+  the connection if the probe is not answered within
+  `RELAY_CORE_PROBE_TIMEOUT` (10 s), or is answered 408. Every session on
   it ends then, as with an unanswered keep-alive, and the next binding
-  dials anew; this is counted as `Core.Closed.PathStalled`. Without it, a
-  connection with traffic both ways stood still until a quiet session's
-  keep-alive timed out, about 270 s. Any answer keeps the connection: a
-  request toward a slow client can time out without the path being at
-  fault, and the probe is answered all the same. `rcs-as` probes its side
-  the same way (`RCSAS_MSRP_PROBE_TIMEOUT`). `TCP_USER_TIMEOUT` does not end
-  this stall: the same ACKs that cause it keep the kernel from checking it
-  (#517).
+  dials anew. Without it, a connection with traffic both ways stood still
+  until a quiet session's keep-alive timed out, about 270 s. Any other
+  answer keeps the connection: a request toward a slow client can time
+  out without the path being at fault, and the probe is answered all the
+  same. `rcs-as` probes its side the same way
+  (`RCSAS_MSRP_PROBE_TIMEOUT`). Each side counts the stalls it ends:
+  the relay as `Core.Closed.PathStalled`, `rcs-as` as `msrp.path_stalled`,
+  with a warning at most once a minute. The side whose probe fails first
+  closes the connection, and the other sees it close: the relay then
+  counts `Core.Closed.PeerGone`, so a stall shows on one of the two
+  counters, and a rise in `rcs-as`'s with the relay's `PeerGone` is the
+  same event. `TCP_USER_TIMEOUT` does not end this stall: the same ACKs
+  that cause it keep the kernel from checking it (#517).
 - **Connections without a session.** A new connection must name a session
   within 30 s (the active side sends its first SEND at once, RFC 4975 §5.4),
   or it is closed (`ClientsClosedUnbound`). A connection whose last bridge

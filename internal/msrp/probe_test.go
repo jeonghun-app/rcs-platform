@@ -54,10 +54,17 @@ func synced(t *testing.T, p *wirePeer, tid string) {
 
 // A request that times out sends a probe at once, and a probe left
 // unanswered for ProbeTimeout, not TransactionTimeout, fails the
-// connection with ErrPathStalled, and its sessions with it (#517).
+// connection with ErrPathStalled, and its sessions with it; its close event
+// says so, which the services count by (#517).
 func TestAnUnansweredProbeFailsTheConnection(t *testing.T) {
 	const probeTimeout = 3 * time.Second
-	clock, c, p, s := probed(t, Config{ProbeTimeout: probeTimeout})
+	closed := make(chan error, 1)
+	onEvent := func(e Event) {
+		if e.Kind == EventClosed {
+			closed <- e.Err
+		}
+	}
+	clock, c, p, s := probed(t, Config{ProbeTimeout: probeTimeout, OnEvent: onEvent})
 	sendUnanswered(t, s, p)
 	clock.Advance(DefaultTransactionTimeout)
 	expectProbe(t, p)
@@ -70,7 +77,28 @@ func TestAnUnansweredProbeFailsTheConnection(t *testing.T) {
 	if !errors.Is(c.Err(), ErrPathStalled) || !errors.Is(s.Err(), ErrConnClosed) {
 		t.Fatalf("connection %v, session %v", c.Err(), s.Err())
 	}
+	if err := <-closed; err != ErrPathStalled {
+		t.Fatalf("the close event carries %v, want ErrPathStalled", err)
+	}
 	p.closed(t)
+}
+
+// A request sent Failure-Report partial is never answered on success
+// (RFC 4975 §7.1.4), so its timeout on a healthy connection sends no probe.
+func TestAPartialReportRequestSendsNoProbe(t *testing.T) {
+	clock, c, p, s := probed(t, Config{})
+	if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("x")), FailureReport: ReportPartial}); err != nil {
+		t.Fatal(err)
+	}
+	if m := p.next(t); !m.HasBody() {
+		t.Fatalf("got %+v, want the chunk", m)
+	}
+	clock.Advance(DefaultTransactionTimeout)
+	synced(t, p, "sync0100") // no probe was sent before it
+	clock.Advance(DefaultProbeTimeout)
+	if c.Err() != nil {
+		t.Fatal(c.Err())
+	}
 }
 
 // Any answer to the probe keeps the connection and its other sessions: the

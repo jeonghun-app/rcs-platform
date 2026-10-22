@@ -184,9 +184,12 @@ type Config struct {
 	// does, so that a connection whose path has stopped carrying anything
 	// ends within about TransactionTimeout plus ProbeTimeout rather than at
 	// a quiet session's keep-alive, and Pool dials a new one. Any answer
-	// keeps it: the request that timed out was slow at the far end, which
-	// a relay's per-session flow control makes it for a slow client. One
-	// probe is in flight per connection at a time. It is for the
+	// but a 408 keeps it: the request that timed out was slow at the far
+	// end, which a relay's per-session flow control makes it for a slow
+	// client; a 408, like no answer, ends it (§10.4). Only a request sent
+	// with Failure-Report yes probes when it times out: one sent partial
+	// is never answered on success (§7.1.4). One probe is in flight per
+	// connection at a time. It is for the
 	// connection msrp-relay and rcs-as share (#517), and is off by
 	// default.
 	ProbeOnTimeout bool
@@ -942,7 +945,10 @@ func (c *Conn) expire(tid string, t *transaction) {
 	if t.mode == ReportYes {
 		t.onResult(StatusRequestTimeout, StatusText(StatusRequestTimeout))
 	}
-	if c.cfg.ProbeOnTimeout && !t.probe {
+	// Only a request whose success is answered (Failure-Report yes) shows
+	// by its timeout that nothing came back: one sent partial has no 200
+	// to wait for (§7.1.4), and times out on a healthy connection too.
+	if c.cfg.ProbeOnTimeout && !t.probe && t.mode == ReportYes {
 		c.probe()
 	}
 }
