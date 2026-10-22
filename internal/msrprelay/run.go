@@ -83,7 +83,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		IdleTimeout:             cfg.IdleTimeout,
 		UserTimeout:             cfg.UserTimeout,
 		Edge:                    msrp.Config{KeepAliveInterval: cfg.KeepAlive, MaxFailedBinds: cfg.MaxUnknownSessions},
-		Core:                    msrp.Config{KeepAliveInterval: cfg.KeepAlive},
+		Core:                    coreConfig(cfg),
 		Dial:                    d.dial,
 		Clock:                   d.clock,
 		Rand:                    d.rand,
@@ -208,3 +208,11 @@ type systemClock struct{}
 func (systemClock) Now() time.Time { return time.Now() }
 
 func (systemClock) AfterFunc(d time.Duration, f func()) msrp.Timer { return time.AfterFunc(d, f) }
+
+// coreConfig is the msrp.Config of the connections toward rcs-as. Every
+// client's session shares one, so it is probed when a request on it times
+// out, and failed if the probe is not answered either (#517); client
+// connections are not.
+func coreConfig(cfg Config) msrp.Config {
+	return msrp.Config{KeepAliveInterval: cfg.KeepAlive, ProbeOnTimeout: true, ProbeTimeout: cfg.CoreProbeTimeout}
+}

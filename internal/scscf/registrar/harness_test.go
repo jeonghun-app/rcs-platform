@@ -163,7 +163,7 @@ func (f *fakeHSS) MAR(_ context.Context, r *cx.MAR) (*cx.MAA, error) {
 		sha, _ := digest.ComputeHA1(digest.SHA256, s.impi, realm, s.password)
 		return &cx.MAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, AuthDataItems: []cx.AuthDataItem{{
 			Scheme: cx.SchemeSIPDigest, Digest: &cx.DigestAuthenticate{
-				Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: md5, AlternateAlgorithm: "SHA-256", AlternateHA1: sha,
+				Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: secret.NewString(md5), AlternateAlgorithm: "SHA-256", AlternateHA1: secret.NewString(sha),
 			},
 		}}}, nil
 	}

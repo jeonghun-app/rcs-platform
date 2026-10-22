@@ -147,6 +147,7 @@ var eventErrNames = []struct {
 	{msrp.ErrPanicked, "Panicked"},
 	{msrp.ErrPeerNotReading, "PeerNotReading"},
 	{msrp.ErrKeepAliveTimeout, "KeepAliveTimeout"},
+	{msrp.ErrPathStalled, "PathStalled"},
 	{msrp.ErrUnbound, "Unbound"},
 	{msrp.ErrFraming, "Framing"},
 	{msrp.ErrWriteTimeout, "WriteTimeout"},

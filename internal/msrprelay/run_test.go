@@ -111,9 +111,11 @@ func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 
-	// Metrics are flushed every interval, not per event.
+	// Metrics are flushed every interval, not per event. The wait is for
+	// ClientConnections, the gauge asserted below and the last the relay's
+	// flush writes.
 	r.clock.Advance(DefaultMetricsInterval)
-	eventually(t, "a metrics flush", func() bool { _, ok := r.h.Metric(mActiveBridges); return ok })
+	eventually(t, "a metrics flush", func() bool { _, ok := r.h.Metric(mClientConnections); return ok })
 	if v, _ := r.h.Metric(mBindingsCreated); v != 1 {
 		t.Fatalf("BindingsCreated = %v", v)
 	}

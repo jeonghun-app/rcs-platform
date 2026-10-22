@@ -127,10 +127,10 @@ func ParseMAA(m *diameter.Message) (*MAA, error) {
 // Authorization and the keys in ConfidentialityKey and IntegrityKey; for SIP
 // Digest it returns Digest. Those are credentials: String and LogValue leave
 // them out, so that an item printed or logged by mistake does not leak them
-// (docs/architecture.md §8), and XRES, CK and IK are secret.Keys, which print
-// as "[redacted]" under the valid verbs and as their closure's address under
-// the invalid ones, never as their bytes (#570). A zero Key leaves its AVP
-// out, an empty one sends it empty.
+// (docs/architecture.md §8), and XRES, CK and IK, like the digest's HA1s,
+// are secret.Keys, which print as "[redacted]" under the valid verbs and as
+// their closure's address under the invalid ones, never as their bytes
+// (#570, #594). A zero Key leaves its AVP out, an empty one sends it empty.
 type AuthDataItem struct {
 	// ItemNumber orders the items of one answer; 0 leaves the AVP out.
 	ItemNumber            uint32
@@ -144,16 +144,18 @@ type AuthDataItem struct {
 }
 
 // DigestAuthenticate is a SIP-Digest-Authenticate (TS 29.229 §6.3.36): what
-// the S-CSCF needs to challenge and check a SIP Digest client. HA1 is a
-// credential and is left out by String and LogValue. The Alternate fields
-// carry a second algorithm, such as SHA-256 (RFC 7616), next to the MD5 HA1.
+// the S-CSCF needs to challenge and check a SIP Digest client. HA1 answers
+// the realm's challenges as the password does, so it is a secret.Key, whose
+// text no fmt verb prints (#594), and String and LogValue leave it out. The
+// Alternate fields carry a second algorithm, such as SHA-256 (RFC 7616),
+// next to the MD5 HA1; a zero AlternateHA1 leaves its AVP out.
 type DigestAuthenticate struct {
 	Realm              string
 	Algorithm          string
 	QoP                string
-	HA1                string
+	HA1                secret.Key
 	AlternateAlgorithm string
-	AlternateHA1       string
+	AlternateHA1       secret.Key
 }
 
 func (a *AuthDataItem) avp() (*diameter.AVP, error) {
@@ -173,14 +175,14 @@ func (a *AuthDataItem) avp() (*diameter.AVP, error) {
 			return nil, errMissing("SIP-Digest-Authenticate", "Digest-Realm")
 		case d.QoP == "":
 			return nil, errMissing("SIP-Digest-Authenticate", "Digest-QoP")
-		case d.HA1 == "":
+		case d.HA1.IsZero():
 			return nil, errMissing("SIP-Digest-Authenticate", "Digest-HA1")
 		}
 		digest := []*diameter.AVP{specDigestRealm.UTF8String(d.Realm)}
 		digest = append(digest, optionalUTF8(specDigestAlgorithm, d.Algorithm)...)
-		digest = append(digest, specDigestQoP.UTF8String(d.QoP), specDigestHA1.UTF8String(d.HA1))
+		digest = append(digest, specDigestQoP.UTF8String(d.QoP), specDigestHA1.UTF8String(d.HA1.RevealString()))
 		digest = append(digest, optionalUTF8(specAlternateDigestAlgorithm, d.AlternateAlgorithm)...)
-		digest = append(digest, optionalUTF8(specAlternateDigestHA1, d.AlternateHA1)...)
+		digest = append(digest, optionalUTF8(specAlternateDigestHA1, d.AlternateHA1.RevealString())...)
 		children = append(children, specSIPDigestAuthenticate.Grouped(digest...))
 	}
 	return specSIPAuthDataItem.Grouped(children...), nil
@@ -193,6 +195,15 @@ func optionalKey(b []byte) secret.Key {
 		return secret.Key{}
 	}
 	return secret.NewKey(b)
+}
+
+// optionalStringKey is optionalKey for a text AVP, which reads as "" when
+// it is missing.
+func optionalStringKey(s string) secret.Key {
+	if s == "" {
+		return secret.Key{}
+	}
+	return secret.NewString(s)
 }
 
 func readAuthDataItem(g *Fields) AuthDataItem {
@@ -210,9 +221,9 @@ func readAuthDataItem(g *Fields) AuthDataItem {
 			Realm:              d.UTF8String(specDigestRealm, Required),
 			Algorithm:          d.UTF8String(specDigestAlgorithm, Optional),
 			QoP:                d.UTF8String(specDigestQoP, Required),
-			HA1:                d.UTF8String(specDigestHA1, Required),
+			HA1:                optionalStringKey(d.UTF8String(specDigestHA1, Required)),
 			AlternateAlgorithm: d.UTF8String(specAlternateDigestAlgorithm, Optional),
-			AlternateHA1:       d.UTF8String(specAlternateDigestHA1, Optional),
+			AlternateHA1:       optionalStringKey(d.UTF8String(specAlternateDigestHA1, Optional)),
 		}
 	}
 	return item

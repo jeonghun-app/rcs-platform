@@ -9,6 +9,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
@@ -130,6 +131,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	mc.MSRP.Panics = panics.New(panics.Config{
 		Metric: msrp.MetricCallbackPanics, Message: "rcs-as: an MSRP callback panicked", Log: rt.Logger, Metrics: rt.Metrics,
 	})
+	// The connections from msrp-relay are probed when a request on them
+	// times out; the ones this side ends as stalled are counted (#517).
+	mc.MSRP.OnEvent = (&pathStalls{metrics: rt.Metrics, log: rt.Logger, now: time.Now}).onEvent
 	engine, err := messaging.New(mc, st, srv, rt.Metrics)
 	if err != nil {
 		return err
