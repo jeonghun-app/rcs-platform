@@ -140,6 +140,31 @@ func TestE2EComposeStack(t *testing.T) {
 		"options/register", "options/tel-uri", "options/capabilities",
 	}, env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
 		composeIMSI, composePeerIMSI)
+
+	// The originating iFC chain through an application server (#14 PR F2):
+	// rcs-as is not in the stack, so a stub on this container takes the
+	// client's OPTIONS, as an AS acting as a proxy does, and sends them back
+	// to scscf, which goes on along the chain to icscf and the peer.
+	as := startStubAS(t, self)
+	throughStubAS(ctx, t, as.uri, impi, impu, "tel:"+composeMSISDN)
+	asCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
+		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
+		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
+		"options")
+	var asOut, asErr bytes.Buffer
+	asCmd.Stdout, asCmd.Stderr = &asOut, &asErr
+	err = asCmd.Run()
+	t.Logf("rcs-sim through the stub AS:\n%s%s", asOut.String(), asErr.String())
+	if err != nil {
+		t.Errorf("rcs-sim through the stub AS: %v", err)
+	}
+	checkResults(t, asOut.String(), asErr.String(), []string{"options/register", "options/tel-uri", "options/capabilities"},
+		env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
+		composeIMSI, composePeerIMSI)
+	// Both OPTIONS went through the stub, each with scscf's iFC position.
+	if n, odi := as.requests.Load(), as.withODI.Load(); n != 2 || odi != 2 {
+		t.Errorf("the stub AS took %d requests, %d with an iFC position; want both OPTIONS with one", n, odi)
+	}
 }
 
 // checkImplicitSet checks that hss lists sip and tel in one implicit

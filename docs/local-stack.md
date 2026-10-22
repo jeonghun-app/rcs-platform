@@ -273,7 +273,15 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
    - `options` sends the peer an OPTIONS to its tel URI and a capability
      query to its SIP URI, through `scscf`'s originating and terminating
      iFC chains.
-6. checks the results of both runs by the same rules as `make e2e`: every
+6. runs `rcs-sim options` once more, with the client's OPTIONS in the
+   originating session case sent through an application server: a stub
+   on the test container, which acts as a proxy and sends them back to
+   `scscf` with the iFC position it signed. The test gives the client a
+   service profile of its own for this, `hss`'s default with that one
+   criterion first, `SESSION_TERMINATED`, and puts the default back at
+   the end (as `stack-seed` does at every `make up`). The stub must have
+   taken both OPTIONS.
+7. checks the results of every run by the same rules as `make e2e`: every
    step, the resume bounds, no busy retries, nothing secret or identifying
    in the output.
 
