@@ -125,7 +125,8 @@ func FuzzRedact(f *testing.F) {
 		if !strings.ContainsRune(s, ':') && !strings.ContainsFunc(s, unicode.IsDigit) && out != s {
 			t.Fatalf("Redact(%q) = %q changed text with no digits or schemes", s, out)
 		}
-		// Never less than main masked before #154 (review of #398).
+		// Never less than main masked at the frozen copy's commit (review
+		// of #398, #490).
 		if lost := maskedLessThanMain(s); lost != "" {
 			t.Fatal(lost)
 		}

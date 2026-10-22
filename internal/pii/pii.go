@@ -150,15 +150,17 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 // [asciiNumberChars]. Other digit-like characters (superscripts, circled
 // digits) are not digits here. The invisible format characters a log viewer
 // hides (U+200B ZWSP, U+2060 WJ, U+00AD SHY, U+FEFF, variation selectors)
-// inside a number, and the combining marks drawn over one of its digits (a
-// keycap "1<VS16><U+20E3>"), are dropped first, so they split no number,
-// though they still end the word before them; see [dropInvisibles]. So are
-// invisible characters inside a URI scheme ("si<SHY>p:", [joinSchemes]) and
-// inside a URI user, whose hint is then the plain user's. The line and
-// paragraph separators and the braille blank group a number as spaces do. A
-// "+" may be followed by a bracketed country code ("+(81)3 1234 5678"); the
-// full-width "＊" and "＃" of a tel number and the small "﹢" read as "*", "#"
-// and "+" (#154, #413).
+// inside a number, and the combining marks drawn over one of its characters
+// (a digit, as in a keycap "1<VS16><U+20E3>", a "+", a separator, a tel
+// number's "*", "#" or hex digit, an IMEI's dash, or the ":" a tel or
+// urn:gsma:imei number starts after), are dropped first, so they split no
+// number, though they still end the word before them; see [dropInvisibles].
+// So are invisible characters inside a URI scheme ("si<SHY>p:",
+// [joinSchemes]) and inside a URI user, whose hint is then the plain user's.
+// The line and paragraph separators and the braille blank group a number as
+// spaces do. A "+" may be followed by a bracketed country code
+// ("+(81)3 1234 5678"); the full-width "＊" and "＃" of a tel number and the
+// small "﹢" read as "*", "#" and "+" (#154, #413).
 //
 // Schemes match case-insensitively (RFC 3261 §19.1.4, RFC 3966 §3). The output
 // never contains a run of eight or more decimal digits. Redact runs in time
@@ -804,7 +806,8 @@ func startsWithFoldPast(s, p string) bool {
 // dropInvisibles removes the invisible format characters that sit inside a
 // number (#154): a run of characters of category Cf, Default_Ignorable or a
 // variation selector (U+200B ZWSP, U+2060 WJ, U+00AD SHY, U+FEFF), and of
-// combining marks (Mn, Me) when it follows a number character (#413, #453),
+// combining marks (Mn, Me) when it follows a number character (#413, #453)
+// or the ":" a tel or urn:gsma:imei URI's number starts after (#490),
 // between two number characters, one of them a digit; between two number
 // characters of a tel or urn:gsma:imei URI, which Redact masks all of; or
 // where at most two separators lead to a digit after it, and before it to a
@@ -854,9 +857,10 @@ func dropInvisibles(s string) (string, []int) {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		// A combining mark right after a number character is drawn over
 		// it, and so joins the run (a keycap "1<VS16><U+20E3>", #413, or
-		// "*<VS16><U+20E3>", #453); whether the run is dropped is still
-		// for the rules below, so "café" stays.
-		marks := numberSide(prev) || inURI && uriNumberRune(prev)
+		// "*<VS16><U+20E3>", #453), as one on the ":" a tel or
+		// urn:gsma:imei number starts after does (#490); whether the run
+		// is dropped is still for the rules below, so "café" stays.
+		marks := numberSide(prev) || inURI && (uriNumberRune(prev) || prev == ':')
 		if !isInvisible(r) && !(marks && isMark(r)) {
 			inURI = inURI && uriNumberRune(r)
 			switch {
