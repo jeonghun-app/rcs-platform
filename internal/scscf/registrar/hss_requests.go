@@ -45,6 +45,8 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 		}
 	}
 	var keys []state.SetKey
+	// unreadable: a private identity's listing had nothing readable.
+	unreadable := false
 	if len(r.PublicIdentities) > 0 {
 		for _, s := range r.PublicIdentities {
 			impu, ok := identity.CanonicalIMPU(s)
@@ -67,16 +69,22 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 		for _, impi := range impis {
 			regs, err := g.cfg.Store.RegistrationsOf(ctx, impi)
 			switch {
-			case errors.Is(err, state.ErrInvalid) && len(regs) > 0:
+			case errors.Is(err, state.ErrInvalid):
 				// Items that do not decode, beside the readable sets the
 				// store still returns: those end, rather than stay live
 				// for want of the others, as the HSS does not send the
-				// RTR again (#451). An unreadable item routes nothing. A
-				// listing with nothing readable stays UNABLE_TO_COMPLY
-				// below, as an invalid read is (#422).
+				// RTR again (#451). An unreadable item routes nothing
+				// here; during a rolling deploy, a task of an older
+				// version may still read one. A listing with nothing
+				// readable answers UNABLE_TO_COMPLY, as an invalid read
+				// does (#422), once the other private identities' sets
+				// have ended (#478 QA).
 				n := unreadableItems(err)
 				g.log.Error("registrar: RTR: unreadable registration items", slog.Int("items", n))
 				g.cfg.Metrics.Count("registrar.rtr_unreadable", int64(n))
+				if len(regs) == 0 {
+					unreadable = true
+				}
 			case err != nil:
 				g.log.Error("registrar: RTR: listing registrations", slog.String("error", err.Error()))
 				return readFailed(err)
@@ -109,14 +117,22 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 		}
 	}
 	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(ended))
+	if unreadable {
+		result = resultUnableToComply
+	}
 	return result
 }
 
 // unreadableItems is how many items err, a listing's ErrInvalid, says did
-// not decode: the store joins one error for each.
+// not decode: the store joins one error for each, which this counts however
+// the joins nest.
 func unreadableItems(err error) int {
 	if j, ok := err.(interface{ Unwrap() []error }); ok {
-		return len(j.Unwrap())
+		n := 0
+		for _, e := range j.Unwrap() {
+			n += unreadableItems(e)
+		}
+		return n
 	}
 	return 1
 }
