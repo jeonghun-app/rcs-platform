@@ -20,7 +20,16 @@ import (
 // whose store calls are slow, delays Cx for that subscriber only as long as the
 // Cx timeout: then the waiting request is answered DIAMETER_TOO_BUSY, which
 // the S-CSCF may retry on another HSS task.
+//
+// The lock is held all along, so TOO_BUSY can only be the wait giving up;
+// that it gives up at the Cx timeout is read from the deadline the wait
+// runs to, not from the clock, which a loaded host stretches (#268). That
+// the answer follows that deadline promptly is not checked: no wall-clock
+// bound on it survives a loaded host, and a wait that sleeps on once its
+// context has ended would need a clock seam to catch. A wait that ends on
+// a timer of its own is caught by TestALockWaitEndsOnlyWithItsContext.
 func TestABusySubscriptionAnswersTooBusyWithinTheCxTimeout(t *testing.T) {
+	const timeout = 200 * time.Millisecond
 	e := newEnv(t)
 	e.provision(impi1, impu1)
 	unlock, err := e.h.lock(context.Background(), impi1)
@@ -28,16 +37,35 @@ func TestABusySubscriptionAnswersTooBusyWithinTheCxTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unlock()
-	c := connectCSCF(t, serveHSSWith(t, e.h, "hss-a.rcs.local", 200*time.Millisecond), "scscf-1.rcs.local")
+	type wait struct {
+		at, deadline time.Time
+		ok           bool
+	}
+	waits := make(chan wait, 1)
+	e.h.onLockWait = func(ctx context.Context) {
+		d, ok := ctx.Deadline()
+		waits <- wait{time.Now(), d, ok}
+	}
+	c := connectCSCF(t, serveHSSWith(t, e.h, "hss-a.rcs.local", timeout), "scscf-1.rcs.local")
 	r := &cx.MAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentity: impu1,
 		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5}, NumberAuthItems: 1, ServerName: scscfName}
-	start := time.Now()
+	sent := time.Now()
 	ans := c.send(r.Message(c.node))
 	if rc, _ := ans.ResultCode(); rc != diameter.ResultTooBusy {
 		t.Fatalf("Result-Code = %d, want DIAMETER_TOO_BUSY", rc)
 	}
-	if took := time.Since(start); took > 2*time.Second {
-		t.Errorf("answered after %v; the wait must end at the Cx timeout", took)
+	// The handler started between the send and the wait, and its deadline
+	// is the Cx timeout from then.
+	// The hook sends before the handler answers, so the wait has been
+	// recorded by now unless TOO_BUSY came without one.
+	var w wait
+	select {
+	case w = <-waits:
+	default:
+		t.Fatal("answered DIAMETER_TOO_BUSY without waiting for the lock")
+	}
+	if !w.ok || w.deadline.Before(sent.Add(timeout)) || w.deadline.After(w.at.Add(timeout)) {
+		t.Errorf("the wait ran to %v after the send (deadline set %v), want the Cx timeout %v", w.deadline.Sub(sent), w.ok, timeout)
 	}
 	if e.metrics.get("lock.busy") != 1 {
 		t.Error("the busy lock was not counted")
@@ -45,6 +73,35 @@ func TestABusySubscriptionAnswersTooBusyWithinTheCxTimeout(t *testing.T) {
 	// Reads need no lock: LIR is still answered.
 	if lia := c.lir(impu1, false); lia.Result != exp(cx.UnregisteredService) {
 		t.Errorf("LIA = %v", lia.Result)
+	}
+}
+
+// A lock wait whose context has no deadline is given up by no other timer,
+// such as one of DefaultCxTimeout: the lock is held for longer than that,
+// and the wait still gets it (QA of #466). It is one-sided, so a loaded
+// host cannot fail the correct code; the sleep is a lower bound only.
+func TestALockWaitEndsOnlyWithItsContext(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	unlock, err := e.h.lock(context.Background(), impi1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{})
+	e.h.onLockWait = func(context.Context) { close(waiting) }
+	got := make(chan error, 1)
+	go func() {
+		u, err := e.h.lock(context.Background(), impi1)
+		if err == nil {
+			u()
+		}
+		got <- err
+	}()
+	<-waiting
+	time.Sleep(DefaultCxTimeout + 500*time.Millisecond)
+	unlock()
+	if err := <-got; err != nil {
+		t.Fatalf("a wait with no deadline gave up: %v", err)
 	}
 }
 
@@ -115,7 +172,7 @@ func TestAnUpdateThatWaitedForTheLockReadsTheSubscriptionAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	waiting := make(chan struct{})
-	e.h.onLockWait = func() { close(waiting) }
+	e.h.onLockWait = func(context.Context) { close(waiting) }
 	done := make(chan error, 1)
 	go func() {
 		_, err := e.h.updateFrom(context.Background(), impi1, read, func(s *store.Subscription) error {
