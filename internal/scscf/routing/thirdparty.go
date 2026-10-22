@@ -256,10 +256,14 @@ func (rt *Router) enqueue(server string, p *pending) (q *serverQueue, prev, done
 // evict evicts the oldest re-registration waiting under another key than
 // key, or with none the oldest initial registration, which then is no
 // longer counted and is never sent, and reports whether there was one. A
-// re-registration lost is no loss to the server, which knows the
+// re-registration lost is mostly no loss to the server, which knows the
 // registration and its last Expires; an initial one lost leaves it unaware
 // of the user until the next refresh, and rcs-as holds the user's stored
-// messages until then (#446 code review).
+// messages until then (#446 code review). A re-registration is not always
+// known to the server, though: the registrar types as one the first
+// REGISTER of an identity new to a set already registered, so evicting
+// that leaves the server unaware of the identity until its next
+// re-registration fills it in, as the lead's decision on #420 accepts.
 func (rt *Router) evict(q *serverQueue, key string) bool {
 	for _, typ := range []ifc.RegistrationType{ifc.ReRegistration, ifc.InitialRegistration} {
 		if w := q.oldestWaiting(key, typ); w != nil {
