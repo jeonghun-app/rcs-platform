@@ -869,6 +869,12 @@ func TestASetsEndIsNotDroppedWhenItsServersQueueIsFull(t *testing.T) {
 			t.Errorf("%s %d, want %d", name, got, want)
 		}
 	}
+	// The evicted refresh is no longer counted: the queue empties.
+	rt.tp.mu.Lock()
+	defer rt.tp.mu.Unlock()
+	if q := rt.tp.servers[rcsAS]; q.queued != 0 || len(q.keys) != 0 || len(q.sets) != 0 || len(q.waiting) != 0 {
+		t.Errorf("after Stop: %d queued, %d keys, %d sets, %d waiting", q.queued, len(q.keys), len(q.sets), len(q.waiting))
+	}
 }
 
 // TestAnEndIsDroppedOnlyWithNothingButEndsQueued (#446, the lead's decision
