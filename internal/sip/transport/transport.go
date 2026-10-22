@@ -819,13 +819,16 @@ func (t *Transport) HoldResponse(res *sip.Response) (release func()) {
 	return func() { t.unhold(res, id) }
 }
 
-// unhold ends the hold id of res, if it is still held.
+// unhold ends the hold id of res, if it is still held. A hold a send took
+// over is that send's count now, which the send itself ends: unhold leaves
+// it, so that a release while the send is still under way does not end it
+// early (QA of #493).
 func (t *Transport) unhold(res *sip.Response, id uint64) {
 	t.sendsMu.Lock()
 	if t.holds[res] == id {
 		delete(t.holds, res)
+		delete(t.sends, id)
 	}
-	delete(t.sends, id)
 	t.sendsMu.Unlock()
 }
 
