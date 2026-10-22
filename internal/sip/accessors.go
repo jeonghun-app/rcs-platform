@@ -44,12 +44,16 @@ func (h *Header) MaxForwards() (int, error) {
 }
 
 // MaxBreadth returns the Max-Breadth value, a positive integer (RFC 5393
-// §5.3.1).
+// §5.3.1, §5.8: 1*DIGIT), held to 2^20 however many digits it has: a proxy
+// overwrites one past its maximum (§5.3.3) rather than refuse it.
 func (h *Header) MaxBreadth() (int, error) {
 	return singleOf(h, "Max-Breadth", func(s string) (int, error) {
-		n, ok := parseDelta(s)
-		if !ok || n == 0 {
+		n, overlarge, ok := parseDeltaSeconds(strings.TrimSpace(s))
+		if !ok || n == 0 && !overlarge {
 			return 0, syntaxError("invalid Max-Breadth")
+		}
+		if overlarge {
+			return 1 << 20, nil
 		}
 		return int(min(n, 1<<20)), nil
 	})

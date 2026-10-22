@@ -60,12 +60,12 @@ func TestScalarHeadersEnforceTheirRanges(t *testing.T) {
 	}
 
 	// Max-Breadth: a positive integer (RFC 5393 §5.3.1), held to 2^20.
-	for in, want := range map[string]int{"60": 60, "0001": 1, "4294967295": 1 << 20} {
+	for in, want := range map[string]int{"60": 60, "0001": 1, "4294967295": 1 << 20, "4294967296": 1 << 20, "100000000000000000000000": 1 << 20} {
 		if mb, err := headerWith(t, "Max-Breadth", in).MaxBreadth(); err != nil || mb != want {
 			t.Errorf("Max-Breadth %q = %d, %v, want %d", in, mb, err, want)
 		}
 	}
-	for _, in := range []string{"", "0", "-1", "7 0", "x", "4294967296"} {
+	for _, in := range []string{"", "0", "-1", "7 0", "x", "1;x"} {
 		_, err := headerWith(t, "Max-Breadth", in).MaxBreadth()
 		wantMalformed(t, "Max-Breadth", in, err)
 	}

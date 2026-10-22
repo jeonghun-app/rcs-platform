@@ -143,7 +143,9 @@ type Decision struct {
 	// being forwarded. The authoritative proxy of RFC 5626 §7 uses it to forget a
 	// binding whose flow failed (430) and try the same instance over another
 	// flow. Targets returned after a 2xx or 6xx, a CANCEL, or past
-	// Config.MaxBranches are ignored. It runs on a goroutine that may block.
+	// Config.MaxBranches are ignored. A returned target that finds no
+	// Max-Breadth left fails at once as 440, ErrMaxBreadth, and is reported
+	// here in turn (RFC 5393 §5.3.3). It runs on a goroutine that may block.
 	OnBranchFailure func(ctx context.Context, f BranchFailure) []Target
 }
 
@@ -170,6 +172,11 @@ type Target struct {
 	// answer (TS 24.229 §5.4.3.2). A non-INVITE request that ends on such a
 	// timeout is answered 504, which OnFinal may change: unlike a 408 after
 	// Timer F (RFC 4320 §4.2) it reaches the client in time.
+	// An INVITE branch it ends this way gives its share of the request's
+	// Max-Breadth back at once, though its cancelled transaction may still
+	// get a 2xx, which RFC 5393 §5.4.1 would count until then: a lone branch
+	// holds all of it, so keeping it would leave every replacement 440,
+	// which is what Timeout is for.
 	Timeout time.Duration
 }
 
@@ -197,7 +204,9 @@ type BranchFailure struct {
 	// made up, nil for a received one: ErrTargetTimeout when Target.Timeout
 	// ended the branch, transaction.ErrTimeout or ErrTerminated for Timer B,
 	// F or C, transaction.ErrFlowClosed when the flow the request was sent
-	// over closed before its final response (RFC 5626 §5.3.1).
+	// over closed before its final response (RFC 5626 §5.3.1), ErrMaxBreadth
+	// for a target never sent for want of Max-Breadth, with a 440 (RFC 5393
+	// §5.3.3): no answer from it, but not a timeout either.
 	Err error
 	// Provisional reports that the branch received a provisional response,
 	// 100 Trying included, before it ended: the target had the request, which

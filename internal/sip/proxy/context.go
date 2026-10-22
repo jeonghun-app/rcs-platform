@@ -116,7 +116,8 @@ type branch struct {
 	c      *respContext
 	target Target
 	// breadth is the branch's share of the request's Max-Breadth, held
-	// until it is final (RFC 5393 §5.3.3.1).
+	// until it is final (RFC 5393 §5.3.3.1; see Target.Timeout for the
+	// exception).
 	breadth int
 
 	// Guarded by c.mu.
@@ -280,6 +281,15 @@ func (c *respContext) run() {
 		p.log.Error("proxy: Router returned an invalid decision", slog.String("error", err.Error()))
 		c.answerWith(500)
 		return
+	}
+	if in.Message.Header.Has("Max-Breadth") {
+		// Checked only for a request the proxy forwards: a UAS ignores the
+		// field (RFC 5393 §5.3.5), as a Serve handler does (code review of
+		// #454).
+		if _, err := in.Message.Header.MaxBreadth(); err != nil {
+			c.answerWith(400)
+			return
+		}
 	}
 	groups := groupByQ(dec.Targets)
 
@@ -527,7 +537,7 @@ func (c *respContext) startBranches(targets []Target) []func() {
 		c.branches = append(c.branches, b)
 		if b.breadth == 0 {
 			c.p.stats.breadthExceeded.Add(1)
-			acts = append(acts, c.branchEnded(b, c.failureResponse(errMaxBreadth), errMaxBreadth)...)
+			acts = append(acts, c.branchEnded(b, c.failureResponse(ErrMaxBreadth), ErrMaxBreadth)...)
 			continue
 		}
 		// Each branch holds a copy of the header (the body is shared) and its
@@ -568,9 +578,10 @@ func sameTarget(a, b Target) bool {
 // errOverload fails a branch that would take the proxy past MaxContextBytes.
 var errOverload = errors.New("proxy: over the memory budget")
 
-// errMaxBreadth fails a branch the request's Max-Breadth leaves no share for
-// (RFC 5393 §5.3.3).
-var errMaxBreadth = errors.New("proxy: no Max-Breadth left for the branch")
+// ErrMaxBreadth is the BranchFailure.Err of a target the request's
+// Max-Breadth left no share for (RFC 5393 §5.3.3): it was never sent, and
+// counts as a 440 Max-Breadth Exceeded the proxy made.
+var ErrMaxBreadth = errors.New("proxy: no Max-Breadth left for the branch")
 
 // breadthShares splits free Max-Breadth among n branches started together,
 // as evenly as it goes, the first ones taking what is left over; the
@@ -731,7 +742,7 @@ func (c *respContext) failureResponse(err error) final {
 	switch {
 	case errors.Is(err, errPrepare):
 		return c.made(500)
-	case errors.Is(err, errMaxBreadth):
+	case errors.Is(err, ErrMaxBreadth):
 		return c.made(440)
 	case errors.Is(err, transport.ErrNoFlow):
 		// RFC 5626 §5.3.1: the flow the target was registered over is gone.
@@ -1255,6 +1266,12 @@ func (c *respContext) best() final {
 // within 5xx anything but a 503; then one received beats one the proxy made up,
 // which says less, and otherwise the first received stays.
 func better(a, b final) bool {
+	// The proxy's own 440, for a target it did not send, ranks below every
+	// other answer it made: a timeout's 408 that RFC 4320 §4.2 keeps from
+	// the client, a cancelled INVITE's 487 (code review of #454).
+	if a.made && b.made && (a.res.StatusCode == 440) != (b.res.StatusCode == 440) {
+		return b.res.StatusCode == 440
+	}
 	ca, cb := a.res.StatusCode/100, b.res.StatusCode/100
 	switch {
 	case ca == 6 || cb == 6:

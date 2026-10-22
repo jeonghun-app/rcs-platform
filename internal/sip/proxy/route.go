@@ -113,11 +113,6 @@ func (p *Proxy) validate(req *sip.Request, loop string) *rejection {
 			return &rejection{code: 483}
 		}
 	}
-	if req.Header.Has("Max-Breadth") {
-		if _, err := req.Header.MaxBreadth(); err != nil {
-			return &rejection{code: 400}
-		}
-	}
 	if loop != "" && p.looped(req, loop) {
 		p.stats.loops.Add(1)
 		return &rejection{code: 482}

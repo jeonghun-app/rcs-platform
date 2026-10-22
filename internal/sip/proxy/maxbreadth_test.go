@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strconv"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // breadths returns the Max-Breadth of each request sent since the last
@@ -64,21 +66,80 @@ func TestForwardedRequestsShareTheirMaxBreadth(t *testing.T) {
 	}
 }
 
-// A Max-Breadth that is not a positive integer is refused 400, before the
-// Router is asked.
-func TestAMalformedMaxBreadthIsRefused(t *testing.T) {
-	for _, v := range []string{"0", "-1", "two", ""} {
+// A Max-Breadth that is not a positive integer is refused 400 for a request
+// the proxy forwards. One the service answers itself (Serve) is served, as a
+// UAS ignores the field (RFC 5393 §5.3.5), and a 2xx's ACK still goes on,
+// with a value of the proxy's (code review of #454).
+func TestAMalformedMaxBreadthIsRefusedOnlyWhenForwarding(t *testing.T) {
+	for _, v := range []string{"0", "-1", "two", "", "1;x"} {
 		t.Run(strconv.Quote(v), func(t *testing.T) {
 			h := newHarness(t, Config{})
-			routed := false
-			h.route(func(_ context.Context, r *Request) Decision { routed = true; return Forward(r) })
 			h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: "+v))
-			check(t, "upstream", h.upstream(), codes(400))
-			if routed {
-				t.Error("the Router was asked")
+			check(t, "forwarded", h.upstream(), codes(400))
+			check(t, "sent", h.sentMethods(), nil)
+
+			h = newHarness(t, Config{})
+			h.decide(Decision{Serve: func(_ context.Context, u *UAS) {
+				if res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1"); err == nil {
+					_ = u.Respond(res)
+				}
+			}})
+			h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: "+v))
+			h.settle()
+			check(t, "served", h.upstream(), codes(200))
+
+			h = newHarness(t, Config{})
+			h.receive(ackFor2xx(t, "Max-Breadth: "+v))
+			if got := breadths(t, h); got["sip:bob@192.0.2.30"] != MaxBreadth {
+				t.Errorf("the ACK went out with %v, want Max-Breadth %d", got, MaxBreadth)
 			}
 		})
 	}
+}
+
+// A Max-Breadth past 2^32 is held to MaxBreadth like any other past it
+// (§5.8: 1*DIGIT, §5.3.3: overwritten), not refused.
+func TestAHugeMaxBreadthIsHeldToTheMaximum(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{Targets: []Target{target("sip:a@192.0.2.1")}})
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: 4294967296"))
+	if got := breadths(t, h); got["sip:a@192.0.2.1"] != MaxBreadth {
+		t.Errorf("Max-Breadth %v, want %d", got, MaxBreadth)
+	}
+}
+
+// The proxy's own 440 ranks below the other answers it makes (code review
+// of #454): a MESSAGE whose only sent branch reaches Timer F gets no answer
+// (RFC 4320 §4.2), not a 440 after the client gave up; a cancelled INVITE
+// whose branch never answers its CANCEL gets the made 487, not the 440.
+func TestTheProxysOwn440RanksBelowItsOtherAnswers(t *testing.T) {
+	two := []Target{target("sip:a@192.0.2.1"), target("sip:b@192.0.2.2")}
+	t.Run("MESSAGE at Timer F", func(t *testing.T) {
+		h := newHarness(t, Config{})
+		h.decide(Decision{Targets: two})
+		h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: 1"))
+		h.one()
+		h.advance(64 * t1)
+		check(t, "upstream", h.upstream(), nil)
+	})
+	t.Run("cancelled INVITE", func(t *testing.T) {
+		h := newHarness(t, Config{})
+		h.decide(Decision{Targets: two})
+		inv := invite(t, "Max-Breadth: 1")
+		h.receive(inv)
+		a := h.one()
+		h.reply(a, 180)
+		h.receive(uacCancel(t, inv))
+		h.advance(64 * t1) // the CANCEL is never answered
+		got := h.upstreamResponses()
+		var finals []int
+		for _, r := range got {
+			if cseq, _ := r.Header.CSeq(); cseq.Method == "INVITE" && r.StatusCode >= 200 {
+				finals = append(finals, r.StatusCode)
+			}
+		}
+		check(t, "INVITE finals", finals, codes(487))
+	})
 }
 
 // Targets that go out together beyond the Max-Breadth left fail at once as
