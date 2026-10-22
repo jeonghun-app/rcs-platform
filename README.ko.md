@@ -57,7 +57,7 @@ Go 표준 라이브러리와 AWS SDK뿐입니다. [docs/architecture.md](docs/ar
 Docker만 있으면 됩니다. Go는 고정된 컨테이너에서 실행됩니다.
 
 ```bash
-make check     # 포맷, vet, 테스트, race detector, 빌드, 문서 링크, 개인정보 검사
+make check     # 포맷, vet, 테스트, race detector, 빌드, 출력 검사, 문서 링크, 개인정보 검사
 make fuzz      # 모든 파서의 퍼즈 테스트
 make vuln      # go mod verify + govulncheck
 ```

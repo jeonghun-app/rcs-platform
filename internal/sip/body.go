@@ -15,30 +15,24 @@ import (
 // and from it, so the code that reads and writes bodies is unchanged.
 //
 // fmt prints some values field by field without calling any method, and a
-// []byte cannot hide its octets there. Where there is a guard:
-//   - the invalid verbs %w, and %p on a message value: go vet's printf
-//     check, which make check runs, refuses %w outside fmt.Errorf or with
-//     an argument that is not an error, and %p on a non-pointer;
-//   - an unexported field holding a *Request or *Response: vet refuses
-//     %s, %q, %x and %X on such a struct, and %v prints the pointer as an
-//     address;
-//   - an unexported field holding a Request, Response or Body by value,
-//     which %v prints field by field and vet lets through:
-//     TestNoStructHoldsAMessageOrBodyByValueUnexported refuses such fields
-//     in the module's code. It reads only a field's written type, so a
-//     field of a local struct type holding one, of a generic type
-//     instantiated with one, or of type any is not seen (#599).
+// []byte cannot hide its octets there. The guards:
+//   - go vet's printf check, which make check runs, refuses %w outside
+//     fmt.Errorf or with an argument that is not an error, %p on a message
+//     value, and %s, %q, %x and %X on a struct with an unexported message
+//     pointer;
+//   - tools/printguard, which make check runs too, refuses every call to a
+//     print function (fmt's, log's, slog's, testing's) in the module's code
+//     whose argument can reach a message through an unexported field, at
+//     any depth and through local, generic and interface types (Message,
+//     any), or that prints a Request or Response value with a format that
+//     is not a constant (#599);
+//   - TestNoStructHoldsAMessageOrBodyByValueUnexported refuses a struct
+//     field that holds a message or a Body by value, unexported, as written.
 //
-// Not guarded (#599): %t, %c, %U and %e on a struct with an unexported
-// *Request or *Response field, which vet accepts since the message has a
-// Format of its own; an unexported field of type Message or any holding a
-// message, which vet accepts under any verb; a Request or Response value
-// printed with a format that is not a constant, under a verb String does
-// not serve (%t, %d, %c, ...; String serves %v, %s, %q, %x and %X), where
-// fmt prints its fields (the body stays hidden, the
-// URI's user part and header values do not); any other format that is not
-// a constant; and a wrapper vet does not recognise as printf-like. fmt
-// prints the message field by field in these cases. internal/content
+// Not guarded: _test.go files; a value already of an interface type at the
+// call, whose dynamic type is unknown; a spread []any; generic code
+// printing a value of a type parameter; and printing through reflection,
+// a function value or a wrapper printguard does not list. internal/content
 // holds the module's other chat content behind a pointer, which closes
 // these cases too; a SIP body is read and written as bytes throughout the
 // SIP layer and every service, so this type keeps it as bytes (#573).

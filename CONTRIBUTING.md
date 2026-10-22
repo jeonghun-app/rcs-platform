@@ -5,7 +5,7 @@
 Only Docker is needed on the host. Go runs in the pinned toolchain container.
 
 ```bash
-make check       # format, vet, tests, race detector, build, docs links, privacy
+make check       # format, vet, tests, race detector, build, print guard, docs links, privacy
 make fuzz        # every fuzz target for FUZZTIME (default 10s) each
 make vuln        # go mod verify + govulncheck
 make infra-lint  # cfn-lint and policy checks on infra/*.yaml (no AWS access)

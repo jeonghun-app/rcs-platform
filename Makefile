@@ -228,8 +228,12 @@ docs: ## Check relative links and anchors in Markdown
 privacy: ## Refuse long numeric identifiers that are not on the allow-list
 	scripts/check_identifiers.sh
 
+.PHONY: printguard
+printguard: volumes ## Refuse print calls that can show a SIP message's content (#599)
+	$(RUNGO) $(GOIMAGE) go run ./tools/printguard
+
 .PHONY: check
-check: fmt-check vet test race build docs privacy ## Everything the CI test job runs
+check: fmt-check vet test race build printguard docs privacy ## Everything the CI test job runs
 
 .PHONY: clean
 clean:
