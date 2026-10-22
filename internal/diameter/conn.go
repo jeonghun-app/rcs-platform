@@ -144,6 +144,7 @@ func addrOf(a net.Addr) netip.Addr {
 
 // accept runs the responder side of a new inbound connection to its end.
 func (n *Node) accept(nc net.Conn, src netip.Addr) {
+	defer n.closedFrom(src)
 	c := newConn(n, nc)
 	if !n.register(c) {
 		n.exchangeDone(src)

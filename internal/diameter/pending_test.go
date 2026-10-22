@@ -233,14 +233,14 @@ func TestSourceLogsStayBounded(t *testing.T) {
 	hss.mu.Lock()
 	defer hss.mu.Unlock()
 	for i := range maxSourceLogs {
-		hss.sourceLog(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)})).note(clock.Now())
+		hss.sourceLogs.of(netip.AddrFrom4([4]byte{10, 0, byte(i >> 8), byte(i)}), clock.Now()).note(clock.Now())
 	}
 	extra := netip.MustParseAddr("10.0.200.1")
-	if l := hss.sourceLog(extra); l != &hss.sourcesLog || len(hss.sourceLogs) != maxSourceLogs {
-		t.Fatalf("source %d had a log of its own; %d kept", maxSourceLogs+1, len(hss.sourceLogs))
+	if l := hss.sourceLogs.of(extra, clock.Now()); l != &hss.sourceLogs.shared || len(hss.sourceLogs.by) != maxSourceLogs {
+		t.Fatalf("source %d had a log of its own; %d kept", maxSourceLogs+1, len(hss.sourceLogs.by))
 	}
 	clock.Advance(refusalLogEvery)
-	if l := hss.sourceLog(extra); l == &hss.sourcesLog || len(hss.sourceLogs) != 1 {
-		t.Fatalf("a minute on: shared %v, %d kept; want a log of its own, the old ones gone", l == &hss.sourcesLog, len(hss.sourceLogs))
+	if l := hss.sourceLogs.of(extra, clock.Now()); l == &hss.sourceLogs.shared || len(hss.sourceLogs.by) != 1 {
+		t.Fatalf("a minute on: shared %v, %d kept; want a log of its own, the old ones gone", l == &hss.sourceLogs.shared, len(hss.sourceLogs.by))
 	}
 }

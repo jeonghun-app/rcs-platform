@@ -427,13 +427,19 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
     exchange. With the variable unset (dev only), every address may connect.
   - **In the CER exchange.** Connections still in the exchange are capped at
     64 in all and 4 from one source address. A host that opens connections and
-    sends nothing then leaves room for the CSCFs, S-CSCF and I-CSCF. Neither
-    cap is configurable: a CSCF task holds one connection and reconnects one
+    sends nothing then leaves room for the CSCFs, S-CSCF and I-CSCF. No cap
+    here is configurable: a CSCF task holds one connection and reconnects one
     at a time.
-  - **After the exchange.** Connections that completed CER count against
-    neither cap. A host inside the peer networks that completes the exchange
-    again and again is not bounded yet (#617). A host with several addresses
-    inside the networks gets 4 places per address, within the 64.
+  - **Open connections.** Every inbound connection counts from accept to
+    close, before and after CER: 1024 in all and 8 from one source address
+    (#617). A host inside the peer networks that completes the exchange again
+    and again, under one Origin-Host after another, is closed on accept past
+    its 8. A host with several addresses inside the networks gets 4 places
+    in the exchange and 8 open per address, within the totals.
+  - **Accept errors.** A temporary one, such as running out of file
+    descriptors, is waited out: 5 ms, doubled each time up to 1 s, as
+    `net/http` does. Then the listener is tried again. Before #617 it ended
+    the Cx listener, and with it the task.
   - **Log lines.** Each kind of refusal logs a line a minute at most, and the
     per-source kind a line a minute for each source. Each line carries
     `suppressed`, the refusals left out since the one before:
@@ -442,7 +448,10 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
       in its count;
     - `diameter connections refused: too many have not completed CER`;
     - `diameter connections refused: too many from one source have not
-      completed CER`.
+      completed CER`;
+    - `diameter connections refused: too many open`;
+    - `diameter connections refused: too many open from one source`;
+    - `diameter accept failed; trying again`, with the error and the wait.
 - The API logs one `audit: provisioning request` line per request: operation,
   caller, token slot (`current` or `next`), status and the masked IMPI.
 - Metrics: `cx.<command>` (latency), `cx.<command>.<result>` (`e` before an
