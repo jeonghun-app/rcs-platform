@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
@@ -86,10 +87,10 @@ func TestARelayedRegistrationIsNotRelayedBack(t *testing.T) {
 		r.d.onInvite(func(Invitation) error { return ErrOffline })
 		r.d.discardInvites.Store(true)
 	}
-	if err := a.e.SubmitGroup(t.Context(), GroupOrigin{Group: groupURI, Sender: alice, Conversation: conv, CPIM: chat(t, "m1", "hi", 0)}); err != nil {
+	if err := a.e.SubmitGroup(t.Context(), GroupOrigin{Group: groupURI, Sender: alice, Conversation: conv, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.e.SubmitGroup(t.Context(), GroupOrigin{Group: otherGroupURI, Sender: alice, Conversation: conv, CPIM: chat(t, "m2", "hi", 0)}); err != nil {
+	if err := b.e.SubmitGroup(t.Context(), GroupOrigin{Group: otherGroupURI, Sender: alice, Conversation: conv, CPIM: content.BodyOf(chat(t, "m2", "hi", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	settled(t, a, b)
@@ -119,7 +120,7 @@ func TestARelayedRegistrationIsNotRelayedBack(t *testing.T) {
 func TestAWakeLeavesAOneToOneInvitationsFailureToCount(t *testing.T) {
 	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
 	r.e.SetGroupHandler(members{all: []string{alice, bob}})
-	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}
 	if err := r.e.Submit(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
