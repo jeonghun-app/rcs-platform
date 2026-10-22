@@ -474,20 +474,19 @@ func (s *Server) failUpload(w http.ResponseWriter, err error) {
 }
 
 // uploadFailed counts the failure under reason and answers status. The
-// answer is a few bytes on a connection the server has written nothing to,
-// which the socket takes at once, so its write has no deadline: one of
-// IdleTimeout from here, as extendWrite sets, passed while a loaded host
-// kept the handler from returning, and net/http then closed the connection
-// with no answer at all (#211).
+// answer is written and flushed here, under a write deadline of IdleTimeout
+// from just before the write (extendWrite), rather than left to net/http
+// once the handler returns: a deadline set first, as before, could pass
+// while a loaded host kept the handler from returning, and net/http then
+// closed the connection with no answer at all (#211).
 func (s *Server) uploadFailed(w http.ResponseWriter, reason string, status int) {
 	s.metrics.Count("upload.failed."+reason, 1)
-	if s.o.IdleTimeout > 0 {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-	}
 	if f := answeringFailure.Load(); f != nil {
 		(*f)()
 	}
+	s.extendWrite(w)
 	http.Error(w, http.StatusText(status), status)
+	_ = http.NewResponseController(w).Flush()
 }
 
 // answeringFailure, empty but in tests, runs in uploadFailed before the

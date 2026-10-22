@@ -317,6 +317,64 @@ func TestAStalledUploadsAnswerSurvivesASlowHandler(t *testing.T) {
 	}
 }
 
+// A failed upload's answer is written while the handler runs, under a
+// write deadline of IdleTimeout set just before the write, and flushed at
+// once: its write is bounded, and no deadline set earlier can pass before
+// it (#211). The writer records what is done to it, in order.
+func TestAFailedUploadsAnswerIsWrittenUnderAFreshDeadline(t *testing.T) {
+	const idle = 100 * time.Millisecond
+	e := newEnv(t, func(o *Options) { o.IdleTimeout = idle })
+	wall := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	e.srv.wallNow = func() time.Time { return wall }
+	w := &recordingWriter{ResponseRecorder: httptest.NewRecorder()}
+	e.srv.uploadFailed(w, "timeout", http.StatusRequestTimeout)
+	want := []string{"deadline " + wall.Add(idle).Format(time.RFC3339Nano), "write", "flush"}
+	if got := w.events(); !slices.Equal(got, want) {
+		t.Fatalf("the writer saw %q, want %q", got, want)
+	}
+	if w.Code != http.StatusRequestTimeout {
+		t.Errorf("status = %d, want 408", w.Code)
+	}
+}
+
+// recordingWriter records the write deadlines, writes and flushes done to
+// it through http.ResponseController.
+type recordingWriter struct {
+	*httptest.ResponseRecorder
+	mu  sync.Mutex
+	log []string
+}
+
+func (w *recordingWriter) add(e string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.log) == 0 || w.log[len(w.log)-1] != e {
+		w.log = append(w.log, e)
+	}
+}
+
+func (w *recordingWriter) events() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.log)
+}
+
+func (w *recordingWriter) SetWriteDeadline(d time.Time) error {
+	w.add("deadline " + d.Format(time.RFC3339Nano))
+	return nil
+}
+
+func (w *recordingWriter) Write(b []byte) (int, error) {
+	w.add("write")
+	return w.ResponseRecorder.Write(b)
+}
+
+func (w *recordingWriter) FlushError() error {
+	w.add("flush")
+	w.ResponseRecorder.Flush()
+	return nil
+}
+
 // badRecordSource answers like an HSS whose record for the user is
 // unusable.
 type badRecordSource struct{}
