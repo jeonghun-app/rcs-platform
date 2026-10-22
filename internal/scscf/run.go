@@ -68,14 +68,21 @@ type deps struct {
 	writeTimeout   time.Duration
 	sendQueueBytes int
 	// dialTimeout replaces coreDialTimeout when set. It may be longer than
-	// the sends' wait, closeMargin less goodbyeMargin, since the
-	// transport's Close cuts a dial (#474).
+	// the sends' wait, closeMargin less goodbyeMargin, as coreDialTimeout
+	// is, since the transport's Close cuts a dial (#474).
 	dialTimeout time.Duration
 	// router, if set, routes in place of the dispatcher.
 	router proxy.Router
 	// subscribeAnswered, if set, runs once a SUBSCRIBE's 200 is written,
 	// before its first NOTIFY goes.
 	subscribeAnswered func()
+	// stopping, if set, hears when the stop began and its deadline;
+	// goodbye, just before the Cx client's goodbye is given its deadline,
+	// which a test may hold it past.
+	stopping func(begun, stopBy time.Time)
+	goodbye  func()
+	// goodbyeAt, if set, hears the deadline the goodbye was given.
+	goodbyeAt func(deadline time.Time)
 	// transportMade, if set, hears of the transport once it is made.
 	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
@@ -252,7 +259,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 
 	// The listener stays open while the drain runs, as Cloud Map's answers
 	// name this task for their TTL after it is deregistered.
-	stopBy := time.Now().Add(cfg.DrainTimeout + stopMargin - returnMargin)
+	begun := time.Now()
+	stopBy := begun.Add(cfg.DrainTimeout + stopMargin - returnMargin)
+	if d.stopping != nil {
+		d.stopping(begun, stopBy)
+	}
 	drainCtx, cancelDrain := context.WithTimeout(context.Background(), cfg.DrainTimeout)
 	defer cancelDrain()
 	if n := px.Drain(drainCtx); n > 0 {
@@ -294,10 +305,33 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	if !routed && !router.WaitFor(sendsCtx) {
 		rt.Logger.Warn("third-party REGISTERs still under way at the end of the stop")
 	}
-	closeCtx, cancelClose := context.WithDeadline(context.Background(), stopBy)
+	if d.goodbye != nil {
+		d.goodbye()
+	}
+	deadline := goodbyeDeadline(stopBy, time.Now())
+	if d.goodbyeAt != nil {
+		d.goodbyeAt(deadline)
+	}
+	closeCtx, cancelClose := context.WithDeadline(context.Background(), deadline)
 	defer cancelClose()
 	closeCx(closeCtx)
 	return nil
+}
+
+// goodbyeDeadline is the Cx client's goodbye's deadline, stopBy unless the
+// stop reaches the goodbye later than goodbyeFloor before it: a process
+// that did not run for a while still sends the DPR (the Diameter
+// connection starts none for a context already done) in returnMargin
+// (#549 code review).
+func goodbyeDeadline(stopBy, now time.Time) time.Time {
+	return later(stopBy, now.Add(goodbyeFloor))
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
 }
 
 // proxyLimits are the bounds of scscf's proxy, as icscf's (#311 code
