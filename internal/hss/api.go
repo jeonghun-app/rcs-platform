@@ -19,6 +19,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Scope is what a caller of the provisioning API may do (ADR 0007 §3; the
@@ -59,8 +60,11 @@ type Tokens struct {
 // HSS_<CALLER>_TOKEN_NEXT); either may be empty. The audit log names the
 // slot a request used by the variable it came from, so it shows when the old
 // token is no longer used whichever order the rotation empties them in.
+// The tokens are secret.Keys, which print as "[redacted]" under every verb,
+// so a Tokens or an APIOptions printed by mistake shows none; NewAPI keeps
+// only their SHA-256 (#533).
 type TokenPair struct {
-	Current, Next string
+	Current, Next secret.Key
 }
 
 // MinTokenLength is the shortest token accepted in staging and prod: 256
@@ -173,11 +177,14 @@ func (h *HSS) NewAPI(o APIOptions) *API {
 	}
 	a.closing, a.close = context.WithCancel(context.Background())
 	add := func(scope Scope, pair TokenPair) {
-		for _, t := range []struct{ value, slot string }{{pair.Current, "current"}, {pair.Next, "next"}} {
-			if t.value == "" {
+		for _, t := range []struct {
+			value secret.Key
+			slot  string
+		}{{pair.Current, "current"}, {pair.Next, "next"}} {
+			if t.value.IsZero() {
 				continue
 			}
-			at := &acceptedToken{digest: sha256.Sum256([]byte(t.value)), scope: scope, slot: t.slot}
+			at := &acceptedToken{digest: sha256.Sum256(t.value.Reveal()), scope: scope, slot: t.slot}
 			if scope == ScopeACS {
 				at.limit = newBucket(rate, burst, now)
 			}

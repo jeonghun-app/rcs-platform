@@ -113,7 +113,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Shuffle: func(p []*diameter.Peer) { mathrand.Shuffle(len(p), func(i, j int) { p[i], p[j] = p[j], p[i] }) },
 	})
 	api := h.NewAPI(APIOptions{
-		Tokens: cfg.Tokens.tokens(), ACSRate: float64(cfg.ACSRate), ACSBurst: cfg.ACSBurst, Notifier: pusher,
+		Tokens: cfg.Tokens, ACSRate: float64(cfg.ACSRate), ACSBurst: cfg.ACSBurst, Notifier: pusher,
 		DefaultProfile: cfg.DefaultProfile, PushTimeout: cfg.PushTimeout, StoreTimeout: cfg.APITimeout,
 	})
 
@@ -195,8 +195,8 @@ func start(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (store.
 // openStore opens the store and the keyring the configuration names.
 func openStore(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (store.Store, *keyring.Keyring, error) {
 	localKey := func() ([]byte, error) {
-		if cfg.DataKey.value() != "" {
-			return base64.StdEncoding.DecodeString(cfg.DataKey.value())
+		if cfg.DataKey.RevealString() != "" {
+			return base64.StdEncoding.DecodeString(cfg.DataKey.RevealString())
 		}
 		// Memory store only (Configure requires the key otherwise): secrets
 		// live as long as the process, and so may the key.

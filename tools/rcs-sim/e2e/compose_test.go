@@ -44,7 +44,7 @@ func TestE2EComposeStack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf", "scscf", "pcscf"} {
+	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf", "scscf", "pcscf", "rcs-as-a"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
 	waitReady(ctx, t, acsURL+"/readyz")
@@ -92,8 +92,9 @@ func TestE2EComposeStack(t *testing.T) {
 
 	// rcs-sim: file transfer through ft-server on S3Mock and DynamoDB Local
 	// with its credentials looked up in hss, and chat through msrp-relay on
-	// DynamoDB Local, rcs-sim standing in for pcscf and rcs-as until they
-	// exist. The relay connects to the stand-in on this container's address.
+	// DynamoDB Local, rcs-sim standing in for pcscf and rcs-as: it has no
+	// chat over SIP yet (#135). The relay connects to the stand-in on this
+	// container's address.
 	bin := build(t, "./tools/rcs-sim")
 	self := ownAddress(t)
 	cmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
@@ -122,9 +123,12 @@ func TestE2EComposeStack(t *testing.T) {
 	// through pcscf, icscf and scscf. reg-event watches the client's own
 	// registration; options sends the peer a query to its tel URI and a
 	// capability query, both through scscf's originating and terminating
-	// iFC chains, where the default profile's criterion toward rcs-as,
-	// absent from the stack, goes on by its default handling. pager-message
-	// is left out: the default profile ends a MESSAGE at rcs-as.
+	// iFC chains, where the default profile's criterion sends the capability
+	// query through rcs-as, which passes it on. pager-message sends the peer
+	// a MESSAGE, which the default profile takes to rcs-as: rcs-as stores it
+	// and delivers it to the peer, the peer's delivery notification goes
+	// back the same way, and a message to the peer unregistered waits in
+	// rcs-as's queue until it registers again (#135).
 	// The client's default profile first: a run cut short before it put
 	// it back would leave the stub's, whose AS is gone, and fail the
 	// first OPTIONS with a 500 that says nothing of why (#473 code review).
@@ -133,7 +137,7 @@ func TestE2EComposeStack(t *testing.T) {
 	sipCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
 		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
-		"reg-event", "options")
+		"reg-event", "options", "pager-message")
 	var sipOut, sipErr bytes.Buffer
 	sipCmd.Stdout, sipCmd.Stderr = &sipOut, &sipErr
 	err = sipCmd.Run()
@@ -141,16 +145,30 @@ func TestE2EComposeStack(t *testing.T) {
 	if err != nil {
 		t.Errorf("rcs-sim over SIP: %v", err)
 	}
-	checkResults(t, sipOut.String(), sipErr.String(), []string{
+	sipResults := checkResults(t, sipOut.String(), sipErr.String(), []string{
 		"reg-event/register", "reg-event/subscribe", "reg-event/re-register", "reg-event/unregister",
 		"options/register", "options/tel-uri", "options/capabilities",
+		"pager-message/register", "pager-message/message", "pager-message/receive",
+		"pager-message/delivery-notification", "pager-message/peer-offline",
 	}, env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
 		composeIMSI, composePeerIMSI)
+	// rcs-as took both messages: it answers 202 to one it has stored, which
+	// the peer's own client never does (it answers 200), so a MESSAGE that
+	// went to the peer past rcs-as would have the peer's 200. The second,
+	// to the peer unregistered, reached it once it registered again.
+	if r := sipResults["pager-message/message"]; r.Detail["status"] != 202 {
+		t.Errorf("the MESSAGE was answered %d, not rcs-as's 202", r.Detail["status"])
+	}
+	if r := sipResults["pager-message/peer-offline"]; r.Detail["status"] != 202 || r.Detail["stored"] != 1 {
+		t.Errorf("the MESSAGE to the unregistered peer was answered %d (stored and delivered: %d), want rcs-as's 202 and its delivery once the peer registered",
+			r.Detail["status"], r.Detail["stored"])
+	}
 
-	// The originating iFC chain through an application server (#14 PR F2):
-	// rcs-as is not in the stack, so a stub on this container takes the
-	// client's OPTIONS, as an AS acting as a proxy does, and sends them back
-	// to scscf, which goes on along the chain to icscf and the peer.
+	// The originating iFC chain through more than one application server
+	// (#14 PR F2): two stubs on this container, in criteria ahead of the
+	// default profile's, take the client's OPTIONS in turn, as an AS acting
+	// as a proxy does, and send them back to scscf, which goes on along the
+	// chain, through rcs-as, to icscf and the peer.
 	as := startStubAS(t, self, stubASPort, "")
 	next := startStubAS(t, self, nextStubASPort, stubASPort)
 	throughStubAS(ctx, t, []sip.URI{as.uri, next.uri}, impi)
