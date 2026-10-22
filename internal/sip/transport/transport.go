@@ -398,6 +398,10 @@ type Transport struct {
 	// or TLS handshake in progress), so Close can close them at once.
 	pending map[net.Conn]struct{}
 
+	// holds are the responses HoldResponse counts in sends, under sendsMu,
+	// until their SendResponse begins.
+	holds map[*sip.Response]uint64
+
 	wg sync.WaitGroup
 }
 
@@ -818,6 +822,52 @@ func (t *Transport) beginSend() uint64 {
 	t.sendNext++
 	t.sends[t.sendNext] = struct{}{}
 	return t.sendNext
+}
+
+// HoldResponse counts res, about to be sent, for Flush as a send under way,
+// from now on. A SendResponse of it that begins takes the hold over as its
+// own count, under the same number, so that a Flush that saw the hold waits
+// for the send as well, a dial to the Via address included (code review of
+// #493). A proxy holds a final response it hands to a transaction this way,
+// so that a Flush while the transaction layer has it, before it calls
+// SendResponse, still waits for it (#469). release must always be called,
+// once the response has been sent or will not be: it ends a hold no send
+// took over, which Flush would otherwise wait for until its deadline.
+func (t *Transport) HoldResponse(res *sip.Response) (release func()) {
+	id := t.beginSend()
+	t.sendsMu.Lock()
+	if t.holds == nil {
+		t.holds = map[*sip.Response]uint64{}
+	}
+	t.holds[res] = id
+	t.sendsMu.Unlock()
+	return func() { t.unhold(res, id) }
+}
+
+// unhold ends the hold id of res, if it is still held. A hold a send took
+// over is that send's count now, which the send itself ends: unhold leaves
+// it, so that a release while the send is still under way does not end it
+// early (QA of #493).
+func (t *Transport) unhold(res *sip.Response, id uint64) {
+	t.sendsMu.Lock()
+	if t.holds[res] == id {
+		delete(t.holds, res)
+		delete(t.sends, id)
+	}
+	t.sendsMu.Unlock()
+}
+
+// takeHold returns the number of the hold of res, if it has one, for a send
+// of it to count itself under: the number stays in sends, and only the hold
+// ends.
+func (t *Transport) takeHold(res *sip.Response) (uint64, bool) {
+	t.sendsMu.Lock()
+	defer t.sendsMu.Unlock()
+	id, ok := t.holds[res]
+	if ok {
+		delete(t.holds, res)
+	}
+	return id, ok
 }
 
 func (t *Transport) endSend(id uint64) {
