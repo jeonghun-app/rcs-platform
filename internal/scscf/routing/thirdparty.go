@@ -190,9 +190,9 @@ func (rt *Router) Registered(ctx context.Context, r registrar.ThirdPartyRegistra
 }
 
 // turn waits for the registration of the same identity before this one,
-// prev, to be done and takes one of the server's slots. It is false, with no slot taken,
-// once StopBy has given up. The wait is short then: StopBy cuts short the
-// send of whatever holds the turn.
+// prev, to be done and takes one of the server's slots. It is false, with
+// no slot taken, once StopBy has given up. The wait is short then: StopBy
+// cuts short the send of whatever holds the turn.
 func (rt *Router) turn(prev, slots chan struct{}) bool {
 	if prev != nil {
 		<-prev

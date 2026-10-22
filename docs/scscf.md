@@ -115,9 +115,16 @@ Alarm on a rise of these:
 - `registrar.hss_failed`;
 - `registrar.reassert_failed`;
 - `routing.third_party.dropped`;
+- `routing.third_party.end_dropped`: an application server never heard
+  that a user ended, so it keeps them registered until the last Expires;
 - `routing.third_party.terminated_unanswered`;
 - `regevent.notify_dropped`;
 - `regevent.final_abandoned`.
+
+`routing.third_party.evicted` counts refreshes an end took the place of in a
+full queue: a server that does not keep up. Each is made good by the user's
+next re-registration, so it needs no alarm of its own, but a steady rate says
+the server's queue is too short for it.
 
 ## Health
 
