@@ -84,7 +84,7 @@ func (s *Service) ownerOrOther(ctx context.Context, g groupstore.Group, maxAge t
 		return groupstore.Owner{}, groupstore.Owner{}, err
 	}
 	if cur.Task == s.cfg.Task {
-		s.own(g.URI, cur)
+		s.own(g.URI, cur, now)
 		return cur, groupstore.Owner{}, nil
 	}
 	if cur.Task != "" && (cur.SIP == "" || cur.SIP != s.cfg.SIP) {
@@ -112,7 +112,7 @@ func (s *Service) ownerOrOther(ctx context.Context, g groupstore.Group, maxAge t
 			return groupstore.Owner{}, groupstore.Owner{}, err
 		}
 		if cur.Task == s.cfg.Task {
-			s.own(g.URI, cur)
+			s.own(g.URI, cur, now)
 			return cur, groupstore.Owner{}, nil
 		}
 		s.notOwned(g.URI)
@@ -122,7 +122,7 @@ func (s *Service) ownerOrOther(ctx context.Context, g groupstore.Group, maxAge t
 		return groupstore.Owner{}, groupstore.Owner{}, err
 	}
 	s.metrics.Count("group.owner_takeover", 1)
-	s.own(g.URI, next)
+	s.own(g.URI, next, now)
 	return next, groupstore.Owner{}, nil
 }
 
@@ -230,15 +230,18 @@ func (s *Service) fence(ctx context.Context, g groupstore.Group) (*store.Fence, 
 	return &store.Fence{Group: g.URI, Task: o.Task, Epoch: o.Epoch}, nil
 }
 
-// own records that this task owns uri as o, which the store just said.
-func (s *Service) own(uri string, o groupstore.Owner) {
+// own records that this task owns uri as o, which the store said when
+// asked at read: the time before the call, not after it, so that an answer
+// held up in the call, past a lease and another task's takeover, is not
+// taken for a fresh one (code review on #440).
+func (s *Service) own(uri string, o groupstore.Owner, read time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.owned) >= s.cfg.MaxTracked {
 		// A group forgotten is only read again.
 		clear(s.owned)
 	}
-	s.owned[uri] = ownership{Owner: o, read: s.cfg.Clock.Now()}
+	s.owned[uri] = ownership{Owner: o, read: read}
 }
 
 // disown forgets that this task owns uri, after a write the store refused
