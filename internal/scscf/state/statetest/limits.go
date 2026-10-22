@@ -13,7 +13,26 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
-func sameChallenge(a, b *state.Challenge) bool { return reflect.DeepEqual(a, b) }
+// sameChallenge compares the credentials by value, which reflect.DeepEqual
+// cannot do for a secret.Key, and the rest of the challenges field by field.
+func sameChallenge(a, b *state.Challenge) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	x, y := *a, *b
+	switch {
+	case (x.AKA == nil) != (y.AKA == nil), (x.Digest == nil) != (y.Digest == nil):
+		return false
+	case x.AKA != nil && !(x.AKA.RAND.Equal(y.AKA.RAND) && x.AKA.AUTN.Equal(y.AKA.AUTN) &&
+		x.AKA.XRES.Equal(y.AKA.XRES) && x.AKA.CK.Equal(y.AKA.CK) && x.AKA.IK.Equal(y.AKA.IK)):
+		return false
+	case x.Digest != nil && !(x.Digest.Realm == y.Digest.Realm && x.Digest.Algorithm == y.Digest.Algorithm &&
+		x.Digest.QoP == y.Digest.QoP && x.Digest.Opaque == y.Digest.Opaque && x.Digest.HA1.Equal(y.Digest.HA1)):
+		return false
+	}
+	x.AKA, y.AKA, x.Digest, y.Digest = nil, nil, nil, nil
+	return reflect.DeepEqual(x, y)
+}
 
 // pausedListing holds a sweep after it listed, as an instance busy with the
 // items before does.
