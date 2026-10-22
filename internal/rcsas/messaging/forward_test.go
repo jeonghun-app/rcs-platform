@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -19,14 +20,14 @@ func TestAStandaloneMessageWaitsForTheRecipientToRegister(t *testing.T) {
 	if err := r.e.Submit(t.Context(), standalone(alice, bob, msg)); err != nil {
 		t.Fatal(err)
 	}
-	if d := r.d.nextPager(t); d.Recipient != bob || d.Sender != alice || !bytes.Equal(d.CPIM, msg) || d.Conversation != conv {
+	if d := r.d.nextPager(t); d.Recipient != bob || d.Sender != alice || !bytes.Equal(d.CPIM.Bytes(), msg) || d.Conversation != conv {
 		t.Fatalf("delivery %+v", d)
 	}
 	waitFor(t, "the message to be released", func() bool { return r.queued(t, bob) == 1 })
 
 	r.d.onPager(nil)
 	r.e.UserRegistered(bob, false)
-	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, msg) {
+	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM.Bytes(), msg) {
 		t.Fatalf("redelivery %+v", d)
 	}
 	waitFor(t, "the delivery to be counted", func() bool { return r.m.get("delivery.pager") == 1 })
@@ -72,7 +73,7 @@ func TestAnExpiredMessageSendsTheNegativeNotificationItsSenderAskedFor(t *testin
 	if d.Recipient != alice || d.Sender != bob || !d.Notification {
 		t.Fatalf("notification delivery %+v", d)
 	}
-	n := readNotification(t, d.CPIM)
+	n := readNotification(t, d.CPIM.Bytes())
 	if n.MessageID != "m1" || n.Kind != imdn.DeliveryNotification || n.Status != imdn.Failed || n.RecipientURI != bob ||
 		n.DateTime != "2026-03-04T05:06:07.000Z" {
 		t.Fatalf("notification %+v", n)
@@ -100,7 +101,7 @@ func TestAnUndeliverableMessageIsAnsweredAtOnce(t *testing.T) {
 	}
 	r.d.nextPager(t)
 	d := r.d.nextPager(t)
-	if n := readNotification(t, d.CPIM); d.Recipient != alice || n.Status != imdn.Failed {
+	if n := readNotification(t, d.CPIM.Bytes()); d.Recipient != alice || n.Status != imdn.Failed {
 		t.Fatalf("delivery %+v", d)
 	}
 	waitFor(t, "the failure to be counted", func() bool { return r.m.get("delivery.undeliverable") == 1 })
@@ -172,7 +173,7 @@ func TestTwoEnginesSharingAStoreDeliverEachMessageOnce(t *testing.T) {
 			return ErrOffline
 		}
 		mu.Lock()
-		delivered[string(d.CPIM)]++
+		delivered[string(d.CPIM.Bytes())]++
 		mu.Unlock()
 		return nil
 	}
@@ -223,7 +224,7 @@ func TestAClientThatTakesNoSessionsGetsWhatFitsByPager(t *testing.T) {
 	small := chat(t, "m1", "short", 0)
 	large := chat(t, "m2", string(bytes.Repeat([]byte("x"), 600)), 0)
 	chatFrom := func(body []byte) Origin {
-		return Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: body}
+		return Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(body)}
 	}
 	if err := r.e.Submit(t.Context(), chatFrom(large)); err != nil {
 		t.Fatal(err)
@@ -233,7 +234,7 @@ func TestAClientThatTakesNoSessionsGetsWhatFitsByPager(t *testing.T) {
 	if err := r.e.Submit(t.Context(), chatFrom(small)); err != nil {
 		t.Fatal(err)
 	}
-	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, small) {
+	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM.Bytes(), small) {
 		t.Fatalf("pager delivery %q", d.CPIM)
 	}
 	// The large message waits; no further invitation goes out until bob
@@ -261,13 +262,13 @@ func TestAClientThatTakesNoSessionsGetsWhatFitsByPager(t *testing.T) {
 
 func TestAFailedInvitationIsRetriedOnlyAfterTheInviteTimeout(t *testing.T) {
 	r := newRig(t, Config{InviteTimeout: time.Minute, RetryInterval: time.Hour})
-	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}
 	if err := r.e.Submit(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
 	r.e.InviteFailed(inv, ErrOffline)
-	o.CPIM = chat(t, "m2", "again", 0)
+	o.CPIM = content.BodyOf(chat(t, "m2", "again", 0))
 	if err := r.e.Submit(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +279,7 @@ func TestAFailedInvitationIsRetriedOnlyAfterTheInviteTimeout(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 	r.clock.Advance(time.Minute)
-	o.CPIM = chat(t, "m3", "once more", 0)
+	o.CPIM = content.BodyOf(chat(t, "m3", "once more", 0))
 	if err := r.e.Submit(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +303,7 @@ func TestNetworkReportedDispositionsBecomeNotifications(t *testing.T) {
 		t.Fatal(err)
 	}
 	got = append(got, r.d.nextPager(t))
-	if n := readNotification(t, got[0].CPIM); got[0].Recipient != alice || n.Status != imdn.Delivered || n.MessageID != "m1" {
+	if n := readNotification(t, got[0].CPIM.Bytes()); got[0].Recipient != alice || n.Status != imdn.Delivered || n.MessageID != "m1" {
 		t.Fatalf("notification %+v", got[0])
 	}
 	if err := r.e.Report(t.Context(), d, imdn.DisplayNotification, imdn.Displayed); err == nil {

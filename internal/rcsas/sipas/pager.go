@@ -162,7 +162,7 @@ func (s *Server) pagerRequest(d messaging.Delivery, next sip.URI) (*sip.Request,
 	// the engine's \uXXXX escapes stand as text, not as quoted pairs.
 	from := sip.Address{DisplayName: d.SenderName, URI: sender}
 	from.Params.Set("tag", tag)
-	req := &sip.Request{Method: "MESSAGE", URI: recipient, Body: d.CPIM}
+	req := &sip.Request{Method: "MESSAGE", URI: recipient, Body: d.CPIM.Bytes()}
 	fields := [][2]string{
 		{"Max-Forwards", "70"},
 		{"Route", "<" + next.String() + ">"},

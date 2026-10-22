@@ -354,6 +354,10 @@ func keyOf(t proxy.Target) string {
 	if len(t.Routes) > 0 {
 		k += "|" + t.Routes[0].URI.String()
 	}
+	if t.Destination != nil {
+		// One address of an application server's after another (#574).
+		k += "|" + t.Destination.Addr.String()
+	}
 	return k
 }
 

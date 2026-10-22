@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 )
 
@@ -326,7 +327,7 @@ func TestNotificationMessageRefusesAnInvalidEnvelope(t *testing.T) {
 
 func TestParseNotificationMessageChecksTheContent(t *testing.T) {
 	msg := func(ctype, disp string, body string) *cpim.Message {
-		m := &cpim.Message{ContentHeaders: []cpim.Field{{Name: "Content-Type", Value: ctype}}, Body: []byte(body)}
+		m := &cpim.Message{ContentHeaders: []cpim.Field{{Name: "Content-Type", Value: ctype}}, Body: content.BodyOf([]byte(body))}
 		if disp != "" {
 			m.ContentHeaders = append(m.ContentHeaders, cpim.Field{Name: "Content-Disposition", Value: disp})
 		}

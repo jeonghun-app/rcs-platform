@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store/storetest"
 )
@@ -29,7 +30,7 @@ func TestAFencedEnqueueNeedsTheGroupsOwner(t *testing.T) {
 	at := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	copyOf := func(id string, f *store.Fence) store.Message {
 		return store.Message{Recipient: "tel:+15550100002", ID: id, Sender: "sip:chat-1@conf.example.net", Mode: store.Group,
-			CPIM: []byte("x"), Enqueued: at, Expires: at.Add(time.Hour), Fence: f}
+			CPIM: content.BodyOf([]byte("x")), Enqueued: at, Expires: at.Add(time.Hour), Fence: f}
 	}
 	s := store.NewMemory()
 	fence := &store.Fence{Group: "sip:chat-1@conf.example.net", Task: "task-a", Epoch: 1}

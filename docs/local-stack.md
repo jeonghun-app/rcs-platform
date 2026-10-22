@@ -123,7 +123,8 @@ settings (the `x-rcs-as` anchor) but their own MSRP host:
   ways.
 
 The default profile's criteria send each REGISTER's third-party REGISTER, a
-capability query's OPTIONS, a chat INVITE and a MESSAGE to `rcs-as` ([hss](hss.md#default-service-profile)).
+capability query's OPTIONS, a chat INVITE, a MESSAGE and a group chat's roster
+SUBSCRIBE to `rcs-as` ([hss](hss.md#default-service-profile)).
 
 ### Ports
 

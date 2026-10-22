@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -21,11 +22,11 @@ func TestMessagesBeyondTheSizeLimitsAreRefused(t *testing.T) {
 	if got := rejected(r.e.Submit(t.Context(), standalone(alice, bob, big))); got != ReasonTooLarge {
 		t.Fatalf("a pager-mode message over the pager limit: %q", got)
 	}
-	large := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: big}
+	large := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(big)}
 	if err := r.e.Submit(t.Context(), large); err != nil {
 		t.Fatalf("the same content in large mode: %v", err)
 	}
-	large.CPIM = chat(t, "m2", strings.Repeat("x", 4096), 0)
+	large.CPIM = content.BodyOf(chat(t, "m2", strings.Repeat("x", 4096), 0))
 	if got := rejected(r.e.Submit(t.Context(), large)); got != ReasonTooLarge {
 		t.Fatalf("a message over the size limit: %q", got)
 	}
@@ -86,7 +87,7 @@ func TestPagerAndLargeModeShareThePipeline(t *testing.T) {
 	if err := r.e.Submit(t.Context(), standalone(alice, bob, small)); err != nil {
 		t.Fatal(err)
 	}
-	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, small) {
+	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM.Bytes(), small) {
 		t.Fatalf("pager delivery %q", d.CPIM)
 	}
 	a.send(t, large)
@@ -138,7 +139,7 @@ func TestTheSenderDisplayNameIsEscapedForSIP(t *testing.T) {
 
 func TestSubmitNeedsAMode(t *testing.T) {
 	r := newRig(t, Config{})
-	err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, CPIM: chat(t, "m1", "hi", 0)})
+	err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))})
 	if err == nil || rejected(err) != "" {
 		t.Fatalf("Submit without a mode = %v", err)
 	}

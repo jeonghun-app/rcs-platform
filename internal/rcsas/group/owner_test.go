@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -309,7 +310,7 @@ func TestTwoRequestsOfOneTaskTakeAGroupOverAtOnce(t *testing.T) {
 // write has who write text in uri through r's engine.
 func (r *rig) write(t *testing.T, uri, who, id string) error {
 	t.Helper()
-	return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: uri, Sender: who, CPIM: message(t, who, id, "x", 0)})
+	return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: uri, Sender: who, CPIM: content.BodyOf(message(t, who, id, "x", 0))})
 }
 
 // #121 D2: a message written on a task that does not own the group, its

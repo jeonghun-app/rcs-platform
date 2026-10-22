@@ -84,7 +84,7 @@ func TestAKARegistrationRunsEndToEnd(t *testing.T) {
 	if doc.PrivateID != impi1 || len(ids) != 2 || ids[0].Identity != impu1 || ids[1].Identity != tel1 {
 		t.Fatalf("User-Data = %+v", doc)
 	}
-	if set, err := ifc.Compile(doc.ServiceProfiles[0].InitialFilterCriteria); err != nil || set.Len() != 4 {
+	if set, err := ifc.Compile(doc.ServiceProfiles[0].InitialFilterCriteria); err != nil || set.Len() != 5 {
 		t.Fatalf("criteria: %v", err)
 	}
 	s := e.sub(impi1)

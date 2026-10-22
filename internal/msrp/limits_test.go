@@ -149,7 +149,7 @@ func TestReassemblingAMessageInOrderCostsTheSameForEveryChunk(t *testing.T) {
 	chunks, _ := Split(bodyOf(size), DefaultChunkSize)
 	msgs := make([]*Message, len(chunks))
 	for i, c := range chunks {
-		msgs[i] = chunkMsg("big", c.Range, string(c.Data), c.Flag)
+		msgs[i] = chunkMsg("big", c.Range, string(c.Data.Bytes()), c.Flag)
 	}
 	r := Reassembler{MaxSize: size}
 	var got *Message

@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -125,7 +126,7 @@ func (e *Endpoint) HandleMessage(s *msrp.Session, m *msrp.Message) error {
 		return nil
 	}
 	from, _ := c.From()
-	r := Received{From: from, ContentType: c.ContentType(), Body: c.Body, Request: req}
+	r := Received{From: from, ContentType: c.ContentType(), Body: c.Body.Bytes(), Request: req}
 	// Counted before the message is handed over, so that whoever has the
 	// message and calls Wait waits for its notifications too.
 	e.pending.Add(1)
@@ -203,7 +204,7 @@ func (e *Endpoint) Send(ctx context.Context, s *msrp.Session, to cpim.Address, c
 		}
 	}
 	m.ContentHeaders = []cpim.Field{{Name: "Content-Type", Value: contentType}}
-	m.Body = text
+	m.Body = content.BodyOf(text)
 	body, err := m.Marshal()
 	if err != nil {
 		return Sent{}, err
