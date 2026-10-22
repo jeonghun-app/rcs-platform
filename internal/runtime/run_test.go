@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -855,4 +856,26 @@ func TestALiveAfterReadyServiceFailsItsHealthCheckUntilItIsReady(t *testing.T) {
 	}
 	h.cancel()
 	h.wait()
+}
+
+// A line through the log package, such as an http.Server's without an
+// ErrorLog, has the addresses in it truncated too (#389 security review).
+func TestTheLogPackagesLinesHaveTheirAddressesTruncated(t *testing.T) {
+	h := startService(t, devEnv(), testService(func(ctx context.Context, _ *Runtime, _ testConfig) error {
+		log.Print("http: TLS handshake error from 203.0.113.5:51234: EOF")
+		<-ctx.Done()
+		return nil
+	}))
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(h.out.String(), "TLS handshake error") {
+		if time.Now().After(deadline) {
+			t.Fatalf("no line from the log package: %q", h.out.String())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	h.cancel()
+	h.wait()
+	if out := h.out.String(); strings.Contains(out, "203.0.113.5") || !strings.Contains(out, "from 203.0.113.0/24: EOF") {
+		t.Errorf("logged %s", out)
+	}
 }
