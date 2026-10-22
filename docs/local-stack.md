@@ -301,7 +301,7 @@ describe them. #56 provides the AWS values. Locally:
 | `HSS_DYNAMODB_ENDPOINT`, `SCSCF_DYNAMODB_ENDPOINT`, `FT_DYNAMODB_ENDPOINT`, `FT_S3_ENDPOINT`, `RELAY_DYNAMODB_ENDPOINT` | `http://dynamodb:8000`, `http://s3:9090` | unset |
 | `AWS_*` credentials | `local` | the task role |
 | hss data key | `HSS_DATA_KEY` (dev keyring path) | `HSS_KMS_KEY_ID` |
-| tokens, `FT_NONCE_KEY`, `RCS_PII_HMAC_KEY`, `scscf`'s keys | `deploy/compose.env` (`scscf`'s as `SCSCF_NONCE_KEY`, `SCSCF_DIALOG_KEY` and `SCSCF_CHALLENGE_KEY`, each given an ID in the compose file) | Secrets Manager |
+| tokens, `FT_NONCE_KEY`, `RCS_PII_HMAC_KEY`, `scscf`'s keys | `deploy/compose.env` (`scscf`'s as `SCSCF_NONCE_KEY`, `SCSCF_DIALOG_KEY` and `SCSCF_CHALLENGE_KEY`) | Secrets Manager |
 | `ICSCF_HSS_DISCOVERY`, `SCSCF_HSS_DISCOVERY` | `dns`, `hss.rcs.local` | `cloudmap` |
 | `PCSCF_CLIENT_TRANSPORT` | `tcp`, no TLS | `nlb-tls` or `tls` |
 | `RELAY_PUBLIC_TLS`, `RCS_PROXY_PROTOCOL` | `false`, `false` (no NLB) | `true`, `true` |

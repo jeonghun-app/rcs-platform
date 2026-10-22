@@ -255,8 +255,8 @@ services:
       # As icscf's: hss.rcs.local by DNS (dev only).
       SCSCF_HSS_DISCOVERY: dns
       SCSCF_NONCE_KEY: ${SCSCF_NONCE_KEY:?not in deploy/compose.env; make up adds new settings to it}
-      SCSCF_DIALOG_KEYS: k1:${SCSCF_DIALOG_KEY:?not in deploy/compose.env; make up adds new settings to it}
-      SCSCF_CHALLENGE_KEYS: c1:${SCSCF_CHALLENGE_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      SCSCF_DIALOG_KEY: ${SCSCF_DIALOG_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      SCSCF_CHALLENGE_KEY: ${SCSCF_CHALLENGE_KEY:?not in deploy/compose.env; make up adds new settings to it}
       # The name clients reach pcscf at, which ends a dialog's route set in
       # rcsjta's session refreshes.
       SCSCF_EDGE_PROXY_PUBLIC_HOSTS: ${PCSCF_PUBLIC_HOST:-pcscf}
