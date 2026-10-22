@@ -393,3 +393,40 @@ func TestOnlyALiveBindingsPathAuthorisesAPCSCF(t *testing.T) {
 	res, _ := e.notifier(1).Subscribe(bg, subscribe(t, impu1, pcscfPath, 3600))
 	wantStatus(t, res, 403)
 }
+
+// TestASubscriptionsNOTIFYsGoOnlyToAPCSCFTheSetCameOver (#256 security
+// review): the first hop of the dialog, its first route or without one the
+// subscriber's Contact, must be the P-CSCF of a live binding of the set,
+// by host and port; anywhere else is refused, so that a SUBSCRIBE cannot
+// have the set's state sent to an address of its choice.
+func TestASubscriptionsNOTIFYsGoOnlyToAPCSCFTheSetCameOver(t *testing.T) {
+	for name, c := range map[string]struct {
+		route, contact string
+		pai            string
+		want           int
+	}{
+		"routed through the P-CSCF":         {"<sip:pcscf." + realm + ";lr>", "<sip:ue1@192.0.2.11:5060;transport=tcp>", impu1, 200},
+		"the P-CSCF itself, no route":       {"", "<sip:pcscf." + realm + ":5060;transport=tcp>", pcscfPath, 200},
+		"routed elsewhere":                  {"<sip:attacker.example.com;lr>", "<sip:pcscf." + realm + ":5060;transport=tcp>", pcscfPath, 403},
+		"the P-CSCF's host on another port": {"<sip:pcscf." + realm + ":5099;lr>", "<sip:ue1@192.0.2.11:5060;transport=tcp>", impu1, 403},
+		"straight to the UE":                {"", "<sip:ue1@192.0.2.11:5060;transport=tcp>", impu1, 403},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.registered(binding(1, time.Hour))
+			m := &counts{}
+			n := newNotifierWith(t, e, e.store, e.send, func(cfg *Config) { cfg.Metrics = m })
+			req := subscribe(t, impu1, c.pai, 3600)
+			req.Header.Del("Record-Route")
+			if c.route != "" {
+				_ = req.Header.Set("Record-Route", c.route)
+			}
+			_ = req.Header.Set("Contact", c.contact)
+			res, _ := n.Subscribe(bg, req)
+			wantStatus(t, res, c.want)
+			if refused := m.get("regevent.refused_route"); (c.want == 403) != (refused == 1) {
+				t.Errorf("regevent.refused_route = %d", refused)
+			}
+		})
+	}
+}

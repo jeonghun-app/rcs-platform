@@ -52,6 +52,9 @@ type deps struct {
 	// transaction layer's and the proxy's memory below their defaults, so
 	// that a test meets each overload refusal.
 	serverTransactionBytes, contextBytes int64
+	// clock, if set, runs the proxy's transaction timers, a branch's
+	// Target.Timeout among them; nil is the system clock.
+	clock transaction.Clock
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
 }
@@ -174,8 +177,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
 		Metrics:   rt.Metrics,
-		// Zero: the defaults.
-		Transaction:     transaction.Config{MaxServerTransactionBytes: d.serverTransactionBytes},
+		// Zero: the defaults, and the system clock.
+		Transaction: transaction.Config{
+			Clock: d.clock, MaxServerTransactionBytes: d.serverTransactionBytes,
+		},
 		MaxContextBytes: d.contextBytes,
 	})
 	if err != nil {

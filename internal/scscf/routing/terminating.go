@@ -203,7 +203,7 @@ func (rt *Router) repair(ctx context.Context, id *state.Identity, set *state.Reg
 	rt.repairs.Add(1)
 	go func() {
 		defer rt.repairs.Done()
-		ctx, cancel := context.WithTimeout(ctx, rt.cfg.RepairTimeout)
+		ctx, cancel := rt.bounded(ctx, rt.cfg.RepairTimeout)
 		defer cancel()
 		if _, err := rt.cfg.Store.SaveIdentity(ctx, &want, rt.cfg.Now()); err != nil {
 			rt.count("routing.identity_repair_failed")

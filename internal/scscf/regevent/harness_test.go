@@ -152,6 +152,9 @@ func subscribe(t *testing.T, target, pai string, expires int, extra ...string) *
 		"Call-ID: sub-call-1",
 		"CSeq: 1 SUBSCRIBE",
 		"Contact: <sip:pcscf." + realm + ":5060;transport=tcp>",
+		// The P-CSCF the bindings came over records the route, as it does
+		// for a UE's SUBSCRIBE; its NOTIFYs go there first.
+		"Record-Route: <sip:pcscf." + realm + ";lr>",
 		"Event: reg",
 		"P-Asserted-Identity: <" + pai + ">",
 	}

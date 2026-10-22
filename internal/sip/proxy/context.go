@@ -122,6 +122,10 @@ const (
 type branch struct {
 	c      *respContext
 	target Target
+	// breadth is the branch's share of the request's Max-Breadth, held
+	// until it is final (RFC 5393 §5.3.3.1; see Target.Timeout for the
+	// exception).
+	breadth int
 
 	// Guarded by c.mu.
 	tx *transaction.ClientTransaction
@@ -529,19 +533,43 @@ func (c *respContext) allFinal() bool {
 // the layer's safety timer starts again (#156): each fork group and each
 // replacement gets its own Timer C or F before the layer answers for the
 // proxy. mu must be held.
+//
+// The branches started together share what the request's Max-Breadth leaves
+// beside the branches still without a final response, at least 1 each (RFC
+// 5393 §5.3.3): a target beyond that fails at once as 440 Max-Breadth
+// Exceeded, the answer when no other branch does better. A branch
+// Target.Timeout ended is final here though its transaction may still run
+// (see Target.Timeout).
 func (c *respContext) startBranches(targets []Target) []func() {
 	var acts []func()
 	started := false
+	var fresh []Target
 	for _, t := range targets {
-		if slices.ContainsFunc(c.branches, func(b *branch) bool { return sameTarget(b.target, t) }) {
+		if slices.ContainsFunc(c.branches, func(b *branch) bool { return sameTarget(b.target, t) }) ||
+			slices.ContainsFunc(fresh, func(f Target) bool { return sameTarget(f, t) }) {
 			continue
 		}
-		if len(c.branches) >= c.p.maxBranch {
+		if len(c.branches)+len(fresh) >= c.p.maxBranch {
 			c.p.stats.targetsDropped.Add(1)
 			continue
 		}
-		b := &branch{c: c, target: t}
+		fresh = append(fresh, t)
+	}
+	free := incomingBreadth(c.in.Message)
+	for _, b := range c.branches {
+		if !b.final {
+			free -= b.breadth
+		}
+	}
+	shares := breadthShares(free, len(fresh))
+	for i, t := range fresh {
+		b := &branch{c: c, target: t, breadth: shares[i]}
 		c.branches = append(c.branches, b)
+		if b.breadth == 0 {
+			c.p.stats.breadthExceeded.Add(1)
+			acts = append(acts, c.branchEnded(b, c.failureResponse(ErrMaxBreadth), ErrMaxBreadth)...)
+			continue
+		}
 		// Each branch holds a copy of the header (the body is shared) and its
 		// CANCEL.
 		cost := 2 * c.header
@@ -580,6 +608,26 @@ func sameTarget(a, b Target) bool {
 // errOverload fails a branch that would take the proxy past MaxContextBytes.
 var errOverload = errors.New("proxy: over the memory budget")
 
+// ErrMaxBreadth is the BranchFailure.Err of a target the request's
+// Max-Breadth left no share for (RFC 5393 §5.3.3): it was never sent, and
+// counts as a 440 Max-Breadth Exceeded the proxy made.
+var ErrMaxBreadth = errors.New("proxy: no Max-Breadth left for the branch")
+
+// breadthShares splits free Max-Breadth among n branches started together,
+// as evenly as it goes, the first ones taking what is left over; the
+// branches past free get 0.
+func breadthShares(free, n int) []int {
+	shares := make([]int, n)
+	k := min(n, max(free, 0))
+	for i := range k {
+		shares[i] = free / k
+		if i < free%k {
+			shares[i]++
+		}
+	}
+	return shares
+}
+
 // start builds and sends the branch's request (§16.6), on a goroutine of its
 // own since resolving, Prepare and the send itself can block.
 func (b *branch) start() {
@@ -595,7 +643,7 @@ func (b *branch) start() {
 	// Under reqCtx, which a CANCEL and Drain's deadline end, so that a
 	// stalled Prepare or Resolver, such as pcscf waiting on msrp-relay, does
 	// not hold the 487 or the drain's answer back (#382).
-	fwd, dst, err := p.buildBranch(c.reqCtx, c.in, &c.dec, b.target, true)
+	fwd, dst, err := p.buildBranch(c.reqCtx, c.in, &c.dec, b.target, true, b.breadth)
 	if err == nil {
 		err = b.addVia(fwd, dst)
 	}
@@ -729,6 +777,8 @@ func (c *respContext) failureResponse(err error) final {
 	switch {
 	case errors.Is(err, errPrepare):
 		return c.made(500)
+	case errors.Is(err, ErrMaxBreadth):
+		return c.made(440)
 	case errors.Is(err, transport.ErrNoFlow):
 		// RFC 5626 §5.3.1: the flow the target was registered over is gone.
 		return c.made(430)
@@ -1048,14 +1098,42 @@ func (b *branch) terminate() {
 // branch ends at once, counting as a 408, so a replacement can start without
 // waiting: an INVITE branch that has a provisional response is cancelled and
 // its transaction left to absorb the 487 (a 2xx from it is still forwarded,
-// §16.7 step 5), and any other branch's transaction is terminated. mu must be
-// held.
+// §16.7 step 5), and any other branch's transaction is terminated, unless
+// Target.OnTimeout keeps the branch. mu must be held.
 func (b *branch) armTimeout() {
 	c, p := b.c, b.c.p
 	b.timeoutTimer = p.clock.AfterFunc(b.target.Timeout, func() {
 		if p.isClosed() {
 			return
 		}
+		keep := b.target.OnTimeout
+		if keep == nil {
+			b.timeoutNow()
+			return
+		}
+		// It may block, as scscf asks its store, and a timer must not.
+		p.spawn(func() {
+			// A panic leaves applies true: the timeout ends the branch, as
+			// when scscf's store cannot say.
+			applies := true
+			p.hook("OnTimeout", func() { applies = keep(c.ctx) })
+			if applies {
+				b.timeoutNow()
+				return
+			}
+			p.stats.targetTimeouts.Add(1)
+			p.stats.targetTimeoutsKept.Add(1)
+		})
+	})
+}
+
+// timeoutNow ends the branch on its target's timeout (armTimeout).
+func (b *branch) timeoutNow() {
+	c, p := b.c, b.c.p
+	if p.isClosed() {
+		return
+	}
+	{
 		c.mu.Lock()
 		if b.final {
 			c.mu.Unlock()
@@ -1077,7 +1155,7 @@ func (b *branch) armTimeout() {
 		}
 		c.mu.Unlock()
 		b.terminate()
-	})
+	}
 }
 
 // armTimerC starts or restarts Timer C (§16.6 step 11, §16.7 step 2). mu must
@@ -1299,6 +1377,12 @@ func (c *respContext) best() final {
 // within 5xx anything but a 503; then one received beats one the proxy made up,
 // which says less, and otherwise the first received stays.
 func better(a, b final) bool {
+	// The proxy's own 440, for a target it did not send, ranks below every
+	// other answer it made: a timeout's 408 that RFC 4320 §4.2 keeps from
+	// the client, a cancelled INVITE's 487 (code review of #454).
+	if a.made && b.made && (a.res.StatusCode == 440) != (b.res.StatusCode == 440) {
+		return b.res.StatusCode == 440
+	}
 	ca, cb := a.res.StatusCode/100, b.res.StatusCode/100
 	switch {
 	case ca == 6 || cb == 6:

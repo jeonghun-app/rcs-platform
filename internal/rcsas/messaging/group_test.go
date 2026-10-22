@@ -22,12 +22,27 @@ const groupURI = "sip:chat-1@conf.ims.example.net"
 // members is a GroupHandler of one group whose participants all write to
 // each other, under the names in names, or refuse when refuse is set.
 // Member leaves out those in left: a copy written to them before they
-// left.
+// left. The group is this task's unless another, alive, owns it
+// (notMine), and its copies are queued under fence; lost counts the
+// groups the engine said it lost.
 type members struct {
-	all    []string
-	left   []string
-	names  map[string]string
-	refuse error
+	all     []string
+	left    []string
+	names   map[string]string
+	refuse  error
+	notMine bool
+	fence   *store.Fence
+	lost    *atomic.Int64
+}
+
+func (h members) Owns(_ context.Context, group string) (bool, error) {
+	return group == groupURI && !h.notMine, nil
+}
+
+func (h members) Lost(group string) {
+	if h.lost != nil && group == groupURI {
+		h.lost.Add(1)
+	}
 }
 
 func (h members) Recipients(_ context.Context, group, sender string, kind GroupKind) (Audience, error) {
@@ -37,7 +52,7 @@ func (h members) Recipients(_ context.Context, group, sender string, kind GroupK
 	if group != groupURI {
 		return Audience{}, Reject(ReasonNoGroup)
 	}
-	aud := Audience{SenderName: h.names[sender]}
+	aud := Audience{SenderName: h.names[sender], Fence: h.fence}
 	for _, m := range h.all {
 		if m != sender {
 			aud.Recipients = append(aud.Recipients, m)
@@ -730,5 +745,57 @@ func TestAParticipantsOwnSessionLiftsTheUnreachableMark(t *testing.T) {
 	waitFor(t, "idle", r.idle)
 	if n := r.store.(*store.Memory).Len(bob); n != 1 || r.m.get("delivery.undeliverable") != 0 {
 		t.Fatalf("bob's queue holds %d, %d given up", n, r.m.get("delivery.undeliverable"))
+	}
+}
+
+// #121 D2 (T8): a copy of a group another task owns is not used to invite
+// its recipient from here: that would open the group's session on this
+// task, and the owner's next message would invite back. The owner, told
+// (Wake), reads the queue again and invites.
+func TestOnlyTheGroupsOwnerInvitesForItsCopies(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}, notMine: true})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 || r.m.get("delivery.group_not_owned") == 0 {
+		t.Fatalf("%d invitations from a task that does not own the group; %d skipped", n, r.m.get("delivery.group_not_owned"))
+	}
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.e.Wake(bob)
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI || r.m.get("group.wake") != 1 {
+		t.Fatalf("invitation %+v after the wake", inv)
+	}
+}
+
+// #121 D2 (T4): every copy is queued under the group's owner the handler
+// names; once the store no longer holds it, the fan-out stops at the first
+// refused copy and the sender is answered as for a store failure.
+func TestACopyIsQueuedOnlyUnderTheGroupsOwner(t *testing.T) {
+	r := newRig(t, Config{})
+	mem := r.store.(*store.Memory)
+	owner := atomic.Int64{}
+	owner.Store(1)
+	mem.SetFence(func(f store.Fence) bool { return f.Group == groupURI && f.Epoch == owner.Load() })
+	h := members{all: []string{alice, bob, carol}, fence: &store.Fence{Group: groupURI, Task: "task-a", Epoch: 1}, lost: new(atomic.Int64)}
+	r.e.SetGroupHandler(h)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if mem.Len(bob) != 1 || mem.Len(carol) != 1 {
+		t.Fatalf("queues: bob %d, carol %d", mem.Len(bob), mem.Len(carol))
+	}
+	owner.Store(2) // another task took the group over
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m2", "hi", 0))); !errors.Is(err, store.ErrNotOwner) {
+		t.Fatalf("SubmitGroup after the takeover = %v", err)
+	}
+	if mem.Len(bob)+mem.Len(carol) != 2 || r.m.get("group.fanout.not_owner") != 1 {
+		t.Fatalf("queues: bob %d, carol %d; %d refused", mem.Len(bob), mem.Len(carol), r.m.get("group.fanout.not_owner"))
+	}
+	// The group package hears of it, and reads the owner again before it
+	// invites for the group (QA on #440).
+	if h.lost.Load() != 1 {
+		t.Fatalf("the handler was told %d times", h.lost.Load())
 	}
 }

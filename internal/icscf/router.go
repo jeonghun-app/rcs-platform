@@ -350,7 +350,9 @@ func (r *Router) answerUnreachable(d *proxy.Decision, kind string, next []transp
 		mu          sync.Mutex
 	)
 	d.OnBranchFailure = func(_ context.Context, f proxy.BranchFailure) []proxy.Target {
-		if f.Err == nil || f.Response == nil || f.Response.StatusCode != 503 {
+		// No replacement for a target the request's Max-Breadth left no
+		// share for: it would fail the same way (proxy.ErrMaxBreadth).
+		if f.Err == nil || errors.Is(f.Err, proxy.ErrMaxBreadth) || f.Response == nil || f.Response.StatusCode != 503 {
 			return nil
 		}
 		if dst := f.Target.Destination; dst != nil && dst.Addr.IsValid() {

@@ -55,7 +55,7 @@ func (p *Proxy) forwardACK(req *sip.Request, src transport.Source) bool {
 	if dec.Response != nil || dec.Status != 0 || len(dec.Targets) == 0 {
 		return false
 	}
-	fwd, dst, err := p.buildBranch(p.ctx, in, &dec, dec.Targets[0], false)
+	fwd, dst, err := p.buildBranch(p.ctx, in, &dec, dec.Targets[0], false, incomingBreadth(in.Message))
 	if err != nil {
 		return false
 	}
