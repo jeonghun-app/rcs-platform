@@ -58,6 +58,7 @@ func stackFT(t *testing.T) (scenario.Config, *simtest.FT) {
 		FileSize:     100 << 10,
 		ResumeSize:   5*part + 123,
 		Control:      &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: secret.NewString(simtest.RelayToken)},
+		RelayPublic:  r.Public,
 		CoreListener: core.Lend,
 		MSRP:         msrp.Config{KeepAliveInterval: 100 * time.Millisecond},
 		IdleWait:     600 * time.Millisecond,
@@ -142,7 +143,7 @@ func TestUnknownScenariosAreRefusedBeforeAnythingRuns(t *testing.T) {
 	if !errors.Is(err, scenario.ErrUnknown) || ran {
 		t.Fatalf("Run = %v, ran %v", err, ran)
 	}
-	if names := scenario.Names(); strings.Join(names, " ") != "chat-client-originated chat-core-originated ft ft-resume options pager-message reg-event" {
+	if names := scenario.Names(); strings.Join(names, " ") != "chat-client-originated chat-core-originated chat-invite ft ft-resume options pager-message reg-event" {
 		t.Fatalf("Names = %v", names)
 	}
 }

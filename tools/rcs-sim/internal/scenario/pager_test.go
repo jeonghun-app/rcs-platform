@@ -71,6 +71,11 @@ func TestAPagerMessageIsDeliveredAndItsNotificationComesBack(t *testing.T) {
 	if steps["message"].Detail["status"] != 200 || steps["receive"].Detail["skipped"] != 0 {
 		t.Fatalf("message %+v, receive %+v", steps["message"], steps["receive"])
 	}
+	// The notification's MESSAGE says who answered it, as the message's
+	// does: here the client itself, through the stand-in.
+	if steps["delivery-notification"].Detail["status"] != 200 {
+		t.Fatalf("delivery-notification %+v", steps["delivery-notification"])
+	}
 	// What the platform does today for an unregistered IMPU.
 	if d := steps["peer-offline"].Detail; d["status"] != 480 || d["stored"] != 0 {
 		t.Fatalf("peer-offline %+v", steps["peer-offline"])
