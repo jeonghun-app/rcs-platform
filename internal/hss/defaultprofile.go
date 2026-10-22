@@ -33,6 +33,13 @@ const (
 	// callee as MSRP and past rcs-as (#359 security review). An ERE has no
 	// case flag, hence the bracket pairs.
 	msrpMedia = `^[Mm][Ee][Ss][Ss][Aa][Gg][Ee] [^ ]+ [Tt][Cc][Pp]/([Tt][Ll][Ss]/)?[Mm][Ss][Rr][Pp] `
+	// The conference event package (RFC 4575) in an Event value: the
+	// whole event type, with or without parameters, so that another
+	// package whose name starts so is not taken for it. In any case, as
+	// rcs-as compares it, so that every roster SUBSCRIBE rcs-as would serve
+	// reaches it (#557). The value is collapsed (ifc), so at most one space
+	// comes before the semicolon.
+	conferenceEvent = `^[Cc][Oo][Nn][Ff][Ee][Rr][Ee][Nn][Cc][Ee]( ?;.*)?$`
 )
 
 // otherService is a feature tag, as an ifc.FeatureTagField presents it,
@@ -72,10 +79,16 @@ const servedUserHeader = "P-Served-User"
 //	    OMA SIMPLE IM, rcsjta's chat, or an MSRP stream
 //	    unless image share, video share or MMTEL)           SESSION_TERMINATED
 //	20  MESSAGE                                             SESSION_TERMINATED
+//	25  SUBSCRIBE to the conference event package (a group
+//	    chat's roster, at its conference URI)              SESSION_TERMINATED
 //	30  OPTIONS for an RCS service (capability discovery)   SESSION_CONTINUED
 //	40  REGISTER (third-party registration)                 SESSION_CONTINUED
 //
 // each only without a P-Served-User (servedUserHeader).
+//
+// A roster SUBSCRIBE goes to a conference URI, whose host is not the home
+// domain, so without its own trigger the S-CSCF would find no route for it
+// (#557). A rejoin INVITE to that URI takes the chat trigger.
 //
 // Chat and messaging fail rather than bypass rcs-as when it cannot be
 // reached: without it there is no MSRP anchor, IMDN or store-and-forward.
@@ -124,11 +137,18 @@ func DefaultRCSProfile(id, asURI string) *store.ServiceProfile {
 	method := func(m string) *ifc.TriggerPoint {
 		return &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: []ifc.SPT{{Groups: []int{0}, Condition: ifc.Method(m)}, notServed(1)}}
 	}
+	// (SUBSCRIBE) AND (Event: conference) AND NOT (P-Served-User).
+	roster := &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: []ifc.SPT{
+		{Groups: []int{0}, Condition: ifc.Method("SUBSCRIBE")},
+		{Groups: []int{1}, Condition: ifc.SIPHeader{Header: "Event", Content: conferenceEvent}},
+		notServed(2),
+	}}
 	return &store.ServiceProfile{
 		ID: id,
 		Criteria: []ifc.FilterCriteria{
 			{Priority: 10, TriggerPoint: rcsRequest("INVITE"), ApplicationServer: as(ifc.SessionTerminated)},
 			{Priority: 20, TriggerPoint: method("MESSAGE"), ApplicationServer: as(ifc.SessionTerminated)},
+			{Priority: 25, TriggerPoint: roster, ApplicationServer: as(ifc.SessionTerminated)},
 			{Priority: 30, TriggerPoint: rcsRequest("OPTIONS"), ApplicationServer: as(ifc.SessionContinued)},
 			{Priority: 40, TriggerPoint: method("REGISTER"), ApplicationServer: as(ifc.SessionContinued)},
 		},
