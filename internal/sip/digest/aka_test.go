@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // TS 35.208 §4.3.1, test set 1.
@@ -248,11 +249,11 @@ func TestVerifyAKARefusesWhatItCannotCheck(t *testing.T) {
 }
 
 func TestAKAServerDataIsOptIn(t *testing.T) {
-	s, err := NewServer(ServerConfig{Realm: testRealm, NonceKey: testKey, NonceCounts: NewMemoryNonceCounts(nil)})
+	s, err := NewServer(ServerConfig{Realm: testRealm, NonceKey: secret.NewKey(testKey), NonceCounts: NewMemoryNonceCounts(nil)})
 	if err != nil || s.akaServerData {
 		t.Fatalf("server data on by default (err %v)", err)
 	}
-	s, err = NewServer(ServerConfig{Realm: testRealm, NonceKey: testKey, NonceCounts: NewMemoryNonceCounts(nil), AKAServerData: true})
+	s, err = NewServer(ServerConfig{Realm: testRealm, NonceKey: secret.NewKey(testKey), NonceCounts: NewMemoryNonceCounts(nil), AKAServerData: true})
 	if err != nil || !s.akaServerData {
 		t.Fatalf("AKAServerData not applied (err %v)", err)
 	}
