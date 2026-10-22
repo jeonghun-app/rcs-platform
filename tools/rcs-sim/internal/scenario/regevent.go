@@ -67,12 +67,12 @@ func regEvent(r *run) error {
 		if _, err := c.ua.Unregister(ctx); err != nil {
 			return nil, sipError(err)
 		}
-		n, own, err := w.next(ctx)
+		n, own, skipped, err := w.untilChanged(ctx, ended)
 		if err != nil {
-			return nil, err
+			return map[string]int64{"skipped": int64(skipped)}, err
 		}
 		if own.Active() || own.Event != reginfo.Unregistered {
-			return nil, errors.New("the client's contact did not end as unregistered")
+			return map[string]int64{"skipped": int64(skipped)}, errors.New("the client's contact did not end as unregistered")
 		}
 		// After the user's own de-registration the subscription ends as if
 		// it had been refreshed with Expires 0 (TS 24.229 §5.4.1.4), so with
@@ -80,7 +80,9 @@ func regEvent(r *run) error {
 		// §4.1.3). "noresource" says the registration itself went away
 		// without the user, an expiry for one, which is not what happened
 		// here, so it fails: the team's decision on #216.
-		return w.ended(n, "", "timeout", "deactivated")
+		detail, err := w.ended(n, "", "timeout", "deactivated")
+		detail["skipped"] = int64(skipped)
+		return detail, err
 	}); err != nil {
 		return err
 	}
@@ -98,23 +100,26 @@ func regEvent(r *run) error {
 		if err := r.cfg.Deregister(ctx, r.cfg.SIP.IMPU); err != nil {
 			return nil, errors.New("the network deregistration could not be asked for")
 		}
-		n, own, err := w.next(ctx)
+		n, own, skipped, err := w.untilChanged(ctx, ended)
+		detail["skipped"] = int64(skipped)
 		if err != nil {
-			return nil, err
+			return detail, err
 		}
 		// TS 24.229 §5.4.1.5 4) b): "unregistered", "deactivated" (the
 		// client may register again) or "rejected" (it may not; RFC 3680
 		// §4.7.1).
 		switch {
 		case own.Active():
-			return nil, errors.New("the client's contact did not end with the network's deregistration")
+			return detail, errors.New("the client's contact did not end with the network's deregistration")
 		case own.Event != reginfo.Unregistered && own.Event != reginfo.Deactivated && own.Event != reginfo.Rejected:
-			return nil, errors.New("the client's contact did not end as unregistered, deactivated or rejected")
+			return detail, errors.New("the client's contact did not end as unregistered, deactivated or rejected")
 		}
 		// §5.4.1.5 sets the state to "terminated" and no reason; RFC 6665
 		// §4.1.3 makes the reason optional, and these are the ones it has
 		// for a subscription the notifier ended.
-		return w.ended(n, "", "deactivated", "probation", "rejected", "timeout", "giveup", "noresource")
+		detail, err = w.ended(n, "", "deactivated", "probation", "rejected", "timeout", "giveup", "noresource")
+		detail["skipped"] = int64(skipped)
+		return detail, err
 	})
 }
 
@@ -148,22 +153,26 @@ func (r *run) subscribeRegEvent(ctx context.Context, c *sipClient) (*regWatch, m
 	return w, detail, nil
 }
 
-// untilChanged waits for the NOTIFY that tells of the change a REGISTER
-// made, and returns it with the client's contact and how many came before
-// it. A network may first send a NOTIFY of a state it has told already,
-// the client's contact as it was and the version raised (#473 QA): one
-// that refreshed does not accept and that repeats the last NOTIFY's
-// contact is skipped, checked as next checks every NOTIFY. Any other is
-// returned for the step to judge.
-func (w *regWatch) untilChanged(ctx context.Context, refreshed func(reginfo.Contact) bool) (sipua.Notification, reginfo.Contact, int, error) {
+// untilChanged waits for the NOTIFY that tells of the change a step made,
+// and returns it with the client's contact and how many came before it. A
+// network may first send a NOTIFY of a state it has told already, the
+// client's contact as it was and the version raised (#473 QA, #516): one
+// that changed does not accept and that repeats the last NOTIFY's contact
+// is skipped, checked as next checks every NOTIFY. Any other is returned
+// for the step to judge.
+func (w *regWatch) untilChanged(ctx context.Context, changed func(reginfo.Contact) bool) (sipua.Notification, reginfo.Contact, int, error) {
 	for skipped := 0; ; skipped++ {
 		before := w.last
 		n, own, err := w.next(ctx)
-		if err != nil || refreshed(own) || !sameContact(own, before) {
+		if err != nil || changed(own) || !sameContact(own, before) {
 			return n, own, skipped, err
 		}
 	}
 }
+
+// ended accepts the client's contact once it is no longer active, for the
+// steps that end the registration.
+func ended(own reginfo.Contact) bool { return !own.Active() }
 
 // refreshedBy accepts the client's contact as the refresh reg made it: by
 // the CSeq of the REGISTER that last changed it, when the NOTIFY gives one
@@ -182,8 +191,10 @@ func refreshedBy(reg *sipua.Registration) func(reginfo.Contact) bool {
 }
 
 // sameContact reports whether a and b tell the same of the client's
-// contact: its state, its event and the CSeq of the REGISTER that last
-// changed it.
+// contact: its state and the CSeq of the REGISTER that last changed it.
+// The event is left out: scscf writes a contact another binding's change
+// left as it was "registered" again, after a "refreshed" (#543 code
+// review).
 func sameContact(a, b reginfo.Contact) bool {
 	cseq := func(c reginfo.Contact) int64 {
 		if c.CSeq == nil {
@@ -191,7 +202,7 @@ func sameContact(a, b reginfo.Contact) bool {
 		}
 		return int64(*c.CSeq)
 	}
-	return a.State == b.State && a.Event == b.Event && cseq(a) == cseq(b)
+	return a.State == b.State && cseq(a) == cseq(b)
 }
 
 // regWatch follows the NOTIFYs of one subscription. instance is the
