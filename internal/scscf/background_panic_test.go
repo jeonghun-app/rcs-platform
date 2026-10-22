@@ -196,3 +196,47 @@ func TestAPanickingReportAtTheStopEndsItAsEver(t *testing.T) {
 		t.Errorf("%v panics counted, want the report's", n)
 	}
 }
+
+// panicsOnceDialer panics on its first dial to addr, as a bug in a dial
+// would, and dials as ever after.
+type panicsOnceDialer struct {
+	addr     string
+	panicked atomic.Bool
+}
+
+func (p *panicsOnceDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if address == p.addr && p.panicked.CompareAndSwap(false, true) {
+		panic("scscf test panic")
+	}
+	var d net.Dialer
+	return d.DialContext(ctx, network, address)
+}
+
+// TestASendAfterAPanickingDialStillGoes (#527 code review): the first
+// third-party REGISTER's dial to the server panics. The panic is
+// recovered, and what it held is released: the next REGISTER to the same
+// server reaches it, and the stop ends within its budget.
+func TestASendAfterAPanickingDialStillGoes(t *testing.T) {
+	hss := startHSS(t)
+	as := startSilentPeer(t)
+	dialer := &panicsOnceDialer{addr: as.addr}
+	uri := "sip:" + as.addr + ";transport=tcp"
+	hss.asURI.Store(&uri)
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
+		c.ThirdPartyTimeout = 2 * time.Second
+		d.sipDialer = dialer
+	})
+	p := dialSCSCF(t, r)
+	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
+	waitFor(t, "the panic counted", func() bool {
+		v, _ := r.h.Metric(metricBackgroundPanics)
+		return v >= 1
+	})
+	p.registerFully(t, deviceAt("127.0.0.1:5070", 2), 600)
+	waitFor(t, "the next REGISTER at the server", func() bool { return as.got.Load() >= 1 })
+	start := time.Now()
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	checkStopTook(t, time.Since(start))
+}
