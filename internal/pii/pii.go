@@ -762,8 +762,9 @@ func joinSchemes(s string) string {
 	return b.String()
 }
 
-// splitsScheme reports whether a run of invisible characters, after the text
-// written followed by pending and before rest, is inside a scheme.
+// splitsScheme reports whether a run of invisible characters and combining
+// marks, after the text written followed by pending and before rest, is
+// inside a scheme.
 func splitsScheme(written, pending, rest string) bool {
 	for _, sch := range schemes {
 		for k := 1; k < len(sch); k++ {

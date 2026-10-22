@@ -601,9 +601,10 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 // default-ignorable one as nothing; a combining mark (Mn, Me) right after a
 // number character as part of it, as the viewer draws it over that
 // character: a digit (a keycap "1\ufe0f\u20e3"), a "+", a separator, a tel
-// number's "*", "#" or hex digit, an IMEI's dash, or the ":" a tel number
-// starts after; and every space (Zs, Zl, Zp, U+2800 BRAILLE
-// PATTERN BLANK) as a space. Every character of each class is tried.
+// number's "*", "#" or hex digit, an IMEI's dash, the ":" a tel number
+// starts after, or a letter of the scheme (#561); and every space (Zs, Zl,
+// Zp, U+2800 BRAILLE PATTERN BLANK) as a space. Every character of each
+// class is tried.
 func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 	k := NewRedactor(testKey)
 	templates := []string{
@@ -627,6 +628,11 @@ func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 		"tX" + "el:*31#",
 		"telX:*31#",
 		"urn:gsma:imXei:00101000-000003-1",
+		// A user that is not a number has no digit rule behind it, so a
+		// mark here that hid the scheme would leave the name plain.
+		"sX" + "ip:alice.smith@" + testDomain,
+		"preXs:alice.smith@" + testDomain,
+		"imX:alice.smith@" + testDomain,
 		"tel:*X31#",
 		"tel:123456*X78#9",
 		"tel:1234abX5678",
@@ -718,6 +724,10 @@ func TestRedactReadsAURIWithInvisiblesAsWithout(t *testing.T) {
 		"t\u0301e\u0301l:*31#":                  "tel:*31#",
 		"urn:gs\u0301ma:imei:00101000-000003-1": "urn:gsma:imei:00101000-000003-1",
 		"urn:gsma\u200b:imei:00101000-000003-1": "urn:gsma:imei:00101000-000003-1",
+		"s\u0301ip:alice.smith@x":               "sip:alice.smith@x",
+		"sips\u0301:alice.smith@x":              "sips:alice.smith@x",
+		"i\u0301m:alice.smith@x":                "im:alice.smith@x",
+		"pre\u0301s:alice.smith@x":              "pres:alice.smith@x",
 		"tel:\u200b123456*78#9":                 "tel:123456*78#9",
 		"tel:\u200b*31#":                        "tel:*31#",
 		"sip:\u200balice.smith@x":               "sip:alice.smith@x",
