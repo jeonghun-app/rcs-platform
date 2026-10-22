@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -110,7 +111,7 @@ func newAnchoring(t *testing.T, perFlow, total int) *anchoring {
 	a := &anchoring{p: p, clock: clock, relay: relay, base: base, sent: &fakeSender{}, alive: map[transport.FlowID]bool{"FLOW-A": true}}
 	// The relay's answers are timed by the test, never by the client: a
 	// loaded host may take more than a second for one (make race).
-	p.msrp = newMSRPAnchor(context.Background(), newRelayClient(base, testRelayToken, waitFor, nil), newBindingLimit(perFlow, total, DefaultBindingsPerMinute, clock.now))
+	p.msrp = newMSRPAnchor(context.Background(), newRelayClient(base, secret.NewString(testRelayToken), waitFor, nil), newBindingLimit(perFlow, total, DefaultBindingsPerMinute, clock.now))
 	p.send = a.sent.send
 	var mu sync.Mutex
 	p.clientFlow = func(id transport.FlowID) bool { mu.Lock(); defer mu.Unlock(); return a.alive[id] }
