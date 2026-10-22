@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -432,7 +433,7 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	n := &deadlineNotifier{recordingNotifier: *newRecorder()}
 	const each = time.Hour
 	start := time.Now()
-	h.pprRejected(context.Background(), n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData), each)
+	h.pprRejected(context.Background(), n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData), pushTimes{each: each})
 	end := time.Now()
 	if e.sub(impi1).Identity(impu1).State != store.NotRegistered {
 		t.Fatal("the user was not marked not registered")
@@ -479,7 +480,7 @@ func TestAnRTRAfterALateRefusalHasItsOwnTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.h.notify(t.Context(), n, e.sub(impi1), p, []push{{set: 0}}, each)
+	e.h.notify(t.Context(), n, e.sub(impi1), p, []push{{set: 0}}, pushTimes{each: each})
 	if len(n.deadlines) != 1 {
 		t.Fatalf("%d RTRs", len(n.deadlines))
 	}
@@ -661,5 +662,305 @@ func TestAStoreOutageAfterALostWriteIsAStoreFailure(t *testing.T) {
 	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
 	if code != http.StatusServiceUnavailable || body["error"] != "the subscriber store is unavailable; retry" || a.metrics.get("api.store_failure") != 1 {
 		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, a.metrics.get("api.store_failure"))
+	}
+}
+
+// refusingAtTheEnd answers each PPR at once, but the refuseAt-th (from 0)
+// it refuses with TOO_MUCH_DATA halfway to the PPR's own deadline, as an
+// S-CSCF slow to refuse; done is when it refused, and pprEnd that PPR's
+// deadline.
+type refusingAtTheEnd struct {
+	deadlineNotifier
+	refuseAt int
+	// refused says the refusal came by the PPR's deadline. On a loaded
+	// host the sleep may wake after it: the fake then fails as the real
+	// Pusher does, with the context's error, and refuses nothing (code
+	// review on #524).
+	refused      bool
+	done, pprEnd time.Time
+}
+
+func (n *refusingAtTheEnd) PushProfile(ctx context.Context, r *cx.PPR) error {
+	_, pprs := n.got()
+	_ = n.recordingNotifier.PushProfile(ctx, r)
+	if len(pprs) != n.refuseAt {
+		return nil
+	}
+	// Halfway through the time the PPR has: late, and still within its
+	// deadline when a loaded host wakes the sleep late by up to that half.
+	d, _ := ctx.Deadline()
+	time.Sleep(time.Until(d) / 2)
+	n.done, n.pprEnd = time.Now(), d
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	// The context's timer may not have fired yet on a loaded host: past the
+	// deadline is past it all the same.
+	if n.done.After(d) {
+		return context.DeadlineExceeded
+	}
+	n.refused = true
+	return &RejectedError{Command: "PPR", Result: exp(cx.ErrorTooMuchData)}
+}
+
+// refusedInTime runs a scenario with a refusingAtTheEnd up to 3 times, and
+// returns the fake of the first run whose refusal came by the PPR's
+// deadline. A run whose refusal came late is not a failure: the S-CSCF
+// failed the PPR rather than refused it, and the HSS rightly sends no RTR.
+// Three such runs in a row are.
+func refusedInTime(t *testing.T, run func() *refusingAtTheEnd) *refusingAtTheEnd {
+	t.Helper()
+	for range 3 {
+		if n := run(); n.refused {
+			return n
+		}
+	}
+	t.Fatal("in 3 runs the refusal never came by the PPR's deadline")
+	return nil
+}
+
+// Code review on #524: a PPR of a change with a budget, refused at its own
+// deadline near the budget's end, still leaves the RTR it brings a whole
+// push timeout: a PPR keeps one before the end for its follow-up.
+func TestAnRTRAfterARefusalNearTheBudgetsEndHasItsOwnTime(t *testing.T) {
+	// The refused PPR starts with about 1 s of the budget, cut short with a
+	// whole each of 4 s kept after it, and is refused about 0.5 s in. A PPR
+	// that kept nothing would have had 4 s itself, and been refused 2 s in,
+	// leaving its RTR less than each before the budget's end.
+	const each, budget, reserve = 4 * time.Second, 5050 * time.Millisecond, 50 * time.Millisecond
+	n := refusedInTime(t, func() *refusingAtTheEnd {
+		e := newEnv(t)
+		e.provision(impi1, impu1)
+		e.modify(impi1, func(s *store.Subscription) {
+			s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
+		})
+		n := &refusingAtTheEnd{deadlineNotifier: deadlineNotifier{recordingNotifier: *newRecorder()}, refuseAt: 3}
+		p, err := e.store.Profile(t.Context(), DefaultProfileID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tm := pushTimes{each: each, until: time.Now().Add(budget), reserve: reserve}
+		e.h.notify(t.Context(), n, e.sub(impi1), p, []push{{set: 0}, {set: 0}, {set: 0}, {set: 0}, {set: 0}}, tm)
+		return n
+	})
+	if len(n.deadlines) != 1 {
+		t.Fatalf("%d RTRs", len(n.deadlines))
+	}
+	// The refusal came by the PPR's deadline, which leaves each before the
+	// budget's end less the reserve; the RTR starts after the refusal and
+	// gets min(its start + each, that end) as its deadline, from one
+	// reading of the clock (pushTimes.deadline). So at least each from the
+	// refusal, exactly.
+	if rtr := n.deadlines[0]; rtr.Before(n.done.Add(each)) {
+		t.Errorf("the RTR's deadline is %v after the refusal, want at least %v", rtr.Sub(n.done), each)
+	}
+}
+
+// #491: a push with less than pushFloor of the budget left is not started
+// with the few milliseconds there are, which would only fail: it is left
+// over, and its set marked stale.
+func TestAPushIsNotStartedWithTooLittleTime(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	e.modify(impi1, func(s *store.Subscription) {
+		s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
+	})
+	// The first RTR has its whole second, and still more than pushFloor
+	// when the host delays it by up to 0.9 s; the second would start with
+	// at most pushFloor/2.
+	const each = time.Second
+	silent := &silentNotifier{}
+	rtr := push{deregister: true, reason: cx.ServerChange, impus: []string{impu1}, set: -1, changed: 0}
+	tm := pushTimes{each: each, until: time.Now().Add(each + pushFloor/2), reserve: 0}
+	e.h.notify(t.Context(), silent, e.sub(impi1), nil, []push{rtr, rtr}, tm)
+	if silent.sent != 1 || e.metrics.get("push.over_budget") != 1 {
+		t.Fatalf("%d sent, %d left over", silent.sent, e.metrics.get("push.over_budget"))
+	}
+	if s := e.sub(impi1); !slices.Equal(s.StaleSets, []int{0}) {
+		t.Errorf("stale sets %v", s.StaleSets)
+	}
+}
+
+// ctxStore fails a write or a read whose context has ended, as DynamoDB
+// would, delays each write by slow, and records each one's deadline.
+type ctxStore struct {
+	store.Store
+	slow          time.Duration
+	mu            sync.Mutex
+	writes, reads []time.Time
+}
+
+func (s *ctxStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
+	d, _ := ctx.Deadline()
+	s.mu.Lock()
+	s.writes = append(s.writes, d)
+	s.mu.Unlock()
+	// An ended context is refused at once, as DynamoDB's client does,
+	// rather than raced against the delay below, which may be none.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-time.After(s.slow):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.Store.UpdateSubscription(ctx, old, n)
+}
+
+func (s *ctxStore) Profile(ctx context.Context, id string) (*store.ServiceProfile, error) {
+	d, _ := ctx.Deadline()
+	s.mu.Lock()
+	s.reads = append(s.reads, d)
+	s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return s.Store.Profile(ctx, id)
+}
+
+// silentRecorder answers no PPR: each fails when its context ends, as an
+// S-CSCF that keeps the connection does. It records the deadline each PPR
+// was given, by set: the pushes go in their order, set 0 first.
+type silentRecorder struct {
+	mu        sync.Mutex
+	deadlines map[int]time.Time
+}
+
+func (n *silentRecorder) PushProfile(ctx context.Context, _ *cx.PPR) error {
+	d, _ := ctx.Deadline()
+	n.mu.Lock()
+	n.deadlines[len(n.deadlines)] = d
+	n.mu.Unlock()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (n *silentRecorder) Deregister(context.Context, *cx.RTR) error {
+	return errors.New("no RTR expected")
+}
+
+// fiveSets provisions impi1 with one identity in each of five implicit
+// sets, all registered.
+func (e *env) fiveSets() {
+	e.t.Helper()
+	ids := []string{impu1, tel1, impu2, "tel:+15550100002", impu3}
+	e.provision(impi1, ids...)
+	e.modify(impi1, func(s *store.Subscription) {
+		s.ServerName = scscfName
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].ImplicitSet, s.PublicIdentities[i].State = i, store.Registered
+		}
+	})
+}
+
+// Code review on #524 (rounds 2 and 3): a PPR the budget cut short, which
+// then failed for want of the time, is marked stale as one left over is.
+// Which one a PPR was is read from the deadline it was given, not from when
+// it ran: a PPR the budget cut short ends at the budget's end less the
+// reserve and a timeout (pushTimes.forPush), exactly. The S-CSCF answers
+// none, so that no answer has to beat a deadline. That a PPR which failed
+// with its whole timeout is not marked, TestAChangesPushesStayWithinTheBudget
+// checks.
+func TestAPushTheBudgetCutShortIsMarkedStale(t *testing.T) {
+	e := newEnv(t)
+	e.fiveSets()
+	p, err := e.store.Profile(t.Context(), DefaultProfileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first PPR starts with a second of its two, cut short; the second
+	// would have none, so it and the rest are left over. The first is still
+	// cut short, and above pushFloor, when the host delays its start by up
+	// to 0.9 s.
+	const each, cut, reserve = 2 * time.Second, time.Second, 40 * time.Millisecond
+	n := &silentRecorder{deadlines: map[int]time.Time{}}
+	tm := pushTimes{each: each, until: time.Now().Add(cut + reserve + each), reserve: reserve}
+	short := tm.until.Add(-reserve - each)
+	var pushes []push
+	for set := range 5 {
+		pushes = append(pushes, push{set: set})
+	}
+	e.h.notify(t.Context(), n, e.sub(impi1), p, pushes, tm)
+	s := e.sub(impi1)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	shortened := 0
+	for set := range 5 {
+		d, sent := n.deadlines[set]
+		if sent && d.Equal(short) {
+			shortened++
+		}
+		if stale := slices.Contains(s.StaleSets, set); stale != (!sent || d.Equal(short)) {
+			t.Errorf("set %d stale %v; sent %v, deadline %v from the budget's cut", set, stale, sent, d.Sub(short))
+		}
+	}
+	if shortened == 0 {
+		t.Fatalf("no PPR was cut short by the budget: deadlines %v", n.deadlines)
+	}
+}
+
+// Code review on #524 (round 2): the mark of what the budget left out is
+// written with a live deadline, within the budget, which a store that
+// honours its context takes.
+func TestTheStaleMarkIsWrittenWithinTheBudget(t *testing.T) {
+	e := newEnv(t)
+	e.fiveSets()
+	cs := &ctxStore{Store: e.store}
+	h := e.newHSS(func(o *Options) { o.Store = cs })
+	silent := &silentNotifier{}
+	// Production's reserve, which the mark's write has (code review on
+	// #524, round 3).
+	const each, reserve = 200 * time.Millisecond, staleReserve
+	tm := pushTimes{each: each, until: time.Now().Add(each + reserve + pushFloor/2), reserve: reserve}
+	rtr := push{deregister: true, reason: cx.ServerChange, impus: []string{impu1}, set: -1, changed: 0}
+	h.notify(t.Context(), silent, e.sub(impi1), nil, []push{rtr, rtr}, tm)
+	if s := e.sub(impi1); !slices.Equal(s.StaleSets, []int{0}) {
+		t.Fatalf("stale sets %v", s.StaleSets)
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if len(cs.writes) != 1 || cs.writes[0].After(tm.until) {
+		t.Errorf("the mark's write had deadline %v, the budget ends at %v", cs.writes, tm.until)
+	}
+}
+
+// Code review on #524 (round 2): the follow-up of a refused PPR has what
+// is left of the budget, not a whole timeout past it: with a slow
+// not-registered write, the RTR still ends by the budget's end, less what
+// it keeps for the stale mark.
+func TestTheFollowUpStaysWithinTheBudget(t *testing.T) {
+	// The refused PPR starts with about 0.6 s, cut short with a whole each
+	// of 1 s kept after it, and is refused about 0.3 s in. The write that
+	// follows takes 0.4 s of the 1 s it has, so the RTR starts after the
+	// point where the budget cut the PPR: a whole each from there would run
+	// past the budget's end.
+	const each, budget, reserve = time.Second, 1650 * time.Millisecond, 50 * time.Millisecond
+	var until time.Time
+	n := refusedInTime(t, func() *refusingAtTheEnd {
+		e := newEnv(t)
+		e.provision(impi1, impu1)
+		e.modify(impi1, func(s *store.Subscription) {
+			s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
+		})
+		cs := &ctxStore{Store: e.store, slow: 400 * time.Millisecond}
+		h := e.newHSS(func(o *Options) { o.Store = cs })
+		n := &refusingAtTheEnd{deadlineNotifier: deadlineNotifier{recordingNotifier: *newRecorder()}, refuseAt: 0}
+		p, err := e.store.Profile(t.Context(), DefaultProfileID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tm := pushTimes{each: each, until: time.Now().Add(budget), reserve: reserve}
+		until = tm.until
+		h.notify(t.Context(), n, e.sub(impi1), p, []push{{set: 0}}, tm)
+		return n
+	})
+	if len(n.deadlines) != 1 {
+		t.Fatalf("%d RTRs", len(n.deadlines))
+	}
+	// Exactly: the deadline is set once, from one reading of the clock
+	// (pushTimes.deadline).
+	if end := until.Add(-reserve); n.deadlines[0].After(end) {
+		t.Errorf("the RTR's deadline is %v past the budget's end", n.deadlines[0].Sub(end))
 	}
 }

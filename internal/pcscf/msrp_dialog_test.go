@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
@@ -255,7 +256,7 @@ func TestAByeOfAnotherForksDialogEndsThatDialogAlone(t *testing.T) {
 // gets no path of it.
 func TestAFlowClosingNeverWaitsForTheRelay(t *testing.T) {
 	a := newAnchoring(t, 16, 100)
-	a.p.msrp.relay = newRelayClient(a.base, testRelayToken, time.Minute, nil)
+	a.p.msrp.relay = newRelayClient(a.base, secret.NewString(testRelayToken), time.Minute, nil)
 	entered, release := make(chan struct{}), make(chan struct{})
 	a.relay.fail = func(m string, _ int) int {
 		if m == http.MethodPatch {

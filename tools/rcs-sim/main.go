@@ -40,6 +40,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/buildinfo"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
@@ -179,7 +180,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		if token == "" {
 			return usage("the relay control API needs RCS_SIM_RELAY_TOKEN")
 		}
-		cfg.Control = &anchor.Control{HTTP: httpClient, URL: u, Token: anchor.NewToken(token)}
+		cfg.Control = &anchor.Control{HTTP: httpClient, URL: u, Token: secret.NewString(token)}
 	}
 
 	if *relayPublic != "" {
