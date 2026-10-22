@@ -758,7 +758,7 @@ func TestSendIsRetriedAfterAScanThatClosedNothing(t *testing.T) {
 	gone, f := r.flow("192.0.2.1"), r.flow("192.0.2.2")
 	testHookBeforeShed = func() { r.tr.closeFlow(gone) }
 	t.Cleanup(func() { testHookBeforeShed = nil })
-	if err := r.tr.write(f, make([]byte, 1000), false); err != nil {
+	if err := r.tr.write(f, make([]byte, 1000), false, nil); err != nil {
 		t.Fatalf("write = %v with room available", err)
 	}
 	if s := r.tr.Stats(); s.BudgetRefusals != 0 || s.BudgetSheds != 0 {

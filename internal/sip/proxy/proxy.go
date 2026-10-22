@@ -107,7 +107,10 @@ type Config struct {
 // Proxy is the transaction-stateful proxy core of RFC 3261 §16, the transaction
 // user of a Layer it owns. Its methods are safe for concurrent use.
 type Proxy struct {
-	sender    transaction.Sender
+	sender transaction.Sender
+	// flushes reports that the sender is a *transport.Transport, whose
+	// Flush Drain ends with (see respContext.inProgress).
+	flushes   bool
 	layer     *transaction.Layer
 	self      []sip.URI
 	router    Router
@@ -237,8 +240,10 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	if _, err := io.ReadFull(cfg.Rand, key); err != nil {
 		return nil, fmt.Errorf("proxy: reading the hash key: %w", err)
 	}
+	_, flushes := s.(*transport.Transport)
 	p := &Proxy{
 		sender:    s,
+		flushes:   flushes,
 		self:      cfg.Self,
 		router:    cfg.Router,
 		resolver:  cfg.Resolver,
