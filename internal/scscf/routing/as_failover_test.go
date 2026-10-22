@@ -199,7 +199,7 @@ func TestARequestTheServerSentBackIsNotFailedOverOnTimerF(t *testing.T) {
 
 // TestAnINVITEWithNoAnswerAtAllGoesOnToTheNextAddress (#578 code review):
 // an INVITE's Timer B with not even a 100 Trying, which every element sends
-// within 200 ms (RFC 3261 §16.2), means the server never had it: the next
+// within 200 ms (RFC 3261 §17.2.1), means the server never had it: the next
 // address is tried.
 func TestAnINVITEWithNoAnswerAtAllGoesOnToTheNextAddress(t *testing.T) {
 	e := newEnv(t)

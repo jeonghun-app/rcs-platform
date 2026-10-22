@@ -85,7 +85,7 @@ func (rt *Router) asAddresses(ctx context.Context, server sip.URI) []transport.D
 // S-CSCF can tell (#574): the transport failed to send it (the proxy's
 // 503, §16.9), which happens before the request is written; or, for an
 // INVITE, Timer B fired with not even a 100 Trying, which every element
-// sends within 200 ms (RFC 3261 §16.2). A non-INVITE's Timer F is not:
+// sends within 200 ms (RFC 3261 §17.2.1). A non-INVITE's Timer F is not:
 // a server that proxies it sends no 100 (RFC 4320), so it may have sent
 // the request back, which a second address would then send on again
 // (#578 code review). The server's own timeout (ASTimeout) is not either:

@@ -139,6 +139,9 @@ Alarm on a rise of these:
 - `routing.third_party.terminated_unanswered`;
 - `regevent.notify_dropped`;
 - `regevent.final_abandoned`;
+- `registrar.saa_profile_moved`: an SAA's profile named another default
+  identity, so the HSS moved the set's default and this S-CSCF missed its
+  RTR, and the set was ended here (#536);
 - `proxy.hook_panics`, panics recovered in scscf's routing (#428), and
   `transaction.handler_panics`, in a response handler of a request scscf
   sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
