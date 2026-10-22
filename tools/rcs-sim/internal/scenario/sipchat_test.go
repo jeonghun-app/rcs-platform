@@ -39,6 +39,9 @@ type chatAnchor struct {
 	answerSetup       sdp.Setup
 	dropNotifications bool
 	change            [2]string
+	// cutOver, if set, cuts what the forwarders send to that many octets
+	// when it is longer: a large message arrives short.
+	cutOver int
 
 	mu    sync.Mutex
 	calls map[string]*anchoredCall // by Call-ID
@@ -201,6 +204,9 @@ func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	if f.a.change[0] != "" {
 		body = bytes.ReplaceAll(body, []byte(f.a.change[0]), []byte(f.a.change[1]))
 	}
+	if n := f.a.cutOver; n > 0 && len(body) > n {
+		body = body[:n]
+	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
@@ -248,13 +254,21 @@ func TestAChatOverSIPCarriesAMessageEachWayAndItsBYEReleasesIt(t *testing.T) {
 		t.Fatalf("results %+v", results)
 	}
 	steps := byStep(results)
-	for _, s := range []string{"register", "invite", "connect", "client-to-peer", "peer-to-client", "bye", "released", "clean"} {
+	for _, s := range []string{"register", "invite", "connect", "client-to-peer", "peer-to-client", "chunked-message", "bye", "released", "peer-offline", "clean"} {
 		if !steps[s].OK {
 			t.Fatalf("%s: %+v", s, steps[s])
 		}
 	}
 	if steps["invite"].Detail["status"] != 200 || steps["client-to-peer"].Detail["skipped"] != 0 {
 		t.Fatalf("invite %+v, client-to-peer %+v", steps["invite"], steps["client-to-peer"])
+	}
+	// Chunked: well over internal/msrp's 2 KiB chunks.
+	if steps["chunked-message"].Detail["bytes"] < 100<<10 {
+		t.Fatalf("chunked-message %+v", steps["chunked-message"])
+	}
+	// The stand-in core stores nothing for an unregistered peer: 480.
+	if d := steps["peer-offline"].Detail; d["status"] != 480 || d["stored"] != 0 {
+		t.Fatalf("peer-offline %+v", steps["peer-offline"])
 	}
 	if core.Registered(self.URI) || core.Registered(peer.URI) {
 		t.Fatal("a binding outlived the scenario")
@@ -305,6 +319,18 @@ func TestAChatThatChangesTheTextFailsTheMessageStep(t *testing.T) {
 	ok, results := runAll(t, cfg, "chat-invite")
 	last := results[len(results)-1]
 	if ok || last.Step != "client-to-peer" || last.Error != "the message arrived changed" {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestAChatThatCutsALargeMessageFailsTheChunkedStep(t *testing.T) {
+	// The short messages pass; the large one arrives cut, its CPIM
+	// headers whole, and the step says it changed.
+	cfg, core := sipStack(t)
+	anchorChats(t, cfg, core).cutOver = 64 << 10
+	ok, results := runAll(t, cfg, "chat-invite")
+	last := results[len(results)-1]
+	if ok || last.Step != "chunked-message" || last.Error != "the message arrived changed" {
 		t.Fatalf("results %+v", results)
 	}
 }

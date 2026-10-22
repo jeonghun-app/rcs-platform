@@ -3,6 +3,7 @@ package scenario
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -56,7 +57,7 @@ func chatInvite(r *run) error {
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoPeer })
 	}
 	calls := make(chan *sipua.IncomingCall, queueLength)
-	var a *sipClient
+	var a, b *sipClient
 	if err := r.step("register", func(ctx context.Context) (map[string]int64, error) {
 		var err error
 		if a, err = r.newSIPClient(ctx, *r.cfg.SIP, r.cfg.Self); err != nil {
@@ -70,9 +71,8 @@ func chatInvite(r *run) error {
 				_ = c.Reject(486)
 			}
 		}
-		// The peer's chats come through OnInvite; it is registered so
-		// that the network can reach it.
-		if _, err = r.newSIPClient(ctx, peer, r.cfg.Peer); err != nil {
+		// The peer's chats come through OnInvite.
+		if b, err = r.newSIPClient(ctx, peer, r.cfg.Peer); err != nil {
 			return nil, fmt.Errorf("peer: %w", sipError(err))
 		}
 		return nil, nil
@@ -197,6 +197,34 @@ func chatInvite(r *run) error {
 	}); err != nil {
 		return err
 	}
+	if err := r.step("chunked-message", func(ctx context.Context) (map[string]int64, error) {
+		// Large enough to travel in internal/msrp's 2 KiB chunks through
+		// the relay and rcs-as, as text, which rcs-as stores and sends on.
+		raw, err := r.content(largeMessage / 2)
+		if err != nil {
+			return nil, err
+		}
+		text := []byte(token + " " + hex.EncodeToString(raw))
+		sent, err := aEnd.Send(ctx, aConn.Session, bEnd.Self, "text/plain;charset=UTF-8", text, imdn.PositiveDelivery|imdn.Display)
+		if err != nil {
+			return nil, err
+		}
+		detail := map[string]int64{"bytes": int64(len(text))}
+		if err := waitReport(ctx, aEnd, sent.MSRP); err != nil {
+			return detail, err
+		}
+		got, skipped, err := awaitChat(ctx, bEnd, sent.IMDN, token)
+		detail["skipped"] = int64(skipped)
+		if err != nil {
+			return detail, err
+		}
+		if !bytes.Equal(got.Body, text) {
+			return detail, errors.New("the message arrived changed")
+		}
+		return detail, awaitNotifications(ctx, aEnd, sent.IMDN)
+	}); err != nil {
+		return err
+	}
 	if err := r.step("bye", func(ctx context.Context) (map[string]int64, error) {
 		res, err := dialog.Bye(ctx)
 		if err != nil {
@@ -256,6 +284,11 @@ func chatInvite(r *run) error {
 	}); err != nil {
 		return err
 	}
+	if err := r.step("peer-offline", func(ctx context.Context) (map[string]int64, error) {
+		return r.chatToOfflinePeer(ctx, b, a, aEnd, bEnd, token)
+	}); err != nil {
+		return err
+	}
 	return r.step("clean", func(context.Context) (map[string]int64, error) {
 		for _, e := range []*chat.Endpoint{aEnd, bEnd} {
 			e.Wait()
@@ -268,6 +301,81 @@ func chatInvite(r *run) error {
 		}
 		return nil, nil
 	})
+}
+
+// chatToOfflinePeer is the peer-offline step (#135 AC 4): the peer
+// unregisters and the client opens a chat to it and sends a message. A
+// network without store-and-forward, as the unit tests' stand-in core,
+// answers the INVITE 480, which passes. One that answers it 2xx, as rcs-as
+// does, must store the message: once the peer registers again the network
+// opens a chat to it, and the message, its text and Message-ID intact,
+// arrives there, and its notifications come back to the client (stored).
+// One that accepts the chat and loses the message fails.
+func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, token string) (map[string]int64, error) {
+	if _, err := b.ua.Unregister(ctx); err != nil {
+		return nil, fmt.Errorf("peer: %w", sipError(err))
+	}
+	local, err := chat.LocalURI(r.cfg.Rand)
+	if err != nil {
+		return nil, err
+	}
+	offer, err := chatSDP(local, sdp.SetupActive)
+	if err != nil {
+		return nil, err
+	}
+	req, err := a.ua.NewInvite(r.cfg.SIPPeer.IMPU, offer)
+	if err != nil {
+		return nil, err
+	}
+	d, res, err := a.ua.Invite(ctx, req, nil)
+	if err != nil {
+		return nil, sipError(err)
+	}
+	detail := map[string]int64{"status": int64(res.StatusCode)}
+	switch {
+	case res.StatusCode == 480:
+		return detail, nil
+	case d == nil:
+		return detail, fmt.Errorf("INVITE to the unregistered peer answered %d, want 480 or store-and-forward", res.StatusCode)
+	}
+	defer r.hangUp(d)
+	path, setup, err := chatAnswer(res.Body)
+	if err != nil {
+		return detail, err
+	}
+	if setup != sdp.SetupPassive {
+		return detail, fmt.Errorf("the answer's a=setup is %s, want passive: the client connects (RFC 6135)", setup)
+	}
+	c, err := chat.Dial(ctx, path, local, aEnd, r.cfg.MSRP, r.cfg.TLS, nil)
+	if err != nil {
+		return detail, err
+	}
+	defer c.Close()
+	text := []byte(sipChatText + " kept " + token)
+	sent, err := aEnd.Send(ctx, c.Session, bEnd.Self, "text/plain;charset=UTF-8", text, imdn.PositiveDelivery|imdn.Display)
+	if err != nil {
+		return detail, err
+	}
+	// The network took the message for the peer, unregistered.
+	if err := waitReport(ctx, aEnd, sent.MSRP); err != nil {
+		return detail, err
+	}
+	if _, err := b.ua.Register(ctx); err != nil {
+		return detail, fmt.Errorf("peer: %w", sipError(err))
+	}
+	got, skipped, err := awaitChat(ctx, bEnd, sent.IMDN, token)
+	detail["skipped"] = int64(skipped)
+	if err != nil {
+		return detail, fmt.Errorf("the message to the unregistered peer never arrived after it registered again: %w", err)
+	}
+	if !bytes.Equal(got.Body, text) {
+		return detail, errors.New("the stored message changed on the way")
+	}
+	if err := awaitNotifications(ctx, aEnd, sent.IMDN); err != nil {
+		return detail, err
+	}
+	detail["stored"] = 1
+	return detail, nil
 }
 
 // answerCalls answers each chat the network opens to the peer: an MSRP

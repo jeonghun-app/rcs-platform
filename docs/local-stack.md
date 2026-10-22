@@ -305,9 +305,12 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
      answers with the relay's `client_path`. The client connects there, and
      `rcs-as` opens a chat to the peer for the client's message, which the
      peer answers and connects to the relay for. A message goes each way,
-     with its success report and its delivery and display notifications.
-     The client's BYE ends the chat, and the relay then refuses its session
-     with 481.
+     with its success report and its delivery and display notifications,
+     and one in 2 KiB chunks. The client's BYE ends the chat, and the relay
+     then refuses its session with 481. Then the client opens a chat to the
+     peer unregistered: `rcs-as` answers 200, keeps the message and
+     delivers it in a chat of its own once the peer registers again, which
+     the test checks.
 6. runs `rcs-sim options` once more, with the client's OPTIONS in the
    originating session case sent through two more application servers:
    stubs on the test container, which act as proxies and send them back to

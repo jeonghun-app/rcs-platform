@@ -125,8 +125,9 @@ func TestE2EComposeStack(t *testing.T) {
 	// the peer an INVITE with an MSRP offer, which pcscf anchors at
 	// msrp-relay and scscf takes to rcs-as; rcs-as opens a chat to the peer
 	// for the client's message, and a message goes each way, each with its
-	// report and notifications, before the client's BYE ends the chat and
-	// its relay binding.
+	// report and notifications, and one in 2 KiB chunks, before the
+	// client's BYE ends the chat and its relay binding. Then a chat to the
+	// peer unregistered, whose message rcs-as keeps until it registers.
 	// The client's default profile first: a run cut short before it put
 	// it back would leave the stub's, whose AS is gone, and fail the
 	// first OPTIONS with a 500 that says nothing of why (#473 code review).
@@ -149,7 +150,8 @@ func TestE2EComposeStack(t *testing.T) {
 		"pager-message/register", "pager-message/message", "pager-message/receive",
 		"pager-message/delivery-notification", "pager-message/peer-offline",
 		"chat-invite/register", "chat-invite/invite", "chat-invite/connect", "chat-invite/client-to-peer",
-		"chat-invite/peer-to-client", "chat-invite/bye", "chat-invite/released", "chat-invite/clean",
+		"chat-invite/peer-to-client", "chat-invite/chunked-message", "chat-invite/bye", "chat-invite/released",
+		"chat-invite/peer-offline", "chat-invite/clean",
 	}, env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
 		composeIMSI, composePeerIMSI)
 	// rcs-as took both messages: it answers 202 to one it has stored, which
@@ -158,6 +160,12 @@ func TestE2EComposeStack(t *testing.T) {
 	// to the peer unregistered, reached it once it registered again.
 	if r := sipResults["pager-message/message"]; r.Detail["status"] != 202 {
 		t.Errorf("the MESSAGE was answered %d, not rcs-as's 202", r.Detail["status"])
+	}
+	// rcs-as took the chat to the peer unregistered, kept the message and
+	// delivered it in a chat of its own once the peer registered again.
+	if r := sipResults["chat-invite/peer-offline"]; r.Detail["status"] != 200 || r.Detail["stored"] != 1 {
+		t.Errorf("the chat to the unregistered peer was answered %d (stored and delivered: %d), want rcs-as's 200 and its delivery once the peer registered",
+			r.Detail["status"], r.Detail["stored"])
 	}
 	// So did the peer's delivery notification, a MESSAGE of its own.
 	if r := sipResults["pager-message/delivery-notification"]; r.Detail["status"] != 202 {
