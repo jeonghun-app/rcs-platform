@@ -9,10 +9,12 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 )
 
 // Each group is served by the task that owns it (#121, ADR 0005): its
@@ -56,11 +58,49 @@ func (s *Server) toOwner(ctx context.Context, r *proxy.Request, uri string) (pro
 			s.cfg.Metrics.Count("group.forwarded", 1)
 			// No Record-Route: the dialog's requests go to the conference
 			// URI, and from wherever they reach, to the owner.
-			return proxy.Decision{Targets: []proxy.Target{{URI: r.Message.URI, Routes: []sip.Address{{URI: next}}}}}, true
+			return proxy.Decision{
+				Targets: []proxy.Target{{URI: r.Message.URI, Routes: []sip.Address{{URI: next}}, Timeout: s.forwardWait()}},
+				OnFinal: unreached, OnResponse: retryUnreached,
+			}, true
 		}
 	}
 	s.cfg.Metrics.Count("group.forward_refused", 1)
 	return s.retryDecision(r), true
+}
+
+// forwardWait bounds a forward the owner does not answer: half of Timer
+// B, so that the client hears 500 with Retry-After before its own
+// transaction gives up (RFC 3261 §17.1.1.2); the proxy ends the branch as
+// a 504 then (unreached).
+const forwardWait = 32 * transaction.DefaultT1
+
+func (s *Server) forwardWait() time.Duration {
+	if s.cfg.forwardWait > 0 {
+		return s.cfg.forwardWait
+	}
+	return forwardWait
+}
+
+// unreached makes the final response of a forward that never reached the
+// owner, a 408, 430 or 504, a 500, which retryUnreached gives a
+// Retry-After as it does the proxy's own 500 for a next hop it could not
+// reach (§16.7, the transport's 503): a failure to try again, as for any group
+// this task cannot serve now: a closed port, or a dial that timed out
+// (QA on #464). The owner's own answers, its 404 for a group that has
+// ended among them, go as they are.
+func unreached(_ context.Context, res *sip.Response) {
+	switch res.StatusCode {
+	case 408, 430, 504:
+		res.StatusCode, res.Reason = 500, sip.DefaultReason(500)
+	}
+}
+
+// retryUnreached gives the 500 of an unreached forward (unreached) its
+// Retry-After.
+func retryUnreached(_ context.Context, res *sip.Response) {
+	if res.StatusCode == 500 && res.Header.Get("Retry-After") == "" {
+		_ = res.Header.Set("Retry-After", busyRetryAfter)
+	}
 }
 
 // peer is the Route to the task at the SIP instance address at, which the
@@ -70,15 +110,18 @@ func (s *Server) toOwner(ctx context.Context, r *proxy.Request, uri string) (pro
 // the same before anything is sent to it (#121 design, security review).
 func (s *Server) peer(at string) (sip.URI, bool) {
 	ap, err := netip.ParseAddrPort(at)
-	if err != nil {
+	if err != nil || ap.Addr().Zone() != "" {
+		// A zone names an interface of the writer's, and no URI host
+		// (security review and QA on #464).
 		return sip.URI{}, false
 	}
+	ap = netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 	var ok bool
 	if s.cfg.peers != nil {
 		ok = s.cfg.peers(ap)
 	} else {
 		own, err := netip.ParseAddr(strings.Trim(s.cfg.Contact.Host, "[]"))
-		ok = ap.Addr().IsPrivate() && int(ap.Port()) == s.cfg.Contact.Port && (err != nil || ap.Addr() != own)
+		ok = ap.Addr().IsPrivate() && int(ap.Port()) == s.cfg.Contact.Port && (err != nil || ap.Addr() != own.Unmap())
 	}
 	if !ok {
 		s.cfg.Metrics.Count("group.forward_refused.address", 1)
@@ -113,14 +156,21 @@ func (s *Server) retryDecision(r *proxy.Request) proxy.Decision {
 // Request-URI names, or for the factory, the one its Contribution-ID makes
 // or takes up (group.Service.URIFor). False when it names none, which
 // serving the request answers.
+// A creator over its rate for new groups is left to Create, which refuses
+// it before any store read: looking its group up first would cost a read
+// for each such INVITE (security review on #464).
 func (s *Server) groupOf(req *sip.Request) (string, bool) {
 	if !s.isFactory(req.URI) {
 		return s.conferenceURI(req.URI)
 	}
-	if c := req.Header.Get("Contribution-ID"); c != "" && s.groups != nil {
-		return s.groups.URIFor(c), true
+	c := req.Header.Get("Contribution-ID")
+	if c == "" || s.groups == nil {
+		return "", false
 	}
-	return "", false
+	if creator, _, ok := s.assertedUser(req); ok && !s.groups.CanCreate(creator) {
+		return "", false
+	}
+	return s.groups.URIFor(c), true
 }
 
 // inDialogElsewhere decides an in-dialog request, an ACK included, to a
@@ -144,8 +194,11 @@ func (s *Server) inDialogElsewhere(ctx context.Context, r *proxy.Request) (proxy
 const wakeType = "application/vnd.rcsplatform.group-wake+json"
 
 // wake is the body of a wake MESSAGE; the group is its Request-URI.
+// Registered says the user registered on a new flow at the sender since
+// its last wake for the group (messaging.Engine.Wake).
 type wake struct {
-	User string `json:"user"`
+	User       string `json:"user"`
+	Registered bool   `json:"registered,omitempty"`
 }
 
 // maxWakeUser bounds the identity a wake names, as long as any a queue is
@@ -157,7 +210,7 @@ const maxWakeUser = 256
 // It goes to the owner directly, as a forwarded request does, without
 // waiting for the answer: a wake lost costs the copy its wait for the
 // owner's own retry.
-func (s *Server) WakeOwner(ctx context.Context, at, uri, user string) error {
+func (s *Server) WakeOwner(ctx context.Context, at, uri, user string, registered bool) error {
 	next, ok := s.peer(at)
 	if !ok {
 		return errors.New("sipas: no route to the group's owner")
@@ -166,7 +219,7 @@ func (s *Server) WakeOwner(ctx context.Context, at, uri, user string) error {
 	if err != nil {
 		return err
 	}
-	body, err := json.Marshal(wake{User: user})
+	body, err := json.Marshal(wake{User: user, Registered: registered})
 	if err != nil {
 		return err
 	}
@@ -243,16 +296,25 @@ func (s *Server) groupWake(ctx context.Context, u *proxy.UAS) {
 	defer cancel()
 	if mine, _, err := s.groups.Place(ctx, uri); err == nil && mine {
 		s.cfg.Metrics.Count("sip.group.woken", 1)
-		s.engine.Wake(w.User)
+		s.engine.Wake(w.User, uri, w.Registered)
 	}
 	s.respond(u, req, 200)
 }
+
+// ackWait bounds how long a session Disowned ends waits for its 2xx's ACK:
+// Timer H, 64*T1, after which the server transaction gives up on it (RFC
+// 3261 §17.2.1).
+const ackWait = 64 * transaction.DefaultT1
 
 // Disowned implements group.Notifier: this task no longer owns the group
 // uri, so the sessions and subscriptions it holds of it end, the sessions
 // with a BYE, the subscriptions with reason=deactivated, which lets the
 // subscriber subscribe again at once (RFC 6665 §4.2.2). The participants
-// rejoin through the group's owner (the lead's decision on #121, Q4).
+// rejoin through the group's owner (the lead's decision on #121, Q4). A
+// session whose 2xx is not acknowledged yet gets its BYE once the ACK
+// comes, or Timer H runs out (RFC 3261 §15; code review on #464), each on
+// a goroutine of its own, so that neither the request nor the heartbeat
+// that found the group lost waits for it.
 func (s *Server) Disowned(uri string) {
 	s.mu.Lock()
 	var ended []*session
@@ -271,7 +333,11 @@ func (s *Server) Disowned(uri string) {
 		sub.mu.Unlock()
 	}
 	for _, ss := range ended {
-		ss.bye("")
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), ackWait)
+			defer cancel()
+			ss.byeConfirmed(ctx)
+		}()
 	}
 	s.cfg.Metrics.Count("sip.group.disowned.sessions", int64(len(ended)))
 }

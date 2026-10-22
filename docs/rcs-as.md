@@ -730,18 +730,30 @@ group's sessions and subscriptions is its conference URI.
   now is answered 500 with `Retry-After` (`group.forward_refused`): one
   forwarded here already, which is never forwarded again, so that two tasks
   whose views of the owner differ for a moment cannot pass it between them; one
-  that arrives while this task's own heartbeat has lapsed; and one whose
-  owner's stored address is not a private address (RFC 1918, or IPv6 unique
-  local) on rcs-as's own SIP port, which is checked before anything is sent
-  there (`group.forward_refused.address`). rcsjta takes a 404 to its rejoin
+  that arrives while this task's own heartbeat has lapsed, in a dialog it does
+  not hold too (never 481); one whose owner's stored address is not a private
+  address (RFC 1918, or IPv6 unique local, mapped addresses compared unmapped,
+  none with an interface zone) on rcs-as's own SIP port, which is checked
+  before anything is sent there (`group.forward_refused.address`); and one
+  forwarded to an owner that does not answer it, a closed port or a dial that
+  times out, whose 408 or the proxy's own 5xx becomes 500 with
+  `Retry-After` (the owner's own answers, a 404 for an ended group among
+  them, go as they are). rcsjta takes a 404 to its rejoin
   for the group's end and restarts it at the factory, where the group's live
   Contribution-ID is refused (403) and the chat fails; any other failure it
   tries again later.
-- **A task that loses a group** (another took it over, or its own heartbeat
-  lapsed) ends what it holds of it: the sessions with a BYE, the
-  subscriptions with `reason=deactivated` (`group.owner_lost`,
+- **A task that loses a group** ends what it holds of it: the sessions with
+  a BYE, once their 2xx is acknowledged (RFC 3261 §15) or Timer H has run
+  out, the subscriptions with `reason=deactivated` (`group.owner_lost`,
   `sip.group.disowned.sessions`). The participants rejoin, and subscribe
-  again, through the owner.
+  again, through the owner. It loses a group when another task took it over,
+  when it drops the group from those it remembers owning, at
+  100 000 of them (`group.owned_dropped`), and every group when its
+  own lease runs out with no beat stored: at the first beat that fails past
+  `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after the last one stored,
+  whether the store is out for every task or for this one alone, as the
+  sessions can deliver nothing meanwhile (the lead's decision on #464), or
+  when a beat is stored that late.
 - **Wake.** A task's queue pass that finds a copy of another task's group
   leaves it alone (`delivery.group_not_owned`), and has the owner read the
   participant's queue: as when the participant registers on that task, which
@@ -749,14 +761,22 @@ group's sessions and subscriptions is its conference URI.
   owner a `MESSAGE` to the conference URI, with the same marked `Route`, its
   own address in `From` (never a conference URI or rcs-as's `rcsas-` tag,
   which the loop guard refuses), and an
-  `application/vnd.rcsplatform.group-wake+json` body naming the participant;
-  at most once per participant and group every `RCSAS_INVITE_TIMEOUT`
-  (`group.wake_sent`, `sip.group.wake.<status>`). The owner answers 200 and
-  reads the queue (`sip.group.woken`).
+  `application/vnd.rcsplatform.group-wake+json` body naming the participant,
+  and saying whether it registered on a new flow there since the last wake;
+  at most once per participant and group every `RCSAS_INVITE_TIMEOUT`, and
+  at once after such a registration (`group.wake_sent`,
+  `sip.group.wake.<status>`). The wake goes off the queue pass, at most 16 at
+  a time. The owner answers 200 and reads the queue (`sip.group.woken`); for
+  a registration, it first forgets the invitation it last asked for the
+  participant in the group and its pager-only mark, as a registration on a
+  new flow there would, so that it invites at once.
 - **Cost.** Where a group is served is remembered for a heartbeat: a task
   reads the group and owner items for it at most once per
   `RCSAS_TASK_HEARTBEAT`, and an INVITE to the factory costs one more read of
-  the group item first.
+  the group item first, unless its creator is over `RCSAS_GROUP_CREATE_RATE`,
+  which refuses it unread. That there is no such group is remembered for a
+  second, up to 10 000 of them; whatever then serves the request reads the
+  group itself, so a group made meanwhile is not taken for none.
 - **Limits.** The per-user bounds on sessions and subscriptions are per task
   (the lead's decision on #121): with a user's groups owned by several tasks,
   a user may hold up to that many on each.
@@ -1237,10 +1257,11 @@ chat on has a heartbeat item:
   at its present time on shutdown, after its sessions have ended, so that
   another task takes its groups at once. A task remembers the groups it
   owns, so that a change of one costs no more reads than before. It forgets
-  them all when a beat is stored later than its last one's hold
-  (`RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW`), whether it saw itself lapse
-  or was paused unaware, and forgets one when the store refuses a write or a
-  message's copy for it. Whether to invite a participant for a group's
+  them all when its last stored beat's hold (`RCSAS_TASK_LEASE` less
+  `RCSAS_TASK_SKEW`) runs out with no beat stored since, at the first beat
+  that fails then, or when a beat is stored that late, as when it was paused
+  unaware, and forgets one when the store refuses a write or a message's copy
+  for it, or when the group has ended. Whether to invite a participant for a group's
   queued copies, which the store does not fence, it asks the owner item
   again once what it remembers is `RCSAS_TASK_HEARTBEAT` old: a task that
   lost a group stops inviting for it within a heartbeat, even one that
@@ -1354,7 +1375,7 @@ identifier ever appears in a metric name.
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
 | `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
 | `group.fanout.not_owner`, `delivery.group_not_owned`, `group.wake` | #121: fan-outs stopped because another task took the group over; group copies a task that does not own the group did not invite for; queue reads the owner was asked for |
-| `group.forwarded`, `group.forward_refused`, `group.forward_refused.address`, `group.owner_lost`, `sip.group.disowned.sessions` | #121: requests forwarded to a group's owner; requests answered 500 with `Retry-After` for want of an owner to forward to, and of those, the ones whose owner's address rcs-as does not forward to; groups this task gave up, and the sessions it ended with them |
+| `group.forwarded`, `group.forward_refused`, `group.forward_refused.address`, `group.owner_lost`, `group.owned_dropped`, `sip.group.disowned.sessions` | #121: requests forwarded to a group's owner; requests answered 500 with `Retry-After` for want of an owner to forward to, and of those, the ones whose owner's address rcs-as does not forward to; groups this task gave up, those of them it dropped at the bound on the groups it remembers owning, and the sessions it ended with them |
 | `group.wake_sent`, `group.wake_failed`, `sip.group.wake.<status>`, `sip.group.wake.timeout`, `sip.group.woken` | #121: wake messages sent to a group's owner, those that could not be sent, their answers, and the wakes an owner acted on |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but neither queued nor summarized, the summaries' total or the queue being full; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 

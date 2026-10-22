@@ -45,11 +45,12 @@ type chatRig struct {
 }
 
 // countingGroups counts the reads of a groups store, and fails the next
-// failUpdates updates.
+// failUpdates updates, and every heartbeat while failBeats is set.
 type countingGroups struct {
 	groupstore.Store
-	gets        atomic.Int64
-	failUpdates atomic.Int64
+	gets, owners atomic.Int64
+	failUpdates  atomic.Int64
+	failBeats    atomic.Bool
 	// getHook, when set, is called before each read.
 	getHook atomic.Pointer[func()]
 }
@@ -61,6 +62,18 @@ func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, owner g
 		return errFakeStore
 	}
 	return c.Store.Update(ctx, g, owner, token)
+}
+
+func (c *countingGroups) Owner(ctx context.Context, uri string) (groupstore.Owner, error) {
+	c.owners.Add(1)
+	return c.Store.Owner(ctx, uri)
+}
+
+func (c *countingGroups) Beat(ctx context.Context, t groupstore.Task) error {
+	if c.failBeats.Load() {
+		return errFakeStore
+	}
+	return c.Store.Beat(ctx, t)
 }
 
 func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (groupstore.Group, error) {
@@ -126,6 +139,8 @@ type rigShare struct {
 	groups *groupstore.Memory
 	task   string
 	beat   bool
+	// group, when set, changes the group service's configuration.
+	group func(*group.Config)
 }
 
 // newChatRigShared is newChatRigOn on what share names.
@@ -156,8 +171,11 @@ func newChatRigShared(t *testing.T, mc messaging.Config, cfg Config, tc transpor
 	// Made once the task's address is known, which it owns its groups at.
 	mk := func(at string) (Groups, error) {
 		var err error
-		r.groups, err = group.New(group.Config{ConferenceHost: confHost, HomeDomain: domain, Clock: r.clock, Task: share.task, SIP: at},
-			r.groupReads, e, notifier{a: &a, skip: &r.skipRoster}, r.metrics)
+		gc := group.Config{ConferenceHost: confHost, HomeDomain: domain, Clock: r.clock, Task: share.task, SIP: at}
+		if share.group != nil {
+			share.group(&gc)
+		}
+		r.groups, err = group.New(gc, r.groupReads, e, notifier{a: &a, skip: &r.skipRoster}, r.metrics)
 		return r.groups, err
 	}
 	if cfg.closeWait == 0 {

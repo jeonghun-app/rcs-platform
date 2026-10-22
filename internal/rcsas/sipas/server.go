@@ -45,7 +45,7 @@ type Engine interface {
 	InviteFailed(inv messaging.Invitation, err error)
 	UserRegistered(user string, newFlow bool)
 	Invite(ctx context.Context, inv messaging.Invitation)
-	Wake(user string)
+	Wake(user, group string, registered bool)
 }
 
 // Config configures a Server.
@@ -115,6 +115,8 @@ type Config struct {
 	// on this task's port: the tests' tasks are on loopback, each on a
 	// port of its own.
 	peers func(netip.AddrPort) bool
+	// forwardWait, when a test sets it, replaces forwardWait.
+	forwardWait time.Duration
 	// Metrics counts events, without identifiers; nil counts nothing.
 	Metrics messaging.Counter
 	// Logger receives operational events, never identities or content; nil
@@ -443,9 +445,19 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 // Each identity as asserted is one the sender may name itself by, as is any
 // other form of it (the engine compares them with UserOf).
 func (s *Server) asserted(req *sip.Request) (string, []string, int) {
+	user, identities, ok := s.assertedUser(req)
+	if !ok {
+		return s.refuseAsserted()
+	}
+	return user, identities, 0
+}
+
+// assertedUser is asserted without the refusal: false for a request it
+// would refuse.
+func (s *Server) assertedUser(req *sip.Request) (string, []string, bool) {
 	pai, err := req.Header.PAssertedIdentity()
 	if err != nil || len(pai) == 0 || len(pai) > 2 {
-		return s.refuseAsserted()
+		return "", nil, false
 	}
 	var sipUser, telUser, sipNumber string
 	var identities []string
@@ -453,29 +465,29 @@ func (s *Server) asserted(req *sip.Request) (string, []string, int) {
 		raw := a.URI.String()
 		user, ok := messaging.UserOf(raw, s.cfg.HomeDomain)
 		if !ok {
-			return s.refuseAsserted()
+			return "", nil, false
 		}
 		switch a.URI.Scheme {
 		case "tel":
 			if telUser != "" {
-				return s.refuseAsserted()
+				return "", nil, false
 			}
 			telUser = user
 		default: // sip or sips, as UserOf took it
 			if sipUser != "" {
-				return s.refuseAsserted()
+				return "", nil, false
 			}
 			sipUser, sipNumber = user, numberOf(a.URI)
 		}
 		identities = append(identities, raw)
 	}
 	if telUser == "" {
-		return sipUser, identities, 0
+		return sipUser, identities, true
 	}
 	if sipNumber != "" && sipNumber != telUser {
-		return s.refuseAsserted()
+		return "", nil, false
 	}
-	return telUser, identities, 0
+	return telUser, identities, true
 }
 
 // numberOf is the tel URI of the number a SIP URI's user part is, at any

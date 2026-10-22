@@ -157,14 +157,29 @@ func (s *Service) Place(ctx context.Context, uri string) (mine bool, at groupsto
 	s.mu.Lock()
 	o, owned := s.owned[uri]
 	other, known := s.others[uri]
+	none, absent := s.absent[uri]
 	s.mu.Unlock()
 	switch {
 	case owned && now.Before(o.read.Add(s.cfg.TaskHeartbeat)) && s.alive(now):
 		return true, groupstore.Owner{}, nil
 	case known && now.Before(other.until):
 		return false, other.owner, nil
+	case absent && now.Before(none):
+		return false, groupstore.Owner{}, ErrNoGroup
 	}
 	g, err := s.get(ctx, uri)
+	if errors.Is(err, ErrNoGroup) {
+		// Remembered a moment, so that requests for a group there is none
+		// of cost no read each (security review on #464). Whatever serves
+		// them reads the group itself, so a group made meanwhile is never
+		// answered as none.
+		s.mu.Lock()
+		if len(s.absent) >= maxAbsent {
+			clear(s.absent)
+		}
+		s.absent[uri] = now.Add(absentFor)
+		s.mu.Unlock()
+	}
 	if err != nil {
 		return false, groupstore.Owner{}, err
 	}
@@ -184,6 +199,13 @@ func (s *Service) Place(ctx context.Context, uri string) (mine bool, at groupsto
 	return false, groupstore.Owner{}, err
 }
 
+// absentFor is how long Place takes for granted that there is no group,
+// and maxAbsent how many such it remembers.
+const (
+	absentFor = time.Second
+	maxAbsent = 10_000
+)
+
 // otherOwner is a group another task owns, and until when Place takes
 // that for granted.
 type otherOwner struct {
@@ -194,13 +216,14 @@ type otherOwner struct {
 // WakeOwner implements messaging.GroupHandler: it asks the task that owns
 // the group uri, if another, to read user's queue again (#121): this
 // task's queue pass found a copy of the group's for user and left it to
-// the owner, which may not know of it, as when user registered here.
-func (s *Service) WakeOwner(ctx context.Context, uri, user string) {
+// the owner, which may not know of it, as when user registered here, which
+// registered says of a registration on a new flow.
+func (s *Service) WakeOwner(ctx context.Context, uri, user string, registered bool) {
 	mine, at, err := s.Place(ctx, uri)
 	if err != nil || mine {
 		return
 	}
-	if err := s.notifier.WakeOwner(ctx, at.SIP, uri, user); err != nil {
+	if err := s.notifier.WakeOwner(ctx, at.SIP, uri, user, registered); err != nil {
 		s.metrics.Count("group.wake_failed", 1)
 		return
 	}
@@ -234,14 +257,36 @@ func (s *Service) fence(ctx context.Context, g groupstore.Group) (*store.Fence, 
 // asked at read: the time before the call, not after it, so that an answer
 // held up in the call, past a lease and another task's takeover, is not
 // taken for a fresh one (code review on #440).
+//
+// At MaxTracked groups one is given up to make room, as a group lost is
+// (Notifier.Disowned): a group forgotten without would keep its sessions
+// here once another task owns it, as nothing would tell the SIP layer
+// (QA on #464).
 func (s *Service) own(uri string, o groupstore.Owner, read time.Time) {
+	var dropped []string
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.owned) >= s.cfg.MaxTracked {
-		// A group forgotten is only read again.
-		clear(s.owned)
+	if _, ok := s.owned[uri]; !ok && len(s.owned) >= s.cfg.MaxTracked {
+		for k := range s.owned {
+			delete(s.owned, k)
+			dropped = append(dropped, k)
+			break
+		}
 	}
 	s.owned[uri] = ownership{Owner: o, read: read}
+	s.mu.Unlock()
+	if len(dropped) > 0 {
+		s.metrics.Count("group.owned_dropped", 1)
+		s.disowned(dropped)
+	}
+}
+
+// ended forgets the group uri, which has ended: nothing of it is held to
+// give up.
+func (s *Service) ended(uri string) {
+	s.mu.Lock()
+	delete(s.owned, uri)
+	delete(s.others, uri)
+	s.mu.Unlock()
 }
 
 // disown forgets that this task owns uri, after a write the store refused
@@ -310,6 +355,19 @@ func (s *Service) beat(ctx context.Context, until time.Time) {
 	at := s.cfg.Clock.Now()
 	if err := s.store.Beat(ctx, groupstore.Task{ID: s.cfg.Task, SIP: s.cfg.SIP, AliveUntil: until}); err != nil {
 		s.metrics.Count("task.heartbeat_failed", 1)
+		// Once the last beat's hold has run out with none stored since,
+		// the groups are given up (#121 §4, the lead's decision on #464):
+		// another task may take them over, and their sessions here can
+		// deliver nothing either way, as every copy is queued under the
+		// owner's fence in the store.
+		var lost []string
+		s.mu.Lock()
+		if !s.cfg.Clock.Now().Before(s.lastBeat.Add(s.cfg.TaskLease - s.cfg.TaskSkew)) {
+			lost = slices.Collect(maps.Keys(s.owned))
+			clear(s.owned)
+		}
+		s.mu.Unlock()
+		s.disowned(lost)
 		return
 	}
 	stored := s.cfg.Clock.Now()

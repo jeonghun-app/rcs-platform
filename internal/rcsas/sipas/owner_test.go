@@ -27,10 +27,23 @@ func loopbackPeers(ap netip.AddrPort) bool { return ap.Addr().IsLoopback() }
 // reached through b.
 func twoTasks(t *testing.T, invitees ...string) (ga, gb *groupRig) {
 	t.Helper()
+	return twoTasksWith(t, twoTaskOptions{}, invitees...)
+}
+
+// twoTaskOptions change both tasks of twoTasksWith: their transports, and
+// their group services' configuration.
+type twoTaskOptions struct {
+	transport transport.Config
+	group     func(*group.Config)
+}
+
+// twoTasksWith is twoTasks with o.
+func twoTasksWith(t *testing.T, o twoTaskOptions, invitees ...string) (ga, gb *groupRig) {
+	t.Helper()
 	st, groups := store.NewMemory(), groupstore.NewMemory()
 	cfg := Config{peers: loopbackPeers}
-	a := newChatRigShared(t, messaging.Config{}, cfg, transport.Config{}, rigShare{store: st, groups: groups, task: "task-a", beat: true})
-	b := newChatRigShared(t, messaging.Config{}, cfg, transport.Config{}, rigShare{store: st, groups: groups, task: "task-b", beat: true})
+	a := newChatRigShared(t, messaging.Config{}, cfg, o.transport, rigShare{store: st, groups: groups, task: "task-a", beat: true, group: o.group})
+	b := newChatRigShared(t, messaging.Config{}, cfg, o.transport, rigShare{store: st, groups: groups, task: "task-b", beat: true, group: o.group})
 	for _, r := range []*chatRig{a, b} {
 		r.core.setAnswer(func(req *sip.Request) int {
 			if req.Method == "INVITE" {
@@ -171,8 +184,8 @@ func TestAnOwnerThatDoesNotAnswerIsNoEndOfTheGroup(t *testing.T) {
 	}
 	m := gb.groupInvite(ga.uri, sdpType, offerSDP(relayPath(), "active"))
 	m.from, m.to, m.fields[0] = "<"+bob+">;tag=g1", "<"+ga.uri+">", "P-Asserted-Identity: <"+bob+">"
-	if res := gb.p.send(m); res.StatusCode == 404 || res.StatusCode < 400 {
-		t.Fatalf("answered %d", res.StatusCode)
+	if res := gb.p.send(m); res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
 	}
 }
 
@@ -242,6 +255,10 @@ func TestARegistrationOnAnotherTaskWakesTheOwner(t *testing.T) {
 		t.Fatalf("wakes sent %d; loops %d, %d", gb.metrics.get("group.wake_sent"), gb.metrics.get("sip.loop"), ga.metrics.get("sip.loop"))
 	}
 	waitUntil(t, "the wake answered", func() bool { return gb.metrics.get("sip.group.wake.200") == 1 })
+	// The wake tells of the registration, so a invites bob at once, though
+	// it asked for his session already, at the group's creation, within
+	// InviteTimeout (code review and QA on #464).
+	ownerInvites(t, ga, bob)
 	select {
 	case req := <-gb.core.got:
 		if req.Method == "INVITE" {
@@ -286,17 +303,20 @@ func TestTheOwnersAddressIsCheckedBeforeForwarding(t *testing.T) {
 		t.Fatal(err)
 	}
 	for at, want := range map[string]bool{
-		"10.0.0.2:5060":    true,
-		"172.16.3.4:5060":  true,
-		"192.168.1.1:5060": true,
-		"[fd00::2]:5060":   true,
-		"10.0.0.1:5060":    false, // this task
-		"10.0.0.2:5061":    false, // not rcs-as's port
-		"192.0.2.1:5060":   false, // not private
-		"127.0.0.1:5060":   false,
-		"":                 false,
-		"10.0.0.2":         false,
-		"rcs-as:5060":      false,
+		"10.0.0.2:5060":          true,
+		"172.16.3.4:5060":        true,
+		"192.168.1.1:5060":       true,
+		"[fd00::2]:5060":         true,
+		"10.0.0.1:5060":          false, // this task
+		"[::ffff:10.0.0.1]:5060": false, // this task, mapped
+		"[::ffff:10.0.0.2]:5060": true,
+		"[fd00::2%eth0]:5060":    false, // a zone
+		"10.0.0.2:5061":          false, // not rcs-as's port
+		"192.0.2.1:5060":         false, // not private
+		"127.0.0.1:5060":         false,
+		"":                       false,
+		"10.0.0.2":               false,
+		"rcs-as:5060":            false,
 	} {
 		u, ok := srv.peer(at)
 		if ok != want {

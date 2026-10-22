@@ -140,8 +140,10 @@ subscribers of the task that made the change.
   lost a group therefore cannot change it or fan a message out, whatever its
   clock or pauses; its write is refused, never applied twice, and it gives the
   group up. A task whose heartbeat has not succeeded within `RCSAS_TASK_LEASE`
-  minus `RCSAS_TASK_SKEW` writes no group until a beat lands, and then gives up
-  every group it held. Decisions the store does not fence (whether to invite
+  minus `RCSAS_TASK_SKEW` writes no group until a beat lands, and gives up
+  every group it held then, at its first failed beat past it: whether the
+  store is out for every task or for this one alone, its sessions can deliver
+  nothing meanwhile, as every copy is queued under the owner's fence. Decisions the store does not fence (whether to invite
   for a queued copy, where to forward a request) read the owner item again
   once a heartbeat old.
 - A task that gives a group up ends the sessions and subscriptions it holds

@@ -35,6 +35,10 @@ type members struct {
 	fence   *store.Fence
 	lost    *atomic.Int64
 	woken   *atomic.Int64
+	// registered counts the wakes that told of a registration on a new
+	// flow, and hold, when set, holds every wake until it is closed.
+	registered *atomic.Int64
+	hold       chan struct{}
 }
 
 func (h members) Owns(_ context.Context, group string) (bool, error) {
@@ -47,9 +51,15 @@ func (h members) Lost(group string) {
 	}
 }
 
-func (h members) WakeOwner(_ context.Context, group, user string) {
+func (h members) WakeOwner(_ context.Context, group, user string, registered bool) {
+	if h.hold != nil {
+		<-h.hold
+	}
 	if h.woken != nil && group == groupURI {
 		h.woken.Add(1)
+	}
+	if h.registered != nil && registered {
+		h.registered.Add(1)
 	}
 }
 
@@ -771,7 +781,7 @@ func TestOnlyTheGroupsOwnerInvitesForItsCopies(t *testing.T) {
 		t.Fatalf("%d invitations from a task that does not own the group; %d skipped", n, r.m.get("delivery.group_not_owned"))
 	}
 	r.e.SetGroupHandler(members{all: []string{alice, bob}})
-	r.e.Wake(bob)
+	r.e.Wake(bob, groupURI, false)
 	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI || r.m.get("group.wake") != 1 {
 		t.Fatalf("invitation %+v after the wake", inv)
 	}
@@ -783,22 +793,91 @@ func TestOnlyTheGroupsOwnerInvitesForItsCopies(t *testing.T) {
 // owner would invite.
 func TestANonOwnersQueuePassWakesTheOwner(t *testing.T) {
 	r := newRig(t, Config{})
-	h := members{all: []string{alice, bob}, notMine: true, woken: new(atomic.Int64)}
+	h := members{all: []string{alice, bob}, notMine: true, woken: new(atomic.Int64), registered: new(atomic.Int64)}
 	r.e.SetGroupHandler(h)
 	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "the owner woken", func() bool { return h.woken.Load() == 1 })
-	before := r.m.get("delivery.group_not_owned")
-	r.e.UserRegistered(bob, true)
-	waitFor(t, "the next pass", func() bool { return r.m.get("delivery.group_not_owned") > before })
-	waitFor(t, "idle", r.idle)
-	if n := h.woken.Load(); n != 1 {
-		t.Fatalf("the owner was woken %d times within InviteTimeout", n)
+	pass := func(newFlow bool) {
+		t.Helper()
+		before := r.m.get("delivery.group_not_owned")
+		if newFlow {
+			r.e.UserRegistered(bob, true)
+		} else {
+			r.e.Wake(bob, groupURI, false)
+		}
+		waitFor(t, "the next pass", func() bool { return r.m.get("delivery.group_not_owned") > before })
+		waitFor(t, "idle", r.idle)
 	}
+	pass(false)
+	if n := h.woken.Load(); n != 1 || h.registered.Load() != 0 {
+		t.Fatalf("woken %d times within InviteTimeout, %d telling of a registration", n, h.registered.Load())
+	}
+	// A registration on a new flow here wakes the owner at once, and says
+	// so (code review on #464), once.
+	pass(true)
+	waitFor(t, "the owner woken for the registration", func() bool { return h.woken.Load() == 2 })
+	if n := h.registered.Load(); n != 1 {
+		t.Fatalf("%d wakes told of the registration", n)
+	}
+	pass(false)
 	r.clock.Advance(DefaultInviteTimeout)
-	r.e.UserRegistered(bob, true)
-	waitFor(t, "the owner woken again", func() bool { return h.woken.Load() == 2 })
+	pass(false)
+	waitFor(t, "the owner woken again", func() bool { return h.woken.Load() == 3 })
+	if n := h.registered.Load(); n != 1 {
+		t.Fatalf("%d wakes told of the one registration", n)
+	}
+}
+
+// Code review on #464: a wake goes off the queue pass, which a connection
+// to the owner still to be made would hold up: with one worker, a pager
+// message for someone else goes while the wake waits.
+func TestAWakeDoesNotHoldTheQueuePass(t *testing.T) {
+	r := newRig(t, Config{Workers: 1})
+	h := members{all: []string{alice, bob}, notMine: true, woken: new(atomic.Int64), hold: make(chan struct{})}
+	r.e.SetGroupHandler(h)
+	defer close(h.hold)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the pass", func() bool { return r.m.get("delivery.group_not_owned") > 0 })
+	if err := r.e.Submit(t.Context(), standalone(alice, carol, chat(t, "p1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if d := r.d.nextPager(t); d.Recipient != carol {
+		t.Fatalf("delivered %+v", d)
+	}
+	if n := h.woken.Load(); n != 0 {
+		t.Fatalf("the held wake finished %d times", n)
+	}
+}
+
+// Code review and QA on #464: a wake that tells of a registration on a new
+// flow has the owner forget the invitation it last asked for the
+// participant in the group, which held its copies back, and invite at once;
+// one that does not leaves the invitation's wait.
+func TestAWakeForARegistrationInvitesAtOnce(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if inv := r.d.nextInvite(t); inv.Recipient != bob {
+		t.Fatalf("invitation %+v", inv)
+	}
+	waitFor(t, "idle", r.idle)
+	r.e.Wake(bob, groupURI, false)
+	waitFor(t, "idle", r.idle)
+	select {
+	case inv := <-r.d.invites:
+		t.Fatalf("invited again within InviteTimeout: %+v", inv)
+	default:
+	}
+	r.e.Wake(bob, groupURI, true)
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v after the registration's wake", inv)
+	}
 }
 
 // #121 D2 (T4): every copy is queued under the group's owner the handler

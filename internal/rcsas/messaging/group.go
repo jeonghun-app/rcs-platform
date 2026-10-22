@@ -60,8 +60,9 @@ type GroupHandler interface {
 	Lost(group string)
 	// WakeOwner asks the task that owns group, another, to read user's
 	// queue again: this task's queue pass left a copy of the group's to
-	// it, which it may not know of, as when user registered here.
-	WakeOwner(ctx context.Context, group, user string)
+	// it, which it may not know of, as when user registered here, which
+	// registered says of a registration on a new flow (Engine.Wake).
+	WakeOwner(ctx context.Context, group, user string, registered bool)
 }
 
 // Audience is who a participant's message in a group goes to, and the
@@ -77,11 +78,21 @@ type Audience struct {
 	Fence *store.Fence
 }
 
-// Wake has the engine read user's queue again, as a registration on a new
-// flow does: for the owner of a group whose copies wait in it, told by
-// the task that saw the registration (#121).
-func (e *Engine) Wake(user string) {
+// Wake has the engine read user's queue again: for the owner of group, a
+// group whose copies wait in it, told by another task whose queue pass
+// left them (#121). With registered, that task saw user register on a new
+// flow, which the owner takes as UserRegistered does for the group: the
+// invitation it last asked for user, which would hold its copies back
+// until InviteTimeout, and its pager-only mark, are forgotten (code review
+// on #464).
+func (e *Engine) Wake(user, group string, registered bool) {
 	e.metrics.Count("group.wake", 1)
+	if registered {
+		e.mu.Lock()
+		delete(e.pagerOnly, user)
+		delete(e.invites, inviteKey{user, group, store.Group, ""})
+		e.mu.Unlock()
+	}
 	e.kickEvent(user)
 }
 

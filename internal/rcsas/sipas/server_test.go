@@ -271,8 +271,8 @@ func (n notifier) RosterChanged(ctx context.Context, u group.RosterUpdate) {
 
 func (n notifier) Disowned(uri string) { (*n.a).srv.Disowned(uri) }
 
-func (n notifier) WakeOwner(ctx context.Context, at, uri, user string) error {
-	return (*n.a).srv.WakeOwner(ctx, at, uri, user)
+func (n notifier) WakeOwner(ctx context.Context, at, uri, user string, registered bool) error {
+	return (*n.a).srv.WakeOwner(ctx, at, uri, user, registered)
 }
 
 // #298: a pager MESSAGE as rcsjta sends it, without conversation headers,

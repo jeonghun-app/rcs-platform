@@ -142,15 +142,18 @@ func (n *notifier) Disowned(uri string) {
 	n.disowned = append(n.disowned, uri)
 }
 
-func (n *notifier) WakeOwner(_ context.Context, at, uri, user string) error {
+func (n *notifier) WakeOwner(_ context.Context, at, uri, user string, registered bool) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.wakes = append(n.wakes, wake{at, uri, user})
+	n.wakes = append(n.wakes, wake{at, uri, user, registered})
 	return nil
 }
 
 // wake is a WakeOwner the notifier was asked for.
-type wake struct{ at, uri, user string }
+type wake struct {
+	at, uri, user string
+	registered    bool
+}
 
 func (n *notifier) all() []RosterUpdate {
 	n.mu.Lock()

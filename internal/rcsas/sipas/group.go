@@ -31,9 +31,11 @@ type Groups interface {
 	FullRoster(ctx context.Context, uri string) (groupstore.Group, []byte, error)
 	Get(ctx context.Context, uri string) (groupstore.Group, error)
 	Established(ctx context.Context, uri string) error
-	// Place and URIFor find the task that owns a group (#121).
+	// Place and URIFor find the task that owns a group (#121); CanCreate
+	// says whether creator may make a group now, without taking a token.
 	Place(ctx context.Context, uri string) (mine bool, at groupstore.Owner, err error)
 	URIFor(contribution string) string
+	CanCreate(creator string) bool
 }
 
 // groupAllowed are the methods of a group chat's requests (RFC 3261

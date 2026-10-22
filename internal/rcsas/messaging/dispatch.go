@@ -445,17 +445,24 @@ func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool)
 		// invitation from here would open the session on this task
 		// instead, and the next message would invite back (#121).
 		e.metrics.Count("delivery.group_not_owned", 1)
-		e.wakeOwner(ctx, m)
+		e.wakeOwner(m)
 		return skip
 	}
 	e.invite(ctx, m)
 	return skip
 }
 
+// maxWakesOut bounds the wakes on their way at once.
+const maxWakesOut = 16
+
 // wakeOwner asks the owner of m's group to read m's recipient's queue
-// (GroupHandler.WakeOwner), once per InviteTimeout: as often as the owner
-// would invite the recipient for it.
-func (e *Engine) wakeOwner(ctx context.Context, m store.Message) {
+// (GroupHandler.WakeOwner), once per InviteTimeout, as often as the owner
+// would invite the recipient for it, and at once after the recipient
+// registered on a new flow here, which the wake tells (Engine.Wake). It
+// goes off the queue pass, which a connection to the owner still to be
+// made would hold up (code review on #464); beyond maxWakesOut on their
+// way it is left for the next pass.
+func (e *Engine) wakeOwner(m store.Message) {
 	h := e.groupHandler()
 	if h == nil {
 		return
@@ -463,14 +470,29 @@ func (e *Engine) wakeOwner(ctx context.Context, m store.Message) {
 	k := legKey{m.Recipient, m.Sender}
 	e.mu.Lock()
 	until, asked := e.woken[k]
-	due := !asked || !e.clock.Now().Before(until)
-	if due {
-		e.markFor(e.woken, k, e.cfg.InviteTimeout)
+	if e.closed || asked && e.clock.Now().Before(until) || e.wakesOut >= maxWakesOut {
+		e.mu.Unlock()
+		return
 	}
+	e.markFor(e.woken, k, e.cfg.InviteTimeout)
+	flow := e.flows[k.user]
+	registered := flow != 0 && e.wokeFlow[k] != flow
+	if len(e.wokeFlow) >= e.cfg.MaxTracked {
+		clear(e.wokeFlow)
+	}
+	e.wokeFlow[k] = flow
+	e.wakesOut++
+	e.wg.Add(1)
 	e.mu.Unlock()
-	if due {
-		h.WakeOwner(ctx, m.Sender, m.Recipient)
-	}
+	go func() {
+		defer e.wg.Done()
+		ctx, cancel := context.WithTimeout(e.ctx, e.cfg.DeliveryTimeout)
+		defer cancel()
+		h.WakeOwner(ctx, m.Sender, m.Recipient, registered)
+		e.mu.Lock()
+		e.wakesOut--
+		e.mu.Unlock()
+	}()
 }
 
 // ownsGroup asks the GroupHandler whether this task owns m's group; when

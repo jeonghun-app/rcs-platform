@@ -453,7 +453,7 @@ func TestQAResumedOwnerInvitesNothingForTheNewOwnersCopies(t *testing.T) {
 	}
 	sa.failBeats.Store(false) // a resumes and beats again
 	a.pass(t, DefaultTaskLease+DefaultTaskSkew+time.Second)
-	a.e.Wake(bob) // as bob registering on a would
+	a.e.Wake(bob, g.URI, false) // as bob registering on a would
 	waitFor(t, "a's queue pass", func() bool { return a.m.get("delivery.group_not_owned") > 0 })
 	a.quiet()
 	if n := a.invitesOf(g, bob); n != 0 {
@@ -575,25 +575,89 @@ func TestAGroupTakenOverIsDisownedOnce(t *testing.T) {
 	}
 }
 
-// #121 §4 and Q4: a task whose heartbeat lapsed gives up every group it
-// held once a beat lands, as another task may have taken any of them:
-// their participants come back through whichever task owns them now.
+// #121 §4 and Q4, the lead's decision on #464: a task whose own lease runs
+// out with no beat stored gives up every group it held then, without
+// waiting for a beat to land: whether the store is out for every task, or
+// this one alone and another takes the groups over, the sessions here can
+// deliver nothing. Their participants come back through whichever task
+// owns them. A beat that lands later gives nothing up twice.
 func TestALapseDisownsEveryGroupHeld(t *testing.T) {
-	a, _, sa, _ := twoTasks(t, Config{}, Config{})
-	g1, g2 := a.create(bob), a.create(carol)
-	sa.failBeats.Store(true)
-	a.passFailing(t, sa, DefaultTaskLease)
-	if got := a.n.disownedOnes(); len(got) != 0 {
-		t.Fatalf("disowned %v before a beat landed", got)
+	for _, outage := range []string{"every task", "this task only"} {
+		t.Run(outage, func(t *testing.T) {
+			a, b, sa, sb := twoTasks(t, Config{}, Config{})
+			g1, g2 := a.create(bob), a.create(carol)
+			sa.failBeats.Store(true)
+			if outage == "every task" {
+				sb.failBeats.Store(true)
+			}
+			a.passFailing(t, sa, DefaultTaskLease-DefaultTaskSkew-time.Second)
+			if got := a.n.disownedOnes(); len(got) != 0 {
+				t.Fatalf("disowned %v while the lease held", got)
+			}
+			a.passFailing(t, sa, DefaultTaskHeartbeat)
+			got := a.n.disownedOnes()
+			slices.Sort(got)
+			want := []string{g1.URI, g2.URI}
+			slices.Sort(want)
+			if !slices.Equal(got, want) {
+				t.Fatalf("disowned %v once the lease ran out, want %v", got, want)
+			}
+			if outage == "this task only" {
+				b.pass(t, DefaultTaskLease+DefaultTaskSkew)
+				if err := b.add(t, g1.URI, dave); err != nil {
+					t.Fatalf("b's takeover: %v", err)
+				}
+			}
+			sa.failBeats.Store(false)
+			a.pass(t, DefaultTaskHeartbeat)
+			if got := a.n.disownedOnes(); len(got) != 2 {
+				t.Errorf("disowned %v once a beat landed, want the two only", got)
+			}
+		})
 	}
-	sa.failBeats.Store(false)
-	a.pass(t, DefaultTaskHeartbeat)
-	got := a.n.disownedOnes()
-	slices.Sort(got)
-	want := []string{g1.URI, g2.URI}
-	slices.Sort(want)
-	if !slices.Equal(got, want) {
-		t.Fatalf("disowned %v, want %v", got, want)
+}
+
+// QA on #464: a group dropped from what this task remembers owning, at
+// MaxTracked, is given up as a lost one is, so that a takeover found later
+// does not leave its sessions here.
+func TestQA464AGroupForgottenAtMaxTrackedIsStillDisowned(t *testing.T) {
+	a, b, sa, _ := twoTasks(t, Config{MaxTracked: 3}, Config{})
+	g1 := a.create(bob)
+	a.create(carol)
+	a.create(dave)
+	a.create(bob, carol)
+	sa.failBeats.Store(true)
+	b.pass(t, DefaultTaskLease+DefaultTaskSkew)
+	if err := b.add(t, g1.URI, erin); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.add(t, g1.URI, dave); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("a's Add = %v", err)
+	}
+	if got := a.n.disownedOnes(); !slices.Contains(got, g1.URI) {
+		t.Fatalf("a held g1 and lost it, but disowned %v", got)
+	}
+}
+
+// QA on #464: an ended group is not kept among those this task owns.
+func TestAnEndedGroupIsForgotten(t *testing.T) {
+	r := newRig(t, Config{})
+	g := r.create(bob)
+	r.s.mu.Lock()
+	_, held := r.s.owned[g.URI]
+	r.s.mu.Unlock()
+	if !held {
+		t.Fatal("the group is not remembered as owned")
+	}
+	r.clock.Advance(DefaultIdleTTL + time.Hour)
+	if _, _, err := r.s.Place(t.Context(), g.URI); !errors.Is(err, ErrNoGroup) {
+		t.Fatalf("Place of an ended group = %v", err)
+	}
+	r.s.mu.Lock()
+	_, ok := r.s.owned[g.URI]
+	r.s.mu.Unlock()
+	if ok {
+		t.Error("an ended group is still remembered as owned")
 	}
 }
 
@@ -602,11 +666,11 @@ func TestALapseDisownsEveryGroupHeld(t *testing.T) {
 func TestWakeOwnerAsksTheOwner(t *testing.T) {
 	a, b, _, _ := twoTasks(t, Config{SIP: "10.0.1.1:5060"}, Config{SIP: "10.0.1.2:5060"})
 	g := a.create(bob)
-	b.s.WakeOwner(t.Context(), g.URI, bob)
-	if got := b.n.wakesSent(); len(got) != 1 || got[0] != (wake{"10.0.1.1:5060", g.URI, bob}) || b.m.get("group.wake_sent") != 1 {
+	b.s.WakeOwner(t.Context(), g.URI, bob, true)
+	if got := b.n.wakesSent(); len(got) != 1 || got[0] != (wake{"10.0.1.1:5060", g.URI, bob, true}) || b.m.get("group.wake_sent") != 1 {
 		t.Fatalf("wakes %+v", got)
 	}
-	a.s.WakeOwner(t.Context(), g.URI, bob)
+	a.s.WakeOwner(t.Context(), g.URI, bob, false)
 	if got := a.n.wakesSent(); len(got) != 0 {
 		t.Fatalf("the owner woke %+v", got)
 	}
@@ -664,7 +728,7 @@ func TestAResumedOwnerInvitesNothingOneHeartbeatLater(t *testing.T) {
 	}
 	sa.failBeats.Store(false)
 	a.pass(t, DefaultTaskHeartbeat+time.Second)
-	a.e.Wake(bob)
+	a.e.Wake(bob, g.URI, false)
 	waitFor(t, "a's queue pass", func() bool { return a.m.get("delivery.group_not_owned") > 0 || a.invitesOf(g, bob) > 0 })
 	a.quiet()
 	if n := a.invitesOf(g, bob); n != 0 {
@@ -716,5 +780,33 @@ func TestTheOwnersOwnsReadsNothingWithinAHeartbeat(t *testing.T) {
 	}
 	if n := sa.gets.Load() + sa.owners.Load() + sa.tasks.Load() - reads; n != 0 {
 		t.Fatalf("10 Owns by the owner within a heartbeat read the store %d times", n)
+	}
+}
+
+// Security review on #464: that there is no such group is remembered a
+// moment, so that requests for one cost no read each, and forgotten once
+// this task makes it.
+func TestNoGroupIsRememberedAMoment(t *testing.T) {
+	a, _, sa, _ := twoTasks(t, Config{}, Config{})
+	uri := a.s.URIFor("gch4t9")
+	if _, _, err := a.s.Place(t.Context(), uri); !errors.Is(err, ErrNoGroup) {
+		t.Fatalf("Place = %v", err)
+	}
+	gets := sa.gets.Load()
+	if _, _, err := a.s.Place(t.Context(), uri); !errors.Is(err, ErrNoGroup) || sa.gets.Load() != gets {
+		t.Fatalf("Place again = %v, %d reads", err, sa.gets.Load()-gets)
+	}
+	if _, err := a.s.Create(t.Context(), CreateRequest{Creator: alice, Invitees: []Invitee{{Identity: bob}}, Contribution: "gch4t9"}); err != nil {
+		t.Fatal(err)
+	}
+	if mine, _, err := a.s.Place(t.Context(), uri); err != nil || !mine {
+		t.Fatalf("Place of the group made = %v, %v", mine, err)
+	}
+	other := a.s.URIFor("gch4t8")
+	_, _, _ = a.s.Place(t.Context(), other)
+	a.clock.Advance(absentFor)
+	gets = sa.gets.Load()
+	if _, _, _ = a.s.Place(t.Context(), other); sa.gets.Load() == gets {
+		t.Error("no read once the moment had passed")
 	}
 }
