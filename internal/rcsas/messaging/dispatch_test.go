@@ -713,6 +713,76 @@ func TestAReleaseDuringAPassHasTheQueueReadAgain(t *testing.T) {
 	}
 }
 
+// releaseGate is a pendingGate whose Release, once armed, says it has been
+// called and goes on only when let.
+type releaseGate struct {
+	*pendingGate
+	releaseArmed atomic.Bool
+	releasing    chan struct{}
+	proceed      chan struct{}
+}
+
+func (s *releaseGate) Release(ctx context.Context, recipient, id, owner string) error {
+	if s.releaseArmed.CompareAndSwap(true, false) {
+		close(s.releasing)
+		<-s.proceed
+	}
+	return s.pendingGate.Release(ctx, recipient, id, owner)
+}
+
+// QA of #316: the queue is marked to be read again only once the message
+// is back in it. Here the pass that read it claimed ends between the
+// attempt's end and the release; marked any earlier, that pass would read
+// the queue once more with the message still claimed, find nothing and
+// let the recipient go, with no retry timer left to read it again (#294).
+// Marked after the release, it finds the pass over and arms the timer.
+func TestAReleaseMarksTheQueueOnlyOnceTheMessageIsBack(t *testing.T) {
+	st := &releaseGate{
+		pendingGate: &pendingGate{Store: store.NewMemory(), read: make(chan struct{}), release: make(chan struct{})},
+		releasing:   make(chan struct{}),
+		proceed:     make(chan struct{}),
+	}
+	r := newRigWith(t, Config{PagerLimit: 600}, st, newFakeClock())
+	// Both let go on every way out, before the engine closes (cleanups run
+	// last first).
+	release := sync.OnceFunc(func() { close(st.release) })
+	proceed := sync.OnceFunc(func() { close(st.proceed) })
+	t.Cleanup(release)
+	t.Cleanup(proceed)
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	// A pass reads the queue, the message claimed, and is held there.
+	st.armed.Store(true)
+	r.e.kickEvent(bob)
+	waitDone(t, st.read)
+	// The attempt fails; its release is held, and the pass ends meanwhile.
+	st.releaseArmed.Store(true)
+	_ = leg.Close()
+	waitDone(t, st.releasing)
+	release()
+	waitFor(t, "the pass to end", r.idle)
+	proceed()
+	waitDone(t, leg.Finished())
+	waitFor(t, "the retry timer", func() bool { return r.clock.armed(DefaultRetryInterval) })
+	r.clock.Advance(DefaultRetryInterval)
+	if got := r.d.nextInvite(t); got.QueueID != inv.QueueID {
+		t.Fatalf("invitation %+v", got)
+	}
+}
+
 // failLargeAttempt makes one large-mode attempt for bob that fails: the
 // client answers and never binds.
 func failLargeAttempt(t *testing.T, r *rig) {
