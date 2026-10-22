@@ -623,6 +623,7 @@ the sweep, every 30 s.
 | `msrp.bindings`, `msrp.refused.*`, `msrp.ended.*`, `msrp.relay_errors`, `msrp.released_after_cancel`, `msrp.create_cut_at_stop`, `msrp.bye_failed` | gauge, count | as in [MSRP anchoring](#msrp-anchoring) |
 | `transport.listener_connections.*`, `transport.*` | gauge, count | as in [Edge rules](#edge-rules) |
 | `proxy.hook_panics` | count | panics recovered in pcscf's routing, SDP and response hooks: the request was answered 500, or the branch or response the hook was for was ended (#428). Alarm on any |
+| `transaction.handler_panics`, `transport.callback_panics`, `background.panics` | count | panics recovered in a response handler (the SUBSCRIBE's), in the transport's callbacks (`Admit`, which then refuses the flow, `OnFlowClosed`, `OnPong`), and in background work (reg-event subscriptions, calls to msrp-relay); each ends only the call or work it was in (#445). Alarm on any |
 | `QueuedBytes` | gauge | bytes waiting in every send queue, against the transport's budget |
 | `BudgetSheds` | count | stalled connections closed to keep the queues in their budget |
 | `BudgetRefusals` | count | sends refused, the connection kept, with the budget full |
@@ -672,6 +673,10 @@ start with that value.
 | `PCSCF_MAX_CLIENT_FLOWS` | `9000` | connections the client listener holds among them, counted from accept; plus `PCSCF_CORE_CONNECTIONS` it must not exceed `PCSCF_MAX_CONNECTIONS` |
 | `PCSCF_CORE_CONNECTIONS` | `256` | connections the core listener holds, kept for it |
 | `PCSCF_CLIENT_IDLE_TIMEOUT` | `340s` | close a client connection silent this long, just under the NLB TLS listener's 350 s |
+| `PCSCF_MAX_SERVER_TRANSACTIONS` | `20000` | the requests pcscf holds at once, 1 to 1000000; one past it is answered 503 with Retry-After, and the proxy allows as many in progress (as icscf, #482). A tenth of the default or less is refused |
+| `PCSCF_MAX_SERVER_TRANSACTION_BYTES` | `268435456` (256 MiB) | the memory those requests and their kept responses hold, client-facing ones 80% of it; the proxy's own memory bound is the same, of which client-facing requests may likewise use 80% (#489). At least 2.5 MiB, room for the largest request a client sends; a tenth of the default or less is refused |
+| `PCSCF_MAX_QUEUED_BYTES` | `268435456` (256 MiB) | the output every send queue holds together (`QueuedBytes`); at it, stalled client connections are closed (`BudgetSheds`). At least 2 MiB; a tenth of the default or less is refused. An alarm set against the default byte budgets must move with them |
+| `PCSCF_WRITE_TIMEOUT` | `10s` | how long writing each 32 KiB of a message may take, on client and core connections alike; past it the connection is closed. Once the send buffers are full, that makes it a throughput floor: the peer must read about 200 KiB within it, about 20 KiB/s at the default and 200 KiB/s at 1s. It is also how long a send waits for room in a full send queue before it fails (`ErrQueueFull`), leaving the connection open. Outside 1s to 1m is refused |
 | `PCSCF_RELAY_URL` | `http://msrp-relay.<RCS_SERVICE_NAMESPACE>:8082` | `msrp-relay`'s control API: `http` or `https` of a private host, without a path |
 | `PCSCF_RELAY_TOKEN` | none | `pcscf`'s bearer token for it, from Secrets Manager in AWS; unset or under 43 characters is refused; without one, MSRP sessions are refused |
 | `PCSCF_RELAY_TIMEOUT` | `2s` | one call to the control API |

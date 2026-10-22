@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"strconv"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
@@ -241,7 +243,17 @@ type Config struct {
 	// Timer C. ServerTransaction.Progress starts either timeout again.
 	NonInviteFinalTimeout time.Duration
 	InviteFinalTimeout    time.Duration
+
+	// Logger and Metrics receive the panics recovered from the TU's
+	// response handlers (ResponseHandler, #445): logged without their
+	// values at most once a minute, and counted as MetricHandlerPanics.
+	// Nil discards the lines and keeps the count in Stats only.
+	Logger  *slog.Logger
+	Metrics panics.Counter
 }
+
+// MetricHandlerPanics counts the panics recovered from response handlers.
+const MetricHandlerPanics = "transaction.handler_panics"
 
 // Validate reports a configuration New refuses, so a service can check its
 // settings before it builds anything.
@@ -251,7 +263,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("transaction: MaxServerTransactions %d is not 0 (the default) or 1..%d", c.MaxServerTransactions, MaxMaxServerTransactions)
 	case c.MaxServerTransactionBytes < 0:
 		return errors.New("transaction: negative MaxServerTransactionBytes")
-	case c.ClientShare < 0 || c.ClientShare > 1:
+	case c.ClientShare < 0 || c.ClientShare > 1 || math.IsNaN(c.ClientShare):
 		return fmt.Errorf("transaction: ClientShare %v is outside 0..1", c.ClientShare)
 	case c.RetryAfter < 0 || c.RetryAfter > MaxRetryAfter:
 		return fmt.Errorf("transaction: RetryAfter %v is outside 0..%v", c.RetryAfter, MaxRetryAfter)
@@ -288,6 +300,8 @@ type Layer struct {
 	// lateFinals count what they did.
 	nonInviteFinal, inviteFinal time.Duration
 	timedOut, lateFinals        atomic.Uint64
+	// panics recovers the response handlers' panics.
+	panics *panics.Guard
 
 	mu      sync.Mutex
 	clients map[string]*ClientTransaction
@@ -330,8 +344,8 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 	l := &Layer{
 		maxServers:    cfg.MaxServerTransactions,
 		maxBytes:      cfg.MaxServerTransactionBytes,
-		clientServers: clientShare(int64(cfg.MaxServerTransactions), cfg.ClientShare),
-		clientBytes:   clientShare(cfg.MaxServerTransactionBytes, cfg.ClientShare),
+		clientServers: ClientShareOf(int64(cfg.MaxServerTransactions), cfg.ClientShare),
+		clientBytes:   ClientShareOf(cfg.MaxServerTransactionBytes, cfg.ClientShare),
 		tagKey:        key,
 		retryAfter:    strconv.FormatInt(int64((cfg.RetryAfter+time.Second-1)/time.Second), 10),
 		ids:           cfg.IDs,
@@ -345,6 +359,9 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 		clients:       make(map[string]*ClientTransaction),
 		servers:       make(map[string]*ServerTransaction),
 		byFlow:        make(map[transport.FlowID]map[*ClientTransaction]struct{}),
+		panics: panics.New(panics.Config{
+			Metric: MetricHandlerPanics, Message: "transaction: a response handler panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
+		}),
 	}
 	if l.clock == nil {
 		l.clock = SystemClock
@@ -507,10 +524,19 @@ func responseSize(res *sip.Response) int64 {
 	return int64(len(res.Reason) + res.Header.WireSize() + len(res.Body) + res.Header.Len()*fieldOverhead)
 }
 
-// clientShare is share of bound, rounded up so that a bound of 1 still lets a
-// client request in.
-func clientShare(bound int64, share float64) int64 {
-	return int64(math.Ceil(float64(bound) * share))
+// ClientShareOf is the part of bound that requests from client-facing
+// listeners may use at a ClientShare of share: rounded up, so that a bound
+// of 1 still lets a client request in, and never past bound, so that a
+// share of 1, or one that rounds to it, keeps even the largest bound. The
+// proxy's context bytes take theirs with it too, so that the two agree.
+func ClientShareOf(bound int64, share float64) int64 {
+	// float64(bound) may round up past bound (the largest int64), so the
+	// result is compared with it rather than converted.
+	v := math.Ceil(float64(bound) * share)
+	if v >= float64(bound) {
+		return bound
+	}
+	return int64(v)
 }
 
 // keep charges tx for a response of size after kept in place of one of size
@@ -598,6 +624,8 @@ type Stats struct {
 	// counts final responses the TU sent after that, which were dropped.
 	ServerTransactionsTimedOut uint64
 	LateFinalResponses         uint64
+	// HandlerPanics counts the panics recovered from response handlers.
+	HandlerPanics uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -607,7 +635,8 @@ func (l *Layer) Stats() Stats {
 	l.mu.Unlock()
 	return Stats{ClientTransactions: c, ServerTransactions: s, ServerTransactionBytes: b,
 		ServerTransactionsRejected: l.rejected.Load(), RefusalAcksAbsorbed: l.absorbed.Load(),
-		ServerTransactionsTimedOut: l.timedOut.Load(), LateFinalResponses: l.lateFinals.Load()}
+		ServerTransactionsTimedOut: l.timedOut.Load(), LateFinalResponses: l.lateFinals.Load(),
+		HandlerPanics: l.panics.Panics()}
 }
 
 // matchServer finds the server transaction a request belongs to (RFC 3261

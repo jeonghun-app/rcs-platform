@@ -473,14 +473,16 @@ func (d *Dynamo) DeleteProfile(ctx context.Context, k state.SetKey) error {
 // others together, so one corrupt item does not hide the rest.
 func decodeAll[T any](items []map[string]types.AttributeValue, decode func(map[string]types.AttributeValue) (T, error)) ([]T, error) {
 	var out []T
-	var errs error
+	// One join of every item's error, so that a caller can count them
+	// (#478 QA).
+	var errs []error
 	for _, item := range items {
 		v, err := decode(item)
 		if err != nil {
-			errs = errors.Join(errs, err)
+			errs = append(errs, err)
 			continue
 		}
 		out = append(out, v)
 	}
-	return out, errs
+	return out, errors.Join(errs...)
 }

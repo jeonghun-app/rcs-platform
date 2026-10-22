@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"sync/atomic"
 
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
@@ -87,7 +89,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{Logger: rt.Logger}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{Logger: rt.Logger, Metrics: rt.Metrics}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}
@@ -125,6 +127,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer px.Close()
 	mc := cfg.Messaging
 	mc.Logger, mc.HomeDomain = rt.Logger, cfg.HomeDomain
+	mc.MSRP.Panics = panics.New(panics.Config{
+		Metric: msrp.MetricCallbackPanics, Message: "rcs-as: an MSRP callback panicked", Log: rt.Logger, Metrics: rt.Metrics,
+	})
 	engine, err := messaging.New(mc, st, srv, rt.Metrics)
 	if err != nil {
 		return err

@@ -672,6 +672,16 @@ func (p *pcscf) sweepMSRP() {
 // no longer has ends the session as one it cannot serve (#136 decision 6,
 // #248 code review 1).
 func (p *pcscf) extend(ctx context.Context, s *msrpSession, ids []string, now time.Time) {
+	// A panic in a relay call still lets the next sweep extend s (#471 code
+	// review).
+	settled := false
+	defer func() {
+		if !settled {
+			s.mu.Lock()
+			s.extending = false
+			s.mu.Unlock()
+		}
+	}()
 	var err error
 	for _, id := range ids {
 		if err = p.msrp.relay.update(ctx, id, relayPaths{ExpiresIn: bindingExpiresIn}); err != nil {
@@ -680,7 +690,7 @@ func (p *pcscf) extend(ctx context.Context, s *msrpSession, ids []string, now ti
 		}
 	}
 	s.mu.Lock()
-	s.extending = false
+	s.extending, settled = false, true
 	if err == nil {
 		s.extended = now
 	}
