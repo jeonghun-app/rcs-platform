@@ -43,7 +43,7 @@ func TestSplitCutsBodiesIntoChunksOfAtMostTheSize(t *testing.T) {
 			if c.Flag != wantFlag {
 				t.Errorf("%d octets: chunk %d flag %q", tt.length, i, c.Flag)
 			}
-			joined = append(joined, c.Data...)
+			joined = append(joined, c.Data.Bytes()...)
 		}
 		if !equalBodies(joined, body) {
 			t.Errorf("%d octets: chunks do not add up to the body", tt.length)

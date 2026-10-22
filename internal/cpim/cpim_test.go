@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 )
 
 const (
@@ -66,8 +68,8 @@ func TestParseReadsEveryPartOfAChatMessage(t *testing.T) {
 	if !reflect.DeepEqual(m.ContentHeaders, wantContent) {
 		t.Errorf("ContentHeaders = %#v", m.ContentHeaders)
 	}
-	if string(m.Body) != "Hello" {
-		t.Errorf("Body = %q", m.Body)
+	if string(m.Body.Bytes()) != "Hello" {
+		t.Errorf("Body = %q", m.Body.Bytes())
 	}
 
 	from, err := m.From()
@@ -223,8 +225,8 @@ func TestLayoutDeviationsAreReadWithoutRewritingTheValue(t *testing.T) {
 		})
 	}
 	m := mustParse(t, []byte("From: <"+alice+">\n\nContent-Type: text/plain\n\nline\r\nend\n"))
-	if string(m.Body) != "line\r\nend\n" {
-		t.Errorf("Body = %q; the body is never touched", m.Body)
+	if string(m.Body.Bytes()) != "line\r\nend\n" {
+		t.Errorf("Body = %q; the body is never touched", m.Body.Bytes())
 	}
 	out, err := m.Marshal()
 	if err != nil || !bytes.HasPrefix(out, crlf("From: <"+alice+">\n\nContent-Type: text/plain\n\n")) {
@@ -556,6 +558,19 @@ Content-Type: text/plain
 	}
 }
 
+// sameMessage reports whether a and b hold the same headers, content
+// headers and body. A Body holds a pointer, which reflect.DeepEqual follows
+// to its first octet only, and its capacity, which a []byte never had it
+// compare: the bodies are compared by their octets instead.
+func sameMessage(a, b *Message) bool {
+	if !bytes.Equal(a.Body.Bytes(), b.Body.Bytes()) {
+		return false
+	}
+	ca, cb := *a, *b
+	ca.Body, cb.Body = content.Body{}, content.Body{}
+	return reflect.DeepEqual(ca, cb)
+}
+
 func TestFoldedContentHeadersAreUnfolded(t *testing.T) {
 	m := mustParse(t, crlf("From: <"+alice+">\n\nContent-Type: multipart/mixed;\n\tboundary=\"imdn-boundary\"\nContent-Disposition: notification\n\n"))
 	if got := m.ContentType(); got != "multipart/mixed;\tboundary=\"imdn-boundary\"" {
@@ -566,7 +581,7 @@ func TestFoldedContentHeadersAreUnfolded(t *testing.T) {
 		t.Fatal(err)
 	}
 	again := mustParse(t, out)
-	if !reflect.DeepEqual(again, m) {
+	if !sameMessage(again, m) {
 		t.Errorf("unfolded message does not round-trip: %#v", again)
 	}
 }
@@ -663,7 +678,7 @@ func TestBuildingAMessageWithAnExtensionNamespace(t *testing.T) {
 	must(m.Declare("other", imdnNS))
 	must(m.Add(imdnNS, "Message-ID", "abc"))
 	m.ContentHeaders = []Field{{Name: "Content-Type", Value: "text/plain"}}
-	m.Body = []byte("Hi")
+	m.Body = content.BodyOf([]byte("Hi"))
 
 	out, err := m.Marshal()
 	if err != nil {
@@ -863,8 +878,8 @@ func TestParsedMessageDoesNotAliasTheInput(t *testing.T) {
 	for i := range data {
 		data[i] = 'x'
 	}
-	if string(m.Body) != "Hello" || m.Headers[0].Name != "From" {
-		t.Errorf("message changed with its input: %q", m.Body)
+	if string(m.Body.Bytes()) != "Hello" || m.Headers[0].Name != "From" {
+		t.Errorf("message changed with its input: %q", m.Body.Bytes())
 	}
 }
 

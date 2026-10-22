@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
@@ -42,7 +43,7 @@ func TestQA464WokenOwnerInvites(t *testing.T) {
 			ga, gb := twoTasks(t, bob) // bob's focus INVITE was answered 486
 			now := time.Now()
 			if err := gb.store.Enqueue(t.Context(), store.Message{Recipient: bob, ID: "c1", Sender: ga.uri, Author: alice, Mode: store.Group,
-				CPIM: []byte(cpimBody("m1", "hi")), Enqueued: now, Expires: now.Add(time.Hour)}, store.Limit{}); err != nil {
+				CPIM: content.BodyOf([]byte(cpimBody("m1", "hi"))), Enqueued: now, Expires: now.Add(time.Hour)}, store.Limit{}); err != nil {
 				t.Fatal(err)
 			}
 			reg := msg{method: "REGISTER", uri: "sip:rcs-as." + domain, from: "<sip:scscf." + domain + ">;tag=s1",

@@ -455,7 +455,7 @@ func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	}
 	err := l.e.Submit(l.e.ctx, Origin{
 		Sender: l.p.User, Identities: l.p.Identities, Recipient: l.p.Peer,
-		Conversation: l.p.Conversation, Mode: l.p.Mode, CPIM: m.Body.Bytes(),
+		Conversation: l.p.Conversation, Mode: l.p.Mode, CPIM: m.Body,
 	})
 	var r *Rejection
 	switch {
