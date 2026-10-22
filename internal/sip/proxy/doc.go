@@ -24,10 +24,11 @@
 //     (RFC 5393 §5): its own, at most MaxBreadth (60), or 60 when it has
 //     none, split among the branches that go out together and carried in
 //     each, a branch's share free again once it is final, even one that
-//     Target.Timeout ended while its CANCEL is answered (see there). A target
-//     with no share left fails at once as 440 Max-Breadth Exceeded, the
-//     answer only when no other branch, nor another answer of the proxy's
-//     own, does better. A request it forwards with a malformed Max-Breadth is
+//     Target.Timeout ended before its transaction did, an intended deviation
+//     from RFC 5393 §5.4.1 (see Target.Timeout). A target with no share left
+//     fails at once as 440 Max-Breadth Exceeded, the answer only when no
+//     other branch, nor another answer of the proxy's own, does better. A
+//     request it forwards with a malformed Max-Breadth is
 //     refused 400; one it serves ignores the field (§5.3.5), and a 2xx's ACK
 //     goes on with MaxBreadth in place of the malformed value;
 //   - forwards provisional responses and every 2xx at once and keeps the

@@ -526,7 +526,9 @@ func (c *respContext) allFinal() bool {
 // The branches started together share what the request's Max-Breadth leaves
 // beside the branches still without a final response, at least 1 each (RFC
 // 5393 §5.3.3): a target beyond that fails at once as 440 Max-Breadth
-// Exceeded, the answer when no other branch does better.
+// Exceeded, the answer when no other branch does better. A branch
+// Target.Timeout ended is final here though its transaction may still run
+// (see Target.Timeout).
 func (c *respContext) startBranches(targets []Target) []func() {
 	var acts []func()
 	started := false

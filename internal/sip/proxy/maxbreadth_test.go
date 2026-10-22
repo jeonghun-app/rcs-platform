@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -222,4 +224,31 @@ func TestAStatelessACKCarriesItsMaxBreadth(t *testing.T) {
 			t.Errorf("%v: Max-Breadth %v, want %d", tc.extra, got, tc.want)
 		}
 	}
+}
+
+// A branch Target.Timeout ended gives its share back at once, though its
+// non-INVITE request runs on at the next hop to Timer F: a deviation from
+// RFC 5393 §5.4.1, so that scscf's default handling of a silent server can
+// go on to the next hop instead of failing it 440 (QA of #454).
+func TestATimedOutBranchGivesBackItsShare(t *testing.T) {
+	h := newHarness(t, Config{})
+	h.decide(Decision{
+		Targets: []Target{{URI: mustURI("sip:as@192.0.2.40"), Timeout: 2 * time.Second}},
+		OnBranchFailure: func(_ context.Context, f BranchFailure) []Target {
+			if f.Target.URI.User == "as" && errors.Is(f.Err, ErrTargetTimeout) {
+				return []Target{target("sip:bob@192.0.2.30")}
+			}
+			return nil
+		},
+	})
+	h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: 1"))
+	as := h.one()
+	h.advance(2 * time.Second)
+	bob := h.one()
+	a, _ := as.Header.MaxBreadth()
+	b, _ := bob.Header.MaxBreadth()
+	if a != 1 || b != 1 {
+		t.Errorf("Max-Breadth: the server's %d, then the replacement's %d, want 1 each", a, b)
+	}
+	check(t, "upstream", h.upstream(), nil)
 }

@@ -61,3 +61,17 @@ func TestAServerThatSentTheRequestOnIsNotBypassedOnEitherSide(t *testing.T) {
 		})
 	}
 }
+
+// A server hop the request's Max-Breadth left no share for was never sent:
+// its default handling does not apply, and no hop replaces it, which would
+// fail the same way and use up the proxy's MaxBranches (QA of #454).
+func TestNoHopReplacesOneWithoutMaxBreadth(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(30, rcsAS, method("OPTIONS"), ifc.SessionContinued))
+	d := e.router(nil).Initial(bg, fromUser(t, "OPTIONS", impu2))
+	f := proxy.BranchFailure{Target: d.Targets[0], Response: &sip.Response{StatusCode: 440}, Err: proxy.ErrMaxBreadth}
+	if more := d.OnBranchFailure(bg, f); len(more) != 0 {
+		t.Errorf("a branch without Max-Breadth was replaced by %v", qaHosts(more))
+	}
+}

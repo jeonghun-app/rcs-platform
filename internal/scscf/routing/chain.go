@@ -112,7 +112,11 @@ func (p *plan) prepare(ctx context.Context, t proxy.Target, req *sip.Request) er
 // (final), unless a later branch succeeds.
 func (p *plan) failed(ctx context.Context, f proxy.BranchFailure) []proxy.Target {
 	h, ok := p.hop(f.Target)
-	if !ok || h.failed == nil {
+	// No hop for a target the request's Max-Breadth left no share for: the
+	// next would fail the same way (proxy.ErrMaxBreadth), and a server's
+	// default handling is for a server that did not answer, not for one the
+	// request never reached.
+	if !ok || h.failed == nil || errors.Is(f.Err, proxy.ErrMaxBreadth) {
 		return nil
 	}
 	s := h.failed(ctx, f)
