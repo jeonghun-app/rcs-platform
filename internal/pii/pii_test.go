@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"regexp"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"syscall"
@@ -348,7 +349,8 @@ func hintOf(t *testing.T, redacted string) string {
 func TestRedactStaysLinearOnAdversarialInput(t *testing.T) {
 	r := NewRedactor(nil)
 	for _, unit := range []string{"sip:", "sips:a", "tel:", "1234567x", "0 ", "1-", "+1 (", "tel:1 1", "urn:gsma:imei:a 1", `im:"`, `pres:"\`, `im:"a"`, "１２３", "＋１\u3000", "（０）－", "1\u00a0", "1ー", "（１２", "(1", "tel:－", "１—\u202f", "1 \u2013", "＋", "1\u200b", "\u200b", "+\u200b", "1\u200b-", "sip:a\u00a01", "＋（", "\ufeff1",
-		"sip:\u00a0", "SIM:\u3000１", "sip:a\u00a0@", "1 \u200b", "+\u200b(", "tel:)\u200b(", "1 \u200b \u200b", "\u200b ", "#\u2002\u061c("} {
+		"sip:\u00a0", "SIM:\u3000１", "sip:a\u00a0@", "1 \u200b", "+\u200b(", "tel:)\u200b(", "1 \u200b \u200b", "\u200b ", "#\u2002\u061c(",
+		"si\u200b", "sip\u00ad", "1\u0301", "sip:\u200b1@", "tel:\u200b+"} {
 		in := strings.Repeat(unit, (1<<20)/len(unit))
 		if out := r.Redact(in); len(out) == 0 {
 			t.Fatalf("empty output for %q", unit)
@@ -378,12 +380,16 @@ func TestRedactIsLinear(t *testing.T) {
 		return cpu() - start
 	}
 	for name, unit := range map[string]string{
-		"sip without a user":        "sip:1",
-		"user scheme in a word":     "SIM:\u3000１",
-		"invisible after a space":   "1 \u200b",
-		"invisible after a plus":    "+\u200b(",
-		"invisible in a tel number": "tel:)\u200b(",
-		"invisibles between digits": "1\u200b\u2060",
+		"sip without a user":                "sip:1",
+		"user scheme in a word":             "SIM:\u3000１",
+		"invisible after a space":           "1 \u200b",
+		"invisible after a plus":            "+\u200b(",
+		"invisible in a tel number":         "tel:)\u200b(",
+		"invisibles between digits":         "1\u200b\u2060",
+		"a scheme split by invisibles":      "s\u200bi\u200b",
+		"invisibles before a scheme's rest": "u\u200b\u200b\u200b",
+		"marks after digits":                "1\u0301\u20e3",
+		"invisibles in a user":              "sip:\u200ba",
 	} {
 		t.Run(name, func(t *testing.T) {
 			small := strings.Repeat(unit, max(1, 1024/len(unit)))
@@ -402,6 +408,25 @@ func TestRedactIsLinear(t *testing.T) {
 			}
 			t.Fatalf("64× the input once took, against 64 of the small, three times over: %s: not linear", strings.Join(ratios, "; "))
 		})
+	}
+}
+
+// Where dropInvisibles removed characters is kept as a list of positions,
+// not as a set the size of the text (review of #398): a long text with one
+// removed run costs its copies only, about twice its length.
+func TestOneRemovedRunCostsNoTextLengthSet(t *testing.T) {
+	r := NewRedactor(nil)
+	in := "1\u200b2 " + strings.Repeat("a", 4<<20)
+	var best uint64 = 1 << 62
+	for range 3 {
+		var before, after goruntime.MemStats
+		goruntime.ReadMemStats(&before)
+		_ = r.Redact(in)
+		goruntime.ReadMemStats(&after)
+		best = min(best, after.TotalAlloc-before.TotalAlloc)
+	}
+	if limit := uint64(len(in)) * 5 / 2; best > limit {
+		t.Fatalf("Redact allocated %d bytes for %d, more than %d", best, len(in), limit)
 	}
 }
 
@@ -570,6 +595,123 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 	}
 }
 
+// Every character of the classes a log viewer shows as nothing, or as a
+// space, is read inside a number as its plain form is (#413), with the same
+// keyed hint: a format character (Cf), a variation selector or another
+// default-ignorable one as nothing; a combining mark (Mn, Me) right after a
+// digit as part of the digit, as the viewer draws it over the digit (a
+// keycap "1\ufe0f\u20e3"); and every space (Zs, Zl, Zp, U+2800 BRAILLE
+// PATTERN BLANK) as a space. Every character of each class is tried.
+func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
+	k := NewRedactor(testKey)
+	templates := []string{
+		"call +1555X0100001",
+		"msisdn=010X0000-0001",
+		"imsi 0010100X00000001",
+		"tel:+1555X0100001;phone-context=example.net",
+		"sip:+1555X0100001@" + testDomain,
+	}
+	// In a user that is not a number, a hidden character is dropped too,
+	// so the hint is the plain user's.
+	userTemplates := []string{"sip:Xalice.smith@" + testDomain, "sip:alice.smiXth@" + testDomain, "sip:alice.smithX@" + testDomain}
+	type class struct {
+		name  string
+		table *unicode.RangeTable
+		plain string
+		user  bool // also tried in userTemplates
+	}
+	classes := []class{
+		{"Cf", unicode.Cf, "", true},
+		{"Variation_Selector", unicode.Variation_Selector, "", true},
+		{"Other_Default_Ignorable_Code_Point", unicode.Other_Default_Ignorable_Code_Point, "", true},
+		{"Mn", unicode.Mn, "", false},
+		{"Me", unicode.Me, "", false},
+		{"Zs", unicode.Zs, " ", false},
+		{"Zl", unicode.Zl, " ", false},
+		{"Zp", unicode.Zp, " ", false},
+		{"U+2800", &unicode.RangeTable{R16: []unicode.Range16{{Lo: 0x2800, Hi: 0x2800, Stride: 1}}}, " ", false},
+	}
+	for _, cl := range classes {
+		t.Run(cl.name, func(t *testing.T) {
+			tried := 0
+			for _, rs := range [][]unicode.Range32{r32(cl.table)} {
+				for _, rg := range rs {
+					for r := rune(rg.Lo); r <= rune(rg.Hi); r += rune(rg.Stride) {
+						if r < utf8.RuneSelf || unicode.IsDigit(r) {
+							continue
+						}
+						tried++
+						ts := templates
+						if cl.user {
+							ts = append(slices.Clone(templates), userTemplates...)
+						}
+						for _, tmpl := range ts {
+							wide := strings.Replace(tmpl, "X", string(r), 1)
+							plain := strings.Replace(tmpl, "X", cl.plain, 1)
+							got, want := k.Redact(wide), k.Redact(plain)
+							if g, w := keyedMask.FindAllString(got, -1), keyedMask.FindAllString(want, -1); !slices.Equal(g, w) || len(g) == 0 {
+								t.Fatalf("U+%04X: Redact(%q) = %q, want the hints of %q", r, wide, got, want)
+							}
+							if strings.ContainsFunc(got, unicode.IsDigit) && !strings.ContainsFunc(want, unicode.IsDigit) {
+								t.Fatalf("U+%04X: Redact(%q) = %q keeps a digit", r, wide, got)
+							}
+						}
+					}
+				}
+			}
+			if tried == 0 {
+				t.Fatal("no character tried")
+			}
+		})
+	}
+}
+
+// r32 returns the ranges of a table as Range32s.
+func r32(t *unicode.RangeTable) []unicode.Range32 {
+	var out []unicode.Range32
+	for _, r := range t.R16 {
+		out = append(out, unicode.Range32{Lo: uint32(r.Lo), Hi: uint32(r.Hi), Stride: uint32(r.Stride)})
+	}
+	return append(out, t.R32...)
+}
+
+// An invisible character inside a URI scheme, or around a URI user, leaves
+// the URI read as it is without it (#413): the user or the number is
+// masked, with the plain form's keyed hint.
+func TestRedactReadsAURIWithInvisiblesAsWithout(t *testing.T) {
+	k := NewRedactor(testKey)
+	for wide, plain := range map[string]string{
+		"sip\u200b:alice.smith@x":               "sip:alice.smith@x",
+		"si\u00adp:alice.smith@x":               "sip:alice.smith@x",
+		"s\u200bi\u2060p:alice.smith@x":         "sip:alice.smith@x",
+		"From: <SIP\u2060:alice.smith@x>":       "From: <SIP:alice.smith@x>",
+		"sips\ufeff:alice.smith@x":              "sips:alice.smith@x",
+		"im\u200b:alice.smith@x":                "im:alice.smith@x",
+		"pre\u200bs:alice.smith@x":              "pres:alice.smith@x",
+		"te\u200bl:123456*78#9":                 "tel:123456*78#9",
+		"tel\u200b:+15550100001":                "tel:+15550100001",
+		"urn:gsma\u200b:imei:00101000-000003-1": "urn:gsma:imei:00101000-000003-1",
+		"tel:\u200b123456*78#9":                 "tel:123456*78#9",
+		"tel:\u200b*31#":                        "tel:*31#",
+		"sip:\u200balice.smith@x":               "sip:alice.smith@x",
+		"sip:alice.smith\u200b@x":               "sip:alice.smith@x",
+		"sip:ali\u200bce.smith@x":               "sip:alice.smith@x",
+		"im:\u2060alice.smith\u00ad@x":          "im:alice.smith@x",
+		"sip:+1555\u200b0100001\u200b@x":        "sip:+15550100001@x",
+	} {
+		got, want := k.Redact(wide), k.Redact(plain)
+		if asciiForm(withoutInvisibles(got)) != want {
+			t.Errorf("Redact(%q) = %q, want it read as %q, %q", wide, got, plain, want)
+		}
+	}
+	// Elsewhere such a character stays, as text.
+	for _, in := range []string{"si\u200bx:alice", "sip:host\u200b>", "s\u200bi"} {
+		if got := k.Redact(in); got != in {
+			t.Errorf("Redact(%q) = %q, want it unchanged", in, got)
+		}
+	}
+}
+
 // Only the characters of a number are rewritten: brackets, spaces and dashes
 // in the text around it keep the form they were written in (#110).
 func TestRedactKeepsTheTextAroundANumber(t *testing.T) {
@@ -667,7 +809,7 @@ func readsAsASCII(ascii, wide string) string {
 // anyFormOf puts in.
 func withoutInvisibles(s string) string {
 	return strings.Map(func(r rune) rune {
-		if slices.Contains(invisibles, r) {
+		if slices.Contains(invisibles, r) || slices.Contains(marks, r) {
 			return -1
 		}
 		return r
@@ -734,9 +876,11 @@ func asciiNumberText(rng *rand.Rand) string {
 // invisible characters it puts inside a number.
 var (
 	invisibles = []rune{'\u200b', '\u200c', '\u200d', '\u2060', '\u00ad', '\ufeff', '\ufe0f', '\u180e', '\u061c'}
+	// marks are combining marks a digit may carry (#413).
+	marks      = []rune{'\u0301', '\u0300', '\u20e3', '\u0338', '\u3099', '\u034f'}
 	digitZeros = []rune{'0', '０', '٠', '۰', '०', '০', '𝟎', '𝟘'}
 	otherForms = map[byte][]rune{
-		' ': {' ', '\u3000', '\u00a0', '\u202f', '\u2009', '\u2002', '\u205f'},
+		' ': {' ', '\u3000', '\u00a0', '\u202f', '\u2009', '\u2002', '\u205f', '\u2800', '\u2028', '\u2029', '\u1680'},
 		'-': {'-', '－', '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015', '\u2212', 'ー', 'ｰ', '\ufe63'},
 		'.': {'.', '．'},
 		'(': {'(', '（'},
@@ -751,11 +895,22 @@ func anyFormOf(rng *rand.Rand, s string) string {
 	var b strings.Builder
 	for i := 0; i < len(s); i++ {
 		if n := schemeLen(s[i:]); n > 0 {
-			b.WriteString(s[i : i+n])
+			// An invisible character may sit inside the scheme, or right
+			// after it (#413).
+			for j := range n {
+				b.WriteByte(s[i+j])
+				if rng.IntN(8) == 0 {
+					b.WriteRune(invisibles[rng.IntN(len(invisibles))])
+				}
+			}
 			i += n - 1
 			continue
 		}
 		if strings.HasPrefix(s[i:], "@"+testDomain) {
+			// And right before a user's "@".
+			if rng.IntN(8) == 0 {
+				b.WriteRune(invisibles[rng.IntN(len(invisibles))])
+			}
 			b.WriteString("@" + testDomain)
 			i += len(testDomain)
 			continue
@@ -764,6 +919,10 @@ func anyFormOf(rng *rand.Rand, s string) string {
 		switch {
 		case isDigit(c):
 			b.WriteRune(digitZeros[rng.IntN(len(digitZeros))] + rune(c-'0'))
+			// A combining mark the digit carries (#413).
+			if rng.IntN(8) == 0 {
+				b.WriteRune(marks[rng.IntN(len(marks))])
+			}
 		case otherForms[c] != nil:
 			forms := otherForms[c]
 			b.WriteRune(forms[rng.IntN(len(forms))])
@@ -866,8 +1025,9 @@ func maskedLessThanMain(s string) string {
 var keyedMask = regexp.MustCompile(`\*\*\*[a-p]{8}`)
 
 // keptOf returns what a keyed output keeps of its input: the text without
-// its masks, every number character read in its ASCII form and invisible
-// characters left out, as neither Redact rewrites them all. The text
+// its masks, every number character read in its ASCII form, and invisible
+// characters and combining marks left out, as neither Redact rewrites them
+// all. The text
 // between two masks is read on its own, so that bytes of invalid UTF-8 on
 // either side of a mask cannot form a rune.
 func keptOf(out string) string {
@@ -881,12 +1041,12 @@ func keptOf(out string) string {
 func keptPiece(b *strings.Builder, piece string) {
 	for _, r := range piece {
 		switch {
-		case unicode.In(r, unicode.Cf, unicode.Variation_Selector, unicode.Other_Default_Ignorable_Code_Point):
+		case unicode.In(r, unicode.Cf, unicode.Variation_Selector, unicode.Other_Default_Ignorable_Code_Point, unicode.Mn, unicode.Me):
 		case r < utf8.RuneSelf:
 			b.WriteRune(r)
 		case unicode.IsDigit(r):
 			b.WriteByte(mainAsciiDigit(r))
-		case unicode.Is(unicode.Zs, r):
+		case unicode.In(r, unicode.Zs, unicode.Zl, unicode.Zp), r == '\u2800':
 			b.WriteByte(' ')
 		case unicode.Is(unicode.Pd, r), r == '−', r == 'ー', r == 'ｰ':
 			b.WriteByte('-')
@@ -922,6 +1082,7 @@ func mixedText(rng *rand.Rand) string {
 		" ", " ", "-", ".", "(", ")", "\u00a0", "\u3000", "\u2009", "－", "ー", "〜", "〰", "—", "（", "）", "．",
 		"+", "＋", "﹢", "*", "＊", "#", "＃",
 		"\u200b", "\u2060", "\u00ad", "\ufeff", "\ufe0f", "\u200d", "\u200e", "\u2068", "\u2069",
+		"\u0301", "\u20e3", "\u2800", "\u2028", "si", "p:", "te", "l:", "s", "ip:",
 		"sip:", "SIP:", "sips:", "im:", "pres:", "tel:", "urn:gsma:imei:", "SIM:", "Interim:",
 		"@", "@x", ";lr", ";", ":", "<", ">", `"`, ",", "x", "zz", "Tel.", "ims.example.net",
 	}
