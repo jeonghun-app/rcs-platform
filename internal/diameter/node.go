@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,7 +32,93 @@ const (
 	// limit only bites when something is opening connections and sending
 	// nothing.
 	DefaultMaxPendingConnections = 64
+	// DefaultMaxPendingPerSource bounds those from one source address. A
+	// CSCF task, S-CSCF or I-CSCF, holds one connection to a node and
+	// reconnects one at a time, so a few leave room for a reconnect racing
+	// a dying connection.
+	DefaultMaxPendingPerSource = 4
+	// DefaultMaxConnections bounds the inbound connections open at once,
+	// and DefaultMaxConnectionsPerSource those from one source address. A
+	// CSCF task holds one connection to a node, so a source needs few:
+	// these leave room for reconnects racing dying connections, and keep a
+	// host that completes the exchange again and again, under one
+	// Origin-Host after another, to a few goroutines, buffers and file
+	// descriptors (#617).
+	DefaultMaxConnections          = 1024
+	DefaultMaxConnectionsPerSource = 8
 )
+
+// acceptRetryMin and acceptRetryMax bound the wait after a temporary
+// Accept error, as net/http's Serve does: out of file descriptors
+// (EMFILE, ENFILE), the listener is tried again rather than given up,
+// which would end the node's service (#617).
+const (
+	acceptRetryMin = 5 * time.Millisecond
+	acceptRetryMax = time.Second
+)
+
+// refusalLogEvery spaces the warnings about refused connections: one line
+// a minute for each kind, and for each source of the per-source kind,
+// however fast connections are refused, each line counting the refusals
+// left out since the one before. maxSourceLogs bounds the sources whose
+// warnings are spaced apart; beyond it, the sources not yet logged within
+// the minute share one.
+const (
+	refusalLogEvery = time.Minute
+	maxSourceLogs   = 256
+)
+
+// sourceLogs spaces the warnings of one kind of refusal by source, up to
+// maxSourceLogs sources, the rest sharing one.
+type sourceLogs struct {
+	by     map[netip.Addr]*refusalLog
+	shared refusalLog
+}
+
+// of is src's refusalLog. Its state outlives the count that had src
+// refused, so that a source that empties its share and fills it again
+// still logs a line a minute. Past maxSourceLogs, the logs of a minute ago
+// make room, and if none has, a source not already kept shares one with
+// the others.
+func (s *sourceLogs) of(src netip.Addr, now time.Time) *refusalLog {
+	if l, ok := s.by[src]; ok {
+		return l
+	}
+	if s.by == nil {
+		s.by = make(map[netip.Addr]*refusalLog)
+	}
+	if len(s.by) >= maxSourceLogs {
+		for a, l := range s.by {
+			if now.Sub(l.at) >= refusalLogEvery {
+				delete(s.by, a)
+			}
+		}
+		if len(s.by) >= maxSourceLogs {
+			return &s.shared
+		}
+	}
+	l := &refusalLog{}
+	s.by[src] = l
+	return l
+}
+
+// refusalLog spaces the warnings of one kind of refusal (refusalLogEvery).
+type refusalLog struct {
+	at         time.Time
+	suppressed int
+}
+
+// note records a refusal at now and reports whether to log it, with how
+// many refusals were left out since the last line.
+func (l *refusalLog) note(now time.Time) (bool, int) {
+	if !l.at.IsZero() && now.Sub(l.at) < refusalLogEvery {
+		l.suppressed++
+		return false, 0
+	}
+	left := l.suppressed
+	l.at, l.suppressed = now, 0
+	return true, left
+}
 
 const (
 	defaultProductName = "rcs-platform"
@@ -72,7 +159,9 @@ type Config struct {
 	Limits     Limits
 
 	// Accept lists the peers [Node.Serve] accepts. With no rules, every
-	// inbound peer is answered with DIAMETER_UNKNOWN_PEER.
+	// inbound peer is answered with DIAMETER_UNKNOWN_PEER. When every rule
+	// has Networks, a connection from an address none of them holds is
+	// closed as it is accepted, with no CER exchange (#32).
 	Accept []PeerRule
 	// MaxPendingConnections bounds inbound connections that have not yet
 	// completed the capabilities exchange; further ones are closed as soon
@@ -81,6 +170,19 @@ type Config struct {
 	// can hold: this many goroutines and read buffers of at most
 	// MaxMessageSize.
 	MaxPendingConnections int
+	// MaxPendingPerSource bounds those from one source address, so that
+	// one host that opens connections and sends nothing takes only its
+	// share of MaxPendingConnections and leaves the rest to the peers
+	// (#32). A source no Accept rule's Networks admits is closed before it
+	// is counted at all.
+	MaxPendingPerSource int
+	// MaxConnections bounds the inbound connections open at once, those
+	// in the capabilities exchange included, and MaxConnectionsPerSource
+	// those from one source address, so that a host the networks admit
+	// cannot hold any number of peers under Origin-Hosts of its choosing
+	// (#617). Further ones are closed as they are accepted.
+	MaxConnections          int
+	MaxConnectionsPerSource int
 
 	// WatchdogInterval is Twinit; each wait is jittered by up to ±2 s as
 	// RFC 3539 §3.4.1 requires.
@@ -161,6 +263,15 @@ func (c *Config) setDefaults() error {
 	if c.MaxPendingConnections <= 0 {
 		c.MaxPendingConnections = DefaultMaxPendingConnections
 	}
+	if c.MaxPendingPerSource <= 0 {
+		c.MaxPendingPerSource = DefaultMaxPendingPerSource
+	}
+	if c.MaxConnections <= 0 {
+		c.MaxConnections = DefaultMaxConnections
+	}
+	if c.MaxConnectionsPerSource <= 0 {
+		c.MaxConnectionsPerSource = DefaultMaxConnectionsPerSource
+	}
 	if c.Clock == nil {
 		c.Clock = systemClock{}
 	}
@@ -230,9 +341,20 @@ type Node struct {
 	conns     map[*conn]struct{} // every connection, including those still exchanging capabilities
 	peers     map[string]*Peer   // open peers by lower-case Origin-Host
 	// exchanging counts accepted connections still in the capabilities
-	// exchange; limitLogged keeps a flood from logging every refusal.
+	// exchange, and pendingFrom those by source address; inbound and
+	// openFrom count them from accept to close (#617). The logs space the
+	// warnings about refused connections, so that a flood logs a line a
+	// minute (refusalLogEvery).
 	exchanging  int
-	limitLogged bool
+	pendingFrom map[netip.Addr]int
+	inbound     int
+	openFrom    map[netip.Addr]int
+	limitLog    refusalLog
+	sourceLogs  sourceLogs
+	openLog     refusalLog
+	openLogs    sourceLogs
+	outsiderLog refusalLog
+	acceptLog   refusalLog
 }
 
 // NewNode validates cfg and returns a node. It does nothing on the network
@@ -242,14 +364,16 @@ func NewNode(cfg Config) (*Node, error) {
 		return nil, err
 	}
 	n := &Node{
-		cfg:       cfg,
-		log:       cfg.Logger.With("diameter_origin_host", cfg.OriginHost),
-		sessions:  NewSessionIDGenerator(cfg.OriginHost, cfg.Clock.Now()),
-		handlers:  make(map[handlerKey]Handler),
-		errorAVPs: make(map[uint32]func(req *Message) []*AVP),
-		listeners: make(map[net.Listener]struct{}),
-		conns:     make(map[*conn]struct{}),
-		peers:     make(map[string]*Peer),
+		cfg:         cfg,
+		log:         cfg.Logger.With("diameter_origin_host", cfg.OriginHost),
+		sessions:    NewSessionIDGenerator(cfg.OriginHost, cfg.Clock.Now()),
+		handlers:    make(map[handlerKey]Handler),
+		errorAVPs:   make(map[uint32]func(req *Message) []*AVP),
+		listeners:   make(map[net.Listener]struct{}),
+		conns:       make(map[*conn]struct{}),
+		pendingFrom: make(map[netip.Addr]int),
+		openFrom:    make(map[netip.Addr]int),
+		peers:       make(map[string]*Peer),
 	}
 	n.e2e.Store(uint32(cfg.Random()))
 	n.ctx, n.cancel = context.WithCancel(context.Background())
@@ -441,8 +565,12 @@ func (n *Node) Peers() []*Peer {
 }
 
 // Serve accepts connections on l and runs the responder side of the
-// capabilities exchange for each. It returns [ErrNodeClosed] after
-// [Node.Shutdown], or the first Accept error.
+// capabilities exchange for each. A connection no Accept rule's Networks
+// admits, or beyond MaxConnections, MaxConnectionsPerSource,
+// MaxPendingConnections or MaxPendingPerSource, is closed as it is
+// accepted. A temporary Accept error, such as running out of file
+// descriptors, is waited out and Accept tried again. Serve returns
+// [ErrNodeClosed] after [Node.Shutdown], or the first other Accept error.
 func (n *Node) Serve(l net.Listener) error {
 	n.mu.Lock()
 	if n.closed {
@@ -456,13 +584,40 @@ func (n *Node) Serve(l net.Listener) error {
 		delete(n.listeners, l)
 		n.mu.Unlock()
 	}()
+	var retry time.Duration
 	for {
 		nc, err := l.Accept()
 		if err != nil {
 			if n.isClosed() {
 				return ErrNodeClosed
 			}
-			return err
+			var ne net.Error
+			//nolint:staticcheck // Temporary is what net/http's Serve goes by too: EMFILE, ENFILE and the like.
+			if !errors.As(err, &ne) || !ne.Temporary() {
+				return err
+			}
+			retry = min(max(2*retry, acceptRetryMin), acceptRetryMax)
+			n.mu.Lock()
+			log, left := n.acceptLog.note(n.cfg.Clock.Now())
+			n.mu.Unlock()
+			if log {
+				n.log.Warn("diameter accept failed; trying again", "error", err.Error(), "retry", retry, "suppressed", left)
+			}
+			if !n.sleep(retry) {
+				return ErrNodeClosed
+			}
+			continue
+		}
+		retry = 0
+		src := addrOf(nc.RemoteAddr())
+		if !n.mayAccept(src) {
+			// No rule could take this peer: it gets no exchange, and no
+			// place among those waiting for one (#32). Each refusal is
+			// logged, or counted, before the close, so that whoever sees
+			// the close sees the line too.
+			n.logOutsider(nc.RemoteAddr())
+			_ = nc.Close()
+			continue
 		}
 		// Adding to the wait group under the lock that Shutdown takes before
 		// waiting guarantees the Add happens before the Wait.
@@ -472,36 +627,114 @@ func (n *Node) Serve(l net.Listener) error {
 			_ = nc.Close()
 			return ErrNodeClosed
 		}
-		if n.exchanging >= n.cfg.MaxPendingConnections {
-			first := !n.limitLogged
-			n.limitLogged = true
+		if n.inbound >= n.cfg.MaxConnections {
+			log, left := n.openLog.note(n.cfg.Clock.Now())
 			n.mu.Unlock()
-			_ = nc.Close()
-			if first {
-				n.log.Warn("diameter connections refused: too many have not completed CER",
-					"limit", n.cfg.MaxPendingConnections, "remote", nc.RemoteAddr().String())
+			if log {
+				n.log.Warn("diameter connections refused: too many open",
+					"limit", n.cfg.MaxConnections, "remote", nc.RemoteAddr().String(), "suppressed", left)
 			}
+			_ = nc.Close()
+			continue
+		}
+		if n.openFrom[src] >= n.cfg.MaxConnectionsPerSource {
+			log, left := n.openLogs.of(src, n.cfg.Clock.Now()).note(n.cfg.Clock.Now())
+			n.mu.Unlock()
+			if log {
+				n.log.Warn("diameter connections refused: too many open from one source",
+					"limit", n.cfg.MaxConnectionsPerSource, "remote", nc.RemoteAddr().String(), "suppressed", left)
+			}
+			_ = nc.Close()
+			continue
+		}
+		if n.exchanging >= n.cfg.MaxPendingConnections {
+			log, left := n.limitLog.note(n.cfg.Clock.Now())
+			n.mu.Unlock()
+			if log {
+				n.log.Warn("diameter connections refused: too many have not completed CER",
+					"limit", n.cfg.MaxPendingConnections, "remote", nc.RemoteAddr().String(), "suppressed", left)
+			}
+			_ = nc.Close()
+			continue
+		}
+		if n.pendingFrom[src] >= n.cfg.MaxPendingPerSource {
+			log, left := n.sourceLogs.of(src, n.cfg.Clock.Now()).note(n.cfg.Clock.Now())
+			n.mu.Unlock()
+			if log {
+				n.log.Warn("diameter connections refused: too many from one source have not completed CER",
+					"limit", n.cfg.MaxPendingPerSource, "remote", nc.RemoteAddr().String(), "suppressed", left)
+			}
+			_ = nc.Close()
 			continue
 		}
 		n.exchanging++
+		n.pendingFrom[src]++
+		n.inbound++
+		n.openFrom[src]++
 		n.wg.Add(1)
 		n.mu.Unlock()
 		go func() {
 			defer n.wg.Done()
-			n.accept(nc)
+			n.accept(nc, src)
 		}()
 	}
 }
 
 // exchangeDone releases a connection's place among those still exchanging
-// capabilities.
-func (n *Node) exchangeDone() {
+// capabilities, its source's included.
+func (n *Node) exchangeDone(src netip.Addr) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.exchanging--
-	if n.exchanging < n.cfg.MaxPendingConnections {
-		n.limitLogged = false
+	if n.pendingFrom[src]--; n.pendingFrom[src] <= 0 {
+		delete(n.pendingFrom, src)
 	}
+}
+
+// closedFrom releases an inbound connection's place among those open,
+// its source's included, once it has closed.
+func (n *Node) closedFrom(src netip.Addr) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.inbound--
+	if n.openFrom[src]--; n.openFrom[src] <= 0 {
+		delete(n.openFrom, src)
+	}
+}
+
+// logOutsider warns that a connection from outside every rule's networks
+// was closed, a line a minute at most, with how many were left out since
+// the last. Before #32 such a peer was answered DIAMETER_UNKNOWN_PEER and
+// logged; without this line a misconfigured peer network would leave
+// nothing to see, and the count shows that more than a scanner's address
+// was closed.
+func (n *Node) logOutsider(remote net.Addr) {
+	n.mu.Lock()
+	log, left := n.outsiderLog.note(n.cfg.Clock.Now())
+	n.mu.Unlock()
+	if log {
+		n.log.Warn("diameter connection closed: source outside every accept rule's networks",
+			"remote", remote.String(), "suppressed", left)
+	}
+}
+
+// mayAccept reports whether some Accept rule could take a peer at src:
+// one without Networks, or whose Networks hold it. Without rules no peer
+// is accepted, but each is still answered DIAMETER_UNKNOWN_PEER, as there
+// is no peer to keep out (RFC 6733 §5.3).
+func (n *Node) mayAccept(src netip.Addr) bool {
+	if len(n.cfg.Accept) == 0 {
+		return true
+	}
+	for _, r := range n.cfg.Accept {
+		if len(r.Networks) == 0 {
+			return true
+		}
+		if src.IsValid() && slices.ContainsFunc(r.Networks, func(p netip.Prefix) bool { return p.Contains(src) }) {
+			return true
+		}
+	}
+	return false
 }
 
 func (n *Node) isClosed() bool {
