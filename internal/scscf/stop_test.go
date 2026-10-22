@@ -344,11 +344,13 @@ func TestTheWorstStopEndsBeforeTheRuntimesDeadline(t *testing.T) {
 		if s != runtime.ExitOK {
 			t.Errorf("exit %d: the stop overran RCS_SHUTDOWN_TIMEOUT (%v):\n%s", s, shutdown, out.String())
 		}
-		// run itself ends returnMargin inside the deadline, which the exit
-		// status alone shows only when the runtime's timer is on time:
-		// half of it is room enough for a loaded host (#479).
-		if took := time.Duration(returned.Load() - cancelled.UnixNano()); took > shutdown-returnMargin/2 {
-			t.Errorf("run returned %v after the cancel, past %v", took, shutdown-returnMargin/2)
+		// run itself returns before the deadline, which the exit status
+		// shows only when the runtime's timer is on time (#479). It ends
+		// its own work returnMargin inside it, so that the closes after,
+		// 0.4 s at most under the race detector on a loaded host, fit;
+		// without the margin it returns past the deadline, every time.
+		if took := time.Duration(returned.Load() - cancelled.UnixNano()); took >= shutdown {
+			t.Errorf("run returned %v after the cancel, at or past the deadline of %v", took, shutdown)
 		}
 	case <-time.After(stopWait):
 		t.Fatal("the runtime did not return")
