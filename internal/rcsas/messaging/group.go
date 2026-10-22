@@ -84,11 +84,15 @@ type Audience struct {
 // flow, which the owner takes as UserRegistered does for the group: the
 // invitation it last asked for user, which would hold its copies back
 // until InviteTimeout, and its pager-only mark, are forgotten (code review
-// on #464).
+// on #464). The registration also gets a new number here, as
+// UserRegistered gives one, so that the failure of an invitation asked
+// before it, which may come in after the wake, is not marked and does not
+// hold the copies back again (#564).
 func (e *Engine) Wake(user, group string, registered bool) {
 	e.metrics.Count("group.wake", 1)
 	if registered {
 		e.mu.Lock()
+		e.numberFlowLocked(user)
 		delete(e.pagerOnly, user)
 		delete(e.invites, inviteKey{user, group, store.Group, ""})
 		e.mu.Unlock()

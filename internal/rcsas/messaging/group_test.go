@@ -880,6 +880,32 @@ func TestAWakeForARegistrationInvitesAtOnce(t *testing.T) {
 	}
 }
 
+// #564: the owner's invitation to the group fails, and its failure comes
+// in only after a wake told of the participant's registration on a new
+// flow on another task. The registration overtakes the failure, as one on
+// this task does (TestARegistrationOvertakesALateInvitationFailure): the
+// failure is not marked, and the wake's read of the queue invites again.
+func TestAWakeForARegistrationOvertakesALateInvitationFailure(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	first := r.d.nextInvite(t)
+	if first.Recipient != bob || first.Peer != groupURI {
+		t.Fatalf("invitation %+v", first)
+	}
+	waitFor(t, "idle", r.idle)
+	r.e.Wake(bob, groupURI, true)
+	r.e.InviteFailed(first, ErrOffline) // the 486 of the group's INVITE, come late
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v after the registration's wake", inv)
+	}
+	if n := r.m.get("invite.failed_overtaken"); n != 1 {
+		t.Fatalf("%d overtaken failures", n)
+	}
+}
+
 // #121 D2 (T4): every copy is queued under the group's owner the handler
 // names; once the store no longer holds it, the fan-out stops at the first
 // refused copy and the sender is answered as for a store failure.
