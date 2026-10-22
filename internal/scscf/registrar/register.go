@@ -722,7 +722,10 @@ func (g *Registrar) reassign(ctx context.Context, reg *state.Registration) error
 		AssignmentType: assignmentOf(reg), UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
 	})
 	if err == nil && saa != nil && cxclient.Classify(saa.Result) == cxclient.Success {
-		g.applySAAProfile(ctx, reg, saa.UserData)
+		if g.applySAAProfile(ctx, reg, saa.UserData, g.cfg.Now()) == nil {
+			// Ended as the HSS's RTR would have: nothing to undo.
+			return nil
+		}
 		return g.undoIfEnded(ctx, reg.Key)
 	}
 	g.count("registrar.hss_failed")

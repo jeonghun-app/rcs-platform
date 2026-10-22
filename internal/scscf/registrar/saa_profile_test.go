@@ -1,11 +1,16 @@
 package registrar
 
 import (
+	"context"
+	"errors"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/ifc"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 )
 
@@ -46,6 +51,128 @@ func TestAReassertsSAAProfileIsApplied(t *testing.T) {
 			return nil, nil
 		}
 		return &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, UserData: grownProfile()}, nil
+	}
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	wantRoutable(t, e, impu3, set1)
+	// Applied after the reassert's save, the profile leaves the mark
+	// cleared: applied before, it would make the save lose (#546 code
+	// review), and the next sweep would tell the HSS again.
+	r := must(e.store.Registration(bg, set1))(t)
+	if !r.Reassert.IsZero() || r.ReassertAttempts != 0 {
+		t.Errorf("after the reassert: Reassert %v, %d attempts", r.Reassert, r.ReassertAttempts)
+	}
+	sars := len(e.hss.sarsOf())
+	e.clock.advance(time.Hour)
+	_, _ = g.Sweep(bg, 10)
+	if got := e.hss.sarsOf()[sars:]; slices.Contains(got, cx.Registration) {
+		t.Errorf("the next sweep told the HSS again: %v", got)
+	}
+}
+
+// TestAReassertWithAMovedDefaultEndsTheSetAsTheRTRWould (#546 code review):
+// the HSS moved the set's default to tel1 and its RTR SERVER_CHANGE was
+// lost; it sends the profile once, on the reassert's SAR (#524). The set
+// ends here as that RTR would have ended it, its subscribers told it was
+// deactivated and its servers that it ended, so the UE registers anew and
+// gets the new default; no SAR tells the HSS anything more.
+func TestAReassertWithAMovedDefaultEndsTheSetAsTheRTRWould(t *testing.T) {
+	e := newEnv(t)
+	ev, tp, m := &recordedEvents{}, &recordedThirdParty{}, &counts{}
+	g := e.instance(1, withEvents(ev), withThirdParty(tp), func(c *Config) { c.Metrics = m })
+	reassertDue(t, e, g)
+	e.hss.sarHook = func(r *cx.SAR) (*cx.SAA, error) {
+		if r.AssignmentType != cx.Registration || r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable {
+			return nil, nil
+		}
+		return &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, UserData: userDataOf(impi1, nil, tel1, impu1)}, nil
+	}
+	sars := len(e.hss.sarsOf())
+	before := len(tp.got())
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	gone(t, e, impu1, tel1)
+	if _, err := e.store.Registration(bg, set1); !errors.Is(err, state.ErrNotFound) {
+		t.Errorf("the set's record under the old default: %v", err)
+	}
+	var ended []regevent.Cause
+	for _, c := range ev.got() {
+		if c.after == -1 {
+			ended = append(ended, c.cause)
+		}
+	}
+	if len(ended) != 1 || ended[0] != regevent.Deactivated {
+		t.Errorf("the subscribers were told of ends %v, want one, deactivated", ended)
+	}
+	ends := 0
+	for _, r := range tp.got()[before:] {
+		if r.Type == ifc.DeRegistration {
+			ends++
+		}
+	}
+	if ends == 0 {
+		t.Error("the application servers were not told the set ended")
+	}
+	if got := e.hss.sarsOf()[sars:]; !slices.Equal(got, []cx.ServerAssignmentType{cx.Registration}) {
+		t.Errorf("SARs after the reassert's own: %v", got)
+	}
+	if got := m.get("registrar.saa_profile_moved"); got != 1 {
+		t.Errorf("registrar.saa_profile_moved = %d, want 1", got)
+	}
+}
+
+// TestAPPRDuringAReassertsSaveKeepsTheNewerProfile (#546 code review): the
+// reassert's SAA brings P1, with impu3; a PPR received after it, P2
+// without impu3, is stored while the reassert saves. P1 is the older, by
+// when the SAA arrived: P2 stays, and impu3 is not routed here.
+func TestAPPRDuringAReassertsSaveKeepsTheNewerProfile(t *testing.T) {
+	e := newEnv(t)
+	st := &atReassertSave{Memory: e.store}
+	g := e.instance(1, func(c *Config) { c.Store = st })
+	reassertDue(t, e, g)
+	e.hss.sarHook = func(r *cx.SAR) (*cx.SAA, error) {
+		if r.AssignmentType != cx.Registration || r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable {
+			return nil, nil
+		}
+		return &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, UserData: grownProfile()}, nil
+	}
+	p2 := userDataOf(impi1, nil, impu1, tel1)
+	st.hook = func() {
+		e.clock.advance(time.Millisecond)
+		wantResult(t, g.HandlePPR(bg, &cx.PPR{UserName: impi1, UserData: p2}), resultSuccess)
+	}
+	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
+		t.Fatalf("swept %d, %v", n, err)
+	}
+	if p, err := e.store.Profile(bg, set1, e.clock.Now()); err != nil || string(p.UserData) != string(p2) {
+		t.Errorf("the stored profile is not the PPR's: %v", err)
+	}
+	gone(t, e, impu3)
+	if r := must(e.store.Registration(bg, set1))(t); hasID(r, impu3) {
+		t.Errorf("the set lists impu3, which the newer profile dropped: %+v", r.Identities)
+	}
+}
+
+// TestAReassertThatLosesItsSaveStillAppliesTheProfile (#546 code review):
+// a write that saved the set first makes the reassert's save lose; the
+// profile its SAA brought, which the HSS may send once only (#524), is
+// applied to what won.
+func TestAReassertThatLosesItsSaveStillAppliesTheProfile(t *testing.T) {
+	e := newEnv(t)
+	st := &atReassertSave{Memory: e.store}
+	g := e.instance(1, func(c *Config) { c.Store = st })
+	reassertDue(t, e, g)
+	e.hss.sarHook = func(r *cx.SAR) (*cx.SAA, error) {
+		if r.AssignmentType != cx.Registration || r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable {
+			return nil, nil
+		}
+		return &cx.SAA{Answer: cx.Answer{Result: cx.ResultCode(2001)}, UserData: grownProfile()}, nil
+	}
+	st.hook = func() {
+		// Another writer, a re-REGISTER say, saves the set first.
+		must(e.store.SaveRegistration(bg, must(e.store.Registration(bg, set1))(t)))(t)
 	}
 	if n, err := g.Sweep(bg, 10); n != 1 || err != nil {
 		t.Fatalf("swept %d, %v", n, err)
@@ -132,4 +259,27 @@ func TestAnUnregisteredUsersRecordTakesTheSAAProfile(t *testing.T) {
 		t.Errorf("Unregistered returned %+v, want the unregistered record with impu3", rec)
 	}
 	wantRoutable(t, e, impu3, first.Key)
+}
+
+// atReassertSave runs hook once, as the reassert saves the set with its
+// mark cleared: after its SAR, before its save.
+type atReassertSave struct {
+	*state.Memory
+	mu   sync.Mutex
+	hook func()
+}
+
+func (s *atReassertSave) SaveRegistration(ctx context.Context, r *state.Registration) (*state.Registration, error) {
+	s.mu.Lock()
+	hook := s.hook
+	if hook != nil && r.Reassert.IsZero() {
+		s.hook = nil
+	} else {
+		hook = nil
+	}
+	s.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return s.Memory.SaveRegistration(ctx, r)
 }

@@ -69,7 +69,10 @@ func (g *Registrar) Unregistered(ctx context.Context, impu string) (*state.Regis
 		return nil, f
 	} else if cur != nil {
 		// The SAA's profile may be newer than the record's (#536).
-		cur = g.applySAAProfile(ctx, cur, saa.UserData)
+		// The key is the SAA's default, so its profile never moves the set.
+		if cur = g.applySAAProfile(ctx, cur, saa.UserData, received); cur == nil {
+			return nil, errors.New("registrar: the set ended as its profile was applied")
+		}
 		if isRegistered(cur) {
 			// The set is registered here after all, and only impu's item
 			// was missing (a REGISTER cut short between its save and its

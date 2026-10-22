@@ -52,9 +52,14 @@ additionally sealed (below).
   PPR saves only its own set. Whatever SAR an SAA answers, User-Data in it
   is applied as a PPR's: the profile is saved and the set's identities follow
   it. The HSS may send a changed profile on any SAR, after a push this
-  S-CSCF missed above all (#536). A profile with another default identity
-  waits for the set's next REGISTER, which moves the record, and is counted
-  in `registrar.saa_profile_moved`.
+  S-CSCF missed above all (#536). An SAA profile is stamped with when the
+  SAA arrived, so a PPR that followed it is not undone, and one that loses
+  to a newer profile leaves the identities to the newer. A profile with
+  another default identity means the HSS moved the default and its RTR
+  SERVER_CHANGE was missed too: the set ends here as that RTR would have
+  ended it, subscribers told it was deactivated and servers that it ended,
+  so that the UE registers anew with the new default. It is counted in
+  `registrar.saa_profile_moved`.
 - **One record per set.** The bindings that every identity of a set shares
   are one item, so a REGISTER, a deregistration or a sweep is one
   conditional save, whichever identity it came for; each IMPU's item only

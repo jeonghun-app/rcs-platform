@@ -131,6 +131,7 @@ func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error
 		UserName: reg.Key.IMPI, PublicIdentities: []string{reg.Key.IMPU},
 		AssignmentType: assignmentOf(reg), UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
 	})
+	received := g.cfg.Now()
 	var res cx.Result
 	if saa != nil {
 		res = saa.Result
@@ -155,6 +156,12 @@ func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error
 	saved, err := g.cfg.Store.SaveRegistration(ctx, next)
 	switch {
 	case (errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound)) && o == cxclient.Success:
+		// The HSS may send this profile once only (#524): it is applied to
+		// whatever won the save, which applyProfile reads again (#546
+		// code review).
+		if g.applySAAProfile(ctx, reg, saa.UserData, received) == nil {
+			return nil
+		}
 		return g.undoIfEnded(ctx, reg.Key)
 	case errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound):
 		return nil
@@ -163,8 +170,9 @@ func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error
 	}
 	if o == cxclient.Success {
 		// After the save, which the sweep's claim makes conditional on the
-		// version it read (#536).
-		g.applySAAProfile(ctx, saved, saa.UserData)
+		// version it read: applied first, a change of identities would
+		// make the save lose and leave Reassert set (#536).
+		g.applySAAProfile(ctx, saved, saa.UserData, received)
 	}
 	return nil
 }
