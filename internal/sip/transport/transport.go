@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -249,7 +250,16 @@ type Config struct {
 	// Logger receives operational events, never message content, addresses or
 	// flow IDs. Nil discards them.
 	Logger *slog.Logger
+	// Metrics, if set, counts the panics recovered from Admit, OnFlowClosed
+	// and OnPong as MetricCallbackPanics, at once (#445); Stats counts them
+	// too. A panic in Admit refuses the flow; one in the others ends that
+	// call only.
+	Metrics panics.Counter
 }
+
+// MetricCallbackPanics counts the panics recovered from the service's
+// callbacks.
+const MetricCallbackPanics = "transport.callback_panics"
 
 func (c Config) withDefaults() Config {
 	setDefault(&c.MaxConnections, DefaultMaxConnections)
@@ -365,6 +375,8 @@ type Transport struct {
 	budget   queueBudget
 	// closures delivers OnFlowClosed; nil when there is none.
 	closures *closureQueue
+	// panics recovers the service's callbacks' panics.
+	panics *panics.Guard
 	// shedMu serializes shedding scans; lastShedScan is when the last one
 	// looked at every flow, in Unix nanoseconds.
 	shedMu       sync.Mutex
@@ -385,6 +397,10 @@ type Transport struct {
 	// pending holds accepted connections that are not flows yet (PROXY header
 	// or TLS handshake in progress), so Close can close them at once.
 	pending map[net.Conn]struct{}
+
+	// holds are the responses HoldResponse counts in sends, under sendsMu,
+	// until their SendResponse begins.
+	holds map[*sip.Response]uint64
 
 	wg sync.WaitGroup
 }
@@ -420,8 +436,13 @@ func New(cfg Config, h Handler) (*Transport, error) {
 	}
 	t.dials, t.cancelDials = context.WithCancel(context.Background())
 	t.budget.max = int64(cfg.MaxQueuedBytes)
+	t.panics = panics.New(panics.Config{
+		Metric: MetricCallbackPanics, Message: "transport: a service callback panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
+	})
 	if cfg.OnFlowClosed != nil {
-		t.closures = newClosureQueue(cfg.OnFlowClosed)
+		t.closures = newClosureQueue(func(id FlowID, info FlowInfo) {
+			t.panics.Run("OnFlowClosed", func() { cfg.OnFlowClosed(id, info) })
+		})
 	}
 	t.flows = newFlowTable(key, cfg.Now, tableConfig{
 		udpTimeout:  cfg.UDPFlowTimeout,
@@ -511,7 +532,12 @@ func (q *closureQueue) stop() {
 
 // admit asks Config.Admit about a new inbound flow.
 func (t *Transport) admit(f *flow) bool {
-	if t.cfg.Admit == nil || t.cfg.Admit(f.id, f.info()) {
+	if t.cfg.Admit == nil {
+		return true
+	}
+	// A panic refuses the flow.
+	admitted := false
+	if t.panics.Run("Admit", func() { admitted = t.cfg.Admit(f.id, f.info()) }) && admitted {
 		return true
 	}
 	t.stats.refused.Add(1)
@@ -706,6 +732,9 @@ type Stats struct {
 	// ProxyHeaderErrors counts every other failure of a header begun, so
 	// that it says the NLB is not sending the header.
 	ProxyHeaderEmpty uint64
+	// CallbackPanics counts the panics recovered from Admit, OnFlowClosed
+	// and OnPong.
+	CallbackPanics uint64
 }
 
 type counters struct {
@@ -795,6 +824,52 @@ func (t *Transport) beginSend() uint64 {
 	return t.sendNext
 }
 
+// HoldResponse counts res, about to be sent, for Flush as a send under way,
+// from now on. A SendResponse of it that begins takes the hold over as its
+// own count, under the same number, so that a Flush that saw the hold waits
+// for the send as well, a dial to the Via address included (code review of
+// #493). A proxy holds a final response it hands to a transaction this way,
+// so that a Flush while the transaction layer has it, before it calls
+// SendResponse, still waits for it (#469). release must always be called,
+// once the response has been sent or will not be: it ends a hold no send
+// took over, which Flush would otherwise wait for until its deadline.
+func (t *Transport) HoldResponse(res *sip.Response) (release func()) {
+	id := t.beginSend()
+	t.sendsMu.Lock()
+	if t.holds == nil {
+		t.holds = map[*sip.Response]uint64{}
+	}
+	t.holds[res] = id
+	t.sendsMu.Unlock()
+	return func() { t.unhold(res, id) }
+}
+
+// unhold ends the hold id of res, if it is still held. A hold a send took
+// over is that send's count now, which the send itself ends: unhold leaves
+// it, so that a release while the send is still under way does not end it
+// early (QA of #493).
+func (t *Transport) unhold(res *sip.Response, id uint64) {
+	t.sendsMu.Lock()
+	if t.holds[res] == id {
+		delete(t.holds, res)
+		delete(t.sends, id)
+	}
+	t.sendsMu.Unlock()
+}
+
+// takeHold returns the number of the hold of res, if it has one, for a send
+// of it to count itself under: the number stays in sends, and only the hold
+// ends.
+func (t *Transport) takeHold(res *sip.Response) (uint64, bool) {
+	t.sendsMu.Lock()
+	defer t.sendsMu.Unlock()
+	id, ok := t.holds[res]
+	if ok {
+		delete(t.holds, res)
+	}
+	return id, ok
+}
+
 func (t *Transport) endSend(id uint64) {
 	t.sendsMu.Lock()
 	delete(t.sends, id)
@@ -850,6 +925,7 @@ func (t *Transport) Stats() Stats {
 		ListenerConnections:    perListener,
 		ProxyHeaderTimeouts:    c.proxyHeaderTimeouts.Load(),
 		ProxyHeaderEmpty:       c.proxyHeaderEmpty.Load(),
+		CallbackPanics:         t.panics.Panics(),
 	}
 }
 

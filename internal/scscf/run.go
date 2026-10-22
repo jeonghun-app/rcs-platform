@@ -129,6 +129,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	var p atomic.Pointer[proxy.Proxy]
 	tr, err := transport.New(transport.Config{
 		DialTimeout: d.dialTimeout, WriteTimeout: d.writeTimeout, SendQueueBytes: d.sendQueueBytes, Dialer: d.sipDialer, Logger: rt.Logger,
+		// The panics recovered from the transport's callbacks (#445).
+		Metrics: rt.Metrics,
 	}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)

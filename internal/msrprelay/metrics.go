@@ -90,6 +90,9 @@ func (m *counters) add(name string, n int64) {
 
 func (m *counters) refuse(reason string) { m.add(mRefusedPrefix+reason, 1) }
 
+// Count counts n as name until the next flush, for a panics.Guard.
+func (m *counters) Count(name string, n int64) { m.add(name, n) }
+
 // flush writes what was counted since the last flush and the two gauges,
 // which are written every time so that their absence means no data rather
 // than zero.
@@ -141,6 +144,7 @@ var eventErrNames = []struct {
 	{msrp.ErrMalformedResponse, "MalformedResponse"},
 	{msrp.ErrTooManyUnknownSessions, "TooManyUnknownSessions"},
 	{msrp.ErrKeepAliveNotSent, "KeepAliveNotSent"},
+	{msrp.ErrPanicked, "Panicked"},
 	{msrp.ErrPeerNotReading, "PeerNotReading"},
 	{msrp.ErrKeepAliveTimeout, "KeepAliveTimeout"},
 	{msrp.ErrUnbound, "Unbound"},

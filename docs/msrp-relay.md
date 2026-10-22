@@ -180,6 +180,18 @@ succeeds. The task role needs
   closes toward the relay. Messages sent with `Failure-Report: no` or
   `partial` in that window are lost without a report, which those modes
   accept (RFC 4975 §7.1.2).
+- **The connection toward rcs-as and jumbo frames.** All sessions toward one
+  `rcs-as` task share one connection. Linux sends nothing on a connection
+  whose peer's receive window is smaller than one segment, and while traffic
+  comes the other way, each ACK puts off the zero-window probe that would
+  send the part that fits. So the connection stands still and every session
+  on it gets 408 (#140). With the usual VPC MTU of 1500 (MSS 1448) this
+  cannot happen: even the smallest buffer the kernel allows leaves a window
+  above one segment. With jumbo frames (MTU 9001, MSS 8949) the receive
+  window must stay at 16 KiB or more; at 8 KiB the connection all but stops
+  (#517). Neither the relay nor `rcs-as` sets `SO_RCVBUF` on it, so the
+  kernel's autotuning sizes it. A buffer set there later should be 32 KiB or
+  more.
 - **Connections without a session.** A new connection must name a session
   within 30 s (the active side sends its first SEND at once, RFC 4975 §5.4),
   or it is closed (`ClientsClosedUnbound`). A connection whose last bridge
@@ -254,7 +266,8 @@ not multiply them. Names come from fixed sets and never carry an identifier.
 | `LookupBudgetUntracked` | count | lookups let through uncounted because the budget's table of sources was full |
 | `Refused.<reason>` | count | `ConnectionLimit`, `SourceLimit`, `ProxyHeader`, `SourceLookupBudget`, `BindOverload`, `UnknownSession`, `EndedSession`, `IncompleteBinding`, `AlreadyClaimed`, `CoreUnreachable`, `StoreUnavailable`, `Draining`, `ControlUnauthorized`, `ControlForbidden`, `ControlInvalid` |
 | `Client.Refused.<code>`, `Core.Refused.<code>` | count | MSRP requests refused on client connections or toward `rcs-as` (`internal/msrp` events) |
-| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PeerNotReading`, `TooManyUnknownSessions`, …). `Dropped.KeepAliveNotSent` is a keep-alive the relay could not build (its random source failed); it is also logged at error level, and the next interval tries again |
+| `msrp.callback_panics` | count | panics recovered on a connection's goroutines (#445). One while reading the peer's input or binding a session closes that connection, which counts as `Client.Closed.Panicked` or `Core.Closed.Panicked`; one while reading a client's PROXY header closes the connection before it is a session connection, so it counts in no `Closed.*`; one in an event's count drops that event only, and the connection goes on. Alarm on any |
+| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PeerNotReading`, `TooManyUnknownSessions`, `Panicked`, …). `Dropped.KeepAliveNotSent` is a keep-alive the relay could not build (its random source failed); it is also logged at error level, and the next interval tries again |
 
 Alarm candidates for Phase 7, each to get a runbook section:
 
