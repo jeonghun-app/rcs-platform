@@ -17,7 +17,7 @@
 //
 // A client's IP address is personal data too, whatever its range;
 // [ClientIP] and [TruncateIP] log only the network it belongs to (IPv4 /24,
-// IPv6 /48).
+// IPv6 /48), and [TruncateIPsIn] does so for the addresses in free text.
 //
 // Redaction is for identifiers only. Display names, message bodies, keys,
 // nonces, RAND/AUTN, digest responses and tokens are not recognised and must
