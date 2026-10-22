@@ -45,11 +45,19 @@ type push struct {
 //   - a change of charging information alone is a PPR without User-Data
 //     (§6.5.2.3).
 //
-// A set that loses an identity is told before any other: when an identity
-// moves from one set to another, the S-CSCF updates the set losing it
-// first, then the one gaining it (§6.5.2.1), and notify sends them in that
-// order, each once the one before is answered. Sets that were not served
-// stay or become not registered.
+// When an identity moves from one set to another, the S-CSCF updates the
+// set losing it first, then the one gaining it (§6.5.2.1), and notify sends
+// the pushes in the order returned, each once the one before is answered:
+//
+//   - first the RTRs of sets that lose an identity: an RTR only takes
+//     identities away, and the S-CSCF finds the set an RTR names by its
+//     identities, so after a PPR that moved one of them into another set it
+//     would end that set too (code review on #476);
+//   - then the PPRs of sets that lose an identity, a set that gives one to
+//     another before that set (byDependency);
+//   - then the rest, the sets that only gain identities among them.
+//
+// Sets that were not served stay or become not registered.
 func reconcile(old, next *store.Subscription, profileChanged bool) []push {
 	state := map[int]store.RegistrationState{}
 	for _, p := range old.PublicIdentities {
@@ -59,36 +67,92 @@ func reconcile(old, next *store.Subscription, profileChanged bool) []push {
 		next.PublicIdentities[i].State = store.NotRegistered
 	}
 	chargingChanged := !reflect.DeepEqual(old.Charging, next.Charging)
-	var losing, others []push
+	var rtrs, others []push
+	var losing []int // the sets that lose an identity and get a PPR
+	ppr := map[int]push{}
 	pprSent := false
 	for _, set := range targetSets(old, nil) {
 		if !state[set].Served() {
 			continue
 		}
 		was, now := members(old, set), members(next, set)
-		pushes := &others
-		if lost(was, now) {
-			pushes = &losing
-		}
+		loses := lost(was, now)
 		switch {
 		case len(now) == 0:
-			*pushes = append(*pushes, push{deregister: true, reason: cx.PermanentTermination, impus: impusOf(was), set: -1})
+			rtrs = append(rtrs, push{deregister: true, reason: cx.PermanentTermination, impus: impusOf(was), set: -1})
 		case defaultIdentity(old, set) != defaultIdentity(next, set):
-			*pushes = append(*pushes, push{deregister: true, reason: cx.ServerChange, impus: impusOf(was), set: -1})
+			p := push{deregister: true, reason: cx.ServerChange, impus: impusOf(was), set: -1}
+			if loses {
+				rtrs = append(rtrs, p)
+			} else {
+				others = append(others, p)
+			}
 		default:
 			setState(next, set, state[set])
 			if profileChanged || !sameMembers(was, now) {
-				*pushes = append(*pushes, push{set: set, charging: chargingChanged})
+				p := push{set: set, charging: chargingChanged}
+				if loses {
+					losing, ppr[set] = append(losing, set), p
+				} else {
+					others = append(others, p)
+				}
 				pprSent = true
 			}
 		}
 	}
-	pushes := append(losing, others...)
+	pushes := rtrs
+	for _, set := range byDependency(losing, gives(old, next)) {
+		pushes = append(pushes, ppr[set])
+	}
+	pushes = append(pushes, others...)
 	if chargingChanged && !pprSent && served(next) {
 		pushes = append(pushes, push{set: -1, charging: true})
 	}
 	clearServerIfIdle(next)
 	return pushes
+}
+
+// gives maps each implicit set of old to the sets of next its identities
+// moved to.
+func gives(old, next *store.Subscription) map[int]map[int]bool {
+	was := map[string]int{}
+	for _, p := range old.PublicIdentities {
+		was[p.IMPU] = p.ImplicitSet
+	}
+	out := map[int]map[int]bool{}
+	for _, p := range next.PublicIdentities {
+		from, ok := was[p.IMPU]
+		if !ok || from == p.ImplicitSet {
+			continue
+		}
+		if out[from] == nil {
+			out[from] = map[int]bool{}
+		}
+		out[from][p.ImplicitSet] = true
+	}
+	return out
+}
+
+// byDependency orders sets so that a set that gives an identity to another
+// comes before it, and otherwise as they are. Sets that give to each other,
+// as when two swap identities by PPRs alone, keep the order they had: no
+// order updates both losing sets first, and the S-CSCF ends with the same
+// sets whichever comes first.
+func byDependency(sets []int, gives map[int]map[int]bool) []int {
+	left := slices.Clone(sets)
+	out := make([]int, 0, len(sets))
+	for len(left) > 0 {
+		next := 0 // on a cycle, the first left
+		for i, s := range left {
+			if !slices.ContainsFunc(left, func(o int) bool { return o != s && gives[o][s] }) {
+				next = i
+				break
+			}
+		}
+		out = append(out, left[next])
+		left = slices.Delete(left, next, next+1)
+	}
+	return out
 }
 
 // lost reports whether a set whose identities were was and are now has lost
@@ -158,24 +222,18 @@ func deletePushes(s *store.Subscription) []push {
 	return []push{{deregister: true, reason: cx.PermanentTermination, set: -1}}
 }
 
-// notify sends pushes for s, whose profile is p (needed for User-Data).
-// Failures are logged and counted, not returned: the stored change stands.
-func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, pushes []push) {
+// notify sends pushes for s, whose profile is p (needed for User-Data), one
+// after the other, each with each to be answered in: a push that is not
+// answered in time leaves the next its own time, so that a slow answer for
+// the set losing an identity does not cost the set gaining it its PPR (QA on
+// #476). Failures are logged and counted, not returned: the stored change
+// stands.
+func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, pushes []push, each time.Duration) {
 	if n == nil {
 		return
 	}
 	for _, ps := range pushes {
-		err := h.send(ctx, n, s, p, ps)
-		if err != nil {
-			kind := "ppr"
-			if ps.deregister {
-				kind = "rtr"
-			}
-			h.log.Warn("could not notify the S-CSCF of a provisioning change",
-				pii.Identity("impi", s.IMPI), slog.String("request", kind), slog.String("error", pii.Redact(err.Error())))
-		}
-		var rejected *RejectedError
-		if !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result) {
+		if h.notifyOne(ctx, n, s, p, ps, each) {
 			// The user is no longer registered at the S-CSCF, which knows
 			// it no longer or is deregistering it: a set's PPR after this
 			// one, the set gaining a moved identity say, has nothing left
@@ -183,6 +241,24 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 			return
 		}
 	}
+}
+
+// notifyOne sends ps within each, and reports whether it left the user no
+// longer registered (pprRejected).
+func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, each time.Duration) bool {
+	ctx, cancel := context.WithTimeout(ctx, each)
+	defer cancel()
+	err := h.send(ctx, n, s, p, ps)
+	if err != nil {
+		kind := "ppr"
+		if ps.deregister {
+			kind = "rtr"
+		}
+		h.log.Warn("could not notify the S-CSCF of a provisioning change",
+			pii.Identity("impi", s.IMPI), slog.String("request", kind), slog.String("error", pii.Redact(err.Error())))
+	}
+	var rejected *RejectedError
+	return !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result)
 }
 
 // pprRejected acts on a PPA failure as TS 29.228 §6.2.2.1 asks of an HSS
@@ -196,8 +272,8 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 //     SERVER_CHANGE, setting the state to not registered, so that the user
 //     registers again and gets an S-CSCF that takes the new data.
 //
-// It reports whether it acted on the failure, the user being no longer
-// registered at the S-CSCF either way.
+// It reports whether it acted on the failure: once the user is marked not
+// registered here, it is no longer registered at the S-CSCF either.
 func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result) bool {
 	if r.Vendor != cx.Vendor3GPP {
 		return false
@@ -228,7 +304,9 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	if err != nil {
 		h.log.Warn("could not mark a user the S-CSCF refused as not registered", pii.Identity("impi", s.IMPI),
 			slog.String("error", pii.Redact(err.Error())))
-		return true
+		// The HSS has not deregistered the user: the change's other
+		// pushes still go (code review on #476).
+		return false
 	}
 	if r.Code == cx.ErrorUserUnknown {
 		h.metrics.Count("push.ppr.user_unknown", 1)

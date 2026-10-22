@@ -2,6 +2,7 @@ package hss
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
@@ -238,8 +239,13 @@ func TestProvisioningChangesTellTheSCSCFWhatItMustKnow(t *testing.T) {
 
 // #213: an identity that moves between two served implicit registration
 // sets updates the set losing it first, then the one gaining it (TS 29.228
-// §6.5.2.1), whichever comes first in the subscription.
+// §6.5.2.1), whichever comes first in the subscription. Among the sets
+// that lose one, the RTRs go first: the S-CSCF finds the set an RTR names
+// by its identities, so after a PPR that moved one of them it would end the
+// set gaining it as well (code review and QA on #476). Then the losing
+// sets' PPRs, a set before any it gives an identity to.
 func TestAnIdentityMovingBetweenSetsUpdatesTheOldSetFirst(t *testing.T) {
+	const tel2 = "tel:+15550100002"
 	registered := func(list ...store.PublicIdentity) *store.Subscription {
 		s := &store.Subscription{IMPI: impi1, Profile: DefaultProfileID, ServerName: scscfName, PublicIdentities: list}
 		for i := range s.PublicIdentities {
@@ -250,21 +256,70 @@ func TestAnIdentityMovingBetweenSetsUpdatesTheOldSetFirst(t *testing.T) {
 	id := func(impu string, set int) store.PublicIdentity {
 		return store.PublicIdentity{IMPU: impu, ImplicitSet: set}
 	}
+	ids := func(list ...store.PublicIdentity) []store.PublicIdentity { return list }
+	rtr := func(reason cx.ReasonCode, impus ...string) push {
+		return push{deregister: true, reason: reason, impus: impus, set: -1}
+	}
 	for name, c := range map[string]struct {
 		old, next []store.PublicIdentity
 		want      []push
+		// ended are the identities of next whose set an RTR ends.
+		ended []string
 	}{
 		// set 1 comes first in the subscription, and gains tel1.
 		"from set 0 to set 1": {
-			[]store.PublicIdentity{id(impu2, 1), id(impu1, 0), id(tel1, 0)},
-			[]store.PublicIdentity{id(impu2, 1), id(tel1, 1), id(impu1, 0)},
-			[]push{{set: 0}, {set: 1}},
+			ids(id(impu2, 1), id(impu1, 0), id(tel1, 0)),
+			ids(id(impu2, 1), id(tel1, 1), id(impu1, 0)),
+			[]push{{set: 0}, {set: 1}}, nil,
 		},
 		// set 0 comes first, and gains impu3.
 		"from set 1 to set 0": {
-			[]store.PublicIdentity{id(impu1, 0), id(impu2, 1), id(impu3, 1)},
-			[]store.PublicIdentity{id(impu1, 0), id(impu3, 0), id(impu2, 1)},
-			[]push{{set: 1}, {set: 0}},
+			ids(id(impu1, 0), id(impu2, 1), id(impu3, 1)),
+			ids(id(impu1, 0), id(impu3, 0), id(impu2, 1)),
+			[]push{{set: 1}, {set: 0}}, nil,
+		},
+		// The code review's swap: set 1 loses impu3 and gains impu1, set 0's
+		// default; set 0, whose default changes, is deregistered first.
+		"a swap whose old set is deregistered": {
+			ids(id(impu2, 1), id(impu3, 1), id(impu1, 0), id(tel1, 0)),
+			ids(id(impu2, 1), id(impu1, 1), id(tel1, 0), id(impu3, 0)),
+			[]push{rtr(cx.ServerChange, impu1, tel1), {set: 1}}, []string{tel1, impu3},
+		},
+		// QA's: impu1, set 0's default, moves to set 1, and impu3 leaves set 1.
+		"a move and a removal": {
+			ids(id(impu2, 1), id(impu3, 1), id(impu1, 0), id(tel1, 0)),
+			ids(id(impu2, 1), id(impu1, 1), id(tel1, 0)),
+			[]push{rtr(cx.ServerChange, impu1, tel1), {set: 1}}, []string{tel1},
+		},
+		"the old set emptied": {
+			ids(id(impu2, 1), id(tel1, 0)),
+			ids(id(impu2, 1), id(tel1, 1)),
+			[]push{rtr(cx.PermanentTermination, tel1), {set: 1}}, nil,
+		},
+		"the old set's default moved": {
+			ids(id(impu2, 1), id(impu1, 0), id(tel1, 0)),
+			ids(id(impu2, 1), id(impu1, 1), id(tel1, 0)),
+			[]push{rtr(cx.ServerChange, impu1, tel1), {set: 1}}, []string{tel1},
+		},
+		// Set 1 loses impu3 and gains tel1 from set 0: set 0 goes first.
+		"the gaining set loses one too": {
+			ids(id(impu2, 1), id(impu3, 1), id(impu1, 0), id(tel1, 0)),
+			ids(id(impu2, 1), id(tel1, 1), id(impu1, 0)),
+			[]push{{set: 0}, {set: 1}}, nil,
+		},
+		// tel1 from set 0 to set 1, and impu3 from set 1 to set 2, the sets
+		// listed 2, 1, 0.
+		"a chain": {
+			ids(id(tel2, 2), id(impu2, 1), id(impu3, 1), id(impu1, 0), id(tel1, 0)),
+			ids(id(tel2, 2), id(impu3, 2), id(impu2, 1), id(tel1, 1), id(impu1, 0)),
+			[]push{{set: 0}, {set: 1}, {set: 2}}, nil,
+		},
+		// No order updates both losing sets first: they keep the
+		// subscription's.
+		"a swap by PPRs alone": {
+			ids(id(impu2, 1), id(impu3, 1), id(impu1, 0), id(tel1, 0)),
+			ids(id(impu2, 1), id(tel1, 1), id(impu1, 0), id(impu3, 0)),
+			[]push{{set: 1}, {set: 0}}, nil,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -273,8 +328,12 @@ func TestAnIdentityMovingBetweenSetsUpdatesTheOldSetFirst(t *testing.T) {
 				t.Errorf("pushes\n got %+v\nwant %+v", got, c.want)
 			}
 			for _, p := range next.PublicIdentities {
-				if p.State != reg {
-					t.Errorf("%s state = %v, want registered", p.IMPU, p.State)
+				want := reg
+				if slices.Contains(c.ended, p.IMPU) {
+					want = nr
+				}
+				if p.State != want {
+					t.Errorf("%s state = %v, want %v", p.IMPU, p.State, want)
 				}
 			}
 		})

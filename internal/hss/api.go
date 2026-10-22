@@ -76,7 +76,7 @@ const (
 	maxSmallBody        = 4 << 10
 )
 
-// DefaultPushTimeout bounds the RTR and PPR a provisioning request causes.
+// DefaultPushTimeout bounds each RTR and PPR a provisioning request causes.
 const DefaultPushTimeout = 5 * time.Second
 
 // APIOptions configures the provisioning API.
@@ -92,7 +92,7 @@ type APIOptions struct {
 	Notifier Notifier
 	// DefaultProfile is used by subscriptions created without one.
 	DefaultProfile string
-	// PushTimeout bounds the requests one change causes.
+	// PushTimeout bounds each request one change causes, each on its own.
 	PushTimeout time.Duration
 	// FanoutWorkers bounds the PPRs sent at once after a shared profile
 	// changes; 8 when zero.
@@ -471,11 +471,4 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.status = http.StatusOK
 	}
 	return s.ResponseWriter.Write(b)
-}
-
-// pushContext is the context of the S-CSCF requests a change causes: they
-// run after the change is stored, so a client that goes away does not cut
-// them short.
-func (a *API) pushContext(r *http.Request) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(r.Context()), a.pushTimeout)
 }
