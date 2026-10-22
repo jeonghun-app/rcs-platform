@@ -3,6 +3,7 @@ package scenario_test
 import (
 	"bytes"
 	"context"
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"regexp"
 	"strings"
@@ -291,7 +292,7 @@ func rewritten(body []byte, edit func(*cpim.Header), text []byte) []byte {
 		edit(&c.Headers[i])
 	}
 	if text != nil {
-		c.Body = text
+		c.Body = content.BodyOf(text)
 	}
 	out, err := c.Marshal()
 	if err != nil {
