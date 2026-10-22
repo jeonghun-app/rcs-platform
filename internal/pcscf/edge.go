@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -178,8 +179,9 @@ type pcscf struct {
 	icscfs allResolver
 	// rand draws charging identifiers.
 	rand io.Reader
-	// dialogKey is the key of dialogMAC, drawn at every start.
-	dialogKey []byte
+	// dialogKey is the key of dialogMAC, drawn at every start; a secret.Key
+	// so that no verb prints it with the edge (#506).
+	dialogKey secret.Key
 	// flows sets a flow's idle timeout; nil in tests that need none.
 	flows flowSetter
 	ids   sip.IDGenerator

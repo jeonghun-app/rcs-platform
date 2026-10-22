@@ -721,7 +721,11 @@ func TestASubscribesFirstNOTIFYIsCountedBeforeIts200(t *testing.T) {
 	var r *running
 	var once sync.Once
 	stopped := make(chan error, 1)
-	r = startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+	r = startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
+		// The NOTIFY's transaction outlasts a loaded host's delay in
+		// reading it: at testConfig's 1 s it could end unanswered, and
+		// the stop with it, before the P-CSCF had the NOTIFY.
+		c.NotifyTimeout = stopWait
 		d.subscribeAnswered = func() {
 			once.Do(func() {
 				go func() { stopped <- r.stop() }()

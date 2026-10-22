@@ -193,9 +193,16 @@ func TestConfigNeverPrintsTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []string{fmt.Sprintf("%v", c), fmt.Sprintf("%+v", c), fmt.Sprintf("%#v", c)} {
-		if strings.Contains(s, testToken) || strings.Contains(s, nextToken) {
-			t.Fatalf("a token was printed: %s", s)
+	// Every verb, valid or not: an invalid one, %p or %w, calls no method
+	// and prints the fields (#506).
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{c, &c, c.Tokens} {
+			s := fmt.Sprintf(verb, v)
+			for _, secret := range []string{testToken[:12], nextToken[:12], strings.Trim(fmt.Sprint([]byte(testToken[:6])), "[]"), fmt.Sprintf("%x", testToken[:6])} {
+				if strings.Contains(s, secret) {
+					t.Errorf("%s printed a token: %s", verb, s)
+				}
+			}
 		}
 	}
 }

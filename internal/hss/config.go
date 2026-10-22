@@ -3,6 +3,8 @@ package hss
 import (
 	"cmp"
 	"encoding/base64"
+	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -12,6 +14,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // The HSS_STORE values.
@@ -85,17 +88,36 @@ type Config struct {
 }
 
 // secret holds a configuration secret so that printing a Config cannot
-// reveal it.
-type secret struct{ v string }
+// reveal it, under every verb: its text is in a secret.Key, which an
+// invalid verb, %p or %w, does not print either (#506).
+type secret struct{ k secretkey.Key }
 
-func (secret) String() string   { return "[redacted]" }
-func (secret) GoString() string { return "[redacted]" }
+// newSecret is a secret of v.
+func newSecret(v string) secret { return secret{k: secretkey.NewString(v)} }
 
-// secretTokens are the API tokens, which print as "[redacted]" too.
-type secretTokens struct{ t Tokens }
+// value is the secret's text.
+func (s secret) value() string { return s.k.RevealString() }
 
-func (secretTokens) String() string   { return "[redacted]" }
-func (secretTokens) GoString() string { return "[redacted]" }
+func (secret) String() string             { return "[redacted]" }
+func (secret) GoString() string           { return "[redacted]" }
+func (secret) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "[redacted]") }
+
+// secretTokens are the API tokens, which print as "[redacted]" too, and
+// are kept sealed, as a secret's text is, for the verbs that call no
+// method (#506).
+type secretTokens struct{ t secretkey.Sealed[Tokens] }
+
+// tokens are the API tokens; the zero secretTokens has none.
+func (s secretTokens) tokens() Tokens {
+	if s.t == nil {
+		return Tokens{}
+	}
+	return *s.t()
+}
+
+func (secretTokens) String() string             { return "[redacted]" }
+func (secretTokens) GoString() string           { return "[redacted]" }
+func (secretTokens) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "[redacted]") }
 
 // Configure reads the HSS_ settings and refuses, in staging and prod, the
 // ones that are unsafe there (docs/architecture.md §8, ADR 0007).
@@ -108,7 +130,7 @@ func Configure(s *runtime.Settings) Config {
 		ProfilesTable:    e.String("PROFILES_TABLE", DefaultProfilesTable),
 		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
 		KMSKeyID:         e.String("KMS_KEY_ID", ""),
-		DataKey:          secret{e.String("DATA_KEY", "")},
+		DataKey:          newSecret(e.String("DATA_KEY", "")),
 		KeyringBootstrap: e.Bool("KEYRING_BOOTSTRAP", false),
 		IMSRealm:         e.String("IMS_REALM", domain),
 		FTRealm:          e.String("FT_REALM", ""),
@@ -189,10 +211,10 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("STORE", "not one of dynamodb, memory")
 	}
 	switch {
-	case c.KMSKeyID != "" && c.DataKey.v != "":
+	case c.KMSKeyID != "" && c.DataKey.value() != "":
 		e.Invalid("DATA_KEY", "not with HSS_KMS_KEY_ID: the data key comes from KMS")
-	case c.DataKey.v != "":
-		if k, err := base64.StdEncoding.DecodeString(c.DataKey.v); err != nil || len(k) != keyring.DataKeySize {
+	case c.DataKey.value() != "":
+		if k, err := base64.StdEncoding.DecodeString(c.DataKey.value()); err != nil || len(k) != keyring.DataKeySize {
 			e.Invalid("DATA_KEY", "not the base64 of "+strconv.Itoa(keyring.DataKeySize)+" bytes")
 		}
 	case c.KMSKeyID == "" && c.Store == StoreDynamoDB:
@@ -207,7 +229,8 @@ func Configure(s *runtime.Settings) Config {
 			"HSS_DIAMETER_PEER_NETWORKS holds a /0 prefix: it restricts no source address (ADR 0007 §6)")
 	}
 
-	c.Tokens = secretTokens{readTokens(s)}
+	tokens := readTokens(s)
+	c.Tokens = secretTokens{secretkey.Seal(&tokens)}
 	return c
 }
 

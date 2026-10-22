@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
@@ -263,7 +264,7 @@ func (c Config) Validate() error {
 		return fmt.Errorf("transaction: MaxServerTransactions %d is not 0 (the default) or 1..%d", c.MaxServerTransactions, MaxMaxServerTransactions)
 	case c.MaxServerTransactionBytes < 0:
 		return errors.New("transaction: negative MaxServerTransactionBytes")
-	case c.ClientShare < 0 || c.ClientShare > 1:
+	case c.ClientShare < 0 || c.ClientShare > 1 || math.IsNaN(c.ClientShare):
 		return fmt.Errorf("transaction: ClientShare %v is outside 0..1", c.ClientShare)
 	case c.RetryAfter < 0 || c.RetryAfter > MaxRetryAfter:
 		return fmt.Errorf("transaction: RetryAfter %v is outside 0..%v", c.RetryAfter, MaxRetryAfter)
@@ -292,10 +293,10 @@ type Layer struct {
 	absorbed    atomic.Uint64
 	// maxBytes bounds the request bytes of the server transactions; the
 	// client limits are ClientShare of the bounds. tagKey keys the 503's To
-	// tags.
+	// tags; a secret.Key so that no verb prints it with the layer (#506).
 	maxBytes                   int64
 	clientServers, clientBytes int64
-	tagKey                     []byte
+	tagKey                     secret.Key
 	// nonInviteFinal and inviteFinal are the safety timeouts; timedOut and
 	// lateFinals count what they did.
 	nonInviteFinal, inviteFinal time.Duration
@@ -344,9 +345,9 @@ func New(s Sender, tu TU, cfg Config) (*Layer, error) {
 	l := &Layer{
 		maxServers:    cfg.MaxServerTransactions,
 		maxBytes:      cfg.MaxServerTransactionBytes,
-		clientServers: clientShare(int64(cfg.MaxServerTransactions), cfg.ClientShare),
-		clientBytes:   clientShare(cfg.MaxServerTransactionBytes, cfg.ClientShare),
-		tagKey:        key,
+		clientServers: ClientShareOf(int64(cfg.MaxServerTransactions), cfg.ClientShare),
+		clientBytes:   ClientShareOf(cfg.MaxServerTransactionBytes, cfg.ClientShare),
+		tagKey:        secret.NewKey(key),
 		retryAfter:    strconv.FormatInt(int64((cfg.RetryAfter+time.Second-1)/time.Second), 10),
 		ids:           cfg.IDs,
 		sender:        s,
@@ -524,10 +525,19 @@ func responseSize(res *sip.Response) int64 {
 	return int64(len(res.Reason) + res.Header.WireSize() + len(res.Body) + res.Header.Len()*fieldOverhead)
 }
 
-// clientShare is share of bound, rounded up so that a bound of 1 still lets a
-// client request in.
-func clientShare(bound int64, share float64) int64 {
-	return int64(math.Ceil(float64(bound) * share))
+// ClientShareOf is the part of bound that requests from client-facing
+// listeners may use at a ClientShare of share: rounded up, so that a bound
+// of 1 still lets a client request in, and never past bound, so that a
+// share of 1, or one that rounds to it, keeps even the largest bound. The
+// proxy's context bytes take theirs with it too, so that the two agree.
+func ClientShareOf(bound int64, share float64) int64 {
+	// float64(bound) may round up past bound (the largest int64), so the
+	// result is compared with it rather than converted.
+	v := math.Ceil(float64(bound) * share)
+	if v >= float64(bound) {
+		return bound
+	}
+	return int64(v)
 }
 
 // keep charges tx for a response of size after kept in place of one of size
@@ -562,7 +572,7 @@ func (l *Layer) refusalTag(req *sip.Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	m := hmac.New(sha256.New, l.tagKey)
+	m := hmac.New(sha256.New, l.tagKey.Reveal())
 	m.Write([]byte(key))
 	return hex.EncodeToString(m.Sum(nil)[:8]), nil
 }

@@ -79,9 +79,9 @@ func TestAPanicBeforeAClientConnectionReadsEndsOnlyThatConnection(t *testing.T) 
 	if _, err := r.dial(0, nil).open(t, b.clientPath, newRecorder()); err == nil {
 		t.Fatal("the connection whose handling panicked was served")
 	}
-	if got := r.metrics.count(msrp.MetricCallbackPanics); got != 1 {
-		t.Fatalf("%s = %d, want 1", msrp.MetricCallbackPanics, got)
-	}
+	// handle's deferred calls close the connection while the panic
+	// unwinds, before the Guard counts it: the count is waited for.
+	eventually(t, "the handle panic's count", func() bool { return r.metrics.count(msrp.MetricCallbackPanics) == 1 })
 	if _, err := r.dial(0, nil).open(t, b.clientPath, newRecorder()); err != nil {
 		t.Fatalf("the next connection: %v", err)
 	}

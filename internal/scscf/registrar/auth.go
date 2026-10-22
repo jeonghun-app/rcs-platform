@@ -9,6 +9,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -49,7 +50,7 @@ func (g *Registrar) authenticate(ctx context.Context, r *register, known bool) *
 		return refuse(403, "Challenge for another identity")
 	}
 	if ch.AKA != nil {
-		err = g.digest.VerifyAKA(ctx, "REGISTER", *c, ch.AKA.XRES, ch.Expires)
+		err = g.digest.VerifyAKA(ctx, "REGISTER", *c, ch.AKA.XRES.Reveal(), ch.Expires)
 		var sync *digest.SyncFailure
 		if errors.As(err, &sync) {
 			if ch.Resynchronised {
@@ -115,7 +116,7 @@ func (g *Registrar) networkNotAuthenticated(ctx context.Context, r *register, c 
 func (g *Registrar) verifyDigest(ctx context.Context, c *digest.Credentials, d *state.DigestChallenge) error {
 	// The secret carries the challenge's algorithm, so credentials for
 	// another one fail to verify.
-	secret, err := digest.HA1(digest.Algorithm(d.Algorithm), d.HA1)
+	secret, err := digest.HA1(digest.Algorithm(d.Algorithm), d.HA1.RevealString())
 	if err != nil {
 		return err
 	}
@@ -223,7 +224,8 @@ func (g *Registrar) akaChallenge(ctx context.Context, r *register, item cx.AuthD
 	// this platform does not set up (it uses TLS), so they are not sent in
 	// the 401 (TS 24.229 §5.4.1.2.1 adds them for IPsec only).
 	err = g.store(ctx, r, ch.Nonce, &state.Challenge{Resynchronised: resynced, AKA: &state.AKAVector{
-		RAND: rand, AUTN: autn, XRES: item.Authorization, CK: item.ConfidentialityKey, IK: item.IntegrityKey,
+		RAND: secretkey.NewKey(rand), AUTN: secretkey.NewKey(autn), XRES: secretkey.NewKey(item.Authorization),
+		CK: secretkey.NewKey(item.ConfidentialityKey), IK: secretkey.NewKey(item.IntegrityKey),
 	}})
 	if err != nil {
 		return nil, err
@@ -258,7 +260,7 @@ func (g *Registrar) digestChallenges(ctx context.Context, r *register, d *cx.Dig
 			return nil, err
 		}
 		err = g.store(ctx, r, ch.Nonce, &state.Challenge{Digest: &state.DigestChallenge{
-			Realm: ch.Realm, Algorithm: string(o.alg), QoP: digest.QOPAuth, Opaque: ch.Opaque, HA1: o.ha1,
+			Realm: ch.Realm, Algorithm: string(o.alg), QoP: digest.QOPAuth, Opaque: ch.Opaque, HA1: secretkey.NewString(o.ha1),
 		}})
 		if err != nil {
 			return nil, err

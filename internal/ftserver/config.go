@@ -116,9 +116,9 @@ func Configure(s *runtime.Settings) Config {
 	c := Config{
 		ListenAddr:              e.String("LISTEN_ADDR", DefaultListenAddr),
 		Realm:                   e.RequiredString("REALM"),
-		NonceKey:                secret{e.String("NONCE_KEY", "")},
+		NonceKey:                newSecret(e.String("NONCE_KEY", "")),
 		Credentials:             e.String("CREDENTIALS", CredentialsHSS),
-		HSSToken:                secret{e.String("HSS_TOKEN", "")},
+		HSSToken:                newSecret(e.String("HSS_TOKEN", "")),
 		HSSTimeout:              e.Duration("HSS_TIMEOUT", DefaultHSSTimeout),
 		Store:                   e.String("STORE", StoreAWS),
 		MaxSize:                 int64(e.Int("MAX_SIZE", DefaultMaxSize)),
@@ -181,10 +181,10 @@ func Configure(s *runtime.Settings) Config {
 		}
 	}
 
-	if k := c.NonceKey.v; k != "" && len(k) < digest.MinNonceKeySize {
+	if k := c.NonceKey.value(); k != "" && len(k) < digest.MinNonceKeySize {
 		e.Invalid("NONCE_KEY", "shorter than "+strconv.Itoa(digest.MinNonceKeySize)+" bytes")
 	}
-	s.ForbidInProduction(c.NonceKey.v == "",
+	s.ForbidInProduction(c.NonceKey.value() == "",
 		"FT_NONCE_KEY is unset: every task would issue nonces the others reject")
 
 	switch c.Credentials {
@@ -193,13 +193,13 @@ func Configure(s *runtime.Settings) Config {
 		s.ForbidInProduction(true, "FT_CREDENTIALS=static authenticates against fixed test passwords")
 	case CredentialsHSS:
 		c.HSSURL = absoluteURL(e, "HSS_URL", true)
-		if c.HSSToken.v == "" {
+		if c.HSSToken.value() == "" {
 			e.Invalid("HSS_TOKEN", "required with FT_CREDENTIALS=hss")
 		}
 		// ADR 0007 §4: service tokens carry at least 256 bits. The length of
 		// 32 random bytes in base64 (43 characters) is the shortest encoded
 		// form; a shorter token cannot hold that much.
-		s.ForbidInProduction(c.HSSToken.v != "" && len(c.HSSToken.v) < minTokenLength,
+		s.ForbidInProduction(c.HSSToken.value() != "" && len(c.HSSToken.value()) < minTokenLength,
 			"FT_HSS_TOKEN is shorter than "+strconv.Itoa(minTokenLength)+" characters (ADR 0007: at least 256 random bits, e.g. 32 bytes in base64)")
 		// ADR 0007: plain http to an internal API only for a private host
 		// (an RFC 1918 or ULA address, or a name in the Cloud Map
@@ -339,7 +339,7 @@ func staticUsers(e *runtime.Env) map[string]secret {
 			e.Invalid("STATIC_USERS", "item "+strconv.Itoa(i+1)+" is not user=password")
 			continue
 		}
-		users[name] = secret{password}
+		users[name] = newSecret(password)
 	}
 	if len(users) == 0 {
 		e.Invalid("STATIC_USERS", "required with FT_CREDENTIALS=static")
