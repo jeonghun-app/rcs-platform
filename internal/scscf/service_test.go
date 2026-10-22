@@ -807,3 +807,35 @@ func TestARequestReachesALiveTaskOfAServerWhoseOtherTaskStopped(t *testing.T) {
 		return n == 1
 	})
 }
+
+// TestAThirdPartyREGISTERReachesALiveTaskOfAServerWhoseOtherTaskStopped
+// (#580): the server's name still resolves to a stopped task, first, and
+// a live one; the third-party REGISTER, which could not be sent to the
+// stopped one, reaches the live one, and the failover is counted.
+func TestAThirdPartyREGISTERReachesALiveTaskOfAServerWhoseOtherTaskStopped(t *testing.T) {
+	hss := startHSS(t)
+	live := startSilentPeer(t)
+	port := live.addr[strings.LastIndex(live.addr, ":")+1:]
+	uri := "sip:rcs-as.rcs.local:" + port + ";transport=tcp"
+	hss.asURI.Store(&uri)
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+		d.lookup = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			if host != "rcs-as.rcs.local" {
+				return nil, errors.New("no such host")
+			}
+			// Nothing listens on 127.0.0.2: the stopped task.
+			return []netip.Addr{netip.MustParseAddr("127.0.0.2"), netip.MustParseAddr("127.0.0.1")}, nil
+		}
+		d.shuffle = func(int, func(i, j int)) {}
+	})
+	p := dialSCSCF(t, r)
+	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
+	waitFor(t, "the REGISTER at the live task", func() bool { return live.got.Load() > 0 })
+	if req := live.first.Load(); req == nil || req.Method != "REGISTER" {
+		t.Fatalf("the live task got %v", req)
+	}
+	waitFor(t, "the failover counted", func() bool {
+		n, _ := r.h.Metric("routing.as_failover")
+		return n == 1
+	})
+}

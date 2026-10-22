@@ -40,7 +40,10 @@ INVITE that met Timer F), or one whose `SCSCF_AS_TIMEOUT` passed.
 
 What `scscf` sends itself, NOTIFYs and third-party REGISTERs, goes in client
 transactions over the core listener, to the first `Route` or else the
-Request-URI.
+Request-URI. A third-party REGISTER to a server reached by name tries its
+addresses as a request to it does, the ones that just failed last, but goes
+on to the next only when it could not be sent at all: once written, the
+server may have it (#580).
 
 Every task names itself by its service name, `sip:scscf.<namespace>`, never a
 task's own:
