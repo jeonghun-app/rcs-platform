@@ -66,7 +66,18 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 	} else {
 		for _, impi := range impis {
 			regs, err := g.cfg.Store.RegistrationsOf(ctx, impi)
-			if err != nil {
+			switch {
+			case errors.Is(err, state.ErrInvalid) && len(regs) > 0:
+				// Items that do not decode, beside the readable sets the
+				// store still returns: those end, rather than stay live
+				// for want of the others, as the HSS does not send the
+				// RTR again (#451). An unreadable item routes nothing. A
+				// listing with nothing readable stays UNABLE_TO_COMPLY
+				// below, as an invalid read is (#422).
+				n := unreadableItems(err)
+				g.log.Error("registrar: RTR: unreadable registration items", slog.Int("items", n))
+				g.cfg.Metrics.Count("registrar.rtr_unreadable", int64(n))
+			case err != nil:
 				g.log.Error("registrar: RTR: listing registrations", slog.String("error", err.Error()))
 				return readFailed(err)
 			}
@@ -99,6 +110,15 @@ func (g *Registrar) HandleRTR(ctx context.Context, r *cx.RTR) cx.Result {
 	}
 	g.cfg.Metrics.Count("registrar.rtr_deregistered", int64(ended))
 	return result
+}
+
+// unreadableItems is how many items err, a listing's ErrInvalid, says did
+// not decode: the store joins one error for each.
+func unreadableItems(err error) int {
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		return len(j.Unwrap())
+	}
+	return 1
 }
 
 // errReadBusy is a store read before an RTR's claim that failed for a reason
