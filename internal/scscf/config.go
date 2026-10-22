@@ -144,7 +144,7 @@ type ServiceConfig struct {
 	MaxServerTransactionBytes int64
 }
 
-// A ServiceConfig prints as a placeholder, whatever the verb, under fmt,
+// A ServiceConfig prints as a placeholder, under every valid verb of fmt,
 // log/slog and encoding/json: it holds NonceKey, the dialog keys and the
 // challenge keys, which must never reach an output. The key types redact
 // themselves too, for when one is printed on its own.

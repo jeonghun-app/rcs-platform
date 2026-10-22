@@ -29,8 +29,10 @@ type ChallengeKey struct {
 func (k ChallengeKey) redacted() string { return "ChallengeKey{ID:" + k.ID + " Key:[redacted]}" }
 
 // String, GoString, Format, LogValue and MarshalJSON print the key's ID
-// alone, as routing.DialogKey's do, so that a Config logged or printed does
-// not give the key away (#439 security review).
+// alone, under every valid verb of fmt, as routing.DialogKey's do, so that
+// a Config logged or printed does not give the key away (#439 security
+// review). fmt does not call Format for an invalid verb, %p on a struct
+// say (#455).
 func (k ChallengeKey) String() string               { return k.redacted() }
 func (k ChallengeKey) GoString() string             { return k.redacted() }
 func (k ChallengeKey) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, k.redacted()) }
