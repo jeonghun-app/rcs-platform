@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -123,7 +124,7 @@ func newTestPcscf(clock *testClock) (*pcscf, idleSet) {
 		icscfFirst:   icscfFirstTimeout, icscfTotal: icscfTotalTimeout,
 		resolve: coreResolver{dns: &proxy.DNSResolver{Namespace: cfg.Namespace, Allow: allowCore(cfg), Lookup: scscfAt("10.0.4.4")}},
 		icscfs:  icscfAt{"10.0.3.7:5060", "10.0.3.8:5060", "10.0.3.9:5060", "10.0.3.10:5060"}, rand: seededRand(),
-		dialogKey: []byte("test dialog key"),
+		dialogKey: secret.NewString("test dialog key"),
 		flows:     idle, now: clock.now, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, idle
 }
