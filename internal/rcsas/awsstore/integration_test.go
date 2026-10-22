@@ -327,3 +327,34 @@ func TestIntegrationGroupVersionsCountAcrossWriters(t *testing.T) {
 		t.Fatalf("final %+v, %v", final, err)
 	}
 }
+
+// #121 D2 against DynamoDB: the transaction of a fenced copy spans the
+// messages and groupchats tables, and a stale owner queues nothing.
+func TestIntegrationAFencedEnqueueSpansBothTables(t *testing.T) {
+	_, queues := integrationTable(t)
+	groups := integrationGroups(t)
+	queues.SetGroupsTable(groups.table)
+	ctx := t.Context()
+	t1 := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	g := groupstore.Group{URI: "sip:chat-f@conf.example.net", Version: 1, Created: t1, Active: t1, Expires: t1.Add(time.Hour),
+		Participants: []groupstore.Participant{{Identity: "sip:a@example.net", Role: groupstore.Chairman, State: groupstore.Joined, Since: t1}}}
+	if err := groups.Create(ctx, g, testOwner, "c", t1); err != nil {
+		t.Fatal(err)
+	}
+	copyOf := func(id string, owner groupstore.Owner) store.Message {
+		return store.Message{Recipient: "tel:+15550100002", ID: id, Sender: g.URI, Mode: store.Group, CPIM: []byte("x"),
+			Enqueued: t1, Expires: t1.Add(time.Hour), Fence: &store.Fence{Group: g.URI, Task: owner.Task, Epoch: owner.Epoch}}
+	}
+	if err := queues.Enqueue(ctx, copyOf("1", testOwner), store.Limit{}); err != nil {
+		t.Fatalf("the owner's enqueue = %v", err)
+	}
+	if _, err := groups.TakeOver(ctx, g.URI, testOwner, groupstore.Owner{Task: "task-b"}, g.Expires, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := queues.Enqueue(ctx, copyOf("2", testOwner), store.Limit{}); !errors.Is(err, store.ErrNotOwner) {
+		t.Fatalf("the old owner's enqueue = %v", err)
+	}
+	if got, err := queues.Pending(ctx, "tel:+15550100002", "", t1, 10); err != nil || len(got) != 1 {
+		t.Fatalf("queue %+v, %v", got, err)
+	}
+}
