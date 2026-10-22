@@ -195,7 +195,7 @@ func (r *Reader) readBodyCharged(limit int64, b *Budget) (int64, error) {
 	if int64(len(buf)) > limit {
 		return charged, r.tooLarge()
 	}
-	r.cur.Body = buf
+	r.cur.Body = BodyOf(buf)
 	r.body = nil
 	return charged, nil
 }
@@ -230,7 +230,7 @@ func (r *Reader) ReadMessage(maxBody int64) (*Message, error) {
 		}
 		return nil, err
 	}
-	if err := checkBody(m, int64(len(m.Body))); err != nil {
+	if err := checkBody(m, int64(m.Body.Len())); err != nil {
 		return m, &MessageError{Message: m, Code: StatusBadRequest, Err: err}
 	}
 	return m, nil

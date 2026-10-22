@@ -389,7 +389,7 @@ func (c *client) send(t *testing.T, body []byte) int {
 
 func (c *client) sendType(t *testing.T, contentType string, body []byte) int {
 	t.Helper()
-	id, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: contentType, Body: body, SuccessReport: true})
+	id, err := c.session.Send(context.Background(), msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(body), SuccessReport: true})
 	if se, ok := err.(*msrp.StatusError); ok {
 		return se.Code
 	}
