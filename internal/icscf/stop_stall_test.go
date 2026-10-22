@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,7 +31,7 @@ func TestAStopDoesNotWaitOnACorePeerThatStoppedReading(t *testing.T) {
 		d.writeTimeout = writeTimeout
 		d.transport = func(t *transport.Transport) { tr = t }
 	})
-	fillCoreQueue(t, tr, func() (net.Conn, error) { return net.Dial("tcp", r.core.String()) }, 30*time.Second, writeTimeout, r.h.Records)
+	fillCoreQueue(t, tr, func() (net.Conn, error) { return net.Dial("tcp", r.core.String()) }, every(30*time.Second), writeTimeout, r.h.Records)
 	failed := tr.Stats().WriteErrors
 	// Only a hang guard, past the write deadline so that a stop that waits
 	// for it still returns and fails below.
@@ -50,12 +51,15 @@ func TestAStopDoesNotWaitOnACorePeerThatStoppedReading(t *testing.T) {
 // 403 fits, whatever its size, and leaves the connection open. The fill is
 // judged by progress, and a failure says what happened to the connection.
 //
-// A connection on which the queue has not moved off 0 bytes for patience is
-// closed and the fill starts again on a new one, up to three: on a loaded
-// host the kernel can stall both ends of one, the requests unsent and
-// icscf waiting to read them, before any answer is queued (QA of #434,
-// #459). Each such stall is logged with the kernel's TCP drop counters.
-func fillCoreQueue(t *testing.T, tr *transport.Transport, dial func() (net.Conn, error), patience, writeTimeout time.Duration, logged func() []map[string]any) {
+// A connection on which the queue has not moved off 0 bytes for the
+// patience of its attempt is closed and the fill starts again on a new one,
+// up to three: on a loaded host the kernel can stall both ends of one, the
+// requests unsent and icscf waiting to read them, before any answer is
+// queued (QA of #434, #459). Each such stall is logged with the kernel's TCP
+// drop counters, which are the network namespace's, not the connection's. A
+// queue that stops once it holds bytes fails at once: icscf stopped
+// answering, which is no precondition to retry.
+func fillCoreQueue(t testing.TB, tr stats, dial func() (net.Conn, error), patience func(attempt int) time.Duration, writeTimeout time.Duration, logged func() []map[string]any) {
 	t.Helper()
 	full := transport.DefaultSendQueueBytes - 64<<10
 	for attempt := 1; ; attempt++ {
@@ -84,14 +88,14 @@ func fillCoreQueue(t *testing.T, tr *transport.Transport, dial func() (net.Conn,
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			if time.Since(lastAt) <= patience {
+			if time.Since(lastAt) <= patience(attempt) {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 			if n != 0 || attempt == 3 {
-				t.Fatalf("the core connection's send queue holds %d bytes, want %d, and has not changed for %v (attempt %d); %+v; kernel %v", n, full, patience, attempt, tr.Stats(), tcpDropsSince(before))
+				t.Fatalf("the core connection's send queue holds %d bytes, want %d, and has not changed for %v (attempt %d); %+v; kernel (namespace-wide) %v", n, full, patience(attempt), attempt, tr.Stats(), tcpDropsSince(before))
 			}
-			t.Logf("the fill made no progress for %v on connection %d; kernel %v; again on a new one", patience, attempt, tcpDropsSince(before))
+			t.Logf("the fill made no progress for %v on connection %d; kernel (namespace-wide) %v; again on a new one", patience(attempt), attempt, tcpDropsSince(before))
 			_ = nc.Close()
 			<-writeErr // the filler ends with the connection
 			break
@@ -102,8 +106,13 @@ func fillCoreQueue(t *testing.T, tr *transport.Transport, dial func() (net.Conn,
 	}
 }
 
+// every gives each attempt of fillCoreQueue the same patience.
+func every(d time.Duration) func(int) time.Duration { return func(int) time.Duration { return d } }
+
 // A first connection the kernel stalls, its writes blocked and nothing
-// queued, does not fail the fill: it starts again on a new one (#459).
+// queued, does not fail the fill: it starts again on a new one (#459). The
+// faked stall gets 5 s, the real connection after it the 30 s of the stop
+// test, so a loaded host does not move the fill on to a third.
 func TestTheFillStartsAgainOnAStalledConnection(t *testing.T) {
 	hss := startHSS(t)
 	scscf := startSCSCF(t)
@@ -120,7 +129,12 @@ func TestTheFillStartsAgainOnAStalledConnection(t *testing.T) {
 			return nc, err
 		}
 		return &stalledConn{Conn: nc, closed: make(chan struct{})}, nil
-	}, 5*time.Second, time.Minute, r.h.Records)
+	}, func(attempt int) time.Duration {
+		if attempt == 1 {
+			return 5 * time.Second
+		}
+		return 30 * time.Second
+	}, time.Minute, r.h.Records)
 	if dials != 2 {
 		t.Errorf("filled after %d connections, want 2", dials)
 	}
@@ -144,9 +158,58 @@ func (c *stalledConn) Close() error {
 	return c.Conn.Close()
 }
 
+// stats is what fillCoreQueue reads of the transport.
+type stats interface{ Stats() transport.Stats }
+
+// heldQueue is a transport whose send queue holds 100 bytes and never
+// moves, as when icscf stops answering partway through a fill.
+type heldQueue struct{}
+
+func (heldQueue) Stats() transport.Stats { return transport.Stats{QueuedBytes: 100} }
+
+// A queue that stops once it holds bytes fails the fill on that connection,
+// with no new one (code review of #470): the retry is for a connection the
+// kernel stalled before any answer was queued, not for icscf stopping.
+func TestTheFillDoesNotStartAgainOnceTheQueueHoldsBytes(t *testing.T) {
+	dials := 0
+	ft := &fatalRecorder{TB: t}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fillCoreQueue(ft, heldQueue{}, func() (net.Conn, error) {
+			dials++
+			near, far := net.Pipe()
+			go func() { _, _ = io.Copy(io.Discard, far) }()
+			t.Cleanup(func() { far.Close() })
+			return near, nil
+		}, every(100*time.Millisecond), time.Minute, func() []map[string]any { return nil })
+	}()
+	<-done
+	if !strings.Contains(ft.fatal, "holds 100 bytes") || dials != 1 {
+		t.Errorf("after %d connections the fill failed with %q, want a stall on the first", dials, ft.fatal)
+	}
+}
+
+// fatalRecorder is t, but records its first Fatal and ends the goroutine
+// instead of the test, so that a test can check a helper fails.
+type fatalRecorder struct {
+	testing.TB
+	fatal string
+}
+
+func (r *fatalRecorder) Fatalf(format string, args ...any) {
+	r.fatal = fmt.Sprintf(format, args...)
+	runtime.Goexit()
+}
+
+func (r *fatalRecorder) Fatal(args ...any) {
+	r.fatal = fmt.Sprint(args...)
+	runtime.Goexit()
+}
+
 // fillWith sends requests over nc, each answered 403 at once, until tr's
 // queued bytes reach full, or until a write fails, which it sends on errs.
-func fillWith(nc net.Conn, tr *transport.Transport, full int, errs chan<- error) {
+func fillWith(nc net.Conn, tr stats, full int, errs chan<- error) {
 	// A Route to a host that is no S-CSCF is refused 403 at once, without the
 	// HSS (#337); the 403 carries the request's long Via.
 	pad := strings.Repeat("z", 3000)

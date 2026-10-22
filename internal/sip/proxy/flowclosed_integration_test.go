@@ -638,6 +638,67 @@ func finalsBehindAStalledPeer(t *testing.T, kind string) {
 func TestDrainWaitsForAFinalWhoseConnectionIsBeingDialled(t *testing.T) {
 	drainSendWait = time.Hour
 	t.Cleanup(func() { drainSendWait = DrainSendWait })
+	d := startDialledFinal(t)
+	done := d.drain()
+	select {
+	case <-done:
+		t.Fatal("Drain returned while the 200 was still being dialled")
+	case <-time.After(drainFlushStall + 500*time.Millisecond):
+	}
+	d.release()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Drain did not return once the dial was done")
+	}
+	if tl, ok := d.back.(*net.TCPListener); ok {
+		_ = tl.SetDeadline(time.Now().Add(30 * time.Second))
+	}
+	got, err := d.back.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer got.Close()
+	_ = got.SetReadDeadline(time.Now().Add(30 * time.Second))
+	m, err := sip.NewReader(bufio.NewReader(got), sip.Limits{}).ReadMessage()
+	if res, ok := m.(*sip.Response); err != nil || !ok || res.StatusCode != 200 {
+		t.Fatalf("the peer got %v, %v, want the 200", m, err)
+	}
+}
+
+// But only until the stop's deadline (code review of #470): a dial that
+// never ends, with an hour of DialTimeout, does not keep Drain past
+// drainSendWait.
+func TestDrainGivesUpOnADialAtItsDeadline(t *testing.T) {
+	drainSendWait = time.Second
+	t.Cleanup(func() { drainSendWait = DrainSendWait })
+	d := startDialledFinal(t)
+	start := time.Now()
+	done := d.drain()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second): // a hang guard, past the deadline
+		t.Fatal("Drain waits for the dial past its deadline")
+	}
+	if took := time.Since(start); took < drainSendWait {
+		t.Errorf("Drain returned after %v, before its %v deadline, with the 200 still being dialled", took, drainSendWait)
+	}
+}
+
+// dialledFinal is a proxy whose 200 to a MESSAGE goes to the Via's address
+// once the sender's connection has closed, over a dial that heldDialer
+// holds until release, with an hour of DialTimeout so that only release
+// ends it.
+type dialledFinal struct {
+	p       *Proxy
+	tr      *transport.Transport
+	back    net.Listener
+	release func()
+}
+
+// startDialledFinal returns once the 200's dial has begun.
+func startDialledFinal(t *testing.T) *dialledFinal {
+	t.Helper()
 	// The peer's own address, where the 200 goes once its connection closed.
 	back, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -646,9 +707,8 @@ func TestDrainWaitsForAFinalWhoseConnectionIsBeingDialled(t *testing.T) {
 	t.Cleanup(func() { back.Close() })
 	dialing, release := make(chan struct{}, 1), make(chan struct{})
 	var once sync.Once
-	t.Cleanup(func() { once.Do(func() { close(release) }) })
 	var px atomic.Pointer[Proxy]
-	tr, err := transport.New(transport.Config{Dialer: heldDialer{dialing: dialing, release: release}}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{Dialer: heldDialer{dialing: dialing, release: release}, DialTimeout: time.Hour}, func(in transport.Inbound) {
 		if p := px.Load(); p != nil {
 			p.Receive(in)
 		}
@@ -673,6 +733,8 @@ func TestDrainWaitsForAFinalWhoseConnectionIsBeingDialled(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(p.Close)
+	// Before p.Close, which waits for the transaction the dial holds.
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
 	px.Store(p)
 
 	nc, err := net.Dial("tcp", addr.String())
@@ -695,35 +757,21 @@ func TestDrainWaitsForAFinalWhoseConnectionIsBeingDialled(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("the 200 never went to the Via's address")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
-	defer cancel()
+	return &dialledFinal{p: p, tr: tr, back: back, release: func() { once.Do(func() { close(release) }) }}
+}
+
+// drain starts Drain, and then the transport's Close, as pcscf and icscf
+// stop, and returns a channel closed once both are done.
+func (d *dialledFinal) drain() <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
-		p.Drain(ctx)
-		_ = tr.Close() // as pcscf and icscf do
+		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+		defer cancel()
+		d.p.Drain(ctx)
+		_ = d.tr.Close()
 		close(done)
 	}()
-	select {
-	case <-done:
-		t.Fatal("Drain returned while the 200 was still being dialled")
-	case <-time.After(drainFlushStall + 500*time.Millisecond):
-	}
-	once.Do(func() { close(release) })
-	select {
-	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("Drain did not return once the dial was done")
-	}
-	got, err := back.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer got.Close()
-	_ = got.SetReadDeadline(time.Now().Add(30 * time.Second))
-	m, err := sip.NewReader(bufio.NewReader(got), sip.Limits{}).ReadMessage()
-	if res, ok := m.(*sip.Response); err != nil || !ok || res.StatusCode != 200 {
-		t.Fatalf("the peer got %v, %v, want the 200", m, err)
-	}
+	return done
 }
 
 // heldDialer dials once release is closed, and says on dialing that it was
