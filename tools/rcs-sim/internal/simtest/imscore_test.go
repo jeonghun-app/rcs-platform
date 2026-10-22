@@ -72,6 +72,25 @@ func (c fastClock) AfterFunc(d time.Duration, f func()) transaction.Timer {
 	return time.AfterFunc(d/c.k, f)
 }
 
+// longHeldClock runs a timer shorter than 64*T1 on the wall clock and holds
+// one of 64*T1 or longer, which then never fires: a client transaction's
+// Timer B or F, and the INVITE's give-up 64*T1 after its CANCEL. A test
+// whose outcome must come from the core, not from the originator giving
+// up, uses it, and its context bounds the wait instead (#584).
+type longHeldClock struct{}
+
+func (longHeldClock) AfterFunc(d time.Duration, f func()) transaction.Timer {
+	if d >= 64*transaction.DefaultT1 {
+		return heldTimer{}
+	}
+	return time.AfterFunc(d, f)
+}
+
+// heldTimer is a timer that never fires.
+type heldTimer struct{}
+
+func (heldTimer) Stop() bool { return true }
+
 func TestARequestTheCalledPartyNeverAnswersIsLeftUnanswered(t *testing.T) {
 	// #363: when the terminating transaction of a non-INVITE times out,
 	// the core sends the originator nothing, as the platform's proxy does
@@ -354,11 +373,13 @@ func TestACancelTheCalleeIgnoresIsAnswered487(t *testing.T) {
 	// QA of #425: B rings, and rings again for the CANCEL, which it ignores.
 	// The core ends the INVITE 64*T1 after it sent the CANCEL, as the
 	// platform's proxy does, and answers 487 (RFC 3261 §9.1). The core's T1
-	// is 10 ms, so 640 ms; the originator's clock runs eight times fast, so
-	// that its own 64*T1 after its CANCEL, which would end it otherwise, is
-	// 4 s. The CANCEL comes on the core's own 100, and the INVITE goes only
-	// once the core has taken it, so that it is cancelled before the core's
-	// Timer B could end it, however late B's ring comes.
+	// is 10 ms, so 640 ms. The originator's own 64*T1 after its CANCEL
+	// would end the INVITE otherwise; its clock holds it (longHeldClock),
+	// so the 487 comes first however slow the host. It ran eight times fast
+	// before, at 4 s, which a loaded host overran (#584); the context bounds
+	// the wait now. The CANCEL comes on the core's own 100, and the INVITE
+	// goes only once the core has taken it, so that it is cancelled before
+	// the core's Timer B could end it, however late B's ring comes.
 	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
 	hold := make(chan struct{})
 	release := sync.OnceFunc(func() { close(hold) })
@@ -377,7 +398,7 @@ func TestACancelTheCalleeIgnoresIsAnswered487(t *testing.T) {
 		t.Fatal(err)
 	}
 	a, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: domain, IMPU: u,
-		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000001", Credentials: creds, Clock: fastClock{8}})
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000001", Credentials: creds, Clock: longHeldClock{}})
 	if err != nil {
 		t.Fatal(err)
 	}

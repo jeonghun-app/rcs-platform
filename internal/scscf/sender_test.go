@@ -84,7 +84,7 @@ func TestTheSubscriptionSweepsRunUntilTheirContextEnds(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		runSubscriptionSweeps(ctx, n, time.Millisecond, 10, slog.New(slog.DiscardHandler))
+		runSubscriptionSweeps(ctx, n, time.Millisecond, 10, slog.New(slog.DiscardHandler), nil)
 	}()
 	time.Sleep(5 * time.Millisecond)
 	cancel()

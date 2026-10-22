@@ -137,6 +137,14 @@ func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
 		// After a word's colon, "/" and a length after an address keep the
 		// length.
 		"host:2001:db8::/48::1": "host:2001:db8::/48::1",
+		// Go's net errors end an address with one colon (#500).
+		"address 2001:db8:5:6::8: too many colons in address": "address 2001:db8:5::/48: too many colons in address",
+		// An unbracketed address with a port of five digits is no
+		// address and stays (out of scope, see the doc).
+		"2001:db8:5:6::8:51234": "2001:db8:5:6::8:51234",
+		// The text after a bracketed address's port is a token of its
+		// own (see the doc).
+		"[::1]:0:1::": "[::/48]:1::/48",
 		// After a "/" that follows no digit, the address is truncated
 		// (#528 security review).
 		"x::/3fff:5:6:7:8:9:a:b":              "x::/3fff:5:6::/48",

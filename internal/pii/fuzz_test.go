@@ -208,12 +208,18 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		"http: panic serving [2001:db8:5:6::8]:51234: boom; from 203.0.113.5:51234.",
 		"remote:2001:db8:5:6::8 cafe:2001:db8:5:6:7:8:9:a conn...203.0.113.9 来自203.0.113.9。",
 		"2002:cb00:7109::/48 203.0.113.5/24x ::ffff:cb00:7105/96 udp/2001:db8::1",
+		"A/0:0:0:0:0:ffff::/0",
 	} {
 		f.Add(s)
 	}
 	run := regexp.MustCompile(`[0-9A-Fa-f:.]+`)
 	ipv4Port := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24(:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
-	bracketPort := regexp.MustCompile(`\[[0-9A-Fa-f:.]+/[0-9]+\](:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
+	// A port may be followed by the colon net/http writes after one
+	// ("]:443: EOF"). One followed by a colon and an address character
+	// is not looked for: that text is a token of its own, whose network
+	// may start with digits that look like a port ("[::/48]:1::/48",
+	// see TruncateIPsIn's doc; #500).
+	bracketPort := regexp.MustCompile(`\[[0-9A-Fa-f:.]+/[0-9]+\](:[0-9]{1,5})([^0-9.:]|:[^0-9A-Fa-f:]|:$|\.[^0-9]|\.$|$)`)
 	// letter is what makes a run part of a longer word: an ASCII letter
 	// past f, or "_" (digits and hex letters are in the run itself).
 	letter := func(c byte) bool { return 'g' <= c && c <= 'z' || 'G' <= c && c <= 'Z' || c == '_' }
@@ -241,9 +247,32 @@ func FuzzTruncateIPsIn(f *testing.F) {
 			if (m[0] == 0 || !letter(got[m[0]-1])) && !afterLength {
 				cands = append(cands, r)
 			}
+			// A part after a colon is an address of its own only when no
+			// longer reading of the run is one: of the run itself and its
+			// parts after a colon, the longest that reads as an address is
+			// the address, as the first start that holds one is in the
+			// code. "0:2002:1::" is one address, whose /48 shows no more than
+			// any /48 does, though its part "2002:1::" reads as a 6to4
+			// address, whose network would be its /16; and a part of
+			// "00:0:0:0:0:ffff::/0", a network written out, is none (#500).
+			// Only a reading the code may start counts: the run itself
+			// after no letter and after no "/" that follows a decimal digit
+			// (a length, as the code reads one), or a part after a colon.
+			reads := func(v string) bool {
+				v = strings.Trim(v, ".")
+				for _, w := range []string{v, strings.TrimSuffix(v, ":")} {
+					if _, err := netip.ParseAddr(w); err == nil {
+						return true
+					}
+				}
+				return false
+			}
+			afterDecimalLength := m[0] >= 2 && got[m[0]-1] == '/' && '0' <= got[m[0]-2] && got[m[0]-2] <= '9'
+			read := (m[0] == 0 || !letter(got[m[0]-1])) && !afterDecimalLength && reads(r)
 			for k := 0; k < len(r); k++ {
-				if r[k] == ':' {
+				if r[k] == ':' && !read {
 					cands = append(cands, r[k+1:])
+					read = reads(r[k+1:])
 				}
 			}
 			// An address may be followed by dots (the end of a sentence) and

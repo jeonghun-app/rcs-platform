@@ -691,22 +691,52 @@ func settled(t *testing.T, n *Notifier, waiting int) {
 // waits for room in its set or next hop.
 func waitQuiet(t *testing.T, n *Notifier) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
+	untilScheduler(t, n, "the scheduler settled", func() bool {
 		sc := &n.sc
 		sc.mu.Lock()
+		defer sc.mu.Unlock()
 		quiet := sc.working == 0
 		for _, w := range sc.waiting {
 			if w.sub == "" || sc.inSet[w.set] < n.cfg.SetConcurrency && sc.inHop[w.hop] < n.cfg.HopConcurrency {
 				quiet = false
 			}
 		}
-		sc.mu.Unlock()
-		if quiet {
-			return
+		return quiet
+	})
+}
+
+// schedulerStall is how long a wait on n's scheduler goes on with nothing
+// in it moving before the test fails, and schedulerGuard bounds the wait
+// whatever moves. A loaded host slows the workers, so a wall-clock bound
+// on all the work failed tests whose scheduler was only slow (#468); one
+// that stops moving is stuck.
+const (
+	schedulerStall = 10 * time.Second
+	schedulerGuard = 2 * time.Minute
+)
+
+// untilScheduler waits until cond holds, failing once n's scheduler has
+// not moved, its tasks on workers, queued or waiting unchanged, for
+// schedulerStall.
+func untilScheduler(t *testing.T, n *Notifier, what string, cond func() bool) {
+	t.Helper()
+	state := func() [3]int {
+		n.sc.mu.Lock()
+		defer n.sc.mu.Unlock()
+		return [3]int{n.sc.working, n.sc.queued, len(n.sc.waiting)}
+	}
+	start, last := time.Now(), state()
+	moved := start
+	for !cond() {
+		now := time.Now()
+		if s := state(); s != last {
+			last, moved = s, now
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("the scheduler never settled")
+		switch {
+		case now.Sub(moved) > schedulerStall:
+			t.Fatalf("waiting for %s: the scheduler stopped moving at %d working, %d queued, %d waiting", what, last[0], last[1], last[2])
+		case now.Sub(start) > schedulerGuard:
+			t.Fatalf("waiting for %s: still moving after %v", what, schedulerGuard)
 		}
 		runtime.Gosched()
 	}
@@ -926,19 +956,11 @@ func TestTheEndsOfOtherSetsAreDeliveredWhileOneSubscriberIsSlow(t *testing.T) {
 		return got
 	}
 	// Only the slow set's are left: two under way, six waiting.
-	deadline := time.Now().Add(10 * time.Second)
-	for {
+	untilScheduler(t, n, "every end sent", func() bool {
 		n.sc.mu.Lock()
-		done := n.sc.working == 0 && n.sc.queued == slow-DefaultSetConcurrency && len(n.sc.inHop) == 1 && len(n.sc.inSet) == 1
-		n.sc.mu.Unlock()
-		if done {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the ends were never all sent")
-		}
-		time.Sleep(time.Millisecond)
-	}
+		defer n.sc.mu.Unlock()
+		return n.sc.working == 0 && n.sc.queued == slow-DefaultSetConcurrency && len(n.sc.inHop) == 1 && len(n.sc.inSet) == 1
+	})
 	e.clock.advance(n.pendingEnd() + time.Second)
 	if _, err := n.Sweep(bg, 2*ended); err != nil {
 		t.Fatal(err)
