@@ -197,7 +197,7 @@ type forwarder struct {
 }
 
 func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
-	body, contentType := m.Body, m.MediaType()
+	body, contentType := m.Body.Bytes(), m.MediaType()
 	if f.a.dropNotifications && bytes.Contains(body, []byte(imdn.ContentType)) {
 		return nil
 	}
@@ -210,7 +210,7 @@ func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_, _ = f.to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: body, SuccessReport: true})
+		_, _ = f.to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(body), SuccessReport: true})
 	}()
 	return nil
 }

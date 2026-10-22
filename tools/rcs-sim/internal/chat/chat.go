@@ -98,7 +98,7 @@ func (e *Endpoint) HandleMessage(s *msrp.Session, m *msrp.Message) error {
 		e.Malformed.Add(1)
 		return &msrp.StatusError{Code: msrp.StatusUnsupportedMediaType}
 	}
-	c, err := cpim.Parse(m.Body)
+	c, err := cpim.Parse(m.Body.Bytes())
 	if err != nil {
 		e.Malformed.Add(1)
 		return &msrp.StatusError{Code: msrp.StatusBadRequest}
@@ -208,7 +208,7 @@ func (e *Endpoint) Send(ctx context.Context, s *msrp.Session, to cpim.Address, c
 	if err != nil {
 		return Sent{}, err
 	}
-	msrpID, err := s.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, SuccessReport: true})
+	msrpID, err := s.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf(body), SuccessReport: true})
 	if err != nil {
 		return Sent{}, fmt.Errorf("chat: send: %w", safeerr.Reason(err))
 	}
@@ -240,7 +240,7 @@ func (e *Endpoint) notify(ctx context.Context, s *msrp.Session, r Received, k im
 	}
 	// Notifications are not reported on themselves (RFC 5438 §7.2.1), and
 	// a failure costs only the receipt.
-	_, err = s.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, FailureReport: msrp.ReportNo})
+	_, err = s.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf(body), FailureReport: msrp.ReportNo})
 	return err
 }
 

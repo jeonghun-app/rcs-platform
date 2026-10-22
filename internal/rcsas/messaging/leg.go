@@ -443,7 +443,7 @@ func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	case cpim.ContentType:
 	case IsComposingType:
 		if l.p.Mode == store.Chat {
-			l.e.forwardComposing(l, m.Body)
+			l.e.forwardComposing(l, m.Body.Bytes())
 			return nil
 		}
 		fallthrough
@@ -455,7 +455,7 @@ func (l *Leg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	}
 	err := l.e.Submit(l.e.ctx, Origin{
 		Sender: l.p.User, Identities: l.p.Identities, Recipient: l.p.Peer,
-		Conversation: l.p.Conversation, Mode: l.p.Mode, CPIM: m.Body,
+		Conversation: l.p.Conversation, Mode: l.p.Mode, CPIM: m.Body.Bytes(),
 	})
 	var r *Rejection
 	switch {
@@ -484,7 +484,7 @@ func (e *Engine) forwardComposing(from *Leg, body []byte) {
 	go func() {
 		ctx, cancel := e.withTimeout(e.ctx, e.cfg.DeliveryTimeout)
 		to.carried.Store(true)
-		_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: IsComposingType, Body: body, FailureReport: msrp.ReportNo})
+		_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: IsComposingType, Body: msrp.BodyOf(body), FailureReport: msrp.ReportNo})
 		cancel()
 		to.composing.Store(false)
 		if err != nil {
@@ -544,7 +544,7 @@ func (l *Leg) send(ctx context.Context, body []byte) (int, error) {
 		l.mu.Unlock()
 	}()
 	l.carried.Store(true)
-	_, err = l.session.Send(ctx, msrp.Outgoing{MessageID: id, ContentType: cpim.ContentType, Body: body, SuccessReport: true})
+	_, err = l.session.Send(ctx, msrp.Outgoing{MessageID: id, ContentType: cpim.ContentType, Body: msrp.BodyOf(body), SuccessReport: true})
 	var se *msrp.StatusError
 	if errors.As(err, &se) {
 		return se.Code, nil

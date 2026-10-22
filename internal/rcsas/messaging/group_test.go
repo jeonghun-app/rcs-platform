@@ -249,7 +249,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := a.outcome(t, cpim.ContentType, chat(t, "m1", "hi", imdn.Display)); code != 200 {
 		t.Fatalf("answered %d", code)
 	}
-	got, err := cpim.Parse(b.next(t).Body)
+	got, err := cpim.Parse(b.next(t).Body.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -259,7 +259,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := b.outcome(t, cpim.ContentType, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)); code != 200 {
 		t.Fatalf("bob's notification answered %d", code)
 	}
-	n, err := cpim.Parse(a.next(t).Body)
+	n, err := cpim.Parse(a.next(t).Body.Bytes())
 	if err != nil || !imdn.IsNotification(n) {
 		t.Fatalf("alice got %v, %v", n, err)
 	}
@@ -271,7 +271,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := a.outcome(t, IsComposingType, ind); code != 200 {
 		t.Fatalf("answered %d", code)
 	}
-	if c, err := cpim.Parse(b.next(t).Body); err != nil || !isComposing(c) {
+	if c, err := cpim.Parse(b.next(t).Body.Bytes()); err != nil || !isComposing(c) {
 		t.Fatalf("bob got %v, %v", c, err)
 	}
 	wrapped := "From: <" + bob + ">\r\nTo: <" + AnonymousURI + ">\r\n\r\nContent-Type: " + IsComposingType + "\r\n\r\n" + string(ind)
@@ -279,7 +279,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := b.outcome(t, cpim.ContentType, []byte(wrapped)); code != 200 {
 		t.Fatalf("answered %d", code)
 	}
-	if c, err := cpim.Parse(a.next(t).Body); err != nil || !isComposing(c) {
+	if c, err := cpim.Parse(a.next(t).Body.Bytes()); err != nil || !isComposing(c) {
 		t.Fatalf("alice got %v, %v", c, err)
 	}
 	// A delivered copy is removed once its success report is in, after
@@ -473,16 +473,16 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 		t.Fatalf("invitation %+v", inv)
 	}
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
-	if got := b.next(t); !strings.HasSuffix(string(got.Body), "one") {
-		t.Fatalf("bob got %q", got.Body)
+	if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), "one") {
+		t.Fatalf("bob got %q", got.Body.Bytes())
 	}
 	// With the mark gone, a copy goes on the open session unasked.
 	before := reads.Load()
 	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1b", "again", 0))); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.next(t); !strings.HasSuffix(string(got.Body), "again") || reads.Load() != before+1 {
-		t.Fatalf("bob got %q after %d reads, want the Recipients one alone", got.Body, reads.Load()-before)
+	if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), "again") || reads.Load() != before+1 {
+		t.Fatalf("bob got %q after %d reads, want the Recipients one alone", got.Body.Bytes(), reads.Load()-before)
 	}
 	// Gone now, with the session still open: the next copy is not sent on
 	// it.
@@ -494,7 +494,7 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 	waitFor(t, "the copy given up", func() bool { return r.m.get("delivery.not_participant") == 1 })
 	select {
 	case m := <-b.got:
-		t.Fatalf("a former participant got %q", m.Body)
+		t.Fatalf("a former participant got %q", m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 	// The marks are bounded.
@@ -630,8 +630,8 @@ func TestANewGroupMessageDoesNotOvertakeOnesWaitingForTheSession(t *testing.T) {
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
 	proceed <- struct{}{}
 	for _, want := range []string{"g1", "g2"} {
-		if got := b.next(t); !strings.HasSuffix(string(got.Body), want) {
-			t.Fatalf("got %q, want %s", got.Body, want)
+		if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), want) {
+			t.Fatalf("got %q, want %s", got.Body.Bytes(), want)
 		}
 	}
 }

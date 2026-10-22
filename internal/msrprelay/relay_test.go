@@ -28,7 +28,7 @@ func send(t *testing.T, s *msrp.Session, body string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if _, err := s.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: []byte(body)}); err != nil {
+	if _, err := s.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: msrp.BodyOf([]byte(body))}); err != nil {
 		t.Fatalf("Send = %v", err)
 	}
 }
@@ -57,13 +57,13 @@ func TestClientOriginatedSessionIsBridgedToRcsAS(t *testing.T) {
 
 	send(t, client, "hello")
 	m := asH.message(t)
-	if string(m.Body) != "hello" || m.FromPath[0].String() != b.coreLocal || m.ToPath[0].String() != r.as.uri("as5e55ion") {
-		t.Fatalf("rcs-as got %q from %v to %v", m.Body, m.FromPath, m.ToPath)
+	if string(m.Body.Bytes()) != "hello" || m.FromPath[0].String() != b.coreLocal || m.ToPath[0].String() != r.as.uri("as5e55ion") {
+		t.Fatalf("rcs-as got %q from %v to %v", m.Body.Bytes(), m.FromPath, m.ToPath)
 	}
 	send(t, as, "back")
 	m = clientH.message(t)
-	if string(m.Body) != "back" || m.FromPath[0].String() != b.clientPath || m.ToPath[0].String() != clientURI {
-		t.Fatalf("client got %q from %v to %v", m.Body, m.FromPath, m.ToPath)
+	if string(m.Body.Bytes()) != "back" || m.FromPath[0].String() != b.clientPath || m.ToPath[0].String() != clientURI {
+		t.Fatalf("client got %q from %v to %v", m.Body.Bytes(), m.FromPath, m.ToPath)
 	}
 	if got := r.metrics.count(mBindingsClaimed); got != 1 {
 		t.Fatalf("BindingsClaimed = %d", got)
@@ -88,12 +88,12 @@ func TestCoreOriginatedSessionIsBridgedOnceTheClientAnswers(t *testing.T) {
 		t.Fatalf("client Open = %v", err)
 	}
 	send(t, as, "offered")
-	if m := clientH.message(t); string(m.Body) != "offered" {
-		t.Fatalf("client got %q", m.Body)
+	if m := clientH.message(t); string(m.Body.Bytes()) != "offered" {
+		t.Fatalf("client got %q", m.Body.Bytes())
 	}
 	send(t, client, "answered")
-	if m := asH.message(t); string(m.Body) != "answered" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "answered" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 }
 
@@ -118,8 +118,8 @@ func TestClientConnectingBeforeItsPathIsRecordedWaitsForIt(t *testing.T) {
 		t.Fatalf("client Open = %v", err)
 	}
 	send(t, client, "raced")
-	if m := asH.message(t); string(m.Body) != "raced" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "raced" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 }
 
@@ -257,8 +257,8 @@ func TestSecondConnectionForAClaimedBindingIsRefusedWith403(t *testing.T) {
 	}
 	// The first connection is unaffected.
 	send(t, client, "still here")
-	if m := asH.message(t); string(m.Body) != "still here" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "still here" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 }
 
@@ -363,8 +363,8 @@ func TestExtendedBindingKeepsItsBridge(t *testing.T) {
 	r.patch(b.id, map[string]any{"expires_in": 120})
 	r.clock.Advance(60 * time.Second)
 	send(t, client, "refreshed")
-	if m := asH.message(t); string(m.Body) != "refreshed" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "refreshed" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 	if r.metrics.bridges.Load() != 1 {
 		t.Fatal("the bridge ended although pcscf extended the binding")
@@ -390,8 +390,8 @@ func TestStoreHiccupAtTheExpiryCheckDoesNotCutTheBridge(t *testing.T) {
 	failing.failGets(1)
 	r.clock.Advance(60 * time.Second)
 	send(t, client, "survived")
-	if m := asH.message(t); string(m.Body) != "survived" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "survived" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 	if r.metrics.count(mStoreErrors) != 1 || r.metrics.bridges.Load() != 1 {
 		t.Fatalf("store errors %d, bridges %d", r.metrics.count(mStoreErrors), r.metrics.bridges.Load())
@@ -828,8 +828,8 @@ func TestDrainKeepsBridgesUntilTheTimeoutThenClosesThem(t *testing.T) {
 		t.Fatal("a draining relay accepted a connection")
 	}
 	send(t, client, "draining")
-	if m := asH.message(t); string(m.Body) != "draining" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "draining" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 	// Halfway through, what is left starts to be closed.
 	r.clock.Advance(5 * time.Second)
