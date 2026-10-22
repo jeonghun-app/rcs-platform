@@ -70,6 +70,9 @@ type deps struct {
 	dialTimeout time.Duration
 	// router, if set, routes in place of the dispatcher.
 	router proxy.Router
+	// subscribeAnswered, if set, runs once a SUBSCRIBE's 200 is written,
+	// before its first NOTIFY goes.
+	subscribeAnswered func()
 	// transportMade, if set, hears of the transport once it is made.
 	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
@@ -184,7 +187,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	}
 	third.router.Store(router)
 
-	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger}
+	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger, answered: d.subscribeAnswered}
 	var pr proxy.Router = disp
 	if d.router != nil {
 		pr = d.router
