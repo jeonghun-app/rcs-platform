@@ -130,7 +130,11 @@ Alarm on a rise of these:
 - `proxy.hook_panics`, panics recovered in scscf's routing (#428), and
   `transaction.handler_panics`, in a response handler of a request scscf
   sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
-  the request or the call it was in; alarm on any.
+  the request or the call it was in; alarm on any;
+- `background.panics`, panics recovered in scscf's own background work:
+  the sweeps, the metrics report, a reg event task, a first NOTIFY, a
+  third-party REGISTER or an identity repair (#488). Each ends only that
+  piece of work, which gives back what it held; alarm on any.
 
 `routing.third_party.evicted` counts refreshes an end took the place of in a
 full queue: a server that does not keep up. Each is made good by the user's
