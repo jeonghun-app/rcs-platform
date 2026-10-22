@@ -126,8 +126,7 @@ func parseDottedQuad(s string) (netip.Addr, bool) {
 // a truncated one or wider, written with its length (10.0.0.0/8,
 // 2001:db8::/32, and 2002::/16 for 6to4), is left as written, so that the
 // function is idempotent and a configured network still reads as
-// configured; a "/" starts a length only after a digit or an address, and
-// only if one to three digits follow it ("5/2001:db8::1" is an address).
+// configured.
 //
 // Out of scope, as net/http and Go's net errors never write them: an
 // address with percent-encoded delimiters (%5B2001:db8::1%5D, %3A), an
@@ -139,7 +138,37 @@ func parseDottedQuad(s string) (netip.Addr, bool) {
 // (00:11:22:ff:fe:33:44:55), a hex word with "::" (dead::beef), a lone
 // "::". That fails safe: the line says less, and nothing more leaks.
 func TruncateIPsIn(s string) string {
-	return truncateIPv4In(truncateIPv6In(s))
+	out, _ := truncateRounds(s, nil)
+	return out
+}
+
+// maxRounds bounds the rounds of truncateRounds, so that TruncateIPsIn
+// stays linear. A search of five million texts found none that needs more
+// than three, the last of which only confirms the second
+// (TestTruncateIPsInIsLinear's "three rounds"); one that is not stable
+// within maxRounds fails FuzzTruncateIPsIn.
+const maxRounds = 6
+
+// truncateRounds truncates s in rounds of both passes, each reading the
+// text the one before wrote, until a round changes nothing, and returns the
+// result and whether it is stable, that is, truncated again it reads the
+// same (#512): a network written next to text that was no address can make
+// one, as "0.0.0.0/24::/48::" did. A round only replaces more text with
+// networks, so nothing a round truncated comes back. each, when not nil,
+// sees every round's output, for the tests.
+func truncateRounds(s string, each func(string)) (out string, stable bool) {
+	out = s
+	for range maxRounds {
+		next := truncateIPv4In(truncateIPv6In(out))
+		if each != nil {
+			each(next)
+		}
+		if next == out {
+			return out, true
+		}
+		out = next
+	}
+	return out, false
 }
 
 // truncateIPv6In truncates the IPv6 addresses of s: "[address]" with or
@@ -188,7 +217,7 @@ func truncateIPv6In(s string) string {
 				starts = append(starts, lead)
 			}
 		}
-		if prev := t.prevByte(i); !wordByte(prev) && !(prev == '/' && t.lengthAt(i)) {
+		if prev := t.prevByte(i); !wordByte(prev) && !(prev == '/' && digit(t.prevByte(i-1))) {
 			addStart(i)
 		}
 		w := max(i, jt-maxAddressToken-1)
@@ -211,21 +240,12 @@ func truncateIPv6In(s string) string {
 		// The first start that holds an IPv6 address is taken.
 		next, at, n, portEnd := j, -1, 0, -1
 		for _, st := range starts {
-			if st >= jt {
+			tok := s[st:jt]
+			if st >= jt || len(tok) > maxAddressToken {
 				continue
 			}
-			// A token longer than an address can be is none, but may
-			// start with one that ends at its dotted quad
-			// ("1::1.0.0.0:000…"), as the IPv4 pass would read its quad
-			// (#512).
-			tok, long := s[st:jt], jt-st > maxAddressToken
-			if long {
-				tok = tok[:maxAddressToken]
-			}
-			m, ok, pe := 0, false, -1
-			if !long {
-				m, ok = addressPrefix(tok)
-			}
+			m, ok := addressPrefix(tok)
+			pe := -1
 			if !ok {
 				// An address with a dotted quad ends at it; after it,
 				// ":port" can be nothing else (::ffff:192.0.2.7:443), and
@@ -442,52 +462,6 @@ func (t *rewriter) prevByte(i int) byte {
 		return t.lastOut
 	}
 	return t.s[i-1]
-}
-
-// lengthAt reports whether s[i:] starts the length of a network that ends
-// at the "/" before it in the copy: a length's digits follow, and a digit
-// comes before the "/" ("10.0.0.0/8"), or a token that is an address
-// ("2001:db8::/32", and "24::/48" read again, #512). A "/" before something longer, as in "5/2001:db8::1", starts no
-// length. The copy is read, not s, so that the copy read again finds the
-// same lengths; and at most maxAddressToken bytes of it, so that this stays
-// linear.
-func (t *rewriter) lengthAt(i int) bool {
-	if !lengthDigits(t.s, i) {
-		return false
-	}
-	if digit(t.prevByte(i - 1)) {
-		return true
-	}
-	before := t.tail(i-1, maxAddressToken)
-	k := len(before)
-	for k > 0 && tokenByte(before[k-1]) {
-		k--
-	}
-	return parseOK(before[k:])
-}
-
-// lengthDigits reports whether s[i:] is a network length: one to three
-// digits, then neither a digit nor a dot and a digit, as prefixLength reads
-// one.
-func lengthDigits(s string, i int) bool {
-	end := i
-	for end < len(s) && end-i < 3 && digit(s[end]) {
-		end++
-	}
-	return end > i && !(end < len(s) && (digit(s[end]) || s[end] == '.' && end+1 < len(s) && digit(s[end+1])))
-}
-
-// tail returns the last n bytes of the copy before s[i], i at least t.last.
-func (t *rewriter) tail(i, n int) string {
-	pending := t.s[t.last:i]
-	if len(pending) >= n {
-		return pending[len(pending)-n:]
-	}
-	out := t.b.String()
-	if need := n - len(pending); len(out) > need {
-		out = out[len(out)-need:]
-	}
-	return out + pending
 }
 
 // address truncates the address of n bytes at s[at:], with the length
