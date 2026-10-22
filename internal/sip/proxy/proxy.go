@@ -1,12 +1,14 @@
 package proxy
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,7 +86,10 @@ type Config struct {
 	// MaxContextBytes bounds the bytes of the requests the contexts hold
 	// (see DefaultMaxContextBytes): a request that would take the total past
 	// it is answered 503 with Retry-After, and a branch that would fails as a
-	// 503 of its own.
+	// 503 of its own. A request from a client-facing listener, and its
+	// branches, may take the total only to Transaction.ClientShare of it, as
+	// at the layer's bounds, so that a flood of clients cannot turn away the
+	// core's terminating requests (#489).
 	MaxContextBytes int64
 	// Rand is the source of branch IDs and of the key behind the proxy's
 	// hashes; nil is crypto/rand. Branches start concurrently, so it must be
@@ -122,6 +127,9 @@ type Proxy struct {
 	maxCtx    int
 	maxBranch int
 	maxBytes  int64
+	// clientBytes is the part of maxBytes the contexts of requests from
+	// client-facing listeners may take the total to.
+	clientBytes int64
 	// bytes is what the contexts hold of maxBytes.
 	bytes atomic.Int64
 	// silent holds the responses the layer may hand to the sender but that
@@ -265,6 +273,8 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
 	}
+	// Rounded up as the layer rounds its share, so that the two agree.
+	p.clientBytes = int64(math.Ceil(float64(cfg.MaxContextBytes) * cmp.Or(tcfg.ClientShare, transaction.DefaultClientShare)))
 	for _, tag := range cfg.Supported {
 		p.supported[strings.ToLower(tag)] = true
 	}
@@ -306,11 +316,15 @@ func (p *Proxy) silence(tx *transaction.ServerTransaction, res *sip.Response) {
 }
 
 // reserve takes n bytes of MaxContextBytes, or reports false if they are not
-// free.
-func (p *Proxy) reserve(n int64) bool {
+// free: for a request from a client-facing listener, within its share.
+func (p *Proxy) reserve(n int64, client bool) bool {
+	limit := p.maxBytes
+	if client {
+		limit = p.clientBytes
+	}
 	for {
 		cur := p.bytes.Load()
-		if cur+n > p.maxBytes {
+		if cur+n > limit {
 			return false
 		}
 		if p.bytes.CompareAndSwap(cur, cur+n) {
@@ -647,7 +661,7 @@ func (p *Proxy) newContext(tx *transaction.ServerTransaction) *respContext {
 	cost := int64(len(req.Body)) + 2*header
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed || len(p.contexts) >= p.maxCtx || !p.reserve(cost) {
+	if p.closed || len(p.contexts) >= p.maxCtx || !p.reserve(cost, tx.Source().ClientFacing) {
 		return nil
 	}
 	c := newRespContext(p, tx, cost, header)
