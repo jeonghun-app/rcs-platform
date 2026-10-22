@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -112,7 +113,7 @@ func TestMD5CredentialsAreAccepted(t *testing.T) {
 			ch = c
 		}
 	}
-	c, err := digest.Respond(ch, digest.ClientParams{Username: alice, Password: []byte(password), Method: "POST", URI: "/ft", CNonce: "c", NC: 1})
+	c, err := digest.Respond(ch, digest.ClientParams{Username: alice, Password: secret.NewKey([]byte(password)), Method: "POST", URI: "/ft", CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

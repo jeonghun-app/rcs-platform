@@ -55,6 +55,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
@@ -231,7 +232,7 @@ func (c *Client) authorize(r *http.Request, uri string) error {
 	ch := *c.challenge
 	ch.Algorithm = ""
 	cred, err := digest.Respond(ch, digest.ClientParams{
-		Username: c.User, Password: c.Password.b, Method: r.Method, URI: uri, CNonce: cnonce, NC: c.nc,
+		Username: c.User, Password: secret.NewKey(c.Password.b), Method: r.Method, URI: uri, CNonce: cnonce, NC: c.nc,
 	})
 	if err != nil {
 		return fmt.Errorf("ft: answering the challenge: %w", err)

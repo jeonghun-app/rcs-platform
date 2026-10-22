@@ -422,9 +422,9 @@ func (u *ue) respond(ch digest.Challenge, auts []byte) string {
 			u.t.Fatalf("the network failed authentication: %v", err)
 		}
 		res := u.m.F2(rnd)
-		p.Password = res[:]
+		p.Password = secret.NewKey(res[:])
 	} else {
-		p.Password = u.password
+		p.Password = secret.NewKey(u.password)
 	}
 	c, err := digest.Respond(ch, p)
 	if err != nil {

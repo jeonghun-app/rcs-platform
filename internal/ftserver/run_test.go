@@ -18,6 +18,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -213,7 +214,7 @@ func authenticateOnce(t *testing.T, addr string) int {
 			ch = c
 		}
 	}
-	c, err := digest.Respond(ch, digest.ClientParams{Username: alice, Password: []byte(password), Method: http.MethodPost,
+	c, err := digest.Respond(ch, digest.ClientParams{Username: alice, Password: secret.NewKey([]byte(password)), Method: http.MethodPost,
 		URI: "/ft", CNonce: "cnonce-1", NC: 1})
 	if err != nil {
 		t.Fatal(err)

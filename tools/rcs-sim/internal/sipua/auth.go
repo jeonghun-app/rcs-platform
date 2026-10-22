@@ -12,6 +12,7 @@ import (
 	"sync"
 
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -201,10 +202,11 @@ func (ua *UA) authorize(res *sip.Response, uri string) (authAnswer, error) {
 		return a, &StatusError{Method: "REGISTER", Code: res.StatusCode, Err: ErrNoUsableChallenge}
 	}
 	var err error
+	var password []byte
 	p := digest.ClientParams{Username: c.impi, Method: "REGISTER", URI: uri}
 	if c.card == nil {
-		p.Password = c.password
-	} else if p.Password, p.AUTS, err = c.card.answer(ch.Nonce); errors.Is(err, ErrNetworkNotAuthenticated) {
+		password = c.password
+	} else if password, p.AUTS, err = c.card.answer(ch.Nonce); errors.Is(err, ErrNetworkNotAuthenticated) {
 		// TS 24.229 §5.1.1.5.3: the network failed authentication, and
 		// the UE says so in a further REGISTER with the challenge's
 		// nonce, an empty response and no auts.
@@ -214,6 +216,7 @@ func (ua *UA) authorize(res *sip.Response, uri string) (authAnswer, error) {
 	} else if err != nil {
 		return a, err
 	}
+	p.Password = secret.NewKey(password)
 	a.resync = len(p.AUTS) > 0
 	a.next = func() (string, error) {
 		p.NC++
