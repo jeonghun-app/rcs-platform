@@ -16,8 +16,8 @@ import (
 // The values below carry subscriber identities (a SIP user part or tel number is
 // an MSISDN or IMSI-based identity) and credentials, which docs/architecture.md
 // §8 keeps out of logs. A service that passes one to log/slog gets these
-// redacted forms instead of the exported fields, the same line of defence as
-// messages having no String method.
+// redacted forms instead of the exported fields. Request and Response print
+// the same way under fmt (their String and Format).
 //
 // slog applies LogValue only to the value it is handed. A plain slice of these
 // values, or a struct of the service's own that holds one, reaches the JSON
