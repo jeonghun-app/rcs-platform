@@ -67,9 +67,9 @@ type Config struct {
 	MaxOutgoingPerUser int
 	MaxIncomingPerUser int
 	// GroupChat turns the conference factory and the conference URIs on
-	// (RCSAS_GROUP_CHAT_ENABLED); off, they answer 404. A group's
-	// subscriptions and sessions live in one task until #121, so it is
-	// turned on with one task only.
+	// (RCSAS_GROUP_CHAT_ENABLED); off, they answer 404. Each group's
+	// subscriptions and sessions live on the task that owns it, and the
+	// others forward its requests there (#121).
 	GroupChat bool
 	// MaxSubscriptionsPerUser bounds one user's conference subscriptions
 	// across all its groups (RCSAS_MAX_SUBSCRIPTIONS_PER_USER).

@@ -59,7 +59,10 @@ type groupFocus struct {
 	cfg  scenario.Config
 
 	// Faults: reinvite invites the peer again before every message from
-	// the client, twiceAfterLoss twice when the owner is lost;
+	// the client, twiceAfterLoss twice when the owner is lost; strayFirst
+	// sends the peer a 1-to-1 chat INVITE first, no focus's, which must not
+	// be taken for the group's; fromOther invites the peer from another
+	// group's conference URI;
 	// otherConference answers the first rejoin with another
 	// group's conference URI; endReason, when set, ends the subscription at
 	// the stop with that reason instead of deactivated; afterLoss answers
@@ -67,24 +70,26 @@ type groupFocus struct {
 	// Retry-After, then 200); crash ends nothing at the stop.
 	reinvite        bool
 	twiceAfterLoss  bool
+	strayFirst      bool
+	fromOther       bool
 	otherConference bool
 	endReason       string
 	afterLoss       []rejoinAnswer
 	crash           bool
 
-	mu          sync.Mutex
-	clientLeg   *msrp.Session
-	peerLeg     *msrp.Session
-	peerReady   chan struct{} // closed once peerLeg is up
-	clientCall  *sipua.Dialog
-	peerCall    *sipua.Dialog
-	lost        bool
-	rejoins     int
-	answers     map[string]response // by Call-ID, for the core's rewrite
-	sub         *rosterSub
-	version     uint32
-	inviting    bool
-	peerInvites int
+	mu               sync.Mutex
+	clientLeg        *msrp.Session
+	peerLeg          *msrp.Session
+	peerReady        chan struct{} // closed once peerLeg is up
+	clientCall       *sipua.Dialog
+	peerCall         *sipua.Dialog
+	lost             bool
+	rejoins          int
+	answers          map[string]response // by Call-ID, for the core's rewrite
+	sub              *rosterSub
+	version          uint32
+	invitedAfterLoss bool
+	peerInvites      int
 }
 
 // response is what the core's rewrite puts in the focus's answer: its
@@ -206,15 +211,24 @@ func (f *groupFocus) invited(c *sipua.IncomingCall) {
 		_ = c.Reject(500)
 		return
 	}
+	// The leg is the client's from the answer on: the client may send on
+	// it, and the peer's notifications come back on it, before Accept
+	// returns.
+	f.mu.Lock()
+	f.clientLeg = s
+	f.mu.Unlock()
 	d, err := c.Accept(focusSDP(f.t, b.ClientPath, sdp.SetupPassive))
 	if err != nil {
 		return
 	}
 	f.mu.Lock()
-	f.clientLeg, f.clientCall = s, d
+	f.clientCall = d
 	invite := !rejoin
 	f.mu.Unlock()
 	if invite {
+		if f.strayFirst {
+			f.inviteStray()
+		}
 		// Once the creator's session is up, the focus invites the peer.
 		f.invitePeer()
 	}
@@ -263,6 +277,14 @@ func (f *groupFocus) invitePeer() {
 		f.t.Error(err)
 		return
 	}
+	// From the conference URI, with it as the Contact marked isfocus, as
+	// rcs-as's focus INVITE is.
+	_ = req.Header.Set("Contact", "<"+thirdIMPU+";transport=tcp>;isfocus;+g.oma.sip-im")
+	if f.fromOther {
+		from, _ := req.Header.From()
+		from.URI, _ = sip.ParseURI(otherConference)
+		_ = req.Header.Set("From", from.String())
+	}
 	f.mu.Lock()
 	f.peerInvites++
 	f.mu.Unlock()
@@ -292,6 +314,34 @@ func (f *groupFocus) invitePeer() {
 	f.mu.Unlock()
 }
 
+// inviteStray sends the peer a 1-to-1 chat INVITE, as a chat an earlier run
+// left queued would bring: its Contact is not a focus's, and its session is
+// none of the group's.
+func (f *groupFocus) inviteStray() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	b, _, err := f.leg(ctx, anchor.Paths{}, true)
+	if err != nil {
+		f.t.Error(err)
+		return
+	}
+	u, _ := sip.ParseURI(peer.URI)
+	req, err := f.ua.NewInvite(u, focusSDP(f.t, b.ClientPath, sdp.SetupActPass))
+	if err != nil {
+		f.t.Error(err)
+		return
+	}
+	d, res, err := f.ua.Invite(ctx, req, nil)
+	if err != nil || d == nil {
+		return
+	}
+	if _, m, err := msrpMedia(res.Body); err == nil {
+		if path, err := mediaPath(m); err == nil {
+			_ = f.ctrl.Complete(ctx, b.ID, anchor.Paths{Client: path}, 0)
+		}
+	}
+}
+
 // focusLeg forwards what one of the focus's legs receives to the other, as
 // rcs-as fans a message out to the group and passes notifications back.
 type focusLeg struct {
@@ -316,21 +366,22 @@ func (l *focusLeg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 			return
 		}
 		if !notification {
+			// The peer is invited again for a message only by a focus
+			// that does so for every one (reinvite), and once by the new
+			// owner, which holds no session with it.
 			f.mu.Lock()
-			again := f.reinvite || f.peerLeg == nil && !f.inviting
+			again := f.reinvite || f.lost && !f.invitedAfterLoss
 			if again {
-				f.inviting = true
+				f.invitedAfterLoss = f.invitedAfterLoss || f.lost
 				f.peerLeg, f.peerReady = nil, make(chan struct{})
 			}
+			twice := again && f.lost && f.twiceAfterLoss
 			f.mu.Unlock()
-			if again {
-				if f.twiceAfterLoss && f.lost {
-					f.invitePeer()
-				}
+			if twice {
 				f.invitePeer()
-				f.mu.Lock()
-				f.inviting = false
-				f.mu.Unlock()
+			}
+			if again {
+				f.invitePeer()
 			}
 		}
 		f.mu.Lock()
@@ -545,28 +596,35 @@ func TestAGroupChatPassesAgainstAFocusThatServesIt(t *testing.T) {
 // it, with a fixed text.
 func TestAGroupChatTheFocusGetsWrongFailsTheStepThatSeesIt(t *testing.T) {
 	for name, tc := range map[string]struct {
-		fault     func(*groupFocus)
-		step, err string
+		fault       func(*groupFocus)
+		step, err   string
+		stepTimeout time.Duration
 	}{
 		// #121's fault: a task that does not hold the peer's session
 		// invites it again for each message.
 		"a re-invite for every message": {func(f *groupFocus) { f.reinvite = true },
-			"message", "the focus invited the peer again, though its session with the group was open"},
+			"message", "the focus invited the peer again, though its session with the group was open", 0},
 		"the new owner invites the peer twice": {func(f *groupFocus) { f.twiceAfterLoss = true },
-			"message-after-loss", "the new owner did not invite the peer back exactly once"},
+			"message-after-loss", "the new owner did not invite the peer back exactly once", 0},
+		// Another group's INVITE is no session of this one's.
+		"the peer invited by another group": {func(f *groupFocus) { f.fromOther = true },
+			"invited", "the network opened no session to the peer", 3 * time.Second},
 		"a rejoin answered by another group": {func(f *groupFocus) { f.otherConference = true },
-			"rejoin", "the rejoin was answered by another conference"},
+			"rejoin", "the rejoin was answered by another conference", 0},
 		"the subscription ended noresource": {func(f *groupFocus) { f.endReason = "noresource" },
-			"owner-lost", "the roster subscription ended for another reason than deactivated"},
+			"owner-lost", "the roster subscription ended for another reason than deactivated", 0},
 		// A live group is never 404 (#121 D3): rcsjta takes it for the
 		// group's end.
 		"a 404 to the rejoin": {func(f *groupFocus) { f.afterLoss = []rejoinAnswer{{status: 404}} },
-			"rejoin-after-loss", "the rejoin was answered 404"},
+			"rejoin-after-loss", "the rejoin was answered 404", 0},
 		"a 500 without Retry-After": {func(f *groupFocus) { f.afterLoss = []rejoinAnswer{{status: 500}} },
-			"rejoin-after-loss", "a 500 without Retry-After"},
+			"rejoin-after-loss", "a 500 without Retry-After", 0},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg, f := groupStack(t)
+			if tc.stepTimeout > 0 {
+				cfg.StepTimeout = tc.stepTimeout
+			}
 			tc.fault(f)
 			ok, results := runAll(t, cfg, "group-chat")
 			last := results[len(results)-1]
@@ -574,6 +632,19 @@ func TestAGroupChatTheFocusGetsWrongFailsTheStepThatSeesIt(t *testing.T) {
 				t.Fatalf("results %+v", results)
 			}
 		})
+	}
+}
+
+// QA on #602: a 1-to-1 chat INVITE the peer gets meanwhile, not a focus's,
+// is answered but is none of the group's: the group's session is the
+// focus's, and the invites counted are the focus's alone.
+func TestAGroupChatTakesOnlyTheFocussSessionForTheGroup(t *testing.T) {
+	cfg, f := groupStack(t)
+	f.strayFirst = true
+	ok, results := runAll(t, cfg, "group-chat")
+	steps := byStep(results)
+	if !ok || steps["invited"].Detail["invites"] != 1 || steps["message"].Detail["invites"] != 0 {
+		t.Fatalf("results %+v", results)
 	}
 }
 

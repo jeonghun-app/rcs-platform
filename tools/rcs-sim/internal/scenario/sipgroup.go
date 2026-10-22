@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -258,6 +259,14 @@ var subscriptionEnds = map[string]int64{"": 1, "deactivated": 2, "probation": 3,
 // endReason is note's reason as subscriptionEnds numbers it.
 func endReason(note sipua.Notification) int64 { return subscriptionEnds[note.Reason] }
 
+// fromFocus reports whether req, an INVITE to the peer, comes from a
+// group's focus: its Contact is marked isfocus (RFC 4579 §5.2), as rcs-as
+// marks every one it sends for a group.
+func fromFocus(req *sip.Request) bool {
+	cs, err := req.Header.Contact()
+	return err == nil && len(cs) == 1 && cs[0].Params.Has("isfocus")
+}
+
 // groupSubject is the subject of the group the scenario makes.
 const groupSubject = "rcs-sim group"
 
@@ -483,11 +492,21 @@ func groupChat(r *run) error {
 	case r.cfg.RelayPublic == "":
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoRelay })
 	}
-	calls := make(chan *sipua.IncomingCall, queueLength)
-	// invites counts the INVITEs the network sends the peer, as they come:
-	// one comes before any message can arrive on the session it opens, so
-	// a step reads it once its message has arrived.
+	// The peer's INVITEs from this group's focus (Contact marked isfocus,
+	// RFC 4579 §5.2, From its conference URI once the create step knows it)
+	// are its sessions with the group; any other, a 1-to-1 chat or another
+	// group's copy an earlier run left queued say, is answered apart and
+	// never taken for one (QA on #602).
+	calls, strays := make(chan *sipua.IncomingCall, queueLength), make(chan *sipua.IncomingCall, queueLength)
+	// invites counts the group INVITEs the network sends the peer, as they
+	// come: one comes before any message can arrive on the session it
+	// opens, so a step reads it once its message has arrived. group is the
+	// group's conference URI, set before known is closed: an INVITE that
+	// comes before the create step has read it from the 200, as one sent
+	// right after the 200 can, waits for it to be told apart.
 	var invites atomic.Int64
+	var group atomic.Value
+	known := make(chan struct{})
 	var a *sipClient
 	if err := r.step("register", func(ctx context.Context) (map[string]int64, error) {
 		var err error
@@ -496,12 +515,24 @@ func groupChat(r *run) error {
 		}
 		peer := *r.cfg.SIPPeer
 		peer.OnInvite = func(c *sipua.IncomingCall) {
-			invites.Add(1)
-			select {
-			case calls <- c:
-			default:
-				_ = c.Reject(486)
-			}
+			go func() {
+				select {
+				case <-known:
+				case <-time.After(r.cfg.StepTimeout):
+				}
+				to := strays
+				from, err := c.Request().Header.From()
+				mine, _ := group.Load().(string)
+				if fromFocus(c.Request()) && err == nil && strings.EqualFold(groupIdentity(from.URI).String(), mine) {
+					invites.Add(1)
+					to = calls
+				}
+				select {
+				case to <- c:
+				default:
+					_ = c.Reject(486)
+				}
+			}()
 		}
 		if _, err = r.newSIPClient(ctx, peer, r.cfg.Peer); err != nil {
 			return nil, fmt.Errorf("peer: %w", sipError(err))
@@ -522,14 +553,12 @@ func groupChat(r *run) error {
 	}
 	aEnd := r.endpoint(r.cfg.Self, false)
 	bEnd := r.endpoint(r.cfg.Peer, true)
-	sessions := make(chan peerSession, queueLength)
+	sessions, strayed := make(chan peerSession, queueLength), make(chan peerSession, queueLength)
 	answerer, stop := context.WithCancel(context.Background())
-	answering := make(chan struct{})
-	go func() {
-		defer close(answering)
-		r.answerCalls(answerer, calls, bEnd, sessions)
-	}()
-	r.onEnd(func() { stop(); <-answering })
+	var answering sync.WaitGroup
+	answering.Go(func() { r.answerCalls(answerer, calls, bEnd, sessions) })
+	answering.Go(func() { r.answerCalls(answerer, strays, bEnd, strayed) })
+	r.onEnd(func() { stop(); answering.Wait() })
 
 	var conf sip.URI
 	var aLeg groupLeg
@@ -562,6 +591,8 @@ func groupChat(r *run) error {
 			return detail, fmt.Errorf("the factory's INVITE was answered %d", res.StatusCode)
 		}
 		conf, aLeg = got, leg
+		group.Store(groupIdentity(conf).String())
+		close(known)
 		return detail, nil
 	}); err != nil {
 		return err
@@ -698,14 +729,36 @@ func groupChat(r *run) error {
 	}
 	if err := r.step("message-after-loss", func(ctx context.Context) (map[string]int64, error) {
 		// The new owner holds no session with the peer, and invites it
-		// back for the message, once.
+		// back for the message, once. The peer's old MSRP session is
+		// closed first, so the message can only come on a new one (QA on
+		// #602).
+		_ = peerLeg.client.Close()
 		before := invites.Load()
 		detail, err := r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after the owner stopped "+token), token)
 		if detail == nil {
 			detail = map[string]int64{}
 		}
 		detail["invites"] = invites.Load() - before
-		if err == nil && detail["invites"] != 1 {
+		opened := 0
+		if err == nil {
+			// The session it came on, then any other opened since.
+			select {
+			case <-sessions:
+				opened++
+			case <-ctx.Done():
+				err = errors.New("the new owner opened no session with the peer")
+			}
+			for drained := false; err == nil && !drained; {
+				select {
+				case <-sessions:
+					opened++
+				default:
+					drained = true
+				}
+			}
+		}
+		detail["sessions"] = int64(opened)
+		if err == nil && (detail["invites"] != 1 || opened != 1) {
 			err = errors.New("the new owner did not invite the peer back exactly once")
 		}
 		return detail, err

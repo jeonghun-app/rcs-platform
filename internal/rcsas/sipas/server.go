@@ -78,8 +78,9 @@ type Config struct {
 	MaxGroupParticipants int
 	// GroupChat turns group chat on (RCSAS_GROUP_CHAT_ENABLED). While it is
 	// off, a request to the conference factory or a conference URI is
-	// answered 404 and creates nothing. Group chat needs rcs-as to run as
-	// one task until #121.
+	// answered 404 and creates nothing. On, each group is served by the
+	// task that owns it, whatever task the core gives its requests to
+	// (#121).
 	GroupChat bool
 	// MaxSubscriptionsPerUser bounds the subscriptions to group rosters
 	// one user holds on this task, across groups
