@@ -113,6 +113,43 @@ func TestARequestInsideADialogGoesOnlyToAHopItsRouteSigned(t *testing.T) {
 	}
 }
 
+// TestAGroupsDialogReachesRcsAsAtTheConferenceContact (code review on #542):
+// in a session with a group, and in a subscription to its roster, rcs-as's
+// Contact is the conference URI (internal/rcsas/sipas focusContact), which
+// the S-CSCF signed as the dialog's hop at the 2xx. With transport=tcp it is
+// an application server's listener, so a BYE in the session and a SUBSCRIBE
+// refreshing the roster go on. Without a transport it reads as UDP on 5060,
+// where no application server listens, and both are refused 403.
+func TestAGroupsDialogReachesRcsAsAtTheConferenceContact(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil)
+	for name, c := range map[string]struct {
+		contact string
+		allowed bool
+	}{
+		"over TCP, as rcs-as writes it": {"sip:chat-00112233445566778899aabbccddeeff@conf.rcs.local;transport=tcp", true},
+		"without a transport":           {"sip:chat-00112233445566778899aabbccddeeff@conf.rcs.local", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, method := range []string{"BYE", "SUBSCRIBE"} {
+				r := inDialog(t, c.contact, "", signedFor(rt, c.contact, pcscfUE))
+				if method == "SUBSCRIBE" {
+					r.Message.Method = "SUBSCRIBE"
+					_ = r.Message.Header.Set("CSeq", "2 SUBSCRIBE")
+					_ = r.Message.Header.Set("Event", "conference")
+				}
+				d := rt.InDialog(bg, r)
+				if got := d.Status == 0 && len(d.Targets) == 1; got != c.allowed {
+					t.Errorf("%s forwarded %v (status %d), want %v", method, got, d.Status, c.allowed)
+				}
+				if !c.allowed && d.Status != 403 {
+					t.Errorf("%s status %d, want 403", method, d.Status)
+				}
+			}
+		})
+	}
+}
+
 // relabelled is a with its signature's key ID changed to id.
 func relabelled(a sip.Address, id string) sip.Address {
 	v, _ := a.URI.Param(dlgParam)

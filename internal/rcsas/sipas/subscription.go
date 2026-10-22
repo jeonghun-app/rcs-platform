@@ -274,7 +274,7 @@ func (s *Server) groupSubscribe(ctx context.Context, u *proxy.UAS) {
 	res, err := dialogResponse(req, 200, tag)
 	if err == nil {
 		err = errors.Join(res.Header.Add("Expires", strconv.Itoa(int(expires))),
-			res.Header.Add("Contact", sip.Address{URI: focus}.String()))
+			res.Header.Add("Contact", "<"+focusContact(focus.String())+">"))
 	}
 	if err == nil {
 		err = u.Respond(res)

@@ -265,11 +265,21 @@ always answers `passive` and listens: `msrp-relay` connects to
 `RCSAS_MSRP_LISTEN_ADDR`, where the engine's `Serve` binds the connection to
 the leg its To-Path names.
 
-The 2xx with which rcs-as sets up a dialog carries the request's
-`Record-Route` in order: the 200 to a chat, large-mode or group INVITE and to
-a roster SUBSCRIBE (RFC 3261 §12.1.1, RFC 6665 §4.1.2.1). It is the client's
+The 200 with which rcs-as answers a chat, large-mode or group INVITE carries
+the request's `Record-Route` in order (RFC 3261 §12.1.1). It is the client's
 route set. `pcscf` refuses a client's request in a dialog on any other route,
-so without it the client could not send its BYE (#541).
+so without it the client could not send its BYE (#541). So does the 200 to a
+roster SUBSCRIBE, for a client that takes its route set from that 200, as
+rcsjta does: RFC 6665 §4.4.1 has a subscriber take it from the first NOTIFY's
+`Record-Route` instead, which the CSCFs do not add (#550).
+
+In a session with a group, and in a subscription to its roster, rcs-as's
+`Contact` is the group's conference URI with `transport=tcp`. `scscf` sends
+the requests in the dialog to that Contact and checks it is an application
+server's listener by port and transport. Without a transport it would read
+UDP on 5060 and refuse them 403. The transport does not change the URI as
+compared (RFC 3261 §19.1.4), so a client rejoins at the Contact it was given,
+and rcs-as reads the group from the user part.
 
 A client's INVITE (the originating session):
 
