@@ -62,7 +62,8 @@ func (r *Request) Initial() bool {
 //
 // A panic in Route or in a Decision's hooks is recovered on its goroutine and
 // ends only what it was for: Route's and Serve's request is answered 500,
-// Prepare's branch fails with 500, OnBranchFailure adds no target, and a
+// Prepare's branch fails with 500, OnBranchFailure adds no target, a
+// Target's OnTimeout lets the timeout end its branch, and a
 // final response whose OnFinal or OnResponse panicked is replaced by a 500,
 // a provisional one or a 2xx retransmission dropped. It is counted
 // (Config.Metrics, #428), and logged without its value, at most once a
@@ -184,7 +185,8 @@ type Target struct {
 	// branch: false keeps it, and it ends on its transaction's own timers
 	// then, as a branch without Timeout does. scscf keeps the branch to an
 	// application server that has sent the request back meanwhile, as the
-	// far end is now the one answering (#386).
+	// far end is now the one answering (#386). A panic in it ends the branch
+	// as the timeout does (see Router).
 	OnTimeout func(ctx context.Context) bool
 }
 

@@ -1063,7 +1063,11 @@ func (b *branch) armTimeout() {
 		}
 		// It may block, as scscf asks its store, and a timer must not.
 		p.spawn(func() {
-			if keep(c.ctx) {
+			// A panic leaves applies true: the timeout ends the branch, as
+			// when scscf's store cannot say.
+			applies := true
+			p.hook("OnTimeout", func() { applies = keep(c.ctx) })
+			if applies {
 				b.timeoutNow()
 				return
 			}
