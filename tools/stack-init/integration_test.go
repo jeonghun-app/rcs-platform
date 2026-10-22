@@ -19,6 +19,8 @@ import (
 	ftstore "github.com/jeonghun-app/rcs-platform/internal/ftserver/awsstore"
 	hssstore "github.com/jeonghun-app/rcs-platform/internal/hss/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/dynamostore"
+	scscfstore "github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Against DynamoDB Local and S3Mock (make test-integration): the tables are
@@ -31,7 +33,10 @@ func TestIntegrationTablesAreCreatedOnceAndAcceptedByTheStores(t *testing.T) {
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 	c := tablesConfig{
 		dynamoEndpoint: ddbEndpoint, s3Endpoint: s3Endpoint,
-		hss:     hssstore.Config{SubscribersTable: "subs-" + suffix, ProfilesTable: "profiles-" + suffix},
+		hss: hssstore.Config{SubscribersTable: "subs-" + suffix, ProfilesTable: "profiles-" + suffix},
+		scscf: scscfstore.Config{
+			RegistrationsTable: "registrations-" + suffix, ChallengesTable: "challenges-" + suffix, SubscriptionsTable: "reg-subs-" + suffix,
+		},
 		ftTable: "files-" + suffix, ftBucket: "ft-" + suffix, relayTable: "bindings-" + suffix,
 	}
 	ctx := t.Context()
@@ -42,7 +47,7 @@ func TestIntegrationTablesAreCreatedOnceAndAcceptedByTheStores(t *testing.T) {
 	if err := createTables(ctx, c, &second); err != nil {
 		t.Fatalf("second run: %v", err)
 	}
-	if strings.Count(first.String(), "created") != 5 || strings.Count(second.String(), "exists") != 5 {
+	if strings.Count(first.String(), "created") != 8 || strings.Count(second.String(), "exists") != 8 {
 		t.Fatalf("first run:\n%ssecond run:\n%s", first.String(), second.String())
 	}
 
@@ -53,6 +58,15 @@ func TestIntegrationTablesAreCreatedOnceAndAcceptedByTheStores(t *testing.T) {
 	ddb := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(ddbEndpoint) })
 	if err := hssstore.NewDynamo(ddb, c.hss).Ready(ctx); err != nil {
 		t.Fatalf("the HSS store does not accept its tables: %v", err)
+	}
+	sc := c.scscf
+	sc.ChallengeKeys = []scscfstore.ChallengeKey{{ID: "it", Key: secretkey.NewKey(make([]byte, scscfstore.KeySize))}}
+	scscf, err := scscfstore.New(ddb, sc)
+	if err == nil {
+		err = scscf.Ready(ctx)
+	}
+	if err != nil {
+		t.Fatalf("the scscf store does not accept its tables: %v", err)
 	}
 	ft, err := ftstore.New(ctx, ftstore.Config{Bucket: c.ftBucket, Table: c.ftTable, SSE: "AES256", S3Endpoint: s3Endpoint, DynamoDBEndpoint: ddbEndpoint})
 	if err == nil {

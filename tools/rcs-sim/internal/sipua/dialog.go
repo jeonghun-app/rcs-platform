@@ -622,6 +622,23 @@ func (d *Dialog) receive(tx *transaction.ServerTransaction) {
 	}
 }
 
+// NewOptions returns a capability query to target (RCC.07 capability
+// discovery over OPTIONS): NewRequest's fields with the UA's Contact, whose
+// feature tags name the services it offers, as a device's query carries
+// them. The far end's 200 names its own in its Contact. Send sends it.
+func (ua *UA) NewOptions(target sip.URI) (*sip.Request, error) {
+	req, err := ua.NewRequest("OPTIONS", target)
+	if err != nil {
+		return nil, err
+	}
+	add(req, &err, "Contact", ua.contact.String())
+	add(req, &err, "Accept", "application/sdp")
+	if err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
 // ICSI of standalone messaging, pager mode, unescaped as P-Preferred-Service
 // carries it (RCC.07, RFC 6050).
 const standaloneService = "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg"

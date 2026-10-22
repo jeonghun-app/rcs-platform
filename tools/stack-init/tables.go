@@ -17,6 +17,7 @@ import (
 	ftstore "github.com/jeonghun-app/rcs-platform/internal/ftserver/awsstore"
 	hssstore "github.com/jeonghun-app/rcs-platform/internal/hss/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/dynamostore"
+	scscfstore "github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
 )
 
 // tablesConfig names the local endpoints and what to create there. The
@@ -24,6 +25,7 @@ import (
 type tablesConfig struct {
 	dynamoEndpoint, s3Endpoint string
 	hss                        hssstore.Config
+	scscf                      scscfstore.Config
 	ftTable, ftBucket          string
 	relayTable                 string
 }
@@ -41,6 +43,11 @@ func readTablesConfig(e environment) (tablesConfig, error) {
 		SubscribersTable: e.get("HSS_SUBSCRIBERS_TABLE", "subscribers"),
 		ProfilesTable:    e.get("HSS_PROFILES_TABLE", "service-profiles"),
 	}
+	c.scscf = scscfstore.Config{
+		RegistrationsTable: e.get("SCSCF_REGISTRATIONS_TABLE", scscfstore.DefaultRegistrationsTable),
+		ChallengesTable:    e.get("SCSCF_CHALLENGES_TABLE", scscfstore.DefaultChallengesTable),
+		SubscriptionsTable: e.get("SCSCF_SUBSCRIPTIONS_TABLE", scscfstore.DefaultSubscriptionsTable),
+	}
 	c.ftTable = e.get("FT_DYNAMODB_TABLE", "files")
 	c.relayTable = e.get("RELAY_DYNAMODB_TABLE", "msrp-bindings")
 	return c, nil
@@ -48,7 +55,8 @@ func readTablesConfig(e environment) (tablesConfig, error) {
 
 // createTables creates, as the service docs describe them for the
 // infrastructure, whatever does not exist yet: hss's two tables
-// (docs/hss.md, Tables), ft-server's files table and content bucket
+// (docs/hss.md, Tables), scscf's three (docs/scscf-state.md), ft-server's
+// files table and content bucket
 // (docs/ft-server.md, Storage) and msrp-relay's bindings table
 // (docs/msrp-relay.md, The bindings table).
 func createTables(ctx context.Context, c tablesConfig, out io.Writer) error {
@@ -68,27 +76,14 @@ func createTables(ctx context.Context, c tablesConfig, out io.Writer) error {
 		o.UsePathStyle = true
 	})
 
-	// The HSS creates its two tables together and waits for both.
-	subs, err := tableExists(ctx, ddb, c.hss.SubscribersTable)
-	if err != nil {
+	// hss and scscf each create their tables together and wait for them.
+	if err := ensureTableSet(ctx, ddb, "hss", []string{c.hss.SubscribersTable, c.hss.ProfilesTable},
+		func() error { return hssstore.CreateTables(ctx, ddb, c.hss) }, out); err != nil {
 		return err
 	}
-	profiles, err := tableExists(ctx, ddb, c.hss.ProfilesTable)
-	if err != nil {
+	if err := ensureTableSet(ctx, ddb, "scscf", []string{c.scscf.RegistrationsTable, c.scscf.ChallengesTable, c.scscf.SubscriptionsTable},
+		func() error { return scscfstore.CreateTables(ctx, ddb, c.scscf) }, out); err != nil {
 		return err
-	}
-	switch {
-	case subs && profiles:
-		fmt.Fprintf(out, "table %s exists\ntable %s exists\n", c.hss.SubscribersTable, c.hss.ProfilesTable)
-	case subs || profiles:
-		// Creating the missing one alone would need a second copy of its
-		// definition; a half-made stack is quicker to remove (make down).
-		return errors.New("only one of the hss tables exists; run make down and make up")
-	default:
-		if err := hssstore.CreateTables(ctx, ddb, c.hss); err != nil {
-			return err
-		}
-		fmt.Fprintf(out, "table %s created\ntable %s created\n", c.hss.SubscribersTable, c.hss.ProfilesTable)
 	}
 	for _, t := range []struct{ name, pk, ttl string }{
 		{c.ftTable, ftstore.PartitionKey, ftstore.TTLAttribute},
@@ -99,6 +94,39 @@ func createTables(ctx context.Context, c tablesConfig, out io.Writer) error {
 		}
 	}
 	return ensureBucket(ctx, s3c, c.ftBucket, out)
+}
+
+// ensureTableSet creates the tables of one service with create, unless they
+// all exist. Creating some alone would need a second copy of their
+// definitions; a half-made stack is quicker to remove (make down).
+func ensureTableSet(ctx context.Context, ddb *dynamodb.Client, service string, names []string, create func() error, out io.Writer) error {
+	found := 0
+	for _, name := range names {
+		exists, err := tableExists(ctx, ddb, name)
+		if err != nil {
+			return err
+		}
+		if exists {
+			found++
+		}
+	}
+	switch found {
+	case len(names):
+		for _, name := range names {
+			fmt.Fprintf(out, "table %s exists\n", name)
+		}
+		return nil
+	case 0:
+	default:
+		return fmt.Errorf("only some of the %s tables exist; run make down and make up", service)
+	}
+	if err := create(); err != nil {
+		return err
+	}
+	for _, name := range names {
+		fmt.Fprintf(out, "table %s created\n", name)
+	}
+	return nil
 }
 
 func tableExists(ctx context.Context, ddb *dynamodb.Client, name string) (bool, error) {
