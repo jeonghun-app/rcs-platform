@@ -12,6 +12,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
@@ -336,6 +337,27 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 	return resultSuccess
 }
 
+// deregisterMoved tells the HSS that the set under key, whose default it
+// moved, is no longer registered here (SAR USER_DEREGISTRATION, TS 29.228
+// §6.1.2). A failure is counted and logged: the set still ends here, and
+// the HSS learns of it at the user's next registration or terminating
+// request.
+func (g *Registrar) deregisterMoved(ctx context.Context, key state.SetKey) {
+	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: key.IMPI, PublicIdentities: []string{key.IMPU}, AssignmentType: cx.UserDeregistration})
+	var res cx.Result
+	if saa != nil {
+		res = saa.Result
+	}
+	o := cxclient.Classify(res)
+	if err != nil {
+		o = cxclient.ErrorOutcome(err)
+	}
+	if o != cxclient.Success && !permanent(o) {
+		g.count("registrar.hss_failed")
+		g.log.Warn("registrar: the HSS did not take the end of a set whose default it moved", slog.String("outcome", o.String()))
+	}
+}
+
 // errNotLive is applyProfile's error for a set without a live record here.
 var errNotLive = errors.New("registrar: no live record of the set")
 
@@ -413,7 +435,11 @@ func (g *Registrar) applyProfile(ctx context.Context, key state.SetKey, set *imp
 // missed too: the set ends here as that RTR would have ended it (endSetNow,
 // HandleRTR), its subscribers told it was deactivated and its servers that
 // it ended, so that the UE registers anew and gets the new profile and
-// default (#546 code review). It is counted, and nil is returned.
+// default (#546 code review). The SAR that brought the profile has just
+// made the HSS hold the set registered here again, which that RTR had
+// undone: the HSS is told of the end first (USER_DEREGISTRATION), before
+// the subscribers are, so that the UE's new REGISTER always follows it.
+// It is counted, and nil is returned.
 func (g *Registrar) applySAAProfile(ctx context.Context, reg *state.Registration, userData []byte, received time.Time) *state.Registration {
 	if len(userData) == 0 {
 		return reg
@@ -425,6 +451,7 @@ func (g *Registrar) applySAAProfile(ctx context.Context, reg *state.Registration
 		return reg
 	case set.defaultID != reg.Key.IMPU:
 		g.count("registrar.saa_profile_moved")
+		g.deregisterMoved(ctx, reg.Key)
 		if _, err := g.endSetNow(ctx, reg.Key, false, regevent.Deactivated); err != nil {
 			// A claim saved before the failure leaves the end to a sweep;
 			// without one, the set's next REGISTER gets the old profile.

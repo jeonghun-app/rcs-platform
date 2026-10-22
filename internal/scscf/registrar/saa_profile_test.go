@@ -76,13 +76,30 @@ func TestAReassertsSAAProfileIsApplied(t *testing.T) {
 // lost; it sends the profile once, on the reassert's SAR (#524). The set
 // ends here as that RTR would have ended it, its subscribers told it was
 // deactivated and its servers that it ended, so the UE registers anew and
-// gets the new default; no SAR tells the HSS anything more.
+// gets the new default. The reassert's SAR made the HSS hold the set
+// registered again, so the HSS is told of the end, before the subscribers
+// are: with a UE that never comes back, the HSS holds the set not
+// registered, however long the sweeps run.
 func TestAReassertWithAMovedDefaultEndsTheSetAsTheRTRWould(t *testing.T) {
 	e := newEnv(t)
 	ev, tp, m := &recordedEvents{}, &recordedThirdParty{}, &counts{}
 	g := e.instance(1, withEvents(ev), withThirdParty(tp), func(c *Config) { c.Metrics = m })
 	reassertDue(t, e, g)
+	// The HSS's registration state, as its SARs leave it.
+	var mu sync.Mutex
+	registered, notifiedFirst := true, false
 	e.hss.sarHook = func(r *cx.SAR) (*cx.SAA, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.AssignmentType {
+		case cx.UserDeregistration:
+			registered = false
+			for _, c := range ev.got() {
+				notifiedFirst = notifiedFirst || c.after == -1
+			}
+		case cx.Registration:
+			registered = true
+		}
 		if r.AssignmentType != cx.Registration || r.UserDataAlreadyAvailable != cx.UserDataAlreadyAvailable {
 			return nil, nil
 		}
@@ -115,9 +132,18 @@ func TestAReassertWithAMovedDefaultEndsTheSetAsTheRTRWould(t *testing.T) {
 	if ends == 0 {
 		t.Error("the application servers were not told the set ended")
 	}
-	if got := e.hss.sarsOf()[sars:]; !slices.Equal(got, []cx.ServerAssignmentType{cx.Registration}) {
-		t.Errorf("SARs after the reassert's own: %v", got)
+	if got := e.hss.sarsOf()[sars:]; !slices.Equal(got, []cx.ServerAssignmentType{cx.Registration, cx.UserDeregistration}) {
+		t.Errorf("SARs: %v, want the reassert's and the end's", got)
 	}
+	for range 6 {
+		e.clock.advance(time.Hour)
+		_, _ = g.Sweep(bg, 10)
+	}
+	mu.Lock()
+	if registered || notifiedFirst {
+		t.Errorf("the HSS holds the set registered %v; the subscribers heard of the end before it %v", registered, notifiedFirst)
+	}
+	mu.Unlock()
 	if got := m.get("registrar.saa_profile_moved"); got != 1 {
 		t.Errorf("registrar.saa_profile_moved = %d, want 1", got)
 	}
