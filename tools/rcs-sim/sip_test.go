@@ -180,11 +180,11 @@ func TestASkippedStepIsCountedAndRequireAllFailsIt(t *testing.T) {
 	lookup := env("RCS_SIM_SIP_IMPI", "001010000000001@"+domain, "RCS_SIM_SIP_PASSWORD", "self-password")
 	code, out, errOut := call(lookup, "-sip-proxy", core.Addr.String(), "-sip-auth", "digest", "reg-event")
 	if code != exitOK || !strings.Contains(out, `"step":"network-deregister","ok":true,"ms":0,"skipped":"network deregistration not configured"`) ||
-		!strings.Contains(errOut, "rcs-sim: 5 steps, 0 failed, 1 skipped") {
+		!strings.Contains(errOut, "rcs-sim: 7 steps, 0 failed, 1 skipped") {
 		t.Fatalf("exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
 	code, out, errOut = call(lookup, "-sip-proxy", core.Addr.String(), "-sip-auth", "digest", "-require-all", "reg-event")
-	if code != exitFailed || !strings.Contains(errOut, "rcs-sim: 5 steps, 1 failed, 0 skipped") {
+	if code != exitFailed || !strings.Contains(errOut, "rcs-sim: 7 steps, 1 failed, 0 skipped") {
 		t.Fatalf("with -require-all: exit %d\nstdout:\n%s\nstderr:\n%s", code, out, errOut)
 	}
 }

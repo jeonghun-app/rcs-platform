@@ -3,6 +3,7 @@ package scenario
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/reginfo"
@@ -59,6 +60,65 @@ func regEvent(r *run) error {
 			return detail, errors.New("the client's contact is not active after the refresh")
 		}
 		detail["version"] = int64(n.Info.Version)
+		return detail, nil
+	}); err != nil {
+		return err
+	}
+	// #563: a subscription of its own is refreshed and then ended, each
+	// SUBSCRIBE in the dialog the first NOTIFY set up (RFC 6665 §4.4.1),
+	// along its route set through pcscf and scscf. The first one stays,
+	// to end with the registration.
+	var rw *regWatch
+	if err := r.step("refresh", func(ctx context.Context) (map[string]int64, error) {
+		var err error
+		var detail map[string]int64
+		if rw, detail, err = r.subscribeRegEvent(ctx, c); err != nil {
+			return detail, err
+		}
+		res, err := rw.sub.Refresh(ctx, sipua.RegEventExpires*time.Second)
+		if res != nil {
+			detail["status"] = int64(res.StatusCode)
+		}
+		if err != nil {
+			return detail, sipError(err)
+		}
+		// A refresh brings a NOTIFY of the state (RFC 6665 §4.2.1.2).
+		n, own, err := rw.next(ctx)
+		switch {
+		case err != nil:
+			return detail, err
+		case n.State != "active":
+			return detail, errors.New("the subscription is not active after its refresh")
+		case !own.Active():
+			return detail, errors.New("the client's contact is not active after the subscription's refresh")
+		}
+		return detail, nil
+	}); err != nil {
+		return err
+	}
+	if err := r.step("unsubscribe", func(ctx context.Context) (map[string]int64, error) {
+		res, err := rw.sub.Unsubscribe(ctx)
+		detail := map[string]int64{}
+		if res != nil {
+			detail["status"] = int64(res.StatusCode)
+		}
+		if err != nil {
+			return detail, sipError(err)
+		}
+		// The last NOTIFY, terminated (§4.2.1.4), while the registration
+		// it tells of goes on.
+		n, _, err := rw.next(ctx)
+		switch {
+		case err != nil:
+			return detail, err
+		case n.State != "terminated":
+			return detail, errors.New("the subscription did not end at its unsubscribe")
+		}
+		select {
+		case <-rw.sub.Done():
+		case <-ctx.Done():
+			return detail, errors.New("the subscription did not end at its unsubscribe")
+		}
 		return detail, nil
 	}); err != nil {
 		return err

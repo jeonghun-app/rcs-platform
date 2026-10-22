@@ -292,8 +292,11 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
    provisions. Both test subscribers register with IMS AKA, with the keys
    `stack-seed` gave `hss`, through `pcscf`, `icscf` and `scscf`:
    - `reg-event` subscribes to the client's own registration and follows it
-     through a refresh and the de-registration. Its network-deregister step
-     is skipped: rcs-sim has no way to ask for one yet.
+     through a refresh and the de-registration. A second subscription is
+     refreshed and then ended along the route set of its first NOTIFY,
+     through `pcscf` and `scscf`, and the test checks both answers are 200
+     (#563). Its network-deregister step is skipped: rcs-sim has no way to
+     ask for one yet.
    - `options` sends the peer an OPTIONS to its tel URI and a capability
      query to its SIP URI, through `scscf`'s originating and terminating
      iFC chains; `rcs-as` passes the capability query on.
