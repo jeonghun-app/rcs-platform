@@ -83,9 +83,9 @@ type peerSession struct {
 }
 
 // peerCall is an INVITE to the peer, with the peer's registration when it
-// came: peer-offline counts the registrations, one more just before the
-// peer registers again, so that a chat opened before then is told from one
-// opened after (code review on #559).
+// came: peer-offline counts one more once the peer's next REGISTER has been
+// answered, so that a chat opened before then, while it was unregistered
+// or as it registered, is told from one opened after (code review on #559).
 type peerCall struct {
 	call         *sipua.IncomingCall
 	registration int64
@@ -451,10 +451,16 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	if err := waitReport(ctx, aEnd, sent.MSRP); err != nil {
 		return detail, err
 	}
-	again := registration.Add(1)
 	if _, err := b.ua.Register(ctx); err != nil {
 		return detail, fmt.Errorf("peer: %w", sipError(err))
 	}
+	// Counted once the registration has been answered: rcs-as answers the
+	// client, stores the message, and may invite a binding it kept before
+	// the peer's REGISTER is answered (code review on #559). An INVITE the
+	// network sends after the 200 is read after it on the peer's flow; its
+	// OnInvite could still run before this line, which would fail the step
+	// rather than pass one that was not stored.
+	again := registration.Add(1)
 	got, skipped, err := awaitChat(ctx, bEnd, sent.IMDN, token)
 	detail["skipped"] = int64(skipped)
 	if err != nil {

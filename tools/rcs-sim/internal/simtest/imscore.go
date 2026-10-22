@@ -63,6 +63,12 @@ type IMSCore struct {
 	// unregistered user does; nil leaves the INVITE to Offline. It runs on
 	// the sender's reading goroutine.
 	AnswerOffline func(req *sip.Request) []byte
+	// HoldRegister, when set before any request, runs for each REGISTER
+	// answered 200, once the binding has changed and before the answer
+	// goes, on the sender's reading goroutine; it must not block. The core
+	// answers once the channel it returns is closed (at once for nil), as
+	// a network that sends the user something before it answers would.
+	HoldRegister func(req *sip.Request) <-chan struct{}
 	// KeepBindings, when set before any request, answers a REGISTER with
 	// Expires: 0 as usual but keeps the binding, so that requests to the
 	// IMPU still reach its flow, as a faulty registrar would.
@@ -338,19 +344,28 @@ func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 	switch {
 	case req.Method == "REGISTER":
 		res, answered, deliver := c.register(tx)
-		c.respond(tx, res)
-		if answered != nil {
-			answered()
+		answer := func() {
+			c.respond(tx, res)
+			if answered != nil {
+				answered()
+			}
+			if deliver != nil {
+				go deliver()
+			}
+			c.mu.Lock()
+			hook := c.answered
+			c.mu.Unlock()
+			if hook != nil && answered != nil {
+				hook(req)
+			}
 		}
-		if deliver != nil {
-			go deliver()
+		if c.HoldRegister != nil && res.StatusCode == 200 {
+			if gate := c.HoldRegister(req); gate != nil {
+				go func() { <-gate; answer() }()
+				return
+			}
 		}
-		c.mu.Lock()
-		hook := c.answered
-		c.mu.Unlock()
-		if hook != nil && answered != nil {
-			hook(req)
-		}
+		answer()
 	case req.Method == "SUBSCRIBE" && strings.EqualFold(eventPackage(req), "reg"):
 		c.subscribe(tx)
 	case req.Method == "CANCEL":
