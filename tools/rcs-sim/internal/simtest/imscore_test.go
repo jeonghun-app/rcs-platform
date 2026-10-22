@@ -351,14 +351,14 @@ func TestACancelOfAnAnsweredInviteIsAnswered200(t *testing.T) {
 }
 
 func TestACancelTheCalleeIgnoresIsAnswered487(t *testing.T) {
-	// QA of #425: B rings and ignores the CANCEL. The core ends the INVITE
-	// 64*T1 after it sent the CANCEL, as the platform's proxy does, and
-	// answers 487 (RFC 3261 §9.1). The core's T1 is 10 ms, so 640 ms; the
-	// originator's clock runs eight times fast, so that its own 64*T1
-	// after its CANCEL, which would end it otherwise, is 4 s. The CANCEL
-	// comes on the core's own 100, and the INVITE goes only once the core
-	// has taken it, so that it is cancelled before the core's Timer B
-	// could end it, however late B's ring comes.
+	// QA of #425: B rings, and rings again for the CANCEL, which it ignores.
+	// The core ends the INVITE 64*T1 after it sent the CANCEL, as the
+	// platform's proxy does, and answers 487 (RFC 3261 §9.1). The core's T1
+	// is 10 ms, so 640 ms; the originator's clock runs eight times fast, so
+	// that its own 64*T1 after its CANCEL, which would end it otherwise, is
+	// 4 s. The CANCEL comes on the core's own 100, and the INVITE goes only
+	// once the core has taken it, so that it is cancelled before the core's
+	// Timer B could end it, however late B's ring comes.
 	core := simtest.StartIMSCore(t, domain, map[string]string{impiA: "a-password", impiB: "b-password"}, 10*time.Millisecond)
 	hold := make(chan struct{})
 	release := sync.OnceFunc(func() { close(hold) })
@@ -385,10 +385,19 @@ func TestACancelTheCalleeIgnoresIsAnswered487(t *testing.T) {
 	if _, err := a.Register(ctx); err != nil {
 		t.Fatal(err)
 	}
+	var invite atomic.Pointer[transaction.ServerTransaction]
 	registered(t, ctx, core, impuB, impiB, "b-password", "urn:uuid:00000000-0000-4000-8000-000000000002",
 		func(tx *transaction.ServerTransaction) {
-			if tx.Request().Method == "INVITE" {
+			switch tx.Request().Method {
+			case "INVITE":
+				invite.Store(tx)
 				answer(t, tx, 180, "")
+			case "CANCEL":
+				// It rings again instead: a provisional does not stop
+				// the core's 64*T1, only a final answer does.
+				if inv := invite.Load(); inv != nil {
+					answer(t, inv, 180, "")
+				}
 			}
 			// The CANCEL is never answered, nor the INVITE after it.
 		})
@@ -400,9 +409,18 @@ func TestACancelTheCalleeIgnoresIsAnswered487(t *testing.T) {
 	ictx, stop := context.WithCancel(ctx)
 	defer stop()
 	var once sync.Once
-	_, res, err := a.Invite(ictx, req, func(*sip.Response) { once.Do(stop) })
+	var cancelledAt atomic.Int64
+	_, res, err := a.Invite(ictx, req, func(*sip.Response) {
+		once.Do(func() { cancelledAt.Store(time.Now().UnixNano()); stop() })
+	})
 	if res == nil || res.StatusCode != 487 {
 		t.Fatalf("INVITE whose CANCEL the callee ignores = %v, %v; want the core's 487", res, err)
+	}
+	// QA of #472: the core waited its 64*T1, which starts only after A
+	// cancelled, so this lower bound holds however slow the host. An end
+	// at once, or after T1, would drop a 200 that crossed the CANCEL.
+	if took := time.Since(time.Unix(0, cancelledAt.Load())); took < 64*10*time.Millisecond {
+		t.Fatalf("487 came %v after the CANCEL, before the core's 64*T1", took)
 	}
 }
 
