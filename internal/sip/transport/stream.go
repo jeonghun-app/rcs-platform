@@ -456,8 +456,7 @@ func (t *Transport) streamTo(network Network, addr netip.AddrPort, serverName st
 	}
 	if d := t.dialing[k]; d != nil {
 		t.mu.Unlock()
-		<-d.done
-		return d.f, d.err
+		return t.waitDial(network, d)
 	}
 	// A dial that finished since the check above has entered its flow before
 	// leaving t.dialing, so looking again under the lock closes the window.
@@ -471,17 +470,42 @@ func (t *Transport) streamTo(network Network, addr netip.AddrPort, serverName st
 		t.stats.dialLimited.Add(1)
 		return nil, ErrTooManyConnections
 	}
-	d := &dialCall{done: make(chan struct{})}
+	// What the callers waiting for the dial get if it panics: the panic goes
+	// on to this caller, which may contain it (#471), and the dial is gone
+	// for everyone, so the next send dials again (#582).
+	d := &dialCall{done: make(chan struct{}), err: errDialPanicked}
 	t.dialing[k] = d
 	t.mu.Unlock()
-
+	defer func() {
+		t.mu.Lock()
+		delete(t.dialing, k)
+		t.mu.Unlock()
+		close(d.done)
+	}()
 	d.f, d.err = t.dial(k)
-
-	t.mu.Lock()
-	delete(t.dialing, k)
-	t.mu.Unlock()
-	close(d.done)
 	return d.f, d.err
+}
+
+// errDialPanicked is the error of a send that waited for a dial which
+// panicked.
+var errDialPanicked = errors.New("transport: the dial this send waited for panicked")
+
+// waitDial waits for d, another caller's dial of the same peer, within that
+// dial's own bounds: Close and DialTimeout. A dial always ends within them,
+// and its caller always closes done (streamTo), so this is a guard: a wait
+// that cannot end would hold the caller's transaction lock, and so
+// Layer.Close, with it (#582).
+func (t *Transport) waitDial(network Network, d *dialCall) (*flow, error) {
+	timer := time.NewTimer(t.cfg.DialTimeout)
+	defer timer.Stop()
+	select {
+	case <-d.done:
+		return d.f, d.err
+	case <-t.dials.Done():
+		return nil, ErrClosed
+	case <-timer.C:
+		return nil, fmt.Errorf("transport: waiting for a dial over %s: %w", network, context.DeadlineExceeded)
+	}
 }
 
 func (t *Transport) dial(k reuseKey) (*flow, error) {
