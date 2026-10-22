@@ -166,3 +166,24 @@ func TestAWakeOvertakesTheFailureOfAnInvitationStillBeingAsked(t *testing.T) {
 		t.Fatalf("%d overtaken failures", n)
 	}
 }
+
+// TestAnInvitationAskedRightAfterAWakeStillCounts (code review of #576):
+// the wake overtakes only invitations asked before it. One asked right
+// after it, with nothing between, that the group cannot reach (a 404)
+// still gives up the group's copies queued for bob.
+func TestAnInvitationAskedRightAfterAWakeStillCounts(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.e.Wake(bob, groupURI, true)
+	waitFor(t, "idle", r.idle)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	r.e.InviteFailed(inv, ErrUndeliverable)
+	mem := r.store.(*store.Memory)
+	waitFor(t, "bob's copy given up", func() bool { return mem.Len(bob) == 0 })
+	if r.m.get("invite.failed_overtaken") != 0 || r.m.get("invite.undeliverable") != 1 {
+		t.Errorf("overtaken %d, undeliverable %d", r.m.get("invite.failed_overtaken"), r.m.get("invite.undeliverable"))
+	}
+}
