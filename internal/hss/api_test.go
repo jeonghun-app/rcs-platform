@@ -1231,7 +1231,9 @@ func TestAChangesPushesStayWithinTheBudget(t *testing.T) {
 	if late := silent.deadline.Sub(silent.first.Add(budget - reserve - each)); late > 0 {
 		t.Errorf("a push's deadline is %v past what the budget leaves it", late)
 	}
-	if s := a.sub(impi1); len(s.StaleSets) != int(skipped) {
+	// Stale: the sets left over, and the one the budget cut short; not the
+	// first, which had its whole timeout and failed as any push may.
+	if s := a.sub(impi1); !slices.Equal(s.StaleSets, []int{1, 2, 3, 4, 5, 6}) {
 		t.Errorf("stale sets %v, %d pushes left over", s.StaleSets, skipped)
 	}
 	var lines []string
@@ -1251,8 +1253,9 @@ func TestAChangesPushesStayWithinTheBudget(t *testing.T) {
 }
 
 // #491, the lead's decision on #524: what an over-budget change left out
-// reaches the S-CSCF with the next registration of each set, though the
-// S-CSCF says it holds the data (TS 29.228 §6.6), once.
+// reaches the S-CSCF with the next registration or re-registration of each
+// set, though the S-CSCF says it holds the data (TS 29.228 §6.6), once;
+// any other SAR gets the data too, and leaves the set stale.
 func TestAStaleSetsNextRegistrationGetsItsUserData(t *testing.T) {
 	const each, budget, reserve = 200 * time.Millisecond, 600 * time.Millisecond, 50 * time.Millisecond
 	silent := &silentNotifier{}
@@ -1276,6 +1279,16 @@ func TestAStaleSetsNextRegistrationGetsItsUserData(t *testing.T) {
 			t.Fatal(err)
 		}
 		return saa
+	}
+	// An UNREGISTERED_USER SAR gets the data too, but our S-CSCF drops it
+	// (#536): the set stays stale (code review on #524).
+	unr := &cx.SAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentities: []string{impu4},
+		ServerName: scscfName, AssignmentType: cx.UnregisteredUser}
+	if saa, err := cx.ParseSAA(c.send(unr.Message(c.node))); err != nil || saa.UserData == nil {
+		t.Fatalf("the stale set's UNREGISTERED_USER SAR got %+v, %v", saa, err)
+	}
+	if s := a.sub(impi1); !slices.Contains(s.StaleSets, 6) {
+		t.Fatalf("an UNREGISTERED_USER SAR cleared set 6: %v", s.StaleSets)
 	}
 	saa := reregister() // impu4's set, 6, was left over
 	if saa.Result != resSuccess || saa.UserData == nil {
@@ -1352,5 +1365,27 @@ func (n *slowNotifier) answer() error {
 func TestThePushTimeoutIsBounded(t *testing.T) {
 	if 2*MaxPushTimeout+staleReserve > PushBudget || MaxAPITimeout+PushBudget >= apiWriteTimeout {
 		t.Fatalf("timeout %v, budget %v, store work %v, write timeout %v", MaxPushTimeout, PushBudget, MaxAPITimeout, apiWriteTimeout)
+	}
+}
+
+// Code review on #524 (round 2): the profile read for a change's pushes is
+// within the change's budget, not a push timeout of its own.
+func TestTheProfileReadIsWithinTheBudget(t *testing.T) {
+	const each, budget = time.Second, 300 * time.Millisecond
+	a := newAPIEnv(t, func(o *APIOptions) { o.PushTimeout, o.PushBudget, o.staleReserve = each, budget, 10*time.Millisecond })
+	ids := a.sevenSets(t)
+	cs := &ctxStore{Store: a.store}
+	a.h.store = cs
+	start := time.Now()
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if len(cs.reads) == 0 {
+		t.Fatal("no profile read")
+	}
+	if d := cs.reads[len(cs.reads)-1]; d.After(time.Now().Add(budget)) || d.Sub(start) >= each {
+		t.Errorf("the profile read's deadline is %v after the change began, the budget %v", d.Sub(start), budget)
 	}
 }

@@ -115,12 +115,17 @@ func applySAR(s *store.Subscription, impus []string, r *cx.SAR, keepName bool) s
 	if len(impus) > 0 {
 		// The S-CSCF may not hold the set's latest User-Data, whatever it
 		// says: a change's pushes for it ran out of time (#491). §6.6 lets
-		// the HSS download the profile all the same.
+		// the HSS download the profile all the same, with every SAR that
+		// carries it. The set stays stale until a REGISTRATION or
+		// RE_REGISTRATION carries it, which our S-CSCF applies; it drops
+		// the User-Data of the others (#536; code review on #524).
 		if i := slices.Index(s.StaleSets, s.Identity(impus[0]).ImplicitSet); i >= 0 {
 			switch r.AssignmentType {
-			case cx.Registration, cx.ReRegistration, cx.UnregisteredUser, cx.NoAssignment:
+			case cx.Registration, cx.ReRegistration:
 				wantData = true
 				s.StaleSets = slices.Delete(slices.Clone(s.StaleSets), i, i+1)
+			case cx.UnregisteredUser, cx.NoAssignment:
+				wantData = true
 			}
 		}
 	}

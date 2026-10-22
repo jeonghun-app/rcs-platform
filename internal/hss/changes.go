@@ -269,19 +269,26 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 	if n == nil {
 		return
 	}
+	var stale []push // cut short by the budget and failed, or left over
 	for i, ps := range pushes {
 		if t.bounded() && t.forPush(ps) < pushFloor {
-			h.overBudget(ctx, s, pushes[i:], t)
-			return
+			h.overBudget(s, pushes[i:])
+			stale = append(stale, pushes[i:]...)
+			break
 		}
-		if h.notifyOne(ctx, n, s, p, ps, t) {
+		stopped, cut := h.notifyOne(ctx, n, s, p, ps, t)
+		if stopped {
 			// The user is no longer registered at the S-CSCF, which knows
 			// it no longer or is deregistering it: a set's PPR after this
 			// one, the set gaining a moved identity say, has nothing left
 			// to update (#213).
 			return
 		}
+		if cut {
+			stale = append(stale, ps)
+		}
 	}
+	h.markStale(ctx, s, stale, t)
 }
 
 // pushFloor is the least time a push of a change is worth starting with.
@@ -321,13 +328,17 @@ func (t pushTimes) forPush(ps push) time.Duration {
 // followUp is how long a refused PPR's write and RTR may each take.
 func (t pushTimes) followUp() time.Duration { return t.left(0) }
 
-// overBudget counts the pushes left when the budget ran out, and marks
-// the sets they were for stale in the store, within what is left of it.
-func (h *HSS) overBudget(ctx context.Context, s *store.Subscription, left []push, t pushTimes) {
+// overBudget counts and logs the pushes left when the budget ran out.
+func (h *HSS) overBudget(s *store.Subscription, left []push) {
 	h.metrics.Count("push.over_budget", int64(len(left)))
 	h.log.Warn("the S-CSCF requests of a provisioning change ran out of time",
 		pii.Identity("impi", s.IMPI), slog.Int("left", len(left)))
-	sets := staleSets(left)
+}
+
+// markStale marks stale in the store the sets of the pushes the budget
+// left out or cut short, within what is left of it (pushTimes.reserve).
+func (h *HSS) markStale(ctx context.Context, s *store.Subscription, pushes []push, t pushTimes) {
+	sets := staleSets(pushes)
 	if len(sets) == 0 {
 		return
 	}
@@ -373,9 +384,12 @@ func staleSets(pushes []push) []int {
 }
 
 // notifyOne sends ps within t, and reports whether it left the user no
-// longer registered (pprRejected).
-func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, t pushTimes) bool {
-	pctx, cancel := context.WithTimeout(ctx, t.forPush(ps))
+// longer registered (pprRejected), and whether the budget cut it short and
+// it then failed without an answer: the budget's doing as much as a push
+// left over, whose set is marked stale too (code review on #524).
+func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, t pushTimes) (stopped, cut bool) {
+	given := t.forPush(ps)
+	pctx, cancel := context.WithTimeout(ctx, given)
 	defer cancel()
 	err := h.send(pctx, n, s, p, ps)
 	if err != nil {
@@ -387,7 +401,10 @@ func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, 
 			pii.Identity("impi", s.IMPI), slog.String("request", kind), slog.String("error", pii.Redact(err.Error())))
 	}
 	var rejected *RejectedError
-	return !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result, t)
+	if errors.As(err, &rejected) {
+		return !ps.deregister && h.pprRejected(ctx, n, s, rejected.Result, t), false
+	}
+	return false, err != nil && t.bounded() && given < t.each
 }
 
 // pprRejected acts on a PPA failure as TS 29.228 §6.2.2.1 asks of an HSS

@@ -221,14 +221,17 @@ once they are done, and must do so within its HTTP write timeout (30 s), after
 the change's store work (`HSS_API_TIMEOUT`, at most 10 s), or the client sees
 the connection cut over a change that was stored, and a retry with its ETag gets
 412 (#491). A push that would have less than 100 ms of the budget left is not
-sent, nor any after it: they are counted in `push.over_budget`, logged once
-with the masked IMPI, and the implicit sets they were for (a PPR's set, a
-`SERVER_CHANGE` RTR's) are marked stale on the subscription, in the last
-second the budget keeps for it (`push.stale_marked`). The next registration,
-re-registration or unregistered-user SAR of a stale set gets its User-Data,
-even when the S-CSCF says it already has it (`USER_DATA_ALREADY_AVAILABLE`,
-which §6.6 lets the HSS override), and the set leaves the stale list in the
-same write. An emptied set's `PERMANENT_TERMINATION` RTR needs no repair: its
+sent, nor any after it: they are counted in `push.over_budget` and logged once
+with the masked IMPI. The implicit sets they were for (a PPR's set, a
+`SERVER_CHANGE` RTR's), and that of a push the budget cut short that then got
+no answer, are marked stale on the subscription, in the last second the budget
+keeps for it (`push.stale_marked`). Every SAR of a stale set that may carry
+User-Data gets it, even when the S-CSCF says it already has it
+(`USER_DATA_ALREADY_AVAILABLE`, which §6.6 lets the HSS override). The repair
+happens at the set's next REGISTRATION or RE_REGISTRATION SAR, whose User-Data
+our S-CSCF applies: the set leaves the stale list in that SAR's write. An
+UNREGISTERED_USER or NO_ASSIGNMENT SAR leaves it stale, as our S-CSCF drops
+the User-Data of those answers (#536). An emptied set's `PERMANENT_TERMINATION` RTR needs no repair: its
 refreshes are refused, and it ends at the S-CSCF within a registration
 period. A shared profile's fan-out answers no request and has no budget:
 each of its pushes has `HSS_PUSH_TIMEOUT`. When identities move between implicit sets, the
