@@ -245,7 +245,12 @@ func TestProvisioningChangesTellTheSCSCFWhatItMustKnow(t *testing.T) {
 // set gaining it as well (code review and QA on #476). Then the losing
 // sets' PPRs, a set before any it gives an identity to.
 func TestAnIdentityMovingBetweenSetsUpdatesTheOldSetFirst(t *testing.T) {
-	const tel2 = "tel:+15550100002"
+	const (
+		tel2 = "tel:+15550100002"
+		i4   = "sip:+15550100004@" + domain
+		t4   = "tel:+15550100004"
+		t5   = "tel:+15550100005"
+	)
 	registered := func(list ...store.PublicIdentity) *store.Subscription {
 		s := &store.Subscription{IMPI: impi1, Profile: DefaultProfileID, ServerName: scscfName, PublicIdentities: list}
 		for i := range s.PublicIdentities {
@@ -312,6 +317,13 @@ func TestAnIdentityMovingBetweenSetsUpdatesTheOldSetFirst(t *testing.T) {
 		"a chain": {
 			ids(id(tel2, 2), id(impu2, 1), id(impu3, 1), id(impu1, 0), id(tel1, 0)),
 			ids(id(tel2, 2), id(impu3, 2), id(impu2, 1), id(tel1, 1), id(impu1, 0)),
+			[]push{{set: 0}, {set: 1}, {set: 2}}, nil,
+		},
+		// QA's: sets 0 and 1 swap tel1 and t4; set 1 also gives t5 to set 2,
+		// which loses impu2 and is listed first: set 1 goes before set 2.
+		"a cycle with a set it gives to": {
+			ids(id(impu1, 2), id(impu2, 2), id(impu3, 0), id(tel1, 0), id(i4, 1), id(t4, 1), id(t5, 1)),
+			ids(id(impu1, 2), id(t5, 2), id(impu3, 0), id(t4, 0), id(i4, 1), id(tel1, 1)),
 			[]push{{set: 0}, {set: 1}, {set: 2}}, nil,
 		},
 		// No order updates both losing sets first: they keep the

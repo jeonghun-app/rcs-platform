@@ -137,22 +137,45 @@ func gives(old, next *store.Subscription) map[int]map[int]bool {
 // comes before it, and otherwise as they are. Sets that give to each other,
 // as when two swap identities by PPRs alone, keep the order they had: no
 // order updates both losing sets first, and the S-CSCF ends with the same
-// sets whichever comes first.
+// sets whichever comes first. Such a cycle is broken at its first set, not
+// at a set it gives to, which still goes after its giver (QA on #476).
 func byDependency(sets []int, gives map[int]map[int]bool) []int {
 	left := slices.Clone(sets)
 	out := make([]int, 0, len(sets))
 	for len(left) > 0 {
-		next := 0 // on a cycle, the first left
-		for i, s := range left {
-			if !slices.ContainsFunc(left, func(o int) bool { return o != s && gives[o][s] }) {
-				next = i
-				break
-			}
+		next := slices.IndexFunc(left, func(s int) bool {
+			return !slices.ContainsFunc(left, func(o int) bool { return o != s && gives[o][s] })
+		})
+		if next < 0 {
+			next = max(slices.IndexFunc(left, func(s int) bool { return onCycle(s, left, gives) }), 0)
 		}
 		out = append(out, left[next])
 		left = slices.Delete(left, next, next+1)
 	}
 	return out
+}
+
+// onCycle reports whether s gives, through sets among left, back to itself.
+func onCycle(s int, left []int, gives map[int]map[int]bool) bool {
+	seen := map[int]bool{}
+	todo := []int{s}
+	for len(todo) > 0 {
+		from := todo[len(todo)-1]
+		todo = todo[:len(todo)-1]
+		for _, to := range left {
+			if !gives[from][to] {
+				continue
+			}
+			if to == s {
+				return true
+			}
+			if !seen[to] {
+				seen[to] = true
+				todo = append(todo, to)
+			}
+		}
+	}
+	return false
 }
 
 // lost reports whether a set whose identities were was and are now has lost
