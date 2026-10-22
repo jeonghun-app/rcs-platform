@@ -618,10 +618,15 @@ func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 	userTemplates := []string{"sip:Xalice.smith@" + testDomain, "sip:alice.smiXth@" + testDomain, "sip:alice.smithX@" + testDomain}
 	// A mark on another character of a number joins it too (#453): on a
 	// tel number's "*", "#" or hex digit, an IMEI's dash, a separator or
-	// the "+", and on the ":" a tel number starts after (#490).
+	// the "+", on the ":" a tel or urn:gsma:imei number starts after
+	// (#490), and on a letter of the scheme (#561).
 	markTemplates := []string{
 		"tel:X*31#",
 		"tel:X123456*78#9",
+		"urn:gsma:imei:X00101000-000003-1",
+		"tX" + "el:*31#",
+		"telX:*31#",
+		"urn:gsma:imXei:00101000-000003-1",
 		"tel:*X31#",
 		"tel:123456*X78#9",
 		"tel:1234abX5678",
@@ -700,15 +705,18 @@ func r32(t *unicode.RangeTable) []unicode.Range32 {
 func TestRedactReadsAURIWithInvisiblesAsWithout(t *testing.T) {
 	k := NewRedactor(testKey)
 	for wide, plain := range map[string]string{
-		"sip\u200b:alice.smith@x":               "sip:alice.smith@x",
-		"si\u00adp:alice.smith@x":               "sip:alice.smith@x",
-		"s\u200bi\u2060p:alice.smith@x":         "sip:alice.smith@x",
-		"From: <SIP\u2060:alice.smith@x>":       "From: <SIP:alice.smith@x>",
-		"sips\ufeff:alice.smith@x":              "sips:alice.smith@x",
-		"im\u200b:alice.smith@x":                "im:alice.smith@x",
-		"pre\u200bs:alice.smith@x":              "pres:alice.smith@x",
-		"te\u200bl:123456*78#9":                 "tel:123456*78#9",
-		"tel\u200b:+15550100001":                "tel:+15550100001",
+		"sip\u200b:alice.smith@x":         "sip:alice.smith@x",
+		"si\u00adp:alice.smith@x":         "sip:alice.smith@x",
+		"s\u200bi\u2060p:alice.smith@x":   "sip:alice.smith@x",
+		"From: <SIP\u2060:alice.smith@x>": "From: <SIP:alice.smith@x>",
+		"sips\ufeff:alice.smith@x":        "sips:alice.smith@x",
+		"im\u200b:alice.smith@x":          "im:alice.smith@x",
+		"pre\u200bs:alice.smith@x":        "pres:alice.smith@x",
+		"te\u200bl:123456*78#9":           "tel:123456*78#9",
+		"tel\u200b:+15550100001":          "tel:+15550100001",
+		// Combining marks on a scheme's letters, one or more (#561).
+		"t\u0301e\u0301l:*31#":                  "tel:*31#",
+		"urn:gs\u0301ma:imei:00101000-000003-1": "urn:gsma:imei:00101000-000003-1",
 		"urn:gsma\u200b:imei:00101000-000003-1": "urn:gsma:imei:00101000-000003-1",
 		"tel:\u200b123456*78#9":                 "tel:123456*78#9",
 		"tel:\u200b*31#":                        "tel:*31#",
@@ -1017,7 +1025,8 @@ func untimedJSONLogger(w io.Writer) *slog.Logger {
 }
 
 // Redact never masks less than main did at the frozen copy's commit, after
-// #154, #413, #444 and #453 (review of #398, #490): on a random corpus of number characters of every form, invisible characters,
+// #154, #413, #444 and #453 (review of #398, #490): on a random corpus of
+// number characters of every form, invisible characters,
 // URI schemes, also inside words and without a user, and words, what the
 // keyed Redactor leaves of a text is part of what main's left, read in the
 // same form. The keyed hint has no digits, so nothing a mask writes can be

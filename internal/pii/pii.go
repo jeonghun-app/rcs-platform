@@ -155,8 +155,9 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 // number's "*", "#" or hex digit, an IMEI's dash, or the ":" a tel or
 // urn:gsma:imei number starts after), are dropped first, so they split no
 // number, though they still end the word before them; see [dropInvisibles].
-// So are invisible characters inside a URI scheme ("si<SHY>p:",
-// [joinSchemes]) and inside a URI user, whose hint is then the plain user's.
+// So are invisible characters and combining marks inside a URI scheme
+// ("si<SHY>p:", "t<U+0301>el:", [joinSchemes]) and invisible characters
+// inside a URI user, whose hint is then the plain user's.
 // The line and paragraph separators and the braille blank group a number as
 // spaces do. A "+" may be followed by a bracketed country code
 // ("+(81)3 1234 5678"); the full-width "＊" and "＃" of a tel number and the
@@ -721,9 +722,10 @@ func asciiNumberChar(r rune) (byte, bool) {
 	return 0, false
 }
 
-// joinSchemes removes the runs of invisible characters inside a URI scheme
-// ("si<SHY>p:", "tel<ZWSP>:"), which a log viewer shows as the scheme, so
-// that Redact finds the scheme as it does without them (#413). A run is
+// joinSchemes removes the runs of invisible characters and combining marks
+// inside a URI scheme ("si<SHY>p:", "tel<ZWSP>:", "t<U+0301>el:"), which a
+// log viewer shows as the scheme, the marks drawn over its letters, so that
+// Redact finds the scheme as it does without them (#413, #561). A run is
 // removed when the text before it ends with the start of a scheme and the
 // text after it, read past further runs, goes on with the rest. The rest is
 // at most 13 bytes, so this is linear.
@@ -735,14 +737,14 @@ func joinSchemes(s string) string {
 	last := 0
 	for i := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
-		if !isInvisible(r) {
+		if !isInvisible(r) && !isMark(r) {
 			i += size
 			continue
 		}
 		end := i + size
 		for end < len(s) {
 			r2, size2 := utf8.DecodeRuneInString(s[end:])
-			if !isInvisible(r2) {
+			if !isInvisible(r2) && !isMark(r2) {
 				break
 			}
 			end += size2
@@ -784,13 +786,13 @@ func endsWithFold(written, pending, p string) bool {
 }
 
 // startsWithFoldPast reports whether s starts with p, ignoring case and the
-// invisible characters between p's bytes.
+// invisible characters and combining marks between p's bytes.
 func startsWithFoldPast(s, p string) bool {
 	j := 0
 	for i := 0; i < len(p); i++ {
 		for j < len(s) {
 			r, size := utf8.DecodeRuneInString(s[j:])
-			if !isInvisible(r) {
+			if !isInvisible(r) && !isMark(r) {
 				break
 			}
 			j += size
