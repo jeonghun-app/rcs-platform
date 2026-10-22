@@ -258,15 +258,22 @@ func (l *listener) acceptLoop() {
 			continue
 		}
 		backoff = 0
-		if refused := t.reserveAccepted(l, c); refused != nil {
-			refused.Add(1)
-			c.Close()
-			continue
-		}
-		t.stats.accepted.Add(1)
-		t.wg.Add(1)
-		go l.serveAccepted(c)
+		l.take(c)
 	}
+}
+
+// take serves a connection accepted on l, unless a limit refuses it. A test
+// hands it a connection of its own, to watch the deadlines it gets.
+func (l *listener) take(c net.Conn) {
+	t := l.t
+	if refused := t.reserveAccepted(l, c); refused != nil {
+		refused.Add(1)
+		c.Close()
+		return
+	}
+	t.stats.accepted.Add(1)
+	t.wg.Add(1)
+	go l.serveAccepted(c)
 }
 
 func nextBackoff(d time.Duration) time.Duration {

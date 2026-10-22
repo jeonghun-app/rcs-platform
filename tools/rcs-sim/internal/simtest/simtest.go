@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -133,7 +134,7 @@ func StartFT(t testing.TB, partSize int64) *FT {
 		}
 		srv.ServeHTTP(w, r)
 	})
-	f.Server = &httptest.Server{Listener: ln, Config: &http.Server{Handler: counted}}
+	f.Server = &httptest.Server{Listener: ln, Config: &http.Server{Handler: counted, ErrorLog: runtime.HTTPErrorLog(slog.Default())}}
 	f.Server.Start()
 	t.Cleanup(f.Server.Close)
 	return f

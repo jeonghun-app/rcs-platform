@@ -360,7 +360,7 @@ func (p *Proxy) Drain(ctx context.Context) int {
 			// #310). The last answers may still sit in the transport's
 			// queues.
 			p.stopping.Store(true)
-			p.flushSender(time.Now().Add(drainSendWait))
+			p.flushSender(drainDeadline())
 			return 0
 		}
 		select {
@@ -399,6 +399,12 @@ func (p *Proxy) openContexts() []*respContext {
 // stop margin must leave room for it.
 const DrainSendWait = 2 * time.Second
 
+// drainDeadline is when a Drain that has answered or waited for its
+// requests stops waiting for what it sends to go out: DrainSendWait from
+// now. answerForStop's timer and both flushes take it, so the wait has one
+// length, which a test sees (QA of #437 and #472).
+func drainDeadline() time.Time { return time.Now().Add(drainSendWait) }
+
 // drainSendWait is DrainSendWait, which a test lengthens to show that
 // something else ends the wait.
 var drainSendWait = DrainSendWait
@@ -432,12 +438,15 @@ func (p *Proxy) answerForStop() int {
 			}
 		}
 	}
-	deadline := time.Now().Add(drainSendWait)
-	// One timer for all the answers, not one each (QA of #310).
-	expired := time.After(drainSendWait)
+	// One timer for all the answers, not one each (QA of #310), ending at
+	// the flush's deadline whether a test stands in for it or not (QA of
+	// #437 and #472).
+	deadline := drainDeadline()
+	until := func(t time.Time) <-chan time.Time { return time.After(time.Until(t)) }
 	if f := drainTimer.Load(); f != nil {
-		expired = (*f)(drainSendWait)
+		until = *f
 	}
+	expired := until(deadline)
 	for _, ch := range sent {
 		select {
 		case <-ch:
@@ -449,11 +458,11 @@ func (p *Proxy) answerForStop() int {
 	return int(answered.Load())
 }
 
-// drainTimer, empty but in tests, stands for time.After in answerForStop's
-// wait, so that a test fires the end of DrainSendWait itself rather than
-// bounding Drain by wall clock (#408). It is atomic since a Drain may
-// outlive the test that set it.
-var drainTimer atomic.Pointer[func(time.Duration) <-chan time.Time]
+// drainTimer, empty but in tests, stands for the timer of answerForStop's
+// wait, which ends at the deadline it is given, so that a test fires the
+// end of DrainSendWait itself rather than bounding Drain by wall clock
+// (#408). It is atomic since a Drain may outlive the test that set it.
+var drainTimer atomic.Pointer[func(deadline time.Time) <-chan time.Time]
 
 // flushSender waits, until deadline, for the CANCELs on their way to be
 // handed to the transaction layer, and for a *transport.Transport sender to
@@ -754,6 +763,7 @@ type Stats struct {
 	// Counters since New.
 	Branches            uint64 // branches started
 	TargetsDropped      uint64 // targets refused past MaxBranches
+	BreadthExceeded     uint64 // targets failed 440, no Max-Breadth left for them (RFC 5393)
 	Cancels             uint64 // CANCELs sent downstream
 	TimerC              uint64 // INVITE branches whose Timer C fired
 	TargetTimeouts      uint64 // branches whose Target.Timeout fired
@@ -779,7 +789,7 @@ type Stats struct {
 }
 
 type counters struct {
-	branches, targetsDropped, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
+	branches, targetsDropped, breadthExceeded, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
 	upstreamErrors, hookPanics, drained atomic.Uint64
 }
@@ -795,6 +805,7 @@ func (p *Proxy) Stats() Stats {
 		ContextBytes:           p.bytes.Load(),
 		Branches:               s.branches.Load(),
 		TargetsDropped:         s.targetsDropped.Load(),
+		BreadthExceeded:        s.breadthExceeded.Load(),
 		Cancels:                s.cancels.Load(),
 		TimerC:                 s.timerC.Load(),
 		TargetTimeouts:         s.targetTimeouts.Load(),

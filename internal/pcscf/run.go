@@ -48,6 +48,13 @@ type deps struct {
 	// icscfFirst and icscfTotal replace icscfFirstTimeout and
 	// icscfTotalTimeout when set.
 	icscfFirst, icscfTotal time.Duration
+	// serverTransactionBytes and contextBytes, when set, bound the
+	// transaction layer's and the proxy's memory below their defaults, so
+	// that a test meets each overload refusal.
+	serverTransactionBytes, contextBytes int64
+	// clock, if set, runs the proxy's transaction timers, a branch's
+	// Target.Timeout among them; nil is the system clock.
+	clock transaction.Clock
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
 }
@@ -170,6 +177,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
 		Metrics:   rt.Metrics,
+		// Zero: the defaults, and the system clock.
+		Transaction: transaction.Config{
+			Clock: d.clock, MaxServerTransactionBytes: d.serverTransactionBytes,
+		},
+		MaxContextBytes: d.contextBytes,
 	})
 	if err != nil {
 		return err
@@ -210,11 +222,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 	var tm transportMetrics
 	var lm layerMetrics
+	var om proxy.OverloadMeter
 	report := func() {
 		ts := tr.Stats()
 		tm.record(rt.Metrics, ts)
 		lm.record(rt.Metrics, ts, px.Layer().Stats())
 		if rt.Metrics != nil {
+			// The one overload counter of #56's alarms (#467).
+			om.Record(rt.Metrics, px)
 			rt.Metrics.Gauge(metricFlows, int64(fl.size()))
 			rt.Metrics.Gauge(metricRegistrations, int64(pc.registry.size()))
 		}

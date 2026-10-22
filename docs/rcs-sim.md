@@ -77,17 +77,23 @@ when requests are sent, not when answers come, so one slow answer on a loaded
 host does not fail the step, not even a slow 404 to the first request (#344).
 Two equal answers in a row were not enough: `ft-server` may still hold the
 broken upload, and about one resume in 800 got 503 (#77). Nothing in the
-upload-info document says the upload is released. Its lease runs for minutes when the process holding it has gone, so waiting
-for it is no option. The 300 ms stand for the time a device takes to come back
-on a network. The step reports how often it asked again (`retries`) and how
-many of those answers were 404 (`not_held`).
+upload-info document says the upload is released. Its lease runs for
+minutes when the process holding it has gone, so waiting for it is no
+option. The 300 ms stand for the time a device takes to come back on a
+network. The step reports how often it asked again (`retries`), how
+many of those answers were 404 (`not_held`), and how long after the step
+began it sent the last request that did not get the bytes it settled on
+(`showed_ms`, 0 if the first one got them): the time the server took to
+show what it keeps. The server reads what it holds somewhere between a
+request and its answer, so a slow answer, a 404 among them, adds nothing.
 
-`make e2e` asserts that `get_upload_info` took at most 2 s, its quiet time
-included. It also asserts that `ft-resume` resumed rather than uploading again,
-and that `busy_retries` is 0 on every step. So a server that is slow to keep a
-broken upload, or busy on an idle stack, fails the run. The bound is on
-elapsed time rather than on the number of answers, so a loaded host that
-answers slowly keeps the margin.
+`make e2e` asserts that `showed_ms` is reported and at most 2 s. It also asserts that
+`ft-resume` resumed rather than uploading again, and that `busy_retries` is 0 on every step. So a server that is slow to keep a
+broken upload, or busy on an idle stack, fails the run. The bound is on time
+rather than on the number of answers, so a loaded host that answers slowly
+keeps the margin, and on the time until the parts showed rather than the
+step's whole time, which the answers' own slowness and the quiet time's
+confirmation stretch to seconds on a loaded host (#286).
 
 The chat client connects actively, as a device behind NAT does: over TLS for
 an `msrps:` path, plain for `msrp:`. It binds the session with a bodiless SEND
@@ -250,9 +256,13 @@ request is left unanswered, so its sender's own transaction times out (RFC
 4320 §4.2, #363); a request whose far end's flow is gone, before it was sent
 or while it waited, gets 480 (the P-CSCF's 430 as an endpoint sees it, RFC
 5626 §5.3.1, #414), and one it fails to pass on otherwise 500 (RFC 3261 §16.7).
-The binding stays until it expires or is removed. A CANCEL is answered 200
-and passed on to the far end (§16.10); a cancelled INVITE that ends without
-the far end's answer, its flow gone or its timer out, gets 487.
+The binding stays until it expires or is removed. A CANCEL that matches an
+INVITE transaction still live, answered or not, is answered 200, and one
+that matches none 481 (§9.2). It is passed on to the far end (§16.10) once
+the far end has answered the INVITE provisionally (§9.1); a cancelled INVITE
+that the far end does not end within 64×T1 of that CANCEL, or that ends
+without its answer, its flow gone or its timer out, gets 487, as on the
+platform.
 
 ## Running it
 
@@ -305,7 +315,7 @@ the flag or variable, never its value.
 One JSON line per step on standard output:
 
 ```json
-{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":252,"detail":{"held":5242880,"not_held":1,"retries":2}}
+{"scenario":"ft-resume","step":"get_upload_info","ok":true,"ms":252,"detail":{"held":5242880,"not_held":1,"retries":2,"showed_ms":0}}
 {"scenario":"chat-core-originated","step":"keep-alive","ok":true,"ms":1500,"detail":{"bytes_while_quiet":514}}
 ```
 

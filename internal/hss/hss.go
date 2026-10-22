@@ -92,8 +92,8 @@ type HSS struct {
 	locksMu sync.Mutex
 	locks   map[string]*subscriptionLock
 	// onLockWait, if set, runs when a request starts waiting for a lock
-	// another holds: a test hook.
-	onLockWait func()
+	// another holds, with the context the wait ends with: a test hook.
+	onLockWait func(ctx context.Context)
 }
 
 // subscriptionLock is one subscription's lock and the requests that hold it
@@ -168,7 +168,7 @@ func (h *HSS) acquire(ctx context.Context, impi string) (unlock func(), waited b
 	default:
 	}
 	if h.onLockWait != nil {
-		h.onLockWait()
+		h.onLockWait(ctx)
 	}
 	select {
 	case l.sem <- struct{}{}:
