@@ -82,10 +82,11 @@
 // per context. MaxContextBytes bounds the request part over all contexts
 // together, and keeps it charged for 64*T1 after a 2xx, or while a branch's
 // CANCEL waits for an answer, since the transactions hold the request that
-// long; requests from client-facing listeners may use only the transaction
-// layer's ClientShare of it, as of the layer's bounds (#489). The responses
-// are bounded by MaxBranches and the transport's message limits. A context lives until every branch has ended. Timer C ends
-// a silent INVITE branch; one that receives a provisional response at least
+// long. Requests from client-facing listeners may use only the transaction
+// layer's ClientShare of it, as they may of the layer's own bounds (#489).
+// The responses are bounded by MaxBranches and the transport's message
+// limits. A context lives until every branch has ended. Timer C ends a
+// silent INVITE branch; one that receives a provisional response at least
 // every TimerC keeps its context, as ringing does, and holds a MaxContexts
 // slot as long. A Router, Resolver or hook that stalls is met by the
 // transaction layer's safety net (#156): the layer answers 500 once Timer C or

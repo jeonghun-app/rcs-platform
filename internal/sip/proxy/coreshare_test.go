@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
@@ -97,4 +98,39 @@ func TestTheProxyTakesTheLayersClientShare(t *testing.T) {
 	if len(h.seen) != 0 {
 		t.Error("the Router saw a request refused at the client share")
 	}
+}
+
+// ofSize is a MESSAGE that, held with one branch, takes exactly n bytes.
+func ofSize(t *testing.T, n int64) *sip.Request {
+	t.Helper()
+	req := numbered(t, 1, "")
+	req.Body = []byte(strings.Repeat("x", int(n-held(req))))
+	if held(req) != n {
+		t.Fatalf("a request of %d bytes takes %d", n, held(req))
+	}
+	return req
+}
+
+// The client share is rounded up and reached, not passed: at 1843 bytes it
+// is ceil(0.8 * 1843) = 1475, and a client request that takes exactly that
+// is forwarded, where one byte more is refused (#511 code review).
+func TestAClientRequestMayTakeTheClientShareExactly(t *testing.T) {
+	for n, want := range map[int64][]int{1475: nil, 1476: codes(503)} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			h := newHarness(t, Config{MaxContextBytes: 1843})
+			h.p.Receive(transport.Inbound{Message: ofSize(t, n), Source: clientSource})
+			h.settle()
+			check(t, "upstream", h.upstream(), want)
+		})
+	}
+}
+
+// A share of 1 with the largest byte bound lets clients use all of it: the
+// client bound does not leave the int64 range (#511 code review).
+func TestAWholeClientShareOfTheLargestBoundAdmitsClients(t *testing.T) {
+	h := newHarness(t, Config{MaxContextBytes: math.MaxInt64, Transaction: transaction.Config{ClientShare: 1}})
+	h.p.Receive(transport.Inbound{Message: numbered(t, 1, ""), Source: clientSource})
+	h.settle()
+	h.one()
+	check(t, "upstream", h.upstream(), nil)
 }

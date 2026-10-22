@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -273,8 +272,7 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
 	}
-	// Rounded up as the layer rounds its share, so that the two agree.
-	p.clientBytes = int64(math.Ceil(float64(cfg.MaxContextBytes) * cmp.Or(tcfg.ClientShare, transaction.DefaultClientShare)))
+	p.clientBytes = transaction.ClientShareOf(cfg.MaxContextBytes, cmp.Or(tcfg.ClientShare, transaction.DefaultClientShare))
 	for _, tag := range cfg.Supported {
 		p.supported[strings.ToLower(tag)] = true
 	}
