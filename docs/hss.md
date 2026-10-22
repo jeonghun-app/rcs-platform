@@ -421,18 +421,28 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   default 60 s start-up fits `startPeriod` 60, `interval` 15, `retries` 3
   (105 s). `startPeriod` is at most 300 s, so `HSS_START_TIMEOUT` is refused
   above 240 s.
-- Inbound Cx connections: one from an address outside every
-  `HSS_DIAMETER_PEER_NETWORKS` CIDR is closed as it is accepted, with no CER
-  exchange, and logged as `diameter connection closed: source outside every
-  accept rule's networks` at most once a minute; a peer missing from the
-  configured networks shows up there. With the variable unset (dev only),
-  every address may connect. Connections still in the CER exchange
-  are capped at 64 in all and 4 from one source address, so a host that
-  opens connections and sends nothing leaves room for the S-CSCFs; a refused
-  one is logged once until the count falls (`too many have not completed
-  CER`, `too many from one source have not completed CER`). Neither cap is
-  configurable: an S-CSCF task holds one connection and reconnects one at a
-  time.
+- Inbound Cx connections:
+  - **Outside the peer networks.** A connection from an address outside every
+    `HSS_DIAMETER_PEER_NETWORKS` CIDR is closed as it is accepted, with no CER
+    exchange. With the variable unset (dev only), every address may connect.
+  - **In the CER exchange.** Connections still in the exchange are capped at
+    64 in all and 4 from one source address. A host that opens connections and
+    sends nothing then leaves room for the CSCFs, S-CSCF and I-CSCF. Neither
+    cap is configurable: a CSCF task holds one connection and reconnects one
+    at a time.
+  - **After the exchange.** Connections that completed CER count against
+    neither cap. A host inside the peer networks that completes the exchange
+    again and again is not bounded yet (#617). A host with several addresses
+    inside the networks gets 4 places per address, within the 64.
+  - **Log lines.** Each kind of refusal logs a line a minute at most, and the
+    per-source kind a line a minute for each source. Each line carries
+    `suppressed`, the refusals left out since the one before:
+    - `diameter connection closed: source outside every accept rule's networks`;
+      a peer missing from the configured networks shows up there, or at least
+      in its count;
+    - `diameter connections refused: too many have not completed CER`;
+    - `diameter connections refused: too many from one source have not
+      completed CER`.
 - The API logs one `audit: provisioning request` line per request: operation,
   caller, token slot (`current` or `next`), status and the masked IMPI.
 - Metrics: `cx.<command>` (latency), `cx.<command>.<result>` (`e` before an
