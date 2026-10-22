@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -201,6 +202,7 @@ func FuzzHeaderValues(f *testing.F) {
 		{"Event", func(h *Header) (any, error) { return h.Event() }, func(v any) []string { return []string{v.(Event).String()} }},
 		{"Subscription-State", func(h *Header) (any, error) { return h.SubscriptionState() }, func(v any) []string { return []string{v.(SubscriptionState).String()} }},
 		{"Session-Expires", func(h *Header) (any, error) { return h.SessionExpires() }, func(v any) []string { return []string{v.(SessionExpires).String()} }},
+		{"Max-Breadth", func(h *Header) (any, error) { return h.MaxBreadth() }, func(v any) []string { return []string{strconv.Itoa(v.(int))} }},
 		{"Min-SE", func(h *Header) (any, error) { return h.MinSE() }, func(v any) []string { return []string{v.(MinSE).String()} }},
 		{"Reason", func(h *Header) (any, error) { return h.Reason() }, func(v any) []string {
 			var out []string

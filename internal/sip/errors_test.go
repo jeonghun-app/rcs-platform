@@ -117,6 +117,7 @@ func TestErrorsNeverContainInput(t *testing.T) {
 		func() error { _, err := h("Call-ID", bad+" "+bad).CallID(); return err },
 		func() error { _, err := h("CSeq", "1 "+bad+" x").CSeq(); return err },
 		func() error { _, err := h("Max-Forwards", bad).MaxForwards(); return err },
+		func() error { _, err := h("Max-Breadth", bad).MaxBreadth(); return err },
 		func() error { _, err := h("Contact", "<sip:a@b>;"+bad+"=").Contact(); return err },
 		func() error {
 			cs, _ := h("Contact", "<sip:a@b>;expires="+bad).Contact()

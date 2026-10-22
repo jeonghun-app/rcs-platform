@@ -74,7 +74,7 @@ func FuzzForwarding(f *testing.F) {
 		if routes, err := in.Message.Header.Route(); err == nil && len(routes) > 0 && p.isSelf(routes[0].URI) {
 			t.Fatal("a Route naming the proxy is left on top")
 		}
-		fwd, dst, err := p.buildBranch(context.Background(), in, &dec, Target{URI: in.Message.URI}, true)
+		fwd, dst, err := p.buildBranch(context.Background(), in, &dec, Target{URI: in.Message.URI}, true, MaxBreadth)
 		if err != nil {
 			return
 		}

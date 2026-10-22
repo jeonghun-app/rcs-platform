@@ -754,6 +754,7 @@ type Stats struct {
 	// Counters since New.
 	Branches            uint64 // branches started
 	TargetsDropped      uint64 // targets refused past MaxBranches
+	BreadthExceeded     uint64 // targets failed 440, no Max-Breadth left for them (RFC 5393)
 	Cancels             uint64 // CANCELs sent downstream
 	TimerC              uint64 // INVITE branches whose Timer C fired
 	TargetTimeouts      uint64 // branches whose Target.Timeout fired
@@ -779,7 +780,7 @@ type Stats struct {
 }
 
 type counters struct {
-	branches, targetsDropped, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
+	branches, targetsDropped, breadthExceeded, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
 	upstreamErrors, hookPanics, drained atomic.Uint64
 }
@@ -795,6 +796,7 @@ func (p *Proxy) Stats() Stats {
 		ContextBytes:           p.bytes.Load(),
 		Branches:               s.branches.Load(),
 		TargetsDropped:         s.targetsDropped.Load(),
+		BreadthExceeded:        s.breadthExceeded.Load(),
 		Cancels:                s.cancels.Load(),
 		TimerC:                 s.timerC.Load(),
 		TargetTimeouts:         s.targetTimeouts.Load(),

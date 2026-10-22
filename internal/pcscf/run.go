@@ -48,6 +48,13 @@ type deps struct {
 	// icscfFirst and icscfTotal replace icscfFirstTimeout and
 	// icscfTotalTimeout when set.
 	icscfFirst, icscfTotal time.Duration
+	// serverTransactionBytes and contextBytes, when set, replace the
+	// transaction layer's and the proxy's memory bounds cfg gives, so that
+	// a test meets each overload refusal on its own.
+	serverTransactionBytes, contextBytes int64
+	// clock, if set, runs the proxy's transaction timers, a branch's
+	// Target.Timeout among them; nil is the system clock.
+	clock transaction.Clock
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
 	// transportConfig, if set, sees the transport's configuration before
@@ -172,6 +179,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		router = pc
 	}
 	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
+	tcfg.Clock = d.clock
+	if d.serverTransactionBytes != 0 {
+		tcfg.MaxServerTransactionBytes = d.serverTransactionBytes
+	}
+	if d.contextBytes != 0 {
+		maxContextBytes = d.contextBytes
+	}
 	px, err := proxy.New(tr, proxy.Config{
 		Self:            selfURIs(cfg, int(coreAddr.Port())),
 		Router:          router,
@@ -222,11 +236,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	}
 	var tm transportMetrics
 	var lm layerMetrics
+	var om proxy.OverloadMeter
 	report := func() {
 		ts := tr.Stats()
 		tm.record(rt.Metrics, ts)
 		lm.record(rt.Metrics, ts, px.Layer().Stats())
 		if rt.Metrics != nil {
+			// The one overload counter of #56's alarms (#467).
+			om.Record(rt.Metrics, px)
 			rt.Metrics.Gauge(metricFlows, int64(fl.size()))
 			rt.Metrics.Gauge(metricRegistrations, int64(pc.registry.size()))
 		}
