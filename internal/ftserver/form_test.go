@@ -307,10 +307,15 @@ func TestMaximumSizeAdversarialFormParsesInLinearTime(t *testing.T) {
 	// loaded host, which one small parse against one large did not (#190:
 	// 3.9 s against 76 ms at load 569). The time is the process's CPU time,
 	// as in internal/cpim and internal/sip/reginfo, so time spent waiting
-	// for a CPU is not counted. Each of three attempts takes the best of
-	// three of each; only all three over the bound fail. Under the race
-	// detector, which times its own instrumentation as much as the parser,
-	// only allocations are compared.
+	// for a CPU is not counted. Linear code comes to at most about 1.13
+	// (QA of #513), so the bound is 2, which a moderate quadratic term
+	// already passes. A first timing of each side fails at once when it is
+	// far past that, as in internal/cpim, so a strongly quadratic parser
+	// fails with its numbers rather than at the package's timeout. Then each
+	// of three attempts times each side three times and keeps the shortest;
+	// only all three over the bound fail. Under the race detector, which
+	// times its own instrumentation as much as the parser, only allocations
+	// are compared.
 	cpu := func() time.Duration {
 		var ru syscall.Rusage
 		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
@@ -333,9 +338,10 @@ func TestMaximumSizeAdversarialFormParsesInLinearTime(t *testing.T) {
 		runtime.ReadMemStats(&after)
 		return after.TotalAlloc - before.TotalAlloc
 	}
-	// Streaming allocates about as much either way; a parser that copies
-	// what it has read so far allocates eight times as much for the one.
-	if large, small := allocated(once), allocated(inParts); large > 4*small+1<<20 {
+	// Streaming allocates a few KiB either way; a parser that copies what it
+	// has read so far allocates eight times as much for the one, and at the
+	// maximum size far more than the 1 MiB of slack.
+	if large, small := allocated(once), allocated(inParts); large > small+1<<20 {
 		t.Fatalf("the maximum size allocated %d bytes against %d for the same total in eighths: not linear", large, small)
 	}
 	if raceEnabled {
@@ -353,10 +359,14 @@ func TestMaximumSizeAdversarialFormParsesInLinearTime(t *testing.T) {
 		}
 		return d
 	}
+	const bound, farPast = 2, 6
+	if large, small := timed(once), timed(inParts); large > farPast*small {
+		t.Fatalf("the maximum size took %v of CPU against %v for the same total in eighths, more than %d times: not linear", large, small, farPast)
+	}
 	var large, small time.Duration
 	for range 3 {
 		large, small = best(once), best(inParts)
-		if large <= 4*small {
+		if large <= bound*small {
 			return
 		}
 	}
