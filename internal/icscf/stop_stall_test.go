@@ -184,7 +184,11 @@ func TestTheFillDoesNotStartAgainOnceTheQueueHoldsBytes(t *testing.T) {
 			return near, nil
 		}, every(100*time.Millisecond), time.Minute, func() []map[string]any { return nil })
 	}()
-	<-done
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second): // a hang guard; the patience is 100 ms
+		t.Fatal("the fill neither failed nor finished on a queue that never moves")
+	}
 	if !strings.Contains(ft.fatal, "holds 100 bytes") || dials != 1 {
 		t.Errorf("after %d connections the fill failed with %q, want a stall on the first", dials, ft.fatal)
 	}
