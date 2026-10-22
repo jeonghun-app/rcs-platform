@@ -374,6 +374,11 @@ type Transport struct {
 	listeners []*listener
 	dialing   map[reuseKey]*dialCall
 	closed    bool
+	// dials is the context every dial runs under, which Close cancels, so
+	// that a send dialling at the stop fails at once rather than after
+	// DialTimeout, holding up its caller and a transaction's lock (#462).
+	dials       context.Context
+	cancelDials context.CancelFunc
 	// accepted counts accepted connections, from accept to close, against
 	// MaxConnections; each listener counts its own as well.
 	accepted int
@@ -413,6 +418,7 @@ func New(cfg Config, h Handler) (*Transport, error) {
 		dialing: make(map[reuseKey]*dialCall),
 		pending: make(map[net.Conn]struct{}),
 	}
+	t.dials, t.cancelDials = context.WithCancel(context.Background())
 	t.budget.max = int64(cfg.MaxQueuedBytes)
 	if cfg.OnFlowClosed != nil {
 		t.closures = newClosureQueue(cfg.OnFlowClosed)
@@ -599,6 +605,8 @@ func (t *Transport) StopListening(names ...string) {
 // Close stops every listener and closes every connection, including those still
 // in their PROXY header or TLS handshake, then waits for the goroutines of the
 // transport to finish. Messages being delivered to the handler complete first.
+// A dial in progress, TLS handshake included, is cut: the sends waiting on it
+// fail with ErrClosed at once.
 func (t *Transport) Close() error {
 	t.mu.Lock()
 	if t.closed {
@@ -606,6 +614,7 @@ func (t *Transport) Close() error {
 		return nil
 	}
 	t.closed = true
+	t.cancelDials()
 	lis := t.listeners
 	for c := range t.pending {
 		c.Close()
