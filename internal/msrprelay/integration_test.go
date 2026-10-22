@@ -18,6 +18,10 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/dynamostore"
 )
 
+// storeHangGuard bounds a DynamoDB Local call in the integration tests: a
+// store that does not answer in it is stuck, not slow.
+const storeHangGuard = 2 * time.Minute
+
 // TestIntegrationTwoRelayTasksShareBindingsInDynamoDB runs the cross-task
 // rules end to end on DynamoDB Local (make test-integration): a binding
 // allocated through the control API is bridged by whichever task the client
@@ -47,7 +51,11 @@ func TestIntegrationTwoRelayTasksShareBindingsInDynamoDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r := newRigWithStore(t, 2, st)
+	// The store's calls are bounded by the hang guard only: the test is of
+	// the cross-task rules, and DynamoDB Local on a loaded host took longer
+	// than the rig's 5 s, so the control API answered 503 (#255), as the
+	// hss tests' Cx timeout did (#200, #225).
+	r := newRigWithStore(t, 2, st, storeTimeout(storeHangGuard))
 
 	// Allocated on one task, bridged on the other.
 	b := r.allocate(map[string]any{"client_endpoint_path": []string{clientURI}})
