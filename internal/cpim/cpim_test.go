@@ -5,7 +5,9 @@ import (
 	"errors"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -350,18 +352,41 @@ func TestContentHeaderLimitsCountEveryLineAndByte(t *testing.T) {
 // TestFoldedContentHeadersCostLinearTime guards against joining continuation
 // lines by repeated concatenation, which made a 1 MiB message cost gigabytes
 // of allocation. With every limit raised to admit the worst case, parsing must
-// allocate a small multiple of the input; the time bound is two orders of
-// magnitude above what a linear parse takes, so it cannot flake.
+// allocate a small multiple of the input, which load does not change.
+//
+// Time is measured too, for a quadratic step that allocates nothing, but
+// compared rather than bounded (#289: a 5 s bound failed at host load 225
+// under -race). The same total of input is parsed both ways: the maximum
+// size once, and a 64th of it 64 times. Linear parsing takes about as long
+// for either, quadratic 64 times as long for the one, so a bound of 8
+// between them needs no slack; and as both take about as long, a loaded
+// host stretches both about alike, which it did not for one small parse
+// against one large one. The time is the process's CPU time, as in
+// internal/sip/reginfo (#317): a CPU quota throttles a timing in wall time
+// by up to 50 times, and a short one now and then not at all, which no
+// bound of 8 or 32 survives (review of #331). The best of five of each is
+// taken, and only three attempts in a row over the bound fail the test.
+// Under the race detector, which times its own instrumentation as much as
+// the parser, only allocations are compared, as in internal/sip/reginfo
+// (#263).
 func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	data := foldedHeaders(DefaultMaxSize - 64)
 	l := Limits{MaxSize: DefaultMaxSize, MaxHeaders: DefaultMaxSize, MaxContentHeaderSize: DefaultMaxSize}
 
+	// cpu is the process's CPU time, GC included.
+	cpu := func() time.Duration {
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			t.Fatal(err)
+		}
+		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+	}
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
-	start := time.Now()
+	start := cpu()
 	m, err := l.Parse(data)
-	elapsed := time.Since(start)
+	first := cpu() - start
 	runtime.ReadMemStats(&after)
 	if err != nil {
 		t.Fatal(err)
@@ -369,12 +394,53 @@ func TestFoldedContentHeadersCostLinearTime(t *testing.T) {
 	if n := len(m.ContentType()); n < DefaultMaxSize/2 {
 		t.Fatalf("ContentType is only %d bytes; the input did not exercise folding", n)
 	}
+	// A parse that copies costs time too; once its allocations say so,
+	// timing it more only makes the failure slow to come (code review).
 	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8*uint64(len(data)) {
-		t.Errorf("parsing %d bytes allocated %d bytes", len(data), allocated)
+		t.Fatalf("parsing %d bytes allocated %d bytes", len(data), allocated)
 	}
-	if elapsed > 5*time.Second {
-		t.Errorf("parsing %d bytes took %v", len(data), elapsed)
+	if raceEnabled {
+		return
 	}
+	small := foldedHeaders(DefaultMaxSize/64 - 64)
+	parse := func(b []byte, times int) time.Duration {
+		start := cpu()
+		for range times {
+			if _, err := l.Parse(b); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return cpu() - start
+	}
+	// Far past anything load does to two timings that last about as long
+	// fails the test without parsing the whole input fifteen times more at
+	// quadratic cost (code review). Each side is timed three times, in
+	// turn, and the medians compared, so one timing that went wrong either
+	// way decides nothing: one stretched yardstick sent a quadratic parser
+	// down the slow path, which took 433 s once (code review).
+	const bound, farPast = 8, 4 * 8
+	larges, bases := []time.Duration{first}, []time.Duration{parse(small, 64)}
+	for range 2 {
+		larges = append(larges, parse(data, 1))
+		bases = append(bases, parse(small, 64))
+	}
+	slices.Sort(larges)
+	slices.Sort(bases)
+	if large, base := larges[1], bases[1]; large > farPast*base {
+		t.Fatalf("parsing %d bytes once took %v (median of three), a 64th of it 64 times %v: not linear", len(data), large, base)
+	}
+	var smallTime, largeTime time.Duration
+	for range 3 {
+		smallTime, largeTime = time.Duration(1<<62), time.Duration(1<<62)
+		for range 5 {
+			smallTime = min(smallTime, parse(small, 64))
+			largeTime = min(largeTime, parse(data, 1))
+		}
+		if largeTime <= bound*smallTime {
+			return
+		}
+	}
+	t.Errorf("parsing %d bytes once took %v, a 64th of it 64 times %v, three times over: not linear", len(data), largeTime, smallTime)
 }
 
 func TestHeaderNamesAreCaseSensitive(t *testing.T) {
