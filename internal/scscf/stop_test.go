@@ -32,7 +32,16 @@ type dprConn struct {
 	net.Conn
 	swallow bool
 	seen    *atomic.Int64
-	mu      sync.Mutex
+	// lateClose, if set, is how long Close takes once a DPR was written.
+	lateClose time.Duration
+	mu        sync.Mutex
+}
+
+func (c *dprConn) Close() error {
+	if c.lateClose > 0 && c.seen.Load() > 0 {
+		time.Sleep(c.lateClose)
+	}
+	return c.Conn.Close()
 }
 
 func (c *dprConn) Write(b []byte) (int, error) {
@@ -83,6 +92,38 @@ func dprDial(hss *diameterHSS, swallow bool, seen *atomic.Int64) func(ctx contex
 			return nil, err
 		}
 		return &dprConn{Conn: c, swallow: swallow, seen: seen}, nil
+	}
+}
+
+// TestAStopEndsInTimeThoughTheGoodbyeEndsLate (#502): on a loaded host the
+// process may not run for a second, and the goodbye's wait for a DPA that
+// does not come was seen to end up to 1.0 s past its deadline. A Cx
+// connection whose close takes that long after the DPR stands for it: run
+// still returns within its budget, DrainTimeout plus stopMargin.
+func TestAStopEndsInTimeThoughTheGoodbyeEndsLate(t *testing.T) {
+	const late = time.Second
+	hss := startHSS(t)
+	var dprs atomic.Int64
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
+		c.CxTimeout = 25 * time.Second
+		dial := dprDial(hss, true, &dprs)
+		d.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			nc, err := dial(ctx, network, addr)
+			if dc, ok := nc.(*dprConn); ok {
+				dc.lateClose = late
+			}
+			return nc, err
+		}
+	})
+	start := time.Now()
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if took, budget := time.Since(start), testConfig().DrainTimeout+stopMargin; took >= budget {
+		t.Errorf("with the goodbye %v late, the stop took %v, at or past its budget of %v", late, took, budget)
+	}
+	if dprs.Load() == 0 {
+		t.Fatal("no DPR was written: the test tested nothing")
 	}
 }
 
@@ -194,9 +235,9 @@ func (b *blackholeDialer) DialContext(ctx context.Context, network, address stri
 // server whose address drops the SYN, each dial lasting the dial timeout.
 // The one dialling when the stop gives up does not end with its context
 // (#462), but the transport's Close cuts it (#474), so the stop ends before
-// its deadline although the dial timeout, 2.5 s, is longer than the 2 s
-// step 5 waits for the sends. The stop is timed so that, with a
-// closeMargin of 1 s, a dial would begin just before the waits end.
+// its deadline although the dial timeout, 2.5 s, is longer than the 1 s
+// step 5 waits for the sends. The stop is timed so that a dial is under
+// way as the waits end.
 func TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling(t *testing.T) {
 	const dialTimeout = 2500 * time.Millisecond
 	hss := startHSS(t)
@@ -214,10 +255,9 @@ func TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling(t *testing
 	for n := 2; n <= 4; n++ {
 		p.registerFully(t, deviceAt("127.0.0.1:5070", n), 600)
 	}
-	// The dials begin at dialStart plus multiples of dialTimeout: the
-	// third at 5 s. With the stop at 0.7 s, it begins 4.3 s after the
-	// stop, before waits that end at 4.5 s with a closeMargin of 1 s, and
-	// after those that end at 2.5 s with 3 s.
+	// The dials begin at dialStart plus multiples of dialTimeout. With the
+	// stop at 0.7 s, the second begins 1.8 s after the stop and is under
+	// way when the waits end, at 2.5 s, and the transport closes.
 	time.Sleep(time.Until(dialStart.Add(700 * time.Millisecond)))
 	start := time.Now()
 	if err := r.stop(); err != nil {
@@ -346,9 +386,9 @@ func TestTheWorstStopEndsBeforeTheRuntimesDeadline(t *testing.T) {
 		}
 		// run itself returns before the deadline, which the exit status
 		// shows only when the runtime's timer is on time (#479). It ends
-		// its own work returnMargin inside it, so that the closes after,
-		// 0.4 s at most under the race detector on a loaded host, fit;
-		// without the margin it returns past the deadline, every time.
+		// its own work returnMargin inside it, so that the closes after
+		// and a late end of its last wait fit (#502); without the margin it
+		// returns past the deadline, every time.
 		if took := time.Duration(returned.Load() - cancelled.UnixNano()); took >= shutdown {
 			t.Errorf("run returned %v after the cancel, at or past the deadline of %v", took, shutdown)
 		}
@@ -413,12 +453,15 @@ func TestTheCxGoodbyeHasItsTimeWhateverTheRouterWaitsFor(t *testing.T) {
 	}
 }
 
-// TestTheCloseMarginHoldsADialAndTheGoodbye: what step 5 of the stop has
-// after the waits holds a dial begun as they ended, and then the goodbye
-// (docs/scscf.md, Stop).
-func TestTheCloseMarginHoldsADialAndTheGoodbye(t *testing.T) {
-	if closeMargin < coreDialTimeout+goodbyeMargin || returnMargin+closeMargin >= stopMargin {
-		t.Errorf("closeMargin %v, coreDialTimeout %v, goodbyeMargin %v, returnMargin %v, stopMargin %v",
-			closeMargin, coreDialTimeout, goodbyeMargin, returnMargin, stopMargin)
+// TestTheStopMarginsLeaveEveryStepItsTime: steps 3 and 4 have part of
+// stopMargin, step 5 has time for the sends before the goodbye's, and the
+// return holds the late end of a wait on a loaded host, 1.0 s as seen
+// (docs/scscf.md, Stop; #502). A dial need not fit in the sends' time: the
+// transport's Close cuts it (#474,
+// TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling).
+func TestTheStopMarginsLeaveEveryStepItsTime(t *testing.T) {
+	if closeMargin <= goodbyeMargin || returnMargin+closeMargin >= stopMargin || returnMargin <= time.Second {
+		t.Errorf("closeMargin %v, goodbyeMargin %v, returnMargin %v, stopMargin %v",
+			closeMargin, goodbyeMargin, returnMargin, stopMargin)
 	}
 }

@@ -58,19 +58,22 @@ const (
 	// notifier's queues, the Cx client and the transport, inside
 	// RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
-	// returnMargin is the end of stopMargin Run keeps for returning, the
-	// proxy's Close above all, so that it ends before the runtime's own
-	// deadline, which the default drain puts at the end of stopMargin
-	// (#439 QA).
-	returnMargin = 500 * time.Millisecond
+	// returnMargin is the end of stopMargin Run keeps for returning, so that
+	// it ends before the runtime's own deadline, which the default drain
+	// puts at the end of stopMargin (#439 QA). It holds the proxy's Close
+	// and the late end of the last wait: on a loaded host the process may
+	// not run for a second, and the goodbye's wait was seen to end up to
+	// 1.0 s past its deadline, a 20 ms timer to wake up to 1.2 s late
+	// (#502).
+	returnMargin = 1500 * time.Millisecond
 	// closeMargin is the part of stopMargin before returnMargin kept for
 	// the closes: the transport's, the sends the router gave up on, and the
 	// Cx client's goodbye to the HSS. The sends get all of it but
-	// goodbyeMargin, as long as coreDialTimeout. The transport's Close cuts
-	// a dial in progress (#474); were it not to, a send that began to open
-	// its connection just before the waits ended would still be done
-	// within that time (#439 code review).
-	closeMargin = 3 * time.Second
+	// goodbyeMargin: the transport's Close cuts a dial in progress (#474),
+	// so they return at once, within 1 ms in 86 of 90 loaded stops and
+	// 1.0 s at the slowest (#502). One still under way is waited for by the
+	// proxy's Close.
+	closeMargin = 2 * time.Second
 	// goodbyeMargin is the end of closeMargin the Cx client's goodbye (DPR)
 	// always has, however long the router's sends take to return (#502).
 	goodbyeMargin = time.Second

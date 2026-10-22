@@ -156,16 +156,15 @@ On `SIGTERM`, `scscf` keeps its listener open and runs these steps in order:
 5. It closes the transport, disconnects from the HSS tasks (DPR), and closes
    the proxy.
 
-The stop ends by its deadline, `SCSCF_DRAIN_TIMEOUT` plus 4.5 s from the
-`SIGTERM`: half a second inside `RCS_SHUTDOWN_TIMEOUT` at the default drain,
-for the proxy's Close and the return. Steps 3 and 4 end 3 s before that
-deadline, and step 5 has those 3 s. Closing the transport cuts a connection
-still opening to a peer. In step 5, the third-party REGISTERs given up on in
-step 3 are waited for once the transport has closed, for 2 s, until 1 s
-before the deadline. That is as long as a connection takes to open or fail,
-so a REGISTER that began to open one as the waits ended would be done within
-it even if the close did not cut it. Then the Cx client says goodbye: it
-always has that last second, however slow the REGISTERs are to return.
+The stop ends by its deadline, `SCSCF_DRAIN_TIMEOUT` plus 3.5 s from the
+`SIGTERM`: 1.5 s inside `RCS_SHUTDOWN_TIMEOUT` at the default drain, for the
+proxy's Close and the return, and for the last wait to end late on a loaded
+host, where the process may not run for a second. Steps 3 and 4 end 2 s
+before that deadline, and step 5 has those 2 s. Closing the transport cuts a
+connection still opening to a peer, so the third-party REGISTERs given up on
+in step 3 return at once; they are waited for for 1 s, until 1 s before the
+deadline. Then the Cx client says goodbye: it always has that last second,
+however slow the REGISTERs are to return.
 
 An application server that missed a third-party REGISTER at a stop hears of
 the registration at its next refresh. What the stop leaves undone is the other
