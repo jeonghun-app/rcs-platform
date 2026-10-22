@@ -149,7 +149,7 @@ func TestWaitForSaysWhetherWhatAStopGaveUpOnHasReturned(t *testing.T) {
 func TestAStopDoesNotCountAnEvictedRegistrationAgain(t *testing.T) {
 	e := newEnv(t)
 	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
-	rt := e.router(nil, withSender(s), func(c *Config) { c.MaxThirdParty = 1 })
+	rt := e.router(nil, withSender(s), holdingLong, func(c *Config) { c.MaxThirdParty = 1 })
 	rt.Registered(bg, otherSet(t, e, 0))
 	recv(t, s.inside)
 	for n := 1; n < queuedPerServer; n++ {
