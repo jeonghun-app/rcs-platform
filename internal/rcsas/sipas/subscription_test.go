@@ -653,6 +653,10 @@ func TestCloseWaitsForTheLastNotifysAnswer(t *testing.T) {
 	case <-time.After(waitFor):
 		t.Fatal("Close did not return after the answer")
 	}
+	// It waited, and did not give up (review of #457).
+	if n := g.metrics.get("sip.subscription.unfinished_at_stop"); n != 0 {
+		t.Fatalf("Close counted %d subscriptions unfinished, whose last NOTIFY was answered", n)
+	}
 }
 
 // QA on #340: a REFER's implicit subscription ends with the outcome of the
@@ -940,13 +944,19 @@ func TestNoNotifyAfterLeaveEvenWithAConcurrentChange(t *testing.T) {
 }
 
 // QA on #340: Close keeps its bound while a SUBSCRIBE holds its
-// subscription's lock to read the roster from a slow store: it gives up on
-// that subscription, which it counts, and returns while the read still
-// holds the lock. Close's own bound is real time; the test waits for it
-// under the hang guard and asks Close's count, not the clock (#432: Close
-// past 100 ms + 500 ms of wall clock on a loaded host).
+// subscription's lock to read the roster from a slow store. The bound runs
+// on a clock the test fires (closeClock, #432): Close arms closeWait for
+// the subscription, and no other length, has not returned before it fires,
+// returns once it has, and counts the subscription it gave up on.
 func TestCloseIsBoundedWhileARosterReadIsHeld(t *testing.T) {
-	g := newGroupRig(t, bob)
+	clk := newFakeClock()
+	g := newGroupRigWith(t, Config{closeClock: clk}, bob)
+	wait := g.a.srv.closeWait()
+	t.Cleanup(func() {
+		for _, d := range clk.armed() {
+			clk.fire(d)
+		}
+	})
 	hold, entered := make(chan struct{}), make(chan struct{}, 1)
 	release := sync.OnceFunc(func() { close(hold) })
 	defer release()
@@ -962,12 +972,20 @@ func TestCloseIsBoundedWhileARosterReadIsHeld(t *testing.T) {
 	<-entered
 	closed := make(chan struct{})
 	go func() { g.a.srv.Close(); close(closed) }()
+	// The bound armed is closeWait, not more: Close takes at most twice it.
+	clk.waitArmed(t, wait)
+	select {
+	case <-closed:
+		t.Fatal("Close returned before its bound for the subscription was over")
+	default:
+	}
+	clk.fire(wait)
 	select {
 	case <-closed:
 	case <-time.After(waitFor):
 		t.Fatal("Close waited for the roster read that holds the subscription's lock")
 	}
-	if n := g.metrics.get("sip.close.subscription_unfinished"); n != 1 {
+	if n := g.metrics.get("sip.subscription.unfinished_at_stop"); n != 1 {
 		t.Fatalf("Close gave up on %d subscriptions, want the one whose lock is held", n)
 	}
 }
