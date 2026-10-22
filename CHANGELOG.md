@@ -70,11 +70,6 @@ Two services can run today, `ft-server` and `msrp-relay`; the IMS core
   per-source limits. See [docs/msrp-relay.md](docs/msrp-relay.md). (#52)
 - PROXY protocol v2 parser (`internal/proxyproto`), shared by the services
   behind the NLB. (#52)
-- `scscf`: the Serving-CSCF as a service (`cmd/scscf`). It wires the
-  registrar, the reg event notifier and the iFC router to the shared state
-  in DynamoDB, the Cx client and one SIP core listener. It names itself to
-  the HSS by its service name, and stops in order within the shutdown. See
-  [docs/scscf.md](docs/scscf.md). (#14)
 
 ### Changed
 
@@ -104,12 +99,6 @@ Two services can run today, `ft-server` and `msrp-relay`; the IMS core
   a real failure still fails because it leaves a corpus entry. (#31)
 - The MSRP loopback TCP tests wait on progress rather than fixed deadlines, so
   slow CI runners no longer fail them. (#55)
-- `HSS_RCS_AS_URI` defaults to `sip:rcs-as.<namespace>;transport=tcp`, as
-  rcs-as listens on TCP only, and takes at most a `transport` parameter of
-  `tcp` or `tls`. `pcscf`'s core port comes from the shared
-  `RCS_PCSCF_CORE_PORT` (default 5070), which `scscf` also reads. (#14)
-- A reg event SUBSCRIBE whose dialog's first hop is not the P-CSCF of a live
-  binding of the set is refused 403. (#14)
 
 ### Security
 
