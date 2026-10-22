@@ -221,20 +221,14 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '_'
 	}
 	sixToFour := netip.MustParsePrefix("2002::/16")
-	f.Fuzz(func(t *testing.T, s string) {
-		got := TruncateIPsIn(s)
-		if again := TruncateIPsIn(got); again != got {
-			t.Fatalf("not idempotent: %q -> %q -> %q", s, got, again)
-		}
-		if !strings.ContainsAny(s, ".:[") && got != s {
-			t.Fatalf("%q changed to %q", s, got)
-		}
-		// The oracle reads addresses its own way, with netip and not the
-		// code under test: every maximal run of [0-9A-Fa-f:.] in the
-		// output, and every part of one after a colon, that netip reads
-		// as an address with the dots or colons around it trimmed, is a
-		// network as wide as a truncated one or text the input did not
-		// hold, unless the run is part of a longer word.
+	// leftWhole is the oracle, which reads addresses its own way, with
+	// netip and not the code under test: every maximal run of
+	// [0-9A-Fa-f:.] in got, and every part of one after a colon, that
+	// netip reads as an address with the dots or colons around it
+	// trimmed, is a network as wide as a truncated one or text the input
+	// s did not hold, unless the run is part of a longer word. It returns
+	// the addresses of s that got leaves whole.
+	leftWhole := func(s, got string) (left []string) {
 		for _, m := range run.FindAllStringIndex(got, -1) {
 			if m[1] < len(got) && letter(got[m[1]]) {
 				continue // a longer word, as 1.2.3.4x
@@ -296,10 +290,49 @@ func FuzzTruncateIPsIn(f *testing.F) {
 					// whole; text the output makes up, such as a hex word
 					// before a network (cafe:2001:db8::), is none.
 					if !wide() && strings.Contains(s, v) {
-						t.Fatalf("%q left %q whole in %q", s, v, got)
+						left = append(left, v)
 					}
 				}
 			}
+		}
+		return left
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		got := TruncateIPsIn(s)
+		if again := TruncateIPsIn(got); again != got {
+			t.Fatalf("not idempotent: %q -> %q -> %q", s, got, again)
+		}
+		if !strings.ContainsAny(s, ".:[") && got != s {
+			t.Fatalf("%q changed to %q", s, got)
+		}
+		// Every round masks at least what the round before it did, and the
+		// last one is stable within maxRounds (#528): truncated again, the
+		// result reads the same.
+		var rounds []string
+		got, stable := truncateRounds(s, func(o string) { rounds = append(rounds, o) })
+		if !stable {
+			t.Fatalf("%q not stable after %d rounds: %q", s, maxRounds, rounds)
+		}
+		if got != TruncateIPsIn(s) {
+			t.Fatalf("TruncateIPsIn(%q) is not its last round", s)
+		}
+		// From the second round on: the first reads the input itself,
+		// whose words and tokens are what the oracle reads, not a round's.
+		prev := rounds[0]
+		for _, o := range rounds[1:] {
+			was := map[string]bool{}
+			for _, v := range leftWhole(s, prev) {
+				was[v] = true
+			}
+			for _, v := range leftWhole(s, o) {
+				if !was[v] {
+					t.Fatalf("%q: a round left %q whole in %q, which the round before truncated in %q", s, v, o, prev)
+				}
+			}
+			prev = o
+		}
+		if left := leftWhole(s, got); len(left) > 0 {
+			t.Fatalf("%q left %q whole in %q", s, left[0], got)
 		}
 		// No port (one to five digits, not followed by another or by a dot
 		// and a digit, which make a number) is left after an address the
