@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -48,11 +49,12 @@ func TestAStopLetsTheTransactionsInFlightFinish(t *testing.T) {
 		"Contact: <sip:127.0.0.1:5070;transport=tcp>;expires=600")
 	inv := r.sendAsync(t, "INVITE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">",
 		"Contact: <sip:127.0.0.1:5071;transport=tcp>")
-	<-scscf.got
-	<-scscf.got
+	before(t, "the REGISTER or the INVITE reaching the S-CSCF", scscf.got, reg, inv)
+	before(t, "the other reaching the S-CSCF", scscf.got, reg, inv)
 	stopped := make(chan struct{})
-	go func() { r.stopWithin(2 * time.Minute); close(stopped) }()
-	<-draining
+	go func() { r.stopWithin(30 * time.Second); close(stopped) }()
+	before(t, "the drain", draining, reg, inv)
+	drainWaits()
 	scscf.answer()
 	if got := <-reg; got != "200" {
 		t.Errorf("REGISTER in flight at the stop: %s, want 200", got)
@@ -62,7 +64,7 @@ func TestAStopLetsTheTransactionsInFlightFinish(t *testing.T) {
 	}
 	select {
 	case <-stopped:
-	case <-time.After(2 * time.Minute):
+	case <-time.After(30 * time.Second): // well short of the drain's minute
 		t.Fatal("Run did not return once the answers were out")
 	}
 }
@@ -245,6 +247,36 @@ type slowSCSCF struct {
 	release chan struct{}
 	once    sync.Once
 }
+
+// before waits for ch, and fails at once with what happened instead if one
+// of the requests in answered has its final response first, as when a Cx
+// answer slower than CxTimeout makes it 480, or once realWait passes: a test
+// left hanging there would end the whole package at its timeout with no
+// message (QA of #461).
+func before(t *testing.T, what string, ch any, answered ...any) {
+	t.Helper()
+	cases := []reflect.SelectCase{
+		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ch)},
+		{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(time.After(realWait))},
+	}
+	for _, a := range answered {
+		cases = append(cases, reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(a)})
+	}
+	switch i, v, _ := reflect.Select(cases); i {
+	case 0:
+	case 1:
+		t.Fatalf("no %s within %v", what, realWait)
+	default:
+		t.Fatalf("a request was answered %+v before %s", v.Interface(), what)
+	}
+}
+
+// drainWaits gives the drain, once it has begun, time to reach its wait
+// for the requests in progress before their 200s go, so that a drain that
+// gave up at once could not pass for one that waited (QA of #461). It is a
+// lower bound only: the drain has a minute, and a slow host only makes the
+// wait longer.
+func drainWaits() { time.Sleep(200 * time.Millisecond) }
 
 // startHeldSCSCF is startSlowSCSCF with every 200 held until answer, so
 // that a test decides when it goes, rather than the clock (#411).
@@ -459,9 +491,10 @@ func TestAStopLetsASingleRequestInFlightFinish(t *testing.T) {
 	})
 	r.waitReady(t)
 	msg := r.sendAsync(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
-	<-scscf.got
-	go r.stopWithin(2 * time.Minute)
-	<-draining
+	before(t, "the MESSAGE reaching the S-CSCF", scscf.got, msg)
+	go r.stopWithin(30 * time.Second)
+	before(t, "the drain", draining, msg)
+	drainWaits()
 	scscf.answer()
 	if got := <-msg; got != "200" {
 		t.Errorf("MESSAGE in flight at the stop: %s, want 200", got)
@@ -619,7 +652,7 @@ func TestAStopAnswersARequestLeftInProgress500(t *testing.T) {
 	})
 	r.waitReady(t)
 	msg := r.sendAsyncResponse(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
-	<-scscf.got
+	before(t, "the MESSAGE reaching the S-CSCF", scscf.got, msg)
 	stopped := time.Now()
 	go r.stop()
 	got := <-msg
@@ -650,7 +683,7 @@ func TestAStopAnswersARegisterLeftInProgress503(t *testing.T) {
 	r.waitReady(t)
 	reg := r.sendAsyncResponse(t, "REGISTER", "sip:"+home, "From: <"+impu1+">;tag=f1", "To: <"+impu1+">",
 		"Contact: <sip:127.0.0.1:5070;transport=tcp>;expires=600")
-	<-scscf.got
+	before(t, "the REGISTER reaching the S-CSCF", scscf.got, reg)
 	go r.stop()
 	if got := <-reg; got.err != nil || got.res.StatusCode != 503 || got.res.Header.Get("Retry-After") != "5" {
 		t.Errorf("REGISTER left at the stop: %v %v, want 503 with Retry-After 5", got.res, got.err)
