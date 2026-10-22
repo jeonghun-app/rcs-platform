@@ -338,12 +338,16 @@ func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 // forwardedInvite is an INVITE the core forwarded: the CANCEL for it, the
 // flow it went over, whether the originator has cancelled it, whether the
 // INVITE has gone to the transaction layer, and whether the CANCEL has: it
-// goes only after the INVITE (RFC 3261 §9.1), whichever comes first.
+// goes only after the INVITE (RFC 3261 §9.1), whichever comes first. end is
+// the 64*T1 timer after the CANCEL, and over says the INVITE has its final
+// answer; c.mu guards both.
 type forwardedInvite struct {
 	cancel                      *sip.Request
 	flow                        transport.FlowID
 	tx                          *transaction.ClientTransaction
 	cancelled, sent, rung, gone bool
+	end                         *time.Timer
+	over                        bool
 }
 
 // cancelNow reports whether the CANCEL should go now, and if so marks it
@@ -361,11 +365,17 @@ func (f *forwardedInvite) cancelNow() bool {
 // sendCancel passes f's CANCEL on, off the calling goroutine, then calls
 // then if it is not nil. An INVITE the callee does not end within 64*T1
 // after it is ended by the core, as the platform's proxy ends it, and
-// answered 487 (§9.1).
+// answered 487 (§9.1). As on the platform, the timer is armed before the
+// CANCEL goes, and a final answer stops it: a 2xx that crossed the CANCEL
+// keeps its transaction for its own 64*T1 (RFC 6026).
 func (c *IMSCore) sendCancel(f *forwardedInvite, then func()) {
 	go func() {
+		c.mu.Lock()
+		if !f.over {
+			f.end = time.AfterFunc(64*c.t1, f.tx.Terminate)
+		}
+		c.mu.Unlock()
 		_, _ = c.layer.Request(f.cancel, transport.Destination{Flow: f.flow}, func(*sip.Response, error) {})
-		time.AfterFunc(64*c.t1, f.tx.Terminate)
 		if then != nil {
 			then()
 		}
@@ -812,8 +822,9 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 			c.mu.Unlock()
 		}
 	}
-	// ended forgets the INVITE, which has its final answer, and reports
-	// whether the originator had cancelled it.
+	// ended forgets the INVITE, which has its final answer, stops the
+	// timer after its CANCEL, and reports whether the originator had
+	// cancelled it.
 	ended := func() bool {
 		if invite == nil {
 			return false
@@ -821,6 +832,10 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		delete(c.invites, tx)
+		invite.over = true
+		if invite.end != nil {
+			invite.end.Stop()
+		}
 		return invite.cancelled
 	}
 	// Off the reading goroutine: Request waits for room on the other flow.
