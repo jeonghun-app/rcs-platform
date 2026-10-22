@@ -4,7 +4,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -274,14 +276,15 @@ func (l *lookalikeReader) Read(p []byte) (int, error) {
 	return 0, io.EOF
 }
 
-func parseLookalikes(t *testing.T, n int64) time.Duration {
+// parseLookalikes parses a form whose file is n bytes of boundary
+// lookalikes.
+func parseLookalikes(t *testing.T, n int64) {
 	t.Helper()
 	body := &lookalikeReader{
 		head: "--boundary1\r\n" + tidPart("t").header + "\r\nt\r\n--boundary1\r\n" + filePart("a", "text/plain", "").header + "\r\n",
 		n:    n,
 		tail: "\r\n--boundary1--\r\n",
 	}
-	start := time.Now()
 	f, err := readUploadHead(formType, body, formLimits{maxFile: DefaultMaxSize, maxThumbnail: 1})
 	if err != nil {
 		t.Fatal(err)
@@ -293,22 +296,79 @@ func parseLookalikes(t *testing.T, n int64) time.Duration {
 	if err := f.finish(); err != nil {
 		t.Fatal(err)
 	}
-	return time.Since(start)
 }
 
 func TestMaximumSizeAdversarialFormParsesInLinearTime(t *testing.T) {
 	// docs/architecture.md §8: a parser is shown linear on a maximum-size
-	// adversarial input. Times are compared, not bounded, so a loaded host
-	// slows both alike; the best of three runs smooths out the rest.
-	best := func(n int64) time.Duration {
-		d := parseLookalikes(t, n)
+	// adversarial input. The same total is parsed both ways: the maximum
+	// size once, and an eighth of it eight times, so a linear parser takes
+	// about as long for either and a quadratic one eight times as long for
+	// the one. Two timings that last about as long are stretched alike by a
+	// loaded host, which one small parse against one large did not (#190:
+	// 3.9 s against 76 ms at load 569). The time is the process's CPU time,
+	// as in internal/cpim and internal/sip/reginfo, so time spent waiting
+	// for a CPU is not counted. Linear code comes to at most about 1.13
+	// (QA of #513), so the bound is 2, which a moderate quadratic term
+	// already passes. A first timing of each side fails at once when it is
+	// far past that, as in internal/cpim, so a strongly quadratic parser
+	// fails with its numbers rather than at the package's timeout. Then each
+	// of three attempts times each side three times and keeps the shortest;
+	// only all three over the bound fail. Under the race detector, which
+	// times its own instrumentation as much as the parser, only allocations
+	// are compared.
+	cpu := func() time.Duration {
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			t.Fatal(err)
+		}
+		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+	}
+	const parts = 8
+	once := func() { parseLookalikes(t, DefaultMaxSize) }
+	inParts := func() {
+		for range parts {
+			parseLookalikes(t, DefaultMaxSize/parts)
+		}
+	}
+	allocated := func(f func()) uint64 {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		f()
+		runtime.ReadMemStats(&after)
+		return after.TotalAlloc - before.TotalAlloc
+	}
+	// Streaming allocates a few KiB either way; a parser that copies what it
+	// has read so far allocates eight times as much for the one, and at the
+	// maximum size far more than the 1 MiB of slack.
+	if large, small := allocated(once), allocated(inParts); large > small+1<<20 {
+		t.Fatalf("the maximum size allocated %d bytes against %d for the same total in eighths: not linear", large, small)
+	}
+	if raceEnabled {
+		return
+	}
+	timed := func(f func()) time.Duration {
+		start := cpu()
+		f()
+		return cpu() - start
+	}
+	best := func(f func()) time.Duration {
+		d := timed(f)
 		for range 2 {
-			d = min(d, parseLookalikes(t, n))
+			d = min(d, timed(f))
 		}
 		return d
 	}
-	small, large := best(DefaultMaxSize/8), best(DefaultMaxSize)
-	if large > 16*small+time.Second {
-		t.Fatalf("8× the input took %v against %v: not linear", large, small)
+	const bound, farPast = 2, 6
+	if large, small := timed(once), timed(inParts); large > farPast*small {
+		t.Fatalf("the maximum size took %v of CPU against %v for the same total in eighths, more than %d times: not linear", large, small, farPast)
 	}
+	var large, small time.Duration
+	for range 3 {
+		large, small = best(once), best(inParts)
+		if large <= bound*small {
+			return
+		}
+	}
+	t.Fatalf("the maximum size took %v of CPU against %v for the same total in eighths: not linear", large, small)
 }
