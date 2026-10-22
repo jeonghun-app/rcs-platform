@@ -17,6 +17,7 @@ import (
 	ftstore "github.com/jeonghun-app/rcs-platform/internal/ftserver/awsstore"
 	hssstore "github.com/jeonghun-app/rcs-platform/internal/hss/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/dynamostore"
+	rcsasstore "github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	scscfstore "github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
 )
 
@@ -28,6 +29,7 @@ type tablesConfig struct {
 	scscf                      scscfstore.Config
 	ftTable, ftBucket          string
 	relayTable                 string
+	rcsasMessages, rcsasGroups string
 }
 
 func readTablesConfig(e environment) (tablesConfig, error) {
@@ -50,15 +52,17 @@ func readTablesConfig(e environment) (tablesConfig, error) {
 	}
 	c.ftTable = e.get("FT_DYNAMODB_TABLE", "files")
 	c.relayTable = e.get("RELAY_DYNAMODB_TABLE", "msrp-bindings")
+	c.rcsasMessages = e.get("RCSAS_DYNAMODB_TABLE", "messages")
+	c.rcsasGroups = e.get("RCSAS_GROUPCHATS_TABLE", "groupchats")
 	return c, nil
 }
 
 // createTables creates, as the service docs describe them for the
 // infrastructure, whatever does not exist yet: hss's two tables
-// (docs/hss.md, Tables), scscf's three (docs/scscf-state.md), ft-server's
-// files table and content bucket
-// (docs/ft-server.md, Storage) and msrp-relay's bindings table
-// (docs/msrp-relay.md, The bindings table).
+// (docs/hss.md, Tables), scscf's three (docs/scscf-state.md), rcs-as's two
+// (docs/rcs-as.md, the messages and groupchats tables), ft-server's files
+// table and content bucket (docs/ft-server.md, Storage) and msrp-relay's
+// bindings table (docs/msrp-relay.md, The bindings table).
 func createTables(ctx context.Context, c tablesConfig, out io.Writer) error {
 	awsCfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -76,13 +80,22 @@ func createTables(ctx context.Context, c tablesConfig, out io.Writer) error {
 		o.UsePathStyle = true
 	})
 
-	// hss and scscf each create their tables together and wait for them.
+	// hss, scscf and rcs-as each create their tables together and wait for
+	// them.
 	if err := ensureTableSet(ctx, ddb, "hss", []string{c.hss.SubscribersTable, c.hss.ProfilesTable},
 		func() error { return hssstore.CreateTables(ctx, ddb, c.hss) }, out); err != nil {
 		return err
 	}
 	if err := ensureTableSet(ctx, ddb, "scscf", []string{c.scscf.RegistrationsTable, c.scscf.ChallengesTable, c.scscf.SubscriptionsTable},
 		func() error { return scscfstore.CreateTables(ctx, ddb, c.scscf) }, out); err != nil {
+		return err
+	}
+	if err := ensureTableSet(ctx, ddb, "rcs-as", []string{c.rcsasMessages, c.rcsasGroups}, func() error {
+		if err := rcsasstore.CreateMessagesTable(ctx, ddb, c.rcsasMessages); err != nil {
+			return err
+		}
+		return rcsasstore.CreateGroupsTable(ctx, ddb, c.rcsasGroups)
+	}, out); err != nil {
 		return err
 	}
 	for _, t := range []struct{ name, pk, ttl string }{
