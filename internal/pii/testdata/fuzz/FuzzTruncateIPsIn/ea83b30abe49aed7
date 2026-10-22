@@ -1,0 +1,2 @@
+go test fuzz v1
+string("address 2001:db8:5:6::8: too many colons in address")
