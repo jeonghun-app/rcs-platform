@@ -786,11 +786,7 @@ group's sessions and subscriptions is its conference URI.
   second later. The owner answers 200 and reads the queue (`sip.group.woken`); for
   a registration, it first forgets the invitation it last asked for the
   participant in the group and its pager-only mark, as a registration on a
-  new flow there would, so that it invites at once. As after such a
-  registration (#384), a failure of an invitation asked before the wake
-  that comes after it is the old flow's and leaves no mark
-  (`invite.failed_overtaken`), so that it does not hold the participant's
-  copies until `RCSAS_INVITE_TIMEOUT` past the wake (#568).
+  new flow there would, so that it invites at once.
 - **Cost.** Where a group is served is remembered for a heartbeat: a task
   reads the group and owner items for it at most once per
   `RCSAS_TASK_HEARTBEAT`, and an INVITE to the factory costs one more read of
