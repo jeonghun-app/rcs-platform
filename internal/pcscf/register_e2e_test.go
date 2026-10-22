@@ -506,3 +506,40 @@ func TestTheRegistryTakesThePendingRegistersPerIP(t *testing.T) {
 		t.Fatalf("per-client bound %d", pc.registry.perClient)
 	}
 }
+
+// A REGISTER refused 400 for a malformed Max-Breadth takes no registration
+// slot: the proxy refuses it before the Router, where pcscf reserves one,
+// so no reservation is left for the sweep (code review of #454). Four such
+// REGISTERs, as many as one address may have pending, do not keep a good
+// one from the same address out.
+func TestAMalformedMaxBreadthTakesNoRegistrationSlot(t *testing.T) {
+	icscf := startCoreNode(t, echo200)
+	cfg := testConfig()
+	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
+	cfg.MaxPendingRegistersPerIP = 4
+	var pc *pcscf
+	s := start(t, cfg, deps{started: func(p *pcscf) { pc = p }})
+	bad := dial(t, s.client, nil)
+	for i, impu := range []string{aliceIMPU, bobIMPU, "sip:+15550100003@ims.mnc001.mcc001.3gppnetwork.org", "sip:+15550100005@ims.mnc001.mcc001.3gppnetwork.org"} {
+		text := registerText(outboundContact, "Supported: outbound", "Max-Breadth: 0")
+		text = strings.Replace(text, "To: <"+aliceIMPU+">", "To: <"+impu+">", 1)
+		text = strings.ReplaceAll(text, "reg-1", fmt.Sprintf("reg-mb-%d", i))
+		_ = bad.nc.SetDeadline(time.Now().Add(waitFor))
+		if _, err := io.WriteString(bad.nc, text); err != nil {
+			t.Fatal(err)
+		}
+		if res := bad.final(); res.StatusCode != 400 {
+			t.Fatalf("REGISTER %d with Max-Breadth 0: %d, want 400", i, res.StatusCode)
+		}
+	}
+	pc.registry.mu.Lock()
+	pending := fmt.Sprint(pc.registry.pendingByClient)
+	n := len(pc.registry.pendingByClient)
+	pc.registry.mu.Unlock()
+	if n != 0 {
+		t.Errorf("reservations held after the 400s: %s", pending)
+	}
+	if res := registerOver(t, dial(t, s.client, nil)); res.StatusCode != 200 {
+		t.Fatalf("a good REGISTER from the same address: %d %s, want 200", res.StatusCode, res.Reason)
+	}
+}

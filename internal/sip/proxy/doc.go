@@ -8,7 +8,8 @@
 // transaction.Layer it owns, and for every request the layer passes up it:
 //
 //   - validates it (§16.3): the Request-URI scheme (416), Max-Forwards (483),
-//     loops (482) and Proxy-Require (420);
+//     a malformed Max-Breadth (400) on anything but a 2xx's ACK, which goes
+//     on with MaxBreadth in its place, loops (482) and Proxy-Require (420);
 //   - preprocesses its Route (§16.4): it undoes a strict router's rewrite and
 //     removes the Route values naming itself (Config.Self), two in a row when
 //     it recorded two (RFC 5658 §5), and hands them to the Router;
@@ -27,10 +28,7 @@
 //     Target.Timeout ended before its transaction did, an intended deviation
 //     from RFC 5393 §5.4.1 (see Target.Timeout). A target with no share left
 //     fails at once as 440 Max-Breadth Exceeded, the answer only when no
-//     other branch, nor another answer of the proxy's own, does better. A
-//     request it forwards with a malformed Max-Breadth is
-//     refused 400; one it serves ignores the field (§5.3.5), and a 2xx's ACK
-//     goes on with MaxBreadth in place of the malformed value;
+//     other branch, nor another answer of the proxy's own, does better;
 //   - forwards provisional responses and every 2xx at once and keeps the
 //     other finals, then sends the best of them (§16.7): a 6xx over all, then
 //     the lowest class, preferring 401, 407, 415, 420 and 484 within 4xx, with

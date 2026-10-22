@@ -289,15 +289,6 @@ func (c *respContext) run() {
 		c.answerWith(500)
 		return
 	}
-	if in.Message.Header.Has("Max-Breadth") {
-		// Checked only for a request the proxy forwards: a UAS ignores the
-		// field (RFC 5393 §5.3.5), as a Serve handler does (code review of
-		// #454).
-		if _, err := in.Message.Header.MaxBreadth(); err != nil {
-			c.answerWith(400)
-			return
-		}
-	}
 	groups := groupByQ(dec.Targets)
 
 	c.mu.Lock()

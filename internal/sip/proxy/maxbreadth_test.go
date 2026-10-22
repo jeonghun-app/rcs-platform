@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"testing"
 	"time"
-
-	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // breadths returns the Max-Breadth of each request sent since the last
@@ -68,29 +66,30 @@ func TestForwardedRequestsShareTheirMaxBreadth(t *testing.T) {
 	}
 }
 
-// A Max-Breadth that is not a positive integer is refused 400 for a request
-// the proxy forwards. One the service answers itself (Serve) is served, as a
-// UAS ignores the field (RFC 5393 §5.3.5), and a 2xx's ACK still goes on,
-// with a value of the proxy's (code review of #454).
-func TestAMalformedMaxBreadthIsRefusedOnlyWhenForwarding(t *testing.T) {
+// A Max-Breadth that is not a positive integer is refused 400 before the
+// Router is asked, so that no decision's hooks, which may release what
+// Route took, miss the answer (code review of #454): a request the service
+// would serve itself included. Only a 2xx's ACK, which nothing can answer,
+// goes on, with a value of the proxy's.
+func TestAMalformedMaxBreadthIsRefusedBeforeTheRouter(t *testing.T) {
 	for _, v := range []string{"0", "-1", "two", "", "1;x"} {
 		t.Run(strconv.Quote(v), func(t *testing.T) {
-			h := newHarness(t, Config{})
-			h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: "+v))
-			check(t, "forwarded", h.upstream(), codes(400))
-			check(t, "sent", h.sentMethods(), nil)
-
-			h = newHarness(t, Config{})
-			h.decide(Decision{Serve: func(_ context.Context, u *UAS) {
-				if res, err := sip.NewResponse(u.Request().Message, 200, "", "uas1"); err == nil {
-					_ = u.Respond(res)
+			for name, d := range map[string]Decision{
+				"forwarded": {Targets: []Target{target("sip:a@192.0.2.1")}},
+				"served":    {Serve: func(context.Context, *UAS) {}},
+			} {
+				h := newHarness(t, Config{})
+				routed := false
+				h.route(func(context.Context, *Request) Decision { routed = true; return d })
+				h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: "+v))
+				check(t, name, h.upstream(), codes(400))
+				check(t, name+" sent", h.sentMethods(), nil)
+				if routed {
+					t.Errorf("%s: the Router was asked", name)
 				}
-			}})
-			h.receive(request(t, "MESSAGE", "sip:bob@example.com", "Max-Breadth: "+v))
-			h.settle()
-			check(t, "served", h.upstream(), codes(200))
+			}
 
-			h = newHarness(t, Config{})
+			h := newHarness(t, Config{})
 			h.receive(ackFor2xx(t, "Max-Breadth: "+v))
 			if got := breadths(t, h); got["sip:bob@192.0.2.30"] != MaxBreadth {
 				t.Errorf("the ACK went out with %v, want Max-Breadth %d", got, MaxBreadth)

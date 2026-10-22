@@ -113,6 +113,15 @@ func (p *Proxy) validate(req *sip.Request, loop string) *rejection {
 			return &rejection{code: 483}
 		}
 	}
+	// Before the Router, so that its decision's hooks, which may release
+	// what Route took, see every answer (code review of #454). A 2xx's ACK
+	// is not refused, since nothing can answer it: it goes on with
+	// MaxBreadth in place of the malformed value (incomingBreadth).
+	if req.Method != "ACK" && req.Header.Has("Max-Breadth") {
+		if _, err := req.Header.MaxBreadth(); err != nil {
+			return &rejection{code: 400}
+		}
+	}
 	if loop != "" && p.looped(req, loop) {
 		p.stats.loops.Add(1)
 		return &rejection{code: 482}
