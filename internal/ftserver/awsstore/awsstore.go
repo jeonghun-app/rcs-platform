@@ -63,6 +63,10 @@ type Config struct {
 	DynamoDBEndpoint string
 	// Now is the clock for nonce-count expiry; time.Now when nil.
 	Now func() time.Time
+	// NonceContended, if set, runs each time a nonce-count update waits
+	// for another on the same nonce or loses a conditional write to one,
+	// for a metric.
+	NonceContended func()
 }
 
 // Stores are the three stores ft-server needs, sharing SDK clients.
@@ -107,7 +111,7 @@ func NewWithClients(c Config, s3c S3API, ddb DynamoAPI) *Stores {
 	return &Stores{
 		Blobs:       &Blobs{api: s3c, bucket: c.Bucket, prefix: c.Prefix, sse: c.SSE, kmsKeyID: c.KMSKeyID},
 		Metadata:    &Metadata{api: ddb, table: c.Table},
-		NonceCounts: &NonceCounts{api: ddb, table: c.Table, now: now},
+		NonceCounts: &NonceCounts{api: ddb, table: c.Table, now: now, contended: c.NonceContended},
 		s3:          s3c,
 		dynamo:      ddb,
 		bucket:      c.Bucket,

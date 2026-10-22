@@ -36,7 +36,7 @@ var (
 	ErrStaleNonce = errors.New("digest: nonce has expired")
 	// ErrReplayed means the nonce-count has already been used with this
 	// nonce, or lies below the NonceCountWindow counts ending at the highest
-	// one used (RFC 7616 §3.4.1, §5.5).
+	// one used (RFC 7616 §3.4, §5.5).
 	ErrReplayed = errors.New("digest: nonce count already used")
 )
 

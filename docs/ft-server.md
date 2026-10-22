@@ -201,7 +201,7 @@ and answers it as MD5.
   (`digest.NonceCountWindow`). A client that breaks an upload may send its next
   request under the same nonce at once, and that request may be verified first.
   The broken upload is still accepted and keeps its whole parts (#66). A count
-  already used, or one below the window, is refused (RFC 7616 §3.4.1). An
+  already used, or one below the window, is refused (RFC 7616 §3.4). An
   upload or resume with a body whose credentials do not verify, for this or any
   other reason, is counted in `upload.failed.auth`: none of its content is
   kept.
@@ -380,10 +380,14 @@ holds three kinds of item:
 
 Every record write is conditional on the version read. A nonce-count write is
 conditional on the item being as it was read, and on a conflict the item is
-read again, up to 16 times. When the SDK resends a nonce-count write whose
-answer was lost, the item that fails the resend's condition names the write's
-own token, so the count is not taken for a replay. Request reads are strongly
-consistent; the sweeper's scan is not (see below). Records and tid
+read again, up to 16 times, after a random wait that doubles with each
+conflict (2 ms at first, 50 ms at most). Within a task, one update at a time
+works on each nonce, so requests in flight on one nonce do not conflict with
+each other; each costs one read and one write. When the SDK resends a
+nonce-count write whose answer was lost, the item that fails the resend's
+condition names the write's own token, so the store does not report the count
+as used. Request reads are strongly consistent; the sweeper's scan is not (see
+below). Records and tid
 items expire 30 days after their validity ends. Nonce-counts expire one hour
 after their nonce. An upload has at most 4999 parts, which keeps a record well
 inside DynamoDB's 400 KB item limit.
@@ -430,6 +434,7 @@ identifier ever appears in a metric name:
 | `download.served`, `download.partial`, `download.bytes`, `download.not_found`, `download.unsatisfiable` | Downloads |
 | `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.uploader_busy`, `download.failed.missing_object` | Failed downloads |
 | `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.bad_credential_record`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
+| `auth.nonce_contended` | DynamoDB store: a nonce-count update that waited for another on the same nonce in the task, or lost its conditional write to one on another task |
 | `sweep.expired`, `sweep.failed`, `sweep.duration` (ms) | Sweeper |
 
 The reasons in `upload.failed.<reason>`:

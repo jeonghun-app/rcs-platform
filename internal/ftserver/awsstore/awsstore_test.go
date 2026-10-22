@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -158,11 +159,25 @@ func (r *racingDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemIn
 func TestNonceCountsReadAgainAfterLosingARace(t *testing.T) {
 	s, _, ddb := fakeStores(t)
 	racing := &racingDynamo{fakeDynamo: ddb, other: s.NonceCounts, races: 3, nc: 100}
-	n := &NonceCounts{api: racing, table: s.NonceCounts.table, now: s.NonceCounts.now}
+	var waits []time.Duration
+	contended := 0
+	n := &NonceCounts{api: racing, table: s.NonceCounts.table, now: s.NonceCounts.now,
+		contended: func() { contended++ },
+		sleep:     func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }}
 	ctx := t.Context()
 	exp := storetest.T0.Add(time.Minute)
 	if ok, err := n.Advance(ctx, "alice", "n", 90, exp); !ok || err != nil {
 		t.Fatalf("Advance after losing 3 races = %v, %v", ok, err)
+	}
+	// A random wait before each read after a lost write, below a bound
+	// that doubles; each lost write counted.
+	if len(waits) != 3 || contended != 3 {
+		t.Fatalf("waits %v, contended %d; want 3 of each", waits, contended)
+	}
+	for i, d := range waits {
+		if limit := nonceBackoffBase << i; d < 0 || d >= limit {
+			t.Fatalf("wait %d is %v, want below %v", i, d, limit)
+		}
 	}
 	// The window the winners and this request left: 101-103 and 90 used.
 	for _, nc := range []uint32{90, 101, 103} {
@@ -176,8 +191,13 @@ func TestNonceCountsReadAgainAfterLosingARace(t *testing.T) {
 
 	// Losing every attempt is an error, not a replay: the count is unused.
 	racing.races = maxNonceCountAttempts
+	waits = nil
 	if ok, err := n.Advance(ctx, "alice", "n", 92, exp); ok || !errors.Is(err, errNonceCountContended) {
 		t.Fatalf("Advance losing every race = %v, %v", ok, err)
+	}
+	// Random: 15 waits all of zero would mean no backoff at all.
+	if len(waits) != maxNonceCountAttempts-1 || slices.Max(waits) >= nonceBackoffMax || slices.Max(waits) == 0 {
+		t.Fatalf("waits %v", waits)
 	}
 	if ok, err := n.Advance(ctx, "alice", "n", 92, exp); !ok || err != nil {
 		t.Fatalf("nc 92 once the races stop = %v, %v", ok, err)

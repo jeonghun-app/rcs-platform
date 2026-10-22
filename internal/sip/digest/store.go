@@ -77,7 +77,7 @@ func (m *MemoryNonceCounts) Len() int {
 // that has not been used is accepted even if a higher one came first: an
 // HTTP client that gives up on a request whose body failed sends the next
 // one at once, and the server may verify that one first (#66). A count below
-// the window is refused, as one already used is (RFC 7616 §3.4.1 asks only
+// the window is refused, as one already used is (RFC 7616 §3.4 asks only
 // that a count is not used twice). 32 covers the requests a client has in
 // flight on one nonce and fits the record of the window in one uint32.
 const NonceCountWindow = 32

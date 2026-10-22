@@ -185,6 +185,7 @@ func openStores(ctx context.Context, cfg Config, rt *runtime.Runtime) (stores, e
 	s, err := awsstore.New(ctx, awsstore.Config{
 		Bucket: a.Bucket, Prefix: a.Prefix, Table: a.Table, SSE: a.SSE, KMSKeyID: a.KMSKeyID,
 		S3Endpoint: a.S3Endpoint, DynamoDBEndpoint: a.DynamoDBEndpoint,
+		NonceContended: func() { rt.Metrics.Count("auth.nonce_contended", 1) },
 	})
 	if err != nil {
 		return stores{}, err

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	mrand "math/rand/v2"
 	"strconv"
 	"strings"
 	"time"
@@ -267,6 +268,44 @@ type NonceCounts struct {
 	api   DynamoAPI
 	table string
 	now   func() time.Time
+	// contended, if set, runs each time an Advance waits for another on
+	// the same nonce in this task, or loses its conditional write to one
+	// on another task.
+	contended func()
+	// sleep waits d or until ctx ends; sleepCtx when nil.
+	sleep func(ctx context.Context, d time.Duration) error
+	locks nonceLocks
+}
+
+// Backoff between the conditional writes of one Advance: a random wait below
+// nonceBackoffBase doubled for each write lost, up to nonceBackoffMax (full
+// jitter), so that tasks racing on one nonce spread out rather than read and
+// write again in step.
+const (
+	nonceBackoffBase = 2 * time.Millisecond
+	nonceBackoffMax  = 50 * time.Millisecond
+)
+
+// nonceBackoff is the longest wait after lost writes lost.
+func nonceBackoff(lost int) time.Duration {
+	return min(nonceBackoffMax, nonceBackoffBase<<min(lost-1, 10))
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (n *NonceCounts) countContention() {
+	if n.contended != nil {
+		n.contended()
+	}
 }
 
 // maxNonceCountAttempts bounds the reads and conditional writes of one
@@ -295,14 +334,37 @@ var nonceCountAttrs = []struct{ name, attr string }{
 // every count up to nc is taken as used, as that version did. DynamoDB
 // deletes expired items late, so expiry is checked here.
 //
+// Within the task, one Advance at a time works on each (user, nonce)
+// (nonceLocks), so the conditional writes race only those of other tasks,
+// and between those it backs off with jitter. A request then costs one read
+// and one write unless another task wrote the same item in between.
+//
 // Each Advance writes a random token of its own in nc_writer. The SDK resends
 // a write whose answer was lost; if the first one had landed, the resend
 // fails its condition, and the item that comes back carries this token, so
-// the count is ours rather than a replay.
+// the count is recorded rather than refused.
 func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
-	k := key(nonceKey(username, nonce))
+	pk := nonceKey(username, nonce)
+	unlock, waited, err := n.locks.lock(ctx, pk)
+	if waited {
+		n.countContention()
+	}
+	if err != nil {
+		return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
+	}
+	defer unlock()
+	sleep := n.sleep
+	if sleep == nil {
+		sleep = sleepCtx
+	}
+	k := key(pk)
 	writer := rand.Text()
-	for range maxNonceCountAttempts {
+	for lost := range maxNonceCountAttempts {
+		if lost > 0 {
+			if err := sleep(ctx, mrand.N(nonceBackoff(lost))); err != nil {
+				return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
+			}
+		}
 		out, err := n.api.GetItem(ctx, &dynamodb.GetItemInput{
 			TableName:      aws.String(n.table),
 			Key:            k,
@@ -348,9 +410,16 @@ func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc ui
 		})
 		var failed *types.ConditionalCheckFailedException
 		if errors.As(err, &failed) {
+			// The token matches only if no other write landed between
+			// this write and the SDK's resend of it. If one did, this
+			// write is not recognised: the item is read again and the
+			// count, already recorded, is refused, a 401 the client
+			// answers with a fresh challenge. The miss goes that safe
+			// way, never to a count accepted twice.
 			if by, ok := failed.Item[attrNCWriter].(*types.AttributeValueMemberS); ok && by.Value == writer {
 				return true, nil
 			}
+			n.countContention()
 			continue
 		}
 		if err != nil {
