@@ -3,8 +3,10 @@ package pcscf
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -130,13 +132,15 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 		return nil, wait, err
 	}
 	made := map[int]*anchoredLine{}
+	// kept counts the shares a create given up on keeps until it ends.
+	kept := 0
 	fail := func(err error) (map[int]*anchoredLine, time.Duration, error) {
 		s.mu.Lock()
 		for _, l := range made {
 			p.releaseLine(s, l)
 		}
 		s.mu.Unlock()
-		p.msrp.limit.give(sh, len(want)-len(made))
+		p.msrp.limit.give(sh, len(want)-len(made)-kept)
 		return nil, 0, err
 	}
 	for _, i := range sortedKeys(want) {
@@ -147,9 +151,13 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 		} else {
 			paths.CorePath, l.corePath = want[i], want[i]
 		}
-		b, err := p.msrp.relay.create(ctx, paths)
+		b, err := p.create(ctx, sh, paths)
+		if errors.Is(err, errCreateAbandoned) {
+			kept++
+			return fail(ctx.Err())
+		}
 		if err != nil {
-			p.relayFailed("create", err)
+			p.createFailed(err)
 			return fail(err)
 		}
 		u, err := msrp.ParseURI(b.ClientPath)
@@ -168,6 +176,78 @@ func (p *pcscf) allocate(ctx context.Context, s *msrpSession, from side, want ma
 		s.mu.Unlock()
 	}
 	return made, 0, nil
+}
+
+// createFailed counts a binding create that failed: a relay error, or one
+// the stop cut, which says nothing about the relay. A binding the relay may
+// already have made for a cut one is left to its expiry.
+func (p *pcscf) createFailed(err error) {
+	if p.msrp.ctx.Err() != nil {
+		p.count(metricCreateCutAtStop, 1)
+		p.log.Debug("msrp-relay create cut by the stop", slog.String("error", err.Error()))
+		return
+	}
+	p.relayFailed("create", err)
+}
+
+// errCreateAbandoned is a binding create that ctx ended first (create).
+var errCreateAbandoned = errors.New("pcscf: binding create given up")
+
+// create asks the relay for a binding, but returns as soon as ctx ends: a
+// CANCEL or the drain's deadline ends the context Prepare runs under, and
+// the 487 or the drain's answer must not wait for a relay that does not
+// answer (#382). The call itself runs on, as background work the stop waits
+// for, bounded by RelayTimeout, so that a binding the relay made meanwhile
+// is released rather than left until it expires; it keeps its share of the
+// flow's binding limit until then, which bounds how many a flow can leave
+// behind. A release that fails leaves the binding to its expiry, counted as
+// any failed relay call.
+func (p *pcscf) create(ctx context.Context, sh share, paths relayPaths) (relayBinding, error) {
+	type result struct {
+		b   relayBinding
+		err error
+	}
+	var mu sync.Mutex
+	abandoned := false
+	got := make(chan result, 1)
+	relay := p.msrp.relay
+	started := p.msrp.goRun(func(bctx context.Context) {
+		b, err := relay.create(bctx, paths)
+		mu.Lock()
+		if !abandoned {
+			got <- result{b, err}
+			mu.Unlock()
+			return
+		}
+		mu.Unlock()
+		if err == nil && b.ID != "" {
+			p.count(metricReleasedCancel, 1)
+			if err := relay.release(bctx, b.ID); err != nil {
+				p.relayFailed("release", err)
+			}
+		} else if err != nil {
+			p.createFailed(err)
+		}
+		p.msrp.limit.give(sh, 1)
+	})
+	if !started {
+		return relayBinding{}, errNoRelay
+	}
+	select {
+	case r := <-got:
+		return r.b, r.err
+	case <-ctx.Done():
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	select {
+	case r := <-got:
+		// It ended just as ctx did: the caller gets the binding after all.
+		return r.b, r.err
+	default:
+	}
+	abandoned = true
+	return relayBinding{}, errCreateAbandoned
 }
 
 // sortedKeys returns the keys of m in order, so that bindings are made in
