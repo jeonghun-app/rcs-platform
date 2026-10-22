@@ -478,15 +478,20 @@ func (s *Server) failUpload(w http.ResponseWriter, err error) {
 // from just before the write (extendWrite), rather than left to net/http
 // once the handler returns: a deadline set first, as before, could pass
 // while a loaded host kept the handler from returning, and net/http then
-// closed the connection with no answer at all (#211).
+// closed the connection with no answer at all (#211). The whole flush is
+// bounded: net/http reads and discards a body the handler left unread
+// before it writes the header, so the read deadline is set in the past
+// first, and that read ends at once; the connection is not reused anyway.
 func (s *Server) uploadFailed(w http.ResponseWriter, reason string, status int) {
 	s.metrics.Count("upload.failed."+reason, 1)
 	if f := answeringFailure.Load(); f != nil {
 		(*f)()
 	}
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Unix(1, 0))
 	s.extendWrite(w)
 	http.Error(w, http.StatusText(status), status)
-	_ = http.NewResponseController(w).Flush()
+	_ = rc.Flush()
 }
 
 // answeringFailure, empty but in tests, runs in uploadFailed before the

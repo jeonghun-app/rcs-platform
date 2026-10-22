@@ -280,8 +280,9 @@ func TestStalledUploadIsCutOffAtTheIdleTimeout(t *testing.T) {
 
 // The 408 still reaches the client when the handler, having seen the idle
 // timeout, does not get to write it for longer than the idle timeout again,
-// as on a loaded host: the answer's write has no deadline to miss (#211).
-// The handler is held three idle timeouts, a lower bound only.
+// as on a loaded host: the answer's write deadline is set just before the
+// write, not before the hold (#211). The handler is held three idle
+// timeouts, a lower bound only.
 func TestAStalledUploadsAnswerSurvivesASlowHandler(t *testing.T) {
 	const idle = 100 * time.Millisecond
 	hold := func() { time.Sleep(3 * idle) }
@@ -328,7 +329,7 @@ func TestAFailedUploadsAnswerIsWrittenUnderAFreshDeadline(t *testing.T) {
 	e.srv.wallNow = func() time.Time { return wall }
 	w := &recordingWriter{ResponseRecorder: httptest.NewRecorder()}
 	e.srv.uploadFailed(w, "timeout", http.StatusRequestTimeout)
-	want := []string{"deadline " + wall.Add(idle).Format(time.RFC3339Nano), "write", "flush"}
+	want := []string{"read deadline " + time.Unix(1, 0).UTC().Format(time.RFC3339Nano), "deadline " + wall.Add(idle).Format(time.RFC3339Nano), "write", "flush"}
 	if got := w.events(); !slices.Equal(got, want) {
 		t.Fatalf("the writer saw %q, want %q", got, want)
 	}
@@ -359,6 +360,11 @@ func (w *recordingWriter) events() []string {
 	return slices.Clone(w.log)
 }
 
+func (w *recordingWriter) SetReadDeadline(d time.Time) error {
+	w.add("read deadline " + d.UTC().Format(time.RFC3339Nano))
+	return nil
+}
+
 func (w *recordingWriter) SetWriteDeadline(d time.Time) error {
 	w.add("deadline " + d.Format(time.RFC3339Nano))
 	return nil
@@ -373,6 +379,57 @@ func (w *recordingWriter) FlushError() error {
 	w.add("flush")
 	w.ResponseRecorder.Flush()
 	return nil
+}
+
+// A resume that fails before its body is read, here for an unknown tid,
+// is answered, and frees the user's upload slot, though the client never
+// sends the body it announced: the failure answer's whole flush is bounded,
+// net/http's discard of the unread body included (#497). The slot must be
+// free within IdleTimeout; the wait is only a hang guard, since nothing
+// else would end that read.
+func TestAFailedResumeWithItsBodyUnsentFreesItsSlot(t *testing.T) {
+	const idle = 30 * time.Second
+	e := newEnv(t, func(o *Options) { o.IdleTimeout = idle; o.MaxUploadsPerUser = 1 })
+	srv := e.serve()
+	u := e.user(alice)
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	req, _ := http.NewRequest(http.MethodPut, srv.URL+"/ft/unknown-tid", nil)
+	u.sign(req)
+	head := "PUT /ft/unknown-tid HTTP/1.1\r\nHost: ft\r\nContent-Type: text/plain" +
+		"\r\nAuthorization: " + req.Header.Get("Authorization") +
+		"\r\nContent-Range: bytes 0-99/100\r\nContent-Length: 100\r\n\r\n"
+	if _, err := io.WriteString(conn, head); err != nil { // and no body
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(idle)); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no answer to a resume whose body was never sent: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", resp.StatusCode)
+	}
+	held := func() int {
+		e.srv.perUser.mu.Lock()
+		defer e.srv.perUser.mu.Unlock()
+		n := 0
+		for _, k := range e.srv.perUser.n {
+			n += k
+		}
+		return n
+	}
+	for deadline := time.Now().Add(idle); held() != 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the user still holds %d upload slots %v after the answer", held(), idle)
+		}
+	}
 }
 
 // badRecordSource answers like an HSS whose record for the user is
