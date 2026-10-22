@@ -95,7 +95,7 @@ func (t *Transport) sendOn(f *flow, req *sip.Request, wait bool) error {
 		if err := setSentBy(req, UDP, f.lis.sentByHost, f.lis.sentByPort); err != nil {
 			return err
 		}
-		return t.writeMessage(f, req, wait)
+		return t.writeMessage(f, req, wait, nil)
 	}
 	return t.sendStream(f, req, "", wait)
 }
@@ -113,7 +113,7 @@ func (t *Transport) sendStream(f *flow, req *sip.Request, listener string, wait 
 	if err := setSentBy(req, f.network, host, port); err != nil {
 		return err
 	}
-	return t.writeMessage(f, req, wait)
+	return t.writeMessage(f, req, wait, nil)
 }
 
 func (t *Transport) listenerNamed(name string) *listener {
@@ -127,12 +127,12 @@ func (t *Transport) listenerNamed(name string) *listener {
 	return nil
 }
 
-func (t *Transport) writeMessage(f *flow, m sip.Message, wait bool) error {
+func (t *Transport) writeMessage(f *flow, m sip.Message, wait bool, counted func()) error {
 	b, err := m.Bytes()
 	if err != nil {
 		return err
 	}
-	return t.write(f, b, wait)
+	return t.write(f, b, wait, counted)
 }
 
 func (t *Transport) sendDatagram(l *listener, to netip.AddrPort, b []byte) error {
@@ -173,6 +173,11 @@ func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOpti
 	if t.isClosed() {
 		return ErrClosed
 	}
+	// Under way for Flush until the response is in a queue's count, however
+	// long finding its connection takes.
+	id := t.beginSend()
+	counted := func() { t.endSend(id) }
+	defer counted()
 	vias, err := res.Header.Via()
 	if err != nil {
 		return err
@@ -182,7 +187,7 @@ func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOpti
 	}
 	if src.Network.Reliable() {
 		if f := t.flows.lookup(src.Flow); f != nil {
-			err := t.writeMessage(f, res, wait)
+			err := t.writeMessage(f, res, wait, counted)
 			if errors.Is(err, errNoRoom) && f.lis != nil && f.lis.clientFacing {
 				// The client is not taking what we send it. Over a reliable
 				// transport it will not retransmit, so a dropped response would
@@ -209,7 +214,7 @@ func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOpti
 		if err != nil {
 			return err
 		}
-		return t.writeMessage(f, res, wait)
+		return t.writeMessage(f, res, wait, counted)
 	}
 	_, addr, err := responseTarget(vias[0], true)
 	if err != nil {

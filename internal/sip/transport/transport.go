@@ -353,11 +353,16 @@ type ListenerConfig struct {
 // Transport sends and receives SIP messages and owns the flow table. Its methods
 // are safe for concurrent use.
 type Transport struct {
-	cfg     Config
-	handler Handler
-	flows   *flowTable
-	stats   counters
-	budget  queueBudget
+	cfg Config
+	// sends are the SendResponse calls under way, by number, until their
+	// message is in a queue's count (Flush).
+	sendsMu  sync.Mutex
+	sends    map[uint64]struct{}
+	sendNext uint64
+	handler  Handler
+	flows    *flowTable
+	stats    counters
+	budget   queueBudget
 	// closures delivers OnFlowClosed; nil when there is none.
 	closures *closureQueue
 	// shedMu serializes shedding scans; lastShedScan is when the last one
@@ -554,7 +559,7 @@ func (t *Transport) Ping(id FlowID) error {
 		return errNotPinging
 	}
 	f.pinging.Store(true)
-	return t.write(f, ping, true)
+	return t.write(f, ping, true, nil)
 }
 
 // SetFlowIdleTimeout changes the idle timeout of one TCP or TLS flow, counted
@@ -716,6 +721,30 @@ type counters struct {
 // room a waiting one was given can complete it while that one still waits,
 // which needs a full queue that keeps taking new output.
 func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
+	// First the responses already being sent but not yet in a queue's
+	// count, such as one whose connection is being dialled again to its
+	// Via address (code review of #438): until each is counted, or none of
+	// them has got there for stall.
+	t.sendsMu.Lock()
+	under := make([]uint64, 0, len(t.sends))
+	for id := range t.sends {
+		under = append(under, id)
+	}
+	t.sendsMu.Unlock()
+	moved := time.Now()
+	for len(under) > 0 && time.Now().Before(deadline) && time.Since(moved) < stall {
+		time.Sleep(5 * time.Millisecond)
+		t.sendsMu.Lock()
+		n := len(under)
+		under = slices.DeleteFunc(under, func(id uint64) bool {
+			_, still := t.sends[id]
+			return !still
+		})
+		t.sendsMu.Unlock()
+		if len(under) < n {
+			moved = time.Now()
+		}
+	}
 	start := time.Now()
 	type pending struct {
 		q      *sendQueue
@@ -743,6 +772,25 @@ func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
 			return closed || sent >= p.target || now.Sub(last) >= stall
 		})
 	}
+}
+
+// beginSend counts a send under way for Flush; endSend, which may be called
+// again, ends the count.
+func (t *Transport) beginSend() uint64 {
+	t.sendsMu.Lock()
+	defer t.sendsMu.Unlock()
+	if t.sends == nil {
+		t.sends = map[uint64]struct{}{}
+	}
+	t.sendNext++
+	t.sends[t.sendNext] = struct{}{}
+	return t.sendNext
+}
+
+func (t *Transport) endSend(id uint64) {
+	t.sendsMu.Lock()
+	delete(t.sends, id)
+	t.sendsMu.Unlock()
 }
 
 // Stats returns the current gauges and counters.
