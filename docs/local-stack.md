@@ -340,10 +340,12 @@ docker access. It:
    taken the group over, then 200; its roster is back, and its next message
    reaches the peer, whom the new owner invites again. The test checks that
    the group's owner item names the other task, one epoch up, and that the
-   `rcs-as` logs (`tmp/e2e-compose/logs`, which the host writes when asked)
-   count a forwarded request (`group.forwarded`) and the takeover
-   (`group.owner_takeover`). The surviving task writes its counters once a
-   minute, so this can take that long.
+   `rcs-as` logs count a forwarded request (`group.forwarded`) and the
+   takeover (`group.owner_takeover`) in this run. For that the host restarts
+   both `rcs-as` tasks before the scenario, so that they start with no
+   counters, and after it, so that each writes its counters as it stops
+   (they are written once a minute otherwise); it then writes their logs
+   since the first restart to `tmp/e2e-compose/logs`.
 
    Whatever the outcome, the host starts the stopped task again and waits
    until it is healthy before `make e2e-compose` returns. Every wait in the
