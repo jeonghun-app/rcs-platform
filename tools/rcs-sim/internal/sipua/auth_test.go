@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
@@ -199,7 +200,7 @@ func TestChallengesForAnotherRealmAreNotAnswered(t *testing.T) {
 	// response computed from the home password, to guess it from offline
 	// (security review of #187).
 	foreign, err := digest.NewServer(digest.ServerConfig{
-		Realm: "foreign.example", NonceKey: []byte(strings.Repeat("f", digest.MinNonceKeySize)),
+		Realm: "foreign.example", NonceKey: secret.NewKey([]byte(strings.Repeat("f", digest.MinNonceKeySize))),
 		NonceCounts: digest.NewMemoryNonceCounts(nil),
 	})
 	if err != nil {

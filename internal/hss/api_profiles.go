@@ -353,8 +353,6 @@ func (a *API) pushOne(ctx context.Context, impi string, p *store.ServiceProfile)
 	if len(pushes) == 0 {
 		return false
 	}
-	pctx, cancel := context.WithTimeout(ctx, a.pushTimeout)
-	defer cancel()
-	a.h.notify(pctx, a.notifier, s, p, pushes)
+	a.h.notify(ctx, a.notifier, s, p, pushes, a.pushTimeout)
 	return true
 }

@@ -93,8 +93,8 @@ func TestConfigureTakesTheDefaults(t *testing.T) {
 	if len(c.ApplicationServers) != 1 || c.ApplicationServers[0].String() != "sip:rcs-as.rcs.local:5060;transport=tcp" {
 		t.Errorf("ApplicationServers %v", c.ApplicationServers)
 	}
-	if len(c.DialogKeys) != 1 || string(c.DialogKeys[0].Key) != dialogKey || len(c.ChallengeKeys) != 1 ||
-		c.SealKeyID != c.ChallengeKeys[0].ID || string(c.NonceKey) != nonceKey {
+	if len(c.DialogKeys) != 1 || string(c.DialogKeys[0].Key.Reveal()) != dialogKey || len(c.ChallengeKeys) != 1 ||
+		c.SealKeyID != c.ChallengeKeys[0].ID || string(c.NonceKey.Reveal()) != nonceKey {
 		t.Error("the keys were not read")
 	}
 }
@@ -200,12 +200,12 @@ func startup(t *testing.T, env map[string]string) (int, string) {
 // written as text, as %d and %x write them, and in base64 (#439 security
 // review). A prefix of each is enough to give it away.
 func keyForms(c ServiceConfig) []string {
-	keys := [][]byte{c.NonceKey}
+	keys := [][]byte{c.NonceKey.Reveal()}
 	for _, k := range c.DialogKeys {
-		keys = append(keys, k.Key)
+		keys = append(keys, k.Key.Reveal())
 	}
 	for _, k := range c.ChallengeKeys {
-		keys = append(keys, k.Key)
+		keys = append(keys, k.Key.Reveal())
 	}
 	var out []string
 	for _, k := range keys {
@@ -229,7 +229,7 @@ func printableASCII(b []byte) bool {
 	return true
 }
 
-// TestTheConfigurationGivesNoKeyAway: printed, formatted, logged or
+// TestTheConfigurationGivesNoKeyAway: printed under any verb, logged or
 // encoded as JSON, it shows none of its keys.
 func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 	c, err := configure(devEnv)
@@ -249,6 +249,7 @@ func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 	var loggedKeys bytes.Buffer
 	slog.New(slog.NewJSONHandler(&loggedKeys, nil)).Info("keys", "challenge", c.ChallengeKeys, "dialog", c.DialogKeys,
 		"one challenge key", c.ChallengeKeys[0], "one dialog key", c.DialogKeys[0])
+	var outs []string
 	for _, out := range []string{
 		fmt.Sprint(c), fmt.Sprintf("%v %+v %#v %s %d %o %b %t %x", c, c, c, c, c, c, c, c, c), string(j), logged.String(),
 		// The key slices on their own.
@@ -256,6 +257,16 @@ func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 		fmt.Sprintf("%v %+v %#v %s %d %x", c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys),
 		string(keys), loggedKeys.String(),
 	} {
+		outs = append(outs, out)
+	}
+	// Every verb, valid or not: fmt calls no method of the key types for
+	// %p, %w or a verb that does not fit, and prints the fields (#455).
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%x", "%o", "%b", "%t", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{c, &c, c.ChallengeKeys, c.DialogKeys, c.ChallengeKeys[0], c.DialogKeys[0], c.NonceKey} {
+			outs = append(outs, fmt.Sprintf(verb, v))
+		}
+	}
+	for _, out := range outs {
 		for _, secret := range keyForms(c) {
 			if strings.Contains(out, secret) {
 				t.Errorf("%q gives a key away", out)
@@ -279,7 +290,7 @@ func TestAKeysIDIsTheStartOfItsSHA256(t *testing.T) {
 	if c.DialogKeys[0].ID != id(dialogKey) || c.ChallengeKeys[0].ID != id(challengeKey) || c.SealKeyID != id(challengeKey) {
 		t.Errorf("IDs %s and %s, seal %s", c.DialogKeys[0].ID, c.ChallengeKeys[0].ID, c.SealKeyID)
 	}
-	seal := c.ChallengeKeys[0].Key
+	seal := c.ChallengeKeys[0].Key.Reveal()
 	if len(seal) != dynamostore.KeySize || string(seal) == challengeKey || strings.Contains(hex.EncodeToString(seal), c.SealKeyID) {
 		t.Error("the challenge seal key is the secret, or holds its ID")
 	}
@@ -301,11 +312,11 @@ func TestARotationKeepsTheReplacedKeyForWhatItSealedAndSigned(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(after.DialogKeys) != 2 || after.DialogKeys[1].ID != before.DialogKeys[0].ID ||
-		!bytes.Equal(after.DialogKeys[1].Key, before.DialogKeys[0].Key) || after.DialogKeys[0].ID == before.DialogKeys[0].ID {
+		!after.DialogKeys[1].Key.Equal(before.DialogKeys[0].Key) || after.DialogKeys[0].ID == before.DialogKeys[0].ID {
 		t.Errorf("dialog keys after the rotation: %v, before: %v", after.DialogKeys, before.DialogKeys)
 	}
 	if len(after.ChallengeKeys) != 2 || after.ChallengeKeys[1].ID != before.ChallengeKeys[0].ID ||
-		!bytes.Equal(after.ChallengeKeys[1].Key, before.ChallengeKeys[0].Key) || after.SealKeyID != after.ChallengeKeys[0].ID ||
+		!after.ChallengeKeys[1].Key.Equal(before.ChallengeKeys[0].Key) || after.SealKeyID != after.ChallengeKeys[0].ID ||
 		after.SealKeyID == before.SealKeyID {
 		t.Errorf("challenge keys after the rotation: %v seal %s, before: %v seal %s", after.ChallengeKeys, after.SealKeyID, before.ChallengeKeys, before.SealKeyID)
 	}

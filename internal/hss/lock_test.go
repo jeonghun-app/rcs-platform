@@ -416,10 +416,10 @@ func (n *deadlineNotifier) Deregister(ctx context.Context, r *cx.RTR) error {
 // TestARefusedPPRsRTRKeepsTimeAfterALateUpdate: the S-CSCF refused new data,
 // so the HSS marks the user not registered and deregisters it with
 // SERVER_CHANGE. The update must leave the RTR time even if it wins only at
-// its own deadline, behind another task's writes (#244 review): it gets half
-// of what the push has left, and the RTR the push's own deadline, not the
-// update's. The deadlines are compared rather than the time left, which a
-// loaded host eats into (#275).
+// its own deadline, behind another task's writes (#244 review): each gets
+// the push timeout of its own, from when it starts (code review on #476).
+// The deadlines are compared rather than the time left, which a loaded host
+// eats into (#275).
 func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	e := newEnv(t)
 	e.provision(impi1, impu1)
@@ -429,28 +429,61 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	ds := &deadlineStore{Store: e.store}
 	h := e.newHSS(func(o *Options) { o.Store = ds })
 	n := &deadlineNotifier{recordingNotifier: *newRecorder()}
-	const push = time.Hour
+	const each = time.Hour
 	start := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), push)
-	defer cancel()
-	pushEnd, _ := ctx.Deadline()
-	h.pprRejected(ctx, n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData))
+	h.pprRejected(context.Background(), n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData), each)
+	end := time.Now()
 	if e.sub(impi1).Identity(impu1).State != store.NotRegistered {
 		t.Fatal("the user was not marked not registered")
 	}
-	if len(n.deadlines) != 1 || !n.deadlines[0].Equal(pushEnd) {
-		t.Fatalf("RTR deadlines %v, want the push's own %v", n.deadlines, pushEnd)
-	}
-	// The update's deadline is half of what was left when it started, read
-	// from one clock reading: at least half of what is left now, and at
-	// most half of the push.
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
-	if len(ds.deadlines) != 1 {
-		t.Fatalf("%d writes", len(ds.deadlines))
+	if len(ds.deadlines) != 1 || len(n.deadlines) != 1 {
+		t.Fatalf("%d writes, %d RTRs", len(ds.deadlines), len(n.deadlines))
 	}
-	if left := pushEnd.Sub(ds.deadlines[0]); left < pushEnd.Sub(time.Now())/2 || left > push/2 {
-		t.Errorf("the update's deadline is %v before the push's end, want half of the %v the push had (started %v ago)", left, push, time.Since(start))
+	update, rtr := ds.deadlines[0], n.deadlines[0]
+	within := func(d time.Time) bool { return !d.Before(start.Add(each)) && !d.After(end.Add(each)) }
+	if !within(update) || !within(rtr) || rtr.Before(update) {
+		t.Errorf("deadlines: update %v, RTR %v; want each %v from its own start, between %v and %v",
+			update.Sub(start), rtr.Sub(start), each, time.Duration(0), end.Sub(start))
+	}
+}
+
+// refusingLate refuses each PPR with TOO_MUCH_DATA after wait, as an S-CSCF
+// answering close to the push timeout.
+type refusingLate struct {
+	deadlineNotifier
+	wait time.Duration
+	done time.Time
+}
+
+func (n *refusingLate) PushProfile(ctx context.Context, r *cx.PPR) error {
+	time.Sleep(n.wait)
+	n.done = time.Now()
+	_ = n.recordingNotifier.PushProfile(ctx, r)
+	return &RejectedError{Command: "PPR", Result: exp(cx.ErrorTooMuchData)}
+}
+
+// Code review on #476: a PPR refused near the end of its timeout leaves the
+// RTR that follows a whole push timeout of its own, not what the PPR left.
+func TestAnRTRAfterALateRefusalHasItsOwnTime(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	e.modify(impi1, func(s *store.Subscription) {
+		s.ServerName, s.PublicIdentities[0].State = scscfName, store.Registered
+	})
+	const each = 400 * time.Millisecond
+	n := &refusingLate{deadlineNotifier: deadlineNotifier{recordingNotifier: *newRecorder()}, wait: each * 9 / 10}
+	p, err := e.store.Profile(t.Context(), DefaultProfileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.h.notify(t.Context(), n, e.sub(impi1), p, []push{{set: 0}}, each)
+	if len(n.deadlines) != 1 {
+		t.Fatalf("%d RTRs", len(n.deadlines))
+	}
+	if rtr := n.deadlines[0]; rtr.Before(n.done.Add(each)) {
+		t.Errorf("the RTR's deadline is %v after the refusal, want at least %v", rtr.Sub(n.done), each)
 	}
 }
 
