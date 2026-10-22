@@ -177,7 +177,11 @@ func (p *pcscf) anchorInitialOffer(ctx context.Context, s *msrpSession, req *sip
 	}
 	x, out, wait, err := p.anchorOffer(ctx, s, s.origin, part.description())
 	if err != nil {
-		s.refused.Store(p.refusalOf(err, wait))
+		// Cancelled or drained: the request's own answer stands, not a
+		// refusal of the relay's (#382).
+		if ctx.Err() == nil {
+			s.refused.Store(p.refusalOf(err, wait))
+		}
 		return err
 	}
 	req.Body = part.with(out)
@@ -809,7 +813,9 @@ func (p *pcscf) offerInRequest(s *msrpSession, d proxy.Decision, from side, part
 		}
 		nx, out, wait, err := p.anchorOffer(ctx, s, from, desc)
 		if err != nil {
-			refused.Store(p.refusalOf(err, wait))
+			if ctx.Err() == nil {
+				refused.Store(p.refusalOf(err, wait))
+			}
 			return err
 		}
 		s.mu.Lock()
