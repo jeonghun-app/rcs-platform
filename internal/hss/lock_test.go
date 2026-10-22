@@ -626,12 +626,12 @@ func (q *qaInflight) UpdateSubscription(ctx context.Context, old, s *store.Subsc
 	return nil, fmt.Errorf("operation error DynamoDB: PutItem, %w", ctx.Err())
 }
 
-func inflightAPI(t *testing.T, mode string) *apiEnv {
+func inflightAPI(t *testing.T, mode string, storeTimeout time.Duration) *apiEnv {
 	q := &qaInflight{Store: store.NewMemory(), mode: mode}
 	e := newEnvWith(t, q)
 	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{
 		Tokens:         Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}},
-		DefaultProfile: DefaultProfileID, StoreTimeout: 500 * time.Millisecond,
+		DefaultProfile: DefaultProfileID, StoreTimeout: storeTimeout,
 	})}
 	a.create(impi1, true, impu1)
 	q.mu.Lock()
@@ -643,7 +643,7 @@ func inflightAPI(t *testing.T, mode string) *apiEnv {
 // TestAWriteCutOffInFlightAfterALostOneIsBusy: contention, not a store
 // failure (QA on #244).
 func TestAWriteCutOffInFlightAfterALostOneIsBusy(t *testing.T) {
-	a := inflightAPI(t, "deadline")
+	a := inflightAPI(t, "deadline", 500*time.Millisecond)
 	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
 	if code != http.StatusServiceUnavailable || body["error"] != "the subscription is busy; retry" || a.metrics.get("api.store_failure") != 0 {
 		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, a.metrics.get("api.store_failure"))
@@ -651,9 +651,12 @@ func TestAWriteCutOffInFlightAfterALostOneIsBusy(t *testing.T) {
 }
 
 // TestAStoreOutageAfterALostWriteIsAStoreFailure: only a context error is
-// contention; a store that fails is still one (QA on #244).
+// contention; a store that fails is still one (QA on #244). The store fails
+// at once, so the request needs no deadline of its own: with 500 ms, a
+// loaded host that took longer to reach the second write made it a
+// deadline, which is contention, and the test failed (#501).
 func TestAStoreOutageAfterALostWriteIsAStoreFailure(t *testing.T) {
-	a := inflightAPI(t, "outage")
+	a := inflightAPI(t, "outage", time.Hour)
 	code, body, _ := a.do("POST", subPath(impi1, "/digest-credential"), acsToken, "")
 	if code != http.StatusServiceUnavailable || body["error"] != "the subscriber store is unavailable; retry" || a.metrics.get("api.store_failure") != 1 {
 		t.Errorf("answer = %d %v, api.store_failure = %d", code, body, a.metrics.get("api.store_failure"))
