@@ -82,6 +82,12 @@ func registration(t *testing.T, typ ifc.RegistrationType, expires time.Duration)
 
 func withSender(s Sender) func(*Config) { return func(c *Config) { c.Sender = s } }
 
+// holdingLong gives the router's third-party REGISTERs an hour, for a test
+// whose sender holds them: at the default 10 s, a host stalled that long
+// frees the slots of the held ones and lets the test see more at the server
+// than the bound (#460).
+func holdingLong(c *Config) { c.ThirdPartyTimeout = time.Hour }
+
 // TestAServerWhoseCriterionTakesTheREGISTERGetsAThirdPartyREGISTER (TS
 // 24.229 §5.4.1.7): to the server's URI, from the S-CSCF, for the user in
 // To, with the set's Expires and the S-CSCF as Contact; a server whose
@@ -302,7 +308,7 @@ func otherSet(t *testing.T, e *env, n int) registrar.ThirdPartyRegistration {
 func TestRegistrationsPastAServersQueueAreDropped(t *testing.T) {
 	e := newEnv(t)
 	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 8)}
-	rt := e.router(nil, withSender(s), func(c *Config) { c.MaxThirdParty = 1 })
+	rt := e.router(nil, withSender(s), holdingLong, func(c *Config) { c.MaxThirdParty = 1 })
 	for n := range queuedPerServer + 1 {
 		rt.Registered(bg, otherSet(t, e, n))
 		if n == 0 {
@@ -326,7 +332,7 @@ func TestOneSetsQueueLeavesRoomForOthers(t *testing.T) {
 	// Room for every send, so that a queue past its bound fails the test
 	// rather than blocks it.
 	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 2*DefaultMaxThirdParty)}
-	rt := e.router(nil, withSender(s))
+	rt := e.router(nil, withSender(s), holdingLong)
 	for range DefaultMaxThirdParty {
 		rt.Registered(bg, registration(t, ifc.ReRegistration, time.Hour))
 	}
@@ -662,7 +668,7 @@ func TestAtMostTheBoundAreAtAServerAtOnce(t *testing.T) {
 	}
 	e := newEnv(t)
 	s := &sentRegisters{hold: make(chan struct{}), inside: make(chan struct{}, 512)}
-	rt := e.router(nil, withSender(s))
+	rt := e.router(nil, withSender(s), holdingLong)
 	const n = 300
 	for i := range n {
 		rt.Registered(bg, otherSet(t, e, i))

@@ -630,6 +630,7 @@ the sweep, every 30 s.
 | `ServerTransactionBytes` | gauge | bytes the server transactions hold, against their cap |
 | `ServerTransactionsRejected` | count | requests refused at the server transaction caps (503) |
 | `RefusalAcksAbsorbed` | count | ACKs of those 503s, which go no further |
+| `sip.overloaded` | count | every request refused as overloaded: the transaction layer's refusals above, and the proxy's own at its context and memory bounds. #56's overload alarms read this one (#467) |
 
 The last seven keep the names of the transport's and the transaction
 layer's `Stats` fields, which the alarms and the dashboard of
