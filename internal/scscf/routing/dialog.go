@@ -143,10 +143,10 @@ func (rt *Router) signedHop(v, callID, hop string) bool {
 // caller's requests go to: the value above the S-CSCF's, or the callee's
 // Contact. A UA copies the values into its route set (RFC 3261 §12.1), so
 // each in-dialog request carries the one its sender's route set holds.
-// It is used only for a request that sets up a dialog (formsDialog), which
-// pcscf records too; the Contact stands in only for a sender that records
-// no route, as rcs-as, a core service, does for the requests it sends for
-// its users.
+// It is used only for a request that sets up a dialog (formsDialog), and
+// for a NOTIFY inside one (InDialog), both of which pcscf records too; the
+// Contact stands in only for a sender that records no route, as rcs-as, a
+// core service, does for the requests it sends for its users.
 type recorder struct {
 	rt     *Router
 	callID string

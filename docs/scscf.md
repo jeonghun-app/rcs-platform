@@ -25,6 +25,16 @@ The proxy hands each request to the part that serves it:
 - **A request inside a dialog** goes along its route, only to a hop the dialog
   was set up through, a P-CSCF on `RCS_PCSCF_CORE_PORT`, or an application
   server in `SCSCF_APPLICATION_SERVERS`.
+  A NOTIFY also gets `scscf`'s `Record-Route` value, signed for the hop
+  toward its notifier, as the request that set the dialog up did: a
+  subscriber takes its route set from the NOTIFY that creates its dialog
+  (RFC 6665 §4.4.1), so its refresh and unsubscribe can come back through
+  `scscf` to the notifier
+  ([#550](https://github.com/jeonghun-app/rcs-platform/issues/550)). That
+  hop is the `Record-Route` value below `scscf`'s, or the Contact of a
+  sender that records none, as `rcs-as` does. A client's NOTIFY always
+  carries `pcscf`'s core-facing value there, which `pcscf` records, so no
+  address a client wrote is signed.
 
 What `scscf` sends itself, NOTIFYs and third-party REGISTERs, goes in client
 transactions over the core listener, to the first `Route` or else the
