@@ -382,7 +382,9 @@ var handingFinal atomic.Pointer[func()]
 // deciding is answered as well; the Router's decision then starts nothing.
 //
 // It returns a channel closed once the 500 has been handed to the
-// transport, or nil when the request needed no answer.
+// transport, or, for a request a Serve handler has, once the handler's
+// final, or serve's in its place, has been handed to the transaction; nil
+// when the request needed no answer.
 func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	if !c.inProgress() {
 		return nil
@@ -398,9 +400,11 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	if uas != nil {
 		// The service answers for itself. It learns of the stop through its
 		// context, and serve answers for it if it returns without a final
-		// response.
+		// response. Drain waits for that final as for its own answers, so
+		// that the flush after it, and the Close, do not leave it behind
+		// (#499).
 		c.cancelReq()
-		return nil
+		return uas.handedCh
 	}
 	// The response, and the service's DrainAnswer, are made without the
 	// lock, as every hook runs.
@@ -424,9 +428,10 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 		return nil
 	case c.uas != nil:
 		// The Router handed the request to a Serve handler meanwhile.
+		uas := c.uas
 		c.mu.Unlock()
 		c.cancelReq()
-		return nil
+		return uas.handedCh
 	case c.cancelled && !cancelled:
 		// Cancelled upstream meanwhile: 487 after all.
 		if res, err = c.p.response(c.tx.Request(), 487); err != nil {

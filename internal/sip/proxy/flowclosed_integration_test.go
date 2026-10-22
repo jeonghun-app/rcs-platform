@@ -1123,3 +1123,89 @@ func TestDrainWaitsForAServedFinalTheTransactionLayerHas(t *testing.T) {
 		t.Fatalf("the sender got %v, %v, want the 200", m, err)
 	}
 }
+
+// A Serve handler that answers once Drain's time is up and its context is
+// cancelled, as rcs-as does, still has its final reach the client: Drain
+// waits for it, within its own deadline, before the flush and the Close
+// (#499, whose repro this is: the 503 was lost 5 times in 5). The handler
+// takes 200 ms over its answer, a lower bound only, so that a Drain that did
+// not wait would be done by then; drainSendWait is long, so that only the
+// answer ends the wait.
+func TestDrainWaitsForAServeHandlerToAnswerItsCancellation(t *testing.T) {
+	drainSendWait = time.Hour
+	t.Cleanup(func() { drainSendWait = DrainSendWait })
+	var px atomic.Pointer[Proxy]
+	tr, err := transport.New(transport.Config{}, func(m transport.Inbound) {
+		if p := px.Load(); p != nil {
+			p.Receive(m)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	addr, err := tr.Listen(transport.ListenerConfig{Network: transport.TCP, Addr: "127.0.0.1:0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serving := make(chan struct{})
+	respErr := make(chan error, 1)
+	p, err := New(tr, Config{
+		Self: []sip.URI{mustURI("sip:" + addr.String() + ";lr")},
+		Router: RouterFunc(func(context.Context, *Request) Decision {
+			return Decision{Serve: func(ctx context.Context, u *UAS) {
+				close(serving)
+				<-ctx.Done() // the stop
+				time.Sleep(200 * time.Millisecond)
+				res, err := sip.NewResponse(u.Request().Message, 503, "", "uas1")
+				if err != nil {
+					respErr <- err
+					return
+				}
+				respErr <- u.Respond(res)
+			}}
+		}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Close)
+	px.Store(p)
+	nc, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { nc.Close() })
+	if _, err := io.WriteString(nc, "MESSAGE sip:bob@example.com SIP/2.0\r\n"+
+		"Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bK-serve-stop\r\nMax-Forwards: 70\r\n"+
+		"To: <sip:bob@example.com>\r\nFrom: <sip:alice@example.com>;tag=a1\r\n"+
+		"Call-ID: serve-stop\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serving:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+	done := make(chan struct{})
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		p.Drain(ctx)
+		_ = tr.Close() // as pcscf, icscf and rcs-as do
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Drain and Close did not return")
+	}
+	if err := <-respErr; err != nil {
+		t.Fatalf("UAS.Respond = %v", err)
+	}
+	_ = nc.SetReadDeadline(time.Now().Add(30 * time.Second))
+	m, err := sip.NewReader(bufio.NewReader(nc), sip.Limits{}).ReadMessage()
+	if res, ok := m.(*sip.Response); err != nil || !ok || res.StatusCode != 503 {
+		t.Fatalf("the sender got %v, %v, want the handler's 503", m, err)
+	}
+}

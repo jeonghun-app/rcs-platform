@@ -35,7 +35,9 @@ type UAS struct {
 	answered bool
 	// handed is set once a final response has been handed to the server
 	// transaction; answered is set before, to refuse a second one.
-	handed   bool
+	handed bool
+	// handedCh is closed when handed is set, for Drain to wait on (#499).
+	handedCh chan struct{}
 	accepted bool
 	// The 2xx being retransmitted, and what became of it.
 	ok       *sip.Response
@@ -68,7 +70,7 @@ func ackKeyOf(h *sip.Header) (ackKey, bool) {
 }
 
 func newUAS(c *respContext) *UAS {
-	return &UAS{c: c, tx: c.tx, done: make(chan struct{})}
+	return &UAS{c: c, tx: c.tx, done: make(chan struct{}), handedCh: make(chan struct{})}
 }
 
 // Request returns the request as the Router saw it.
@@ -119,6 +121,7 @@ func (u *UAS) Respond(res *sip.Response) error {
 		// for the proxy's own answers (respContext.handed).
 		u.mu.Lock()
 		u.handed = true
+		close(u.handedCh)
 		u.mu.Unlock()
 	}
 	if err != nil {
