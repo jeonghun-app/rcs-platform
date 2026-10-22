@@ -339,7 +339,16 @@ docker access. It:
    Both sessions get the owner's BYE and the roster subscription ends. The
    client rejoins, answered 500 with `Retry-After` until the other task has
    taken the group over, then 200; its roster is back, and its next message
-   reaches the peer, whom the new owner invites again. The test checks that
+   reaches the peer, whom the new owner invites again, once. No step may see
+   the network invite the peer while its session is open, the fault #121
+   fixed. A second run, `TestE2EComposeGroupChatOwnerCrash`, kills the owner
+   instead (`tmp/e2e-compose/kill`, `docker kill`), as a crash: nothing ends,
+   the client gives its own session up, and its rejoin is answered 500 with
+   `Retry-After`, never 404, until the other task takes the group over once
+   the owner's lease has run out, `RCSAS_TASK_LEASE` and `RCSAS_TASK_SKEW`
+   (22 s) after its last beat; the test checks that it had to wait at least
+   once. The crash run adds about 50 s to `make e2e-compose`. In both
+   runs the test checks that
    the group's owner item names the other task, one epoch up, and that the
    `rcs-as` logs count a forwarded request (`group.forwarded`) and the
    takeover (`group.owner_takeover`) in this run. For that the host restarts
@@ -348,9 +357,12 @@ docker access. It:
    (they are written once a minute otherwise); it then writes their logs
    since the first restart to `tmp/e2e-compose/logs`.
 
-   Whatever the outcome, the host starts the stopped task again and waits
-   until it is healthy before `make e2e-compose` returns. Every wait in the
-   handshake is bounded. The docker socket is never given to the test.
+   The host records each container before it stops or kills one. Whatever
+   the outcome, it starts every one recorded again, each whatever became of
+   the others, and waits until it is healthy before `make e2e-compose`
+   returns. Every docker call in the handshake is bounded (60 s), and each
+   wait for a healthy container is bounded in wall time (120 s). The docker
+   socket is never given to the test.
 8. checks the results of every run by the same rules as `make e2e`: every
    step, the resume bounds, no busy retries, nothing secret or identifying
    in the output.

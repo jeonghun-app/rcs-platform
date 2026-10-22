@@ -7,8 +7,10 @@
 #
 # The test writes, in the handshake directory:
 #   stop          an rcs-as task's IPv4 address on the stack's network: the
-#                 host stops that container and writes `stopped` with its
-#                 service name, or `failed` with why;
+#                 host stops that container cleanly and writes `stopped`
+#                 with its service name, or `failed` with why;
+#   kill          the same, killing the container (SIGKILL) as a crash
+#                 would: no shutdown, no last heartbeat;
 #   restart       the host restarts every rcs-as container of the stack (a
 #                 clean stop, which writes the task's counters, then a
 #                 start), waits until each is healthy, and writes
@@ -18,9 +20,11 @@
 #                 (atomically, by a rename) and removes the request. The
 #                 request may hold a time in Unix seconds, from which on
 #                 the logs are written (docker logs --since).
-# Whatever the test's outcome, every container stopped for it is started
-# again, and waited for until healthy, before this exits; the exit status is
-# the test's, or 1 if a container did not come back.
+# Each container is recorded before it is stopped or killed. Whatever the
+# test's outcome, every one recorded is started again, and waited for until
+# healthy, before this exits, a failure to start one not keeping the others
+# from starting; the exit status is the test's, or 1 if a container did not
+# come back.
 #
 # usage: scripts/e2e-compose.sh <project> <handshake dir> <container> command...
 #   project    the compose project (COMPOSE_PROJECT): its network is
@@ -32,7 +36,8 @@ set -u
 project=$1 dir=$2 container=$3
 shift 3
 network="${project}_default"
-# Every docker call is bounded, as is the wait for a restarted container.
+# Every docker call is bounded, and the wait for a restarted container is
+# bounded in wall time, the docker calls in it included.
 docker_timeout=60
 healthy_timeout=120
 
@@ -79,9 +84,29 @@ service() {
 	bounded "$docker_timeout" docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$1"
 }
 
+# remember records container $1 among those to start again, once.
+remember() {
+	case " $stopped " in
+	*" $1 "*) ;;
+	*) stopped="$stopped $1" ;;
+	esac
+}
+
+# forget takes container $1 out of those to start again.
+forget() {
+	kept=""
+	for n in $stopped; do
+		[ "$n" = "$1" ] || kept="$kept $n"
+	done
+	stopped=$kept
+}
+
+# stop_owner acts on the request file $1, stop or kill: it stops the rcs-as
+# container with the address the file holds, cleanly or by SIGKILL.
 stop_owner() {
-	addr=$(tr -d ' \r\n' <"$dir/stop")
-	rm -f "$dir/stop"
+	kind=$1
+	addr=$(tr -d ' \r\n' <"$dir/$kind")
+	rm -f "$dir/$kind"
 	case "$addr" in
 	*[!0-9.]* | "")
 		echo "not an IPv4 address" >"$dir/failed"
@@ -93,14 +118,20 @@ stop_owner() {
 		echo "no rcs-as container of $project has that address" >"$dir/failed"
 		return
 	fi
-	# Above RCS_SHUTDOWN_TIMEOUT (20 s), as the compose file's
-	# stop_grace_period: a clean stop, whose last beat lets the other task
-	# take the groups at once.
-	if ! bounded "$docker_timeout" docker stop -t 25 "$name" >/dev/null; then
-		echo "docker stop failed" >"$dir/failed"
+	# Recorded first: a stop cut short by its bound may still have stopped
+	# it, and it must come back either way.
+	remember "$name"
+	if [ "$kind" = kill ]; then
+		bounded "$docker_timeout" docker kill "$name" >/dev/null
+	else
+		# Above RCS_SHUTDOWN_TIMEOUT (20 s), as the compose file's
+		# stop_grace_period: a clean stop, whose last beat lets the other
+		# task take the groups soon.
+		bounded "$docker_timeout" docker stop -t 25 "$name" >/dev/null
+	fi || {
+		echo "docker $kind failed" >"$dir/failed"
 		return
-	fi
-	stopped="$stopped $name"
+	}
 	service "$name" >"$dir/stopped.tmp" && mv "$dir/stopped.tmp" "$dir/stopped"
 }
 
@@ -130,51 +161,54 @@ write_logs() {
 	mv "$dir/logs.tmp" "$dir/logs"
 }
 
-# start_healthy starts container $1 and waits until it is healthy.
+# start_healthy starts container $1 and waits until it is healthy, for at
+# most healthy_timeout seconds of wall time.
 start_healthy() {
 	if ! bounded "$docker_timeout" docker start "$1" >/dev/null; then
 		echo "e2e-compose: $1 did not start again" >&2
 		return 1
 	fi
-	waited=0
+	began=$(date +%s)
 	until [ "$(bounded "$docker_timeout" docker inspect -f '{{.State.Health.Status}}' "$1")" = healthy ]; do
-		if [ "$waited" -ge "$healthy_timeout" ]; then
+		if [ $(($(date +%s) - began)) -ge "$healthy_timeout" ]; then
 			echo "e2e-compose: $1 is not healthy ${healthy_timeout}s after it started again" >&2
 			return 1
 		fi
 		sleep 2
-		waited=$((waited + 2))
 	done
 }
 
+# restart_stopped starts every container recorded, each whatever became of
+# the others, and keeps those that did not come back recorded.
 restart_stopped() {
 	failed=0
 	for name in $stopped; do
-		start_healthy "$name" || failed=1
+		if start_healthy "$name"; then
+			forget "$name"
+		else
+			failed=1
+		fi
 	done
-	stopped=""
 	return "$failed"
 }
 
 # restart_all restarts every rcs-as container, so that each writes its
 # counters as it stops and starts with none: the logs from the time it
-# writes then on hold one run's counters alone.
+# writes then on hold one run's counters alone. Each is recorded before it
+# is stopped, so that one that does not come back is started again at the
+# end too.
 restart_all() {
 	rm -f "$dir/restart" "$dir/restarted"
-	names=$(rcsas_containers)
-	for name in $names; do
-		if ! bounded "$docker_timeout" docker stop -t 25 "$name" >/dev/null; then
-			echo "docker stop failed" >"$dir/failed"
-			return
-		fi
+	why=""
+	for name in $(rcsas_containers); do
+		remember "$name"
+		bounded "$docker_timeout" docker stop -t 25 "$name" >/dev/null || why="docker stop failed"
 	done
-	for name in $names; do
-		if ! start_healthy "$name"; then
-			echo "an rcs-as task did not come back" >"$dir/failed"
-			return
-		fi
-	done
-	stopped=""
+	restart_stopped || why="an rcs-as task did not come back"
+	if [ -n "$why" ]; then
+		echo "$why" >"$dir/failed"
+		return
+	fi
 	date +%s >"$dir/restarted.tmp" && mv "$dir/restarted.tmp" "$dir/restarted"
 }
 
@@ -184,7 +218,8 @@ test_pid=$!
 trap 'kill "$test_pid" 2>/dev/null; bounded "$docker_timeout" docker rm -f "$container" >/dev/null 2>&1; restart_stopped; exit 130' INT TERM
 
 while kill -0 "$test_pid" 2>/dev/null; do
-	[ -f "$dir/stop" ] && stop_owner
+	[ -f "$dir/stop" ] && stop_owner stop
+	[ -f "$dir/kill" ] && stop_owner kill
 	[ -f "$dir/restart" ] && restart_all
 	[ -f "$dir/logs-request" ] && write_logs
 	sleep 0.2

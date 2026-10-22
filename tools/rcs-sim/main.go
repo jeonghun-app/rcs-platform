@@ -98,6 +98,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		requireAll    = fs.Bool("require-all", false, "fail a step that would be skipped for want of something the stack does not offer yet")
 		groupRejoins  = fs.Int("group-rejoins", 1, "how many times group-chat's client rejoins before the owner stops")
 		ownerStopDir  = fs.String("group-owner-stop-dir", "", "handshake directory through which group-chat has its group's owner stopped (scripts/e2e-compose.sh); without it the owner steps are skipped")
+		ownerCrash    = fs.Bool("group-owner-crash", false, "group-chat's owner is killed, not stopped cleanly: no BYE or end of the roster subscription is expected")
 		sf            sipFlags
 	)
 	fs.StringVar(&sf.proxy, "sip-proxy", "", "pcscf's host:port; enables the SIP client")
@@ -165,6 +166,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		return usage("-group-rejoins must be at least 1")
 	}
 	cfg.GroupRejoins = *groupRejoins
+	cfg.OwnerCrash = *ownerCrash
 	if *ownerStopDir != "" {
 		cfg.StopOwner = ownerStopper(*ownerStopDir)
 	}

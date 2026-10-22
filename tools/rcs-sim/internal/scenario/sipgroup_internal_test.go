@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
 	"github.com/jeonghun-app/rcs-platform/internal/resourcelists"
@@ -256,6 +257,31 @@ func TestTheRosterMergesItsNotifies(t *testing.T) {
 	} {
 		if err := r.apply(n); err == nil {
 			t.Errorf("%s: taken", name)
+		}
+	}
+}
+
+// Code review on #602: Retry-After is read as RFC 3261 §20.33 writes it,
+// a comment and parameters after the seconds, and bounded; a 500 without
+// one, or with one that is no number of seconds, is a failure.
+func TestARetryAfterIsReadAndBounded(t *testing.T) {
+	for v, want := range map[string]time.Duration{
+		"1": time.Second, "1;duration=60": time.Second, "1 (busy)": time.Second, "0": 0,
+		"30": maxRetryAfter,
+	} {
+		res := &sip.Response{StatusCode: 500}
+		_ = res.Header.Add("Retry-After", v)
+		if got, err := retryAfter(res); err != nil || got != want {
+			t.Errorf("Retry-After %q: %v, %v; want %v", v, got, err, want)
+		}
+	}
+	for _, v := range []string{"", "-1", "soon"} {
+		res := &sip.Response{StatusCode: 500}
+		if v != "" {
+			_ = res.Header.Add("Retry-After", v)
+		}
+		if _, err := retryAfter(res); err == nil {
+			t.Errorf("Retry-After %q taken", v)
 		}
 	}
 }

@@ -89,6 +89,10 @@ type Config struct {
 	// returns once it has stopped, for group-chat's owner steps (#121).
 	// Nil skips them, which RequireAll makes a failure.
 	StopOwner func(ctx context.Context, conf sip.URI) error
+	// OwnerCrash says StopOwner kills the owner rather than stopping it
+	// cleanly: group-chat then expects no BYE and no end of its roster
+	// subscription, and its client gives up its own session (#121).
+	OwnerCrash bool
 	// RelayPublic is msrp-relay's public host:port, the authority of every
 	// client_path (RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT). chat-invite
 	// requires each a=path the network gives a client to name it, so a

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -23,12 +24,12 @@ import (
 
 // The group scenario's bounds. handshakeWait is how long the host may take
 // to stop a task or write the logs (scripts/e2e-compose.sh bounds each
-// docker call to 60 s); restartWait how long it may take to restart both
-// rcs-as tasks, each stopped cleanly (25 s at most) and then healthy (120 s
-// at most).
+// docker call to 60 s); a restart of both tasks, each stopped cleanly (25 s
+// at most) and then healthy (120 s at most), is bounded by the test's own
+// deadline, groupTestWait.
 const (
 	handshakeWait = 90 * time.Second
-	restartWait   = 6 * time.Minute
+	groupTestWait = 8 * time.Minute
 	handshakePoll = 100 * time.Millisecond
 	// groupRejoins is how many times the client rejoins before the owner
 	// stops. The core gives each request to either task at random, so
@@ -80,11 +81,28 @@ func (h handshake) write(name string, data []byte) error {
 	return os.Rename(tmp, filepath.Join(h.dir, name))
 }
 
-// stop has the host stop the rcs-as task at addr and returns its service.
-func (h handshake) stop(ctx context.Context, addr netip.Addr) (string, error) {
+// reset clears what an earlier test left in the handshake directory.
+func (h handshake) reset(t *testing.T) {
+	t.Helper()
+	for _, n := range []string{"conference", "stop", "kill", "stopped", "failed", "restart", "restarted", "logs-request", "logs"} {
+		for _, f := range []string{n, n + ".tmp"} {
+			if err := os.Remove(filepath.Join(h.dir, f)); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// stop has the host stop the rcs-as task at addr, cleanly or, with crash,
+// by SIGKILL, and returns its service.
+func (h handshake) stop(ctx context.Context, addr netip.Addr, crash bool) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, handshakeWait)
 	defer cancel()
-	if err := h.write("stop", []byte(addr.String())); err != nil {
+	kind := "stop"
+	if crash {
+		kind = "kill"
+	}
+	if err := h.write(kind, []byte(addr.String())); err != nil {
 		return "", err
 	}
 	name, b, err := h.wait(ctx, "stopped", "failed")
@@ -105,8 +123,6 @@ func (h handshake) restart(ctx context.Context) (string, error) {
 	for _, n := range []string{"restarted", "failed"} {
 		_ = os.Remove(filepath.Join(h.dir, n))
 	}
-	ctx, cancel := context.WithTimeout(ctx, restartWait)
-	defer cancel()
 	if err := h.write("restart", nil); err != nil {
 		return "", err
 	}
@@ -163,8 +179,9 @@ type ownerStop struct {
 }
 
 // serveOwnerStop waits for rcs-sim to ask for the group's owner to be
-// stopped, reads the owner from the groups table, and has the host stop it.
-func serveOwnerStop(ctx context.Context, h handshake, groups *awsstore.Groups) <-chan ownerStop {
+// stopped, reads the owner from the groups table, and has the host stop it,
+// or kill it with crash.
+func serveOwnerStop(ctx context.Context, h handshake, groups *awsstore.Groups, crash bool) <-chan ownerStop {
 	out := make(chan ownerStop, 1)
 	go func() {
 		var s ownerStop
@@ -186,20 +203,33 @@ func serveOwnerStop(ctx context.Context, h handshake, groups *awsstore.Groups) <
 			s.err = errors.New("the owner's SIP address does not parse")
 			return
 		}
-		s.service, s.err = h.stop(ctx, ap.Addr())
+		s.service, s.err = h.stop(ctx, ap.Addr(), crash)
 	}()
 	return out
 }
 
-func TestE2EComposeGroupChat(t *testing.T) {
+// TestE2EComposeGroupChat runs group-chat with its owner stopped cleanly:
+// the owner ends its sessions and subscriptions, and the other task takes
+// the group over RCSAS_TASK_SKEW after its last beat.
+func TestE2EComposeGroupChat(t *testing.T) { groupChat(t, false) }
+
+// TestE2EComposeGroupChatOwnerCrash runs it with its owner killed, as a
+// crash (D4 design on #121, §3): nothing ends, and for up to
+// RCSAS_TASK_LEASE and RCSAS_TASK_SKEW (22 s) after its last beat the group
+// is answered 500 with Retry-After, never 404, until the other task takes
+// it over.
+func TestE2EComposeGroupChatOwnerCrash(t *testing.T) { groupChat(t, true) }
+
+func groupChat(t *testing.T, crash bool) {
 	domain := composeDomain
 	impi := composeIMSI + "@" + domain
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), groupTestWait)
 	defer cancel()
 	for _, svc := range []string{"hss", "msrp-relay", "icscf", "scscf", "pcscf", "rcs-as-a", "rcs-as-b"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
 	h := newHandshake(t)
+	h.reset(t)
 	// Both tasks start afresh: their counters from now on are this run's.
 	since, err := h.restart(ctx)
 	if err != nil {
@@ -222,17 +252,21 @@ func TestE2EComposeGroupChat(t *testing.T) {
 	pcscf := doc.value("LBO_P-CSCF_Address", "Address")
 	stopCtx, stopWaiting := context.WithCancel(ctx)
 	defer stopWaiting()
-	stopped := serveOwnerStop(stopCtx, h, groups)
+	stopped := serveOwnerStop(stopCtx, h, groups, crash)
 
 	bin := build(t, "./tools/rcs-sim")
-	cmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
+	args := []string{
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
-		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
+		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI + "@" + domain,
 		"-sip-conference-factory", doc.value("CHAT", "ConfFctyURI"),
 		// The authority of every client_path, RELAY_PUBLIC_PORT 2855.
 		"-relay-public", net.JoinHostPort(env(t, "RELAY_PUBLIC_HOST"), "2855"),
-		"-group-rejoins", "5", "-group-owner-stop-dir", h.dir, "-require-all",
-		"group-chat")
+		"-group-rejoins", strconv.Itoa(groupRejoins), "-group-owner-stop-dir", h.dir, "-require-all",
+	}
+	if crash {
+		args = append(args, "-group-owner-crash")
+	}
+	cmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"), append(args, "group-chat")...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err = cmd.Run()
@@ -244,12 +278,18 @@ func TestE2EComposeGroupChat(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(h.dir, "conference")); err != nil {
 		stopWaiting()
 	}
-	checkResults(t, stdout.String(), stderr.String(), []string{
+	results := checkResults(t, stdout.String(), stderr.String(), []string{
 		"group-chat/register", "group-chat/create", "group-chat/invited", "group-chat/message", "group-chat/roster",
 		"group-chat/rejoin", "group-chat/owner-stop", "group-chat/owner-lost", "group-chat/rejoin-after-loss",
 		"group-chat/roster-after-loss", "group-chat/message-after-loss", "group-chat/clean",
 	}, env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
 		composeIMSI, composePeerIMSI)
+	// A crashed owner's group waits for its lease: the rejoin is answered
+	// 500 with Retry-After at least once (rcs-sim fails on any other
+	// answer, a 404 among them) before the other task takes it over.
+	if r := results["group-chat/rejoin-after-loss"]; crash && r.Detail["tries"] < 2 {
+		t.Errorf("after the owner crashed the rejoin took %d tries: want a wait for the lease first", r.Detail["tries"])
+	}
 
 	var stop ownerStop
 	select {

@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
@@ -183,16 +184,21 @@ func (r *roster) apply(n sipua.Notification) error {
 	if len(n.Body) == 0 {
 		return nil
 	}
+	// Fixed texts: what the network wrote stays out of the result lines
+	// (as reg-event's since #216).
 	if n.ContentType != conference.ContentType {
-		return fmt.Errorf("the NOTIFY's body is %s, not a conference-info document", n.ContentType)
+		return errNotRoster
 	}
 	doc, err := conference.Parse(n.Body)
 	if err != nil {
-		return fmt.Errorf("the roster does not parse: %w", err)
+		return errRosterParse
 	}
 	merged, err := conference.Merge(r.info, doc)
-	if err != nil {
-		return fmt.Errorf("the roster does not merge: %w", err)
+	switch {
+	case errors.Is(err, conference.ErrVersionGap):
+		return errRosterGap
+	case err != nil:
+		return errRosterMerge
 	}
 	r.info = merged
 	return nil
@@ -228,6 +234,29 @@ func (r *roster) status(ids ...string) (conference.EndpointStatus, bool) {
 
 // errNoFactory fails the group scenario without a conference factory URI.
 var errNoFactory = errors.New("no conference factory configured (-sip-conference-factory)")
+
+// errReinvited is the fault #121 exists to fix: the focus invited the peer
+// again though its session with the group was open, as a task that does
+// not hold the session would.
+var errReinvited = errors.New("the focus invited the peer again, though its session with the group was open")
+
+// The roster's errors, fixed texts: a document's own text never reaches a
+// result line. errRosterGap wraps conference.ErrVersionGap.
+var (
+	errNotRoster   = errors.New("the NOTIFY's body is not a conference-info document")
+	errRosterParse = errors.New("the roster does not parse")
+	errRosterMerge = errors.New("the roster does not merge")
+	errRosterGap   = fmt.Errorf("the roster skips a version: %w", conference.ErrVersionGap)
+)
+
+// subscriptionEnds numbers the reasons RFC 6665 §4.2.2 gives for a
+// subscription's end, for a step's detail ("reason"): a reason the network
+// wrote is never quoted, 0 is one not listed and 1 none at all.
+var subscriptionEnds = map[string]int64{"": 1, "deactivated": 2, "probation": 3, "rejected": 4,
+	"timeout": 5, "giveup": 6, "noresource": 7, "invariant": 8}
+
+// endReason is note's reason as subscriptionEnds numbers it.
+func endReason(note sipua.Notification) int64 { return subscriptionEnds[note.Reason] }
 
 // groupSubject is the subject of the group the scenario makes.
 const groupSubject = "rcs-sim group"
@@ -276,7 +305,7 @@ func (r *run) joinGroup(ctx context.Context, c *sipClient, req *sip.Request, loc
 		// The session must be anchored at msrp-relay (ADR 0004).
 		err = errNotRelay
 	case setup != sdp.SetupPassive:
-		err = fmt.Errorf("the answer's a=setup is %s, want passive: the client connects (RFC 6135)", setup)
+		err = errors.New("the answer's a=setup is not passive: the client connects (RFC 6135)")
 	}
 	if err != nil {
 		r.hangUp(d)
@@ -358,8 +387,9 @@ func identities(impu sip.URI) []string {
 }
 
 // awaitRoster applies sub's NOTIFYs to ro until ready says it shows what the
-// step waits for.
-func awaitRoster(ctx context.Context, sub *sipua.Subscription, ro *roster, ready func() bool) (int, error) {
+// step waits for. A subscription that ends first fails it, its reason
+// numbered (endReason) in *reason.
+func awaitRoster(ctx context.Context, sub *sipua.Subscription, ro *roster, ready func() bool, reason *int64) (int, error) {
 	n := 0
 	for !ready() {
 		select {
@@ -369,7 +399,8 @@ func awaitRoster(ctx context.Context, sub *sipua.Subscription, ro *roster, ready
 				return n, err
 			}
 			if note.State == "terminated" && !ready() {
-				return n, fmt.Errorf("the roster subscription ended (%s)", note.Reason)
+				*reason = endReason(note)
+				return n, errors.New("the roster subscription ended before it listed the participants")
 			}
 		case <-ctx.Done():
 			return n, errors.New("the roster never showed the participants")
@@ -390,6 +421,7 @@ func subscribeRoster(ctx context.Context, c *sipClient, conf sip.URI, who ...[]s
 		return nil, nil, detail, sipError(err)
 	}
 	ro := &roster{}
+	var reason int64
 	n, err := awaitRoster(ctx, sub, ro, func() bool {
 		for _, ids := range who {
 			if s, ok := ro.status(ids...); !ok || s != conference.Connected {
@@ -397,8 +429,12 @@ func subscribeRoster(ctx context.Context, c *sipClient, conf sip.URI, who ...[]s
 			}
 		}
 		return true
-	})
-	return sub, ro, map[string]int64{"status": int64(res.StatusCode), "notifies": int64(n), "version": int64(ro.version())}, err
+	}, &reason)
+	detail := map[string]int64{"status": int64(res.StatusCode), "notifies": int64(n), "version": int64(ro.version())}
+	if reason != 0 {
+		detail["reason"] = reason
+	}
+	return sub, ro, detail, err
 }
 
 // groupMessage sends a message from from on its leg to the group at conf,
@@ -448,6 +484,10 @@ func groupChat(r *run) error {
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoRelay })
 	}
 	calls := make(chan *sipua.IncomingCall, queueLength)
+	// invites counts the INVITEs the network sends the peer, as they come:
+	// one comes before any message can arrive on the session it opens, so
+	// a step reads it once its message has arrived.
+	var invites atomic.Int64
 	var a *sipClient
 	if err := r.step("register", func(ctx context.Context) (map[string]int64, error) {
 		var err error
@@ -456,6 +496,7 @@ func groupChat(r *run) error {
 		}
 		peer := *r.cfg.SIPPeer
 		peer.OnInvite = func(c *sipua.IncomingCall) {
+			invites.Add(1)
 			select {
 			case calls <- c:
 			default:
@@ -530,12 +571,26 @@ func groupChat(r *run) error {
 		// The focus invites the peer once the creator's session is up.
 		var err error
 		peerLeg, err = latestSession(ctx, sessions, peerSession{})
-		return nil, r.peerRefused(err)
+		return map[string]int64{"invites": invites.Load()}, r.peerRefused(err)
 	}); err != nil {
 		return err
 	}
+	// sameSession checks that the network sent the peer no INVITE since
+	// before, a count of invites: its session with the group is open.
+	sameSession := func(detail map[string]int64, err error, before int64) (map[string]int64, error) {
+		if detail == nil {
+			detail = map[string]int64{}
+		}
+		detail["invites"] = invites.Load() - before
+		if err == nil && detail["invites"] != 0 {
+			err = errReinvited
+		}
+		return detail, err
+	}
 	if err := r.step("message", func(ctx context.Context) (map[string]int64, error) {
-		return r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" to the group "+token), token)
+		before := invites.Load()
+		detail, err := r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" to the group "+token), token)
+		return sameSession(detail, err, before)
 	}); err != nil {
 		return err
 	}
@@ -550,6 +605,7 @@ func groupChat(r *run) error {
 		return err
 	}
 	if err := r.step("rejoin", func(ctx context.Context) (map[string]int64, error) {
+		before := invites.Load()
 		n := 0
 		for range max(r.cfg.GroupRejoins, 1) {
 			// The client's session ends without its leaving, as one idle
@@ -564,9 +620,7 @@ func groupChat(r *run) error {
 			n++
 		}
 		detail, err := r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after rejoining "+token), token)
-		if detail == nil {
-			detail = map[string]int64{}
-		}
+		detail, err = sameSession(detail, err, before)
 		detail["rejoins"] = int64(n)
 		return detail, err
 	}); err != nil {
@@ -583,6 +637,15 @@ func groupChat(r *run) error {
 		return err
 	}
 	if err := r.step("owner-lost", func(ctx context.Context) (map[string]int64, error) {
+		if r.cfg.OwnerCrash {
+			// An owner that crashed ends nothing: its sessions and the
+			// roster subscription just go quiet, and the client, its MSRP
+			// session broken, gives its own up and rejoins (RCC.07). Its
+			// old dialog ends with the scenario.
+			old := aLeg.dialog
+			r.onEnd(func() { r.hangUp(old) })
+			return map[string]int64{"crash": 1}, nil
+		}
 		// The owner ended what it held of the group on its way out: both
 		// sessions with a BYE, the roster subscription deactivated, so
 		// that the client subscribes again at once (docs/rcs-as.md).
@@ -597,10 +660,11 @@ func groupChat(r *run) error {
 			select {
 			case note := <-sub.Notifications():
 				if note.State == "terminated" {
+					detail := map[string]int64{"reason": endReason(note)}
 					if note.Reason != "deactivated" {
-						return nil, fmt.Errorf("the roster subscription ended %s, want deactivated", note.Reason)
+						return detail, errors.New("the roster subscription ended for another reason than deactivated")
 					}
-					return nil, nil
+					return detail, nil
 				}
 			case <-ctx.Done():
 				return nil, errors.New("the roster subscription outlived the owner")
@@ -633,7 +697,18 @@ func groupChat(r *run) error {
 		return err
 	}
 	if err := r.step("message-after-loss", func(ctx context.Context) (map[string]int64, error) {
-		return r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after the owner stopped "+token), token)
+		// The new owner holds no session with the peer, and invites it
+		// back for the message, once.
+		before := invites.Load()
+		detail, err := r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after the owner stopped "+token), token)
+		if detail == nil {
+			detail = map[string]int64{}
+		}
+		detail["invites"] = invites.Load() - before
+		if err == nil && detail["invites"] != 1 {
+			err = errors.New("the new owner did not invite the peer back exactly once")
+		}
+		return detail, err
 	}); err != nil {
 		return err
 	}
