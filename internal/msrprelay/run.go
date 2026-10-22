@@ -129,7 +129,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       time.Minute,
 		MaxHeaderBytes:    8 << 10,
-		ErrorLog:          slog.NewLogLogger(rt.Logger.Handler(), slog.LevelWarn),
+		ErrorLog:          runtime.HTTPErrorLog(rt.Logger),
 	}
 	failed := make(chan error, 2)
 	go func() { failed <- relay.Serve(public) }()

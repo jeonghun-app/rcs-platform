@@ -112,11 +112,14 @@ func (a *author) take(t *testing.T, body []byte) {
 }
 
 // deliveredWork counts the work done toward alice reading her messages by
-// all: statuses raised, summaries expanded, and her queue emptying. A
-// notification sent again, or a summary resent every pass, does not count,
-// so a delivery that loops stands still (code review on #335).
+// all: statuses raised, and her queue emptying. A notification sent again,
+// or a summary resent every pass, does not count, so a delivery that loops
+// stands still (code review on #335). Nor do summaries expanded: one
+// removed already shows in the queue, and the count, which has no bound,
+// would let a summary expanded but never removed look like progress for
+// ever (QA of #335).
 func deliveredWork(r *rig, a *author) int64 {
-	return a.changed.Load() + r.m.get("group.summary.expanded") - int64(r.store.(*store.Memory).Len(alice))
+	return a.changed.Load() - int64(r.store.(*store.Memory).Len(alice))
 }
 
 func (a *author) readByAll(id string, recipients []string) bool {
