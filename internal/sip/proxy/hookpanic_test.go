@@ -145,6 +145,25 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 			},
 		},
 		{
+			// The timeout ends the branch, as when the hook says so: a
+			// non-INVITE ended that way is answered 504 (#443).
+			name: "OnTimeout", hook: "OnTimeout", want: codes(504),
+			run: func(t *testing.T, h *harness) []int {
+				h.route(func(_ contextT, r *Request) Decision {
+					return Decision{Targets: []Target{{
+						URI:       mustURI("sip:a@192.0.2.1"),
+						Timeout:   2 * time.Second,
+						OnTimeout: func(contextT) bool { panicWith(&r.Message.Header); return false },
+					}}}
+				})
+				h.receive(request(t, "MESSAGE", "sip:bob@example.com"))
+				h.one()
+				h.advance(2 * time.Second)
+				check(t, "sent", h.sentMethods(), nil)
+				return h.upstream()
+			},
+		},
+		{
 			// The response the hook may have half changed is not sent.
 			name: "OnFinal", hook: "OnFinal", want: codes(500),
 			run: func(t *testing.T, h *harness) []int {
