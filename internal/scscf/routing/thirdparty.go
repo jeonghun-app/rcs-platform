@@ -46,7 +46,10 @@ type thirdParty struct {
 // than, so that the server hears the latest state (#379 code review). At
 // most queuedPerSet of a whole set's are queued, whatever its identities,
 // so that one user's refreshes do not take the queue (#379 and #446 code
-// review).
+// review), but for an identity with nothing queued, whose first goes past
+// the set's cap so that it is not dropped while the server's queue has
+// room (#446 QA): a set holds at most queuedPerSet plus its identities, at
+// most state.MaxIdentities.
 //
 // An end with none to take the place of goes past either bound, by at most
 // MaxThirdParty, as no later registration would tell the server of it
@@ -65,8 +68,8 @@ type serverQueue struct {
 	// registrations queued.
 	keys map[string]*keyQueue
 	sets map[string]int
-	// waiting are the refreshes queued and not yet sent, oldest first, an
-	// end may evict.
+	// waiting are the registrations queued and not yet sent, oldest first;
+	// an end may evict the refreshes among them.
 	waiting []*pending
 }
 
@@ -99,7 +102,8 @@ const queuedPerServer = 4
 // queuedPerSet bounds one set's registrations queued for a server, all its
 // identities together, the ones under way included: a registration, a
 // refresh and an end, with room for one more. An end goes past it as past
-// the server's bound.
+// the server's bound, and so does an identity's first with none of its own
+// queued (serverQueue).
 const queuedPerSet = 4
 
 // Registered sends the application servers whose criteria take r's
@@ -219,7 +223,7 @@ func (rt *Router) enqueue(server string, p *pending) (q *serverQueue, prev, done
 	bound := queuedPerServer * rt.cfg.MaxThirdParty
 	end := p.r.Type == ifc.DeRegistration
 	switch {
-	case q.queued < bound && q.sets[p.set] < queuedPerSet:
+	case q.queued < bound && (q.sets[p.set] < queuedPerSet || kq == nil):
 	case kq != nil && kq.last != nil && !kq.last.sent:
 		kq.last.r, kq.last.server = p.r, p.server
 		rt.count("routing.third_party.replaced")
@@ -243,9 +247,9 @@ func (rt *Router) enqueue(server string, p *pending) (q *serverQueue, prev, done
 	kq.queued++
 	q.sets[p.set]++
 	q.queued++
-	if !end {
-		q.waiting = append(q.waiting, p)
-	}
+	// Every type: an end a re-registration then takes the place of is a
+	// refresh an end may evict (#446 QA).
+	q.waiting = append(q.waiting, p)
 	return q, prev, done, true
 }
 
@@ -289,7 +293,7 @@ func (rt *Router) evictOne(q *serverQueue, w *pending) {
 	rt.count("routing.third_party.evicted")
 }
 
-// unwait takes p off the refreshes waiting.
+// unwait takes p off the registrations waiting.
 func (q *serverQueue) unwait(p *pending) {
 	if i := slices.Index(q.waiting, p); i >= 0 {
 		q.waiting = slices.Delete(q.waiting, i, i+1)
