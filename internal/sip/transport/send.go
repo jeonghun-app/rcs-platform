@@ -74,6 +74,10 @@ func (t *Transport) SendRequest(req *sip.Request, dst Destination, opts ...SendO
 			return UDP, t.sendDatagram(l, dst.Addr, b)
 		}
 		f, err := t.streamTo(TCP, dst.Addr, "")
+		if errors.Is(err, ErrClosed) {
+			// Close cut the attempt: the UDP socket is closing too.
+			return "", ErrClosed
+		}
 		if err != nil {
 			// §18.1.1: fall back to UDP when the TCP attempt is refused.
 			return UDP, t.sendDatagram(l, dst.Addr, b)
