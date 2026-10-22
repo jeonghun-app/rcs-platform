@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +26,43 @@ var (
 	chatAcceptTypes  = []string{cpim.ContentType, "application/im-iscomposing+xml"}
 	chatWrappedTypes = []string{"text/plain", imdn.ContentType}
 )
+
+// errNoRelay fails chat-invite without the relay's address, and errNotRelay
+// an answer whose a=path is not the relay's: a P-CSCF that did not anchor
+// the chat passes rcs-as's own path on, which a client on the same network
+// could connect to and chat through, the relay left out (code review on
+// #553).
+var (
+	errNoRelay  = errors.New("no relay address configured (-relay-public)")
+	errNotRelay = errors.New("the answer's a=path is not msrp-relay's client_path (ADR 0004)")
+)
+
+// atRelay reports whether u is msrp-relay's: its host and port those of
+// Config.RelayPublic, over TCP, as every client_path is.
+func (r *run) atRelay(u msrp.URI) bool {
+	host, port, err := net.SplitHostPort(r.cfg.RelayPublic)
+	return err == nil && strings.EqualFold(u.Host, host) && strconv.Itoa(u.Port) == port && u.Transport == "tcp"
+}
+
+// refuseCall answers call code and keeps why, which the step then waiting
+// for the peer reports (peerRefused) instead of a time out.
+func (r *run) refuseCall(call *sipua.IncomingCall, code int, why string) {
+	r.refusalMu.Lock()
+	r.refusal = why
+	r.refusalMu.Unlock()
+	_ = call.Reject(code)
+}
+
+// peerRefused is the reason the peer last refused an offer, as an error,
+// or err if it refused none.
+func (r *run) peerRefused(err error) error {
+	r.refusalMu.Lock()
+	defer r.refusalMu.Unlock()
+	if r.refusal != "" {
+		return errors.New(r.refusal)
+	}
+	return err
+}
 
 // releasePoll is how long the released step waits between binds, while
 // pcscf's release of the binding is on its way.
@@ -55,6 +94,8 @@ func chatInvite(r *run) error {
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoSIP })
 	case r.cfg.SIPPeer == nil:
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoPeer })
+	case r.cfg.RelayPublic == "":
+		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoRelay })
 	}
 	calls := make(chan *sipua.IncomingCall, queueLength)
 	var a, b *sipClient
@@ -119,7 +160,10 @@ func chatInvite(r *run) error {
 		}
 		detail := map[string]int64{"status": int64(res.StatusCode)}
 		if d == nil {
-			return detail, fmt.Errorf("INVITE answered %d", res.StatusCode)
+			// A network that passes the INVITE on to the peer, as the
+			// unit tests' stand-in core does, answers with the peer's
+			// refusal.
+			return detail, r.peerRefused(fmt.Errorf("INVITE answered %d", res.StatusCode))
 		}
 		dialog = d
 		r.onEnd(func() { r.hangUp(d) })
@@ -129,6 +173,9 @@ func chatInvite(r *run) error {
 		}
 		if setup != sdp.SetupPassive {
 			return detail, fmt.Errorf("the answer's a=setup is %s, want passive: the client connects (RFC 6135)", setup)
+		}
+		if !r.atRelay(path) {
+			return detail, errNotRelay
 		}
 		relayPath = path
 		return detail, nil
@@ -160,16 +207,16 @@ func chatInvite(r *run) error {
 		got, skipped, err := awaitChat(ctx, bEnd, sent.IMDN, token)
 		detail := map[string]int64{"skipped": int64(skipped)}
 		if err != nil {
-			return detail, err
+			return detail, r.peerRefused(err)
 		}
 		if !bytes.Equal(got.Body, text) || got.From.URI != aEnd.Self.URI {
 			return detail, errors.New("the message arrived changed")
 		}
 		// The session the network opened to the peer for it, the latest.
 		if peer, err = latestSession(ctx, sessions, peer); err != nil {
-			return detail, err
+			return detail, r.peerRefused(err)
 		}
-		return detail, awaitNotifications(ctx, aEnd, sent.IMDN)
+		return detail, awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
 	}); err != nil {
 		return err
 	}
@@ -193,7 +240,7 @@ func chatInvite(r *run) error {
 		if err := aEnd.Display(ctx, aConn.Session, got); err != nil {
 			return detail, fmt.Errorf("sending the display notification: %w", err)
 		}
-		return detail, awaitNotifications(ctx, bEnd, sent.IMDN)
+		return detail, awaitNotifications(ctx, bEnd, sent.IMDN, aEnd.Self.URI)
 	}); err != nil {
 		return err
 	}
@@ -221,7 +268,7 @@ func chatInvite(r *run) error {
 		if !bytes.Equal(got.Body, text) {
 			return detail, errors.New("the message arrived changed")
 		}
-		return detail, awaitNotifications(ctx, aEnd, sent.IMDN)
+		return detail, awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
 	}); err != nil {
 		return err
 	}
@@ -346,6 +393,9 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	if setup != sdp.SetupPassive {
 		return detail, fmt.Errorf("the answer's a=setup is %s, want passive: the client connects (RFC 6135)", setup)
 	}
+	if !r.atRelay(path) {
+		return detail, errNotRelay
+	}
 	c, err := chat.Dial(ctx, path, local, aEnd, r.cfg.MSRP, r.cfg.TLS, nil)
 	if err != nil {
 		return detail, err
@@ -366,12 +416,12 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	got, skipped, err := awaitChat(ctx, bEnd, sent.IMDN, token)
 	detail["skipped"] = int64(skipped)
 	if err != nil {
-		return detail, fmt.Errorf("the message to the unregistered peer never arrived after it registered again: %w", err)
+		return detail, fmt.Errorf("the message to the unregistered peer never arrived after it registered again: %w", r.peerRefused(err))
 	}
 	if !bytes.Equal(got.Body, text) {
 		return detail, errors.New("the stored message changed on the way")
 	}
-	if err := awaitNotifications(ctx, aEnd, sent.IMDN); err != nil {
+	if err := awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI); err != nil {
 		return detail, err
 	}
 	detail["stored"] = 1
@@ -379,10 +429,11 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 }
 
 // answerCalls answers each chat the network opens to the peer: an MSRP
-// offer naming the relay, answered with the peer's own path and
-// a=setup:active, and the peer connecting to the relay at once, as a
-// device behind NAT does. Each session goes to sessions; an offer the peer
-// cannot take is refused 488. It runs on a goroutine of its own until ctx
+// offer naming the relay, a=setup:actpass, answered with the peer's own
+// path and a=setup:active, and the peer connecting to the relay at once, as
+// a device behind NAT does. Each session goes to sessions; an offer the
+// peer cannot take is refused 488, and why is kept for the step waiting on
+// the peer (peerRefused). It runs on a goroutine of its own until ctx
 // ends, and then closes the sessions it opened and hangs up their dialogs
 // before it returns: the caller cancels ctx and waits for it at the
 // scenario's end (onEnd is the scenario goroutine's alone).
@@ -401,9 +452,18 @@ func (r *run) answerCalls(ctx context.Context, calls <-chan *sipua.IncomingCall,
 		case <-ctx.Done():
 			return
 		}
+		// The network offers actpass (RFC 6135 §4.2.2 forbids passive in
+		// an offer) with the relay's client_path, as pcscf writes it.
 		path, setup, err := chatAnswer(call.Request().Body)
-		if err != nil || (setup != sdp.SetupActPass && setup != sdp.SetupPassive) {
-			_ = call.Reject(488)
+		switch {
+		case err != nil:
+			r.refuseCall(call, 488, "the network's offer to the peer has no MSRP path it can take")
+			continue
+		case setup != sdp.SetupActPass:
+			r.refuseCall(call, 488, "the network's offer to the peer has a=setup:"+string(setup)+", not actpass (RFC 6135 §4.2.2)")
+			continue
+		case !r.atRelay(path):
+			r.refuseCall(call, 488, "the network's offer to the peer has an a=path that is not msrp-relay's client_path (ADR 0004)")
 			continue
 		}
 		local, err := chat.LocalURI(r.cfg.Rand)
@@ -493,21 +553,38 @@ func awaitChat(ctx context.Context, e *chat.Endpoint, id, token string) (chat.Re
 	}
 }
 
-// awaitNotifications waits for the delivery and the display notification of
-// the message with IMDN Message-ID id. Notifications about other messages,
-// an earlier run's, are passed over.
-func awaitNotifications(ctx context.Context, e *chat.Endpoint, id string) error {
-	want := map[imdn.Status]bool{imdn.Delivered: true, imdn.Displayed: true}
+// awaitNotifications waits for the delivery and the display notification
+// that each of recipients, by its URI, sends about the message with IMDN
+// Message-ID id: a group's message gets one pair from every invitee (RFC
+// 5438 §7.1.2, code review on #553). Each pair counts once; another from a
+// recipient, or one from someone the message was not sent to, fails.
+// Notifications about other messages, an earlier run's, are passed over.
+func awaitNotifications(ctx context.Context, e *chat.Endpoint, id string, recipients ...string) error {
+	type pair struct {
+		recipient string
+		status    imdn.Status
+	}
+	want := map[pair]bool{}
+	for _, who := range recipients {
+		want[pair{who, imdn.Delivered}], want[pair{who, imdn.Displayed}] = true, true
+	}
+	if len(want) == 0 {
+		return errors.New("no recipient to wait for notifications from")
+	}
 	for len(want) > 0 {
 		select {
 		case n := <-e.Notifications:
 			if n.MessageID != id {
 				continue
 			}
-			if !want[n.Status] {
+			p := pair{n.RecipientURI, n.Status}
+			switch {
+			case !slices.Contains(recipients, n.RecipientURI):
+				return fmt.Errorf("a %s notification from someone the message was not sent to", n.Status)
+			case !want[p]:
 				return fmt.Errorf("unexpected %s notification", n.Status)
 			}
-			delete(want, n.Status)
+			delete(want, p)
 		case <-ctx.Done():
 			return fmt.Errorf("%d notifications did not arrive", len(want))
 		}

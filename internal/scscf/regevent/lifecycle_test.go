@@ -722,7 +722,7 @@ func TestASetHasAtMostSetConcurrencyNotifiesUnderWay(t *testing.T) {
 	e.subscribedMany(subs)
 	g := newGate(subs)
 	n := newNotifierWith(t, e, e.store, g)
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	for range DefaultSetConcurrency {
 		<-g.entered
 	}
@@ -748,7 +748,7 @@ func TestANextHopHasAtMostHopConcurrencyNotifiesUnderWay(t *testing.T) {
 	g := newGate(sets)
 	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.HopConcurrency = hop })
 	for _, r := range others {
-		n.Changed(bg, r, r, Registered)
+		n.Changed(bg, r, e.touched(r), Registered)
 	}
 	for range hop {
 		<-g.entered
@@ -814,8 +814,8 @@ func TestASlowSubscriberHoldsNoWorker(t *testing.T) {
 	other := e.otherSets(1, "fast")
 	s := &slowSender{release: make(chan struct{}), fast: make(chan *sip.Request, 1)}
 	n := newNotifierWith(t, e, e.store, s, func(c *Config) { c.Workers, c.NotifyTimeout = 1, time.Minute })
-	n.Changed(bg, slowSet, slowSet, Registered)
-	n.Changed(bg, other[0], other[0], Registered)
+	n.Changed(bg, slowSet, e.touched(slowSet), Registered)
+	n.Changed(bg, other[0], e.touched(other[0]), Registered)
 	select {
 	case <-s.fast:
 	case <-time.After(10 * time.Second):
@@ -836,7 +836,7 @@ func TestNotifiesBeyondTheQueueAreDroppedAndCounted(t *testing.T) {
 	m := &counts{}
 	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.Queue, c.Metrics = 8, m })
 	// Two are under way, two wait (8/4 for the hop), six are dropped.
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	settled(t, n, 2)
 	for range 10 {
 		g.release <- struct{}{}
@@ -861,8 +861,8 @@ func TestANotifyWaitingIsNotQueuedTwice(t *testing.T) {
 	// subscription whose first is still waiting merges into it: all three,
 	// if the second change is listed before the first NOTIFY starts, or the
 	// two others if it is listed after.
-	n.Changed(bg, before, before, Registered)
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	waitQuiet(t, n)
 	for range 10 {
 		g.release <- struct{}{}
@@ -895,7 +895,7 @@ func TestTheEndsOfOtherSetsAreDeliveredWhileOneSubscriberIsSlow(t *testing.T) {
 	s := &slowSender{release: make(chan struct{}), held: make(chan struct{})}
 	m := &counts{}
 	n := newNotifierWith(t, e, e.store, s, func(c *Config) { c.NotifyTimeout, c.Metrics = time.Minute, m })
-	n.Changed(bg, slowSet, slowSet, Registered)
+	n.Changed(bg, slowSet, e.touched(slowSet), Registered)
 	for _, r := range others {
 		if err := e.store.DeleteRegistration(bg, r); err != nil {
 			t.Fatal(err)
@@ -1072,7 +1072,7 @@ func TestAStoreFailureSendsNoDocumentWithoutTheSet(t *testing.T) {
 		t.Errorf("refresh while the store fails: %d, Retry-After %q", r.StatusCode, r.Header.Get("Retry-After"))
 	}
 	fs.registration = 1
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	n.Wait()
 	if got := len(e.send.notifies()) - k; got != 0 {
 		t.Errorf("%d NOTIFYs sent without the set", got)
@@ -1080,7 +1080,7 @@ func TestAStoreFailureSendsNoDocumentWithoutTheSet(t *testing.T) {
 	if subs := e.subscriptions(impu1); len(subs) != 1 {
 		t.Errorf("%d subscriptions left", len(subs))
 	}
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	n.Wait()
 	got := e.send.notifies()
 	if doc, _, _ := info(t, got[len(got)-1]); len(got) != k+1 || len(activeURIs(doc, impu1)) != 1 {
@@ -1104,7 +1104,7 @@ func TestAReconnectedUELeavesNoDeadSubscription(t *testing.T) {
 	}
 	byCall := &byCallSender{status: map[string]int{"old-flow": 430}}
 	n2 := newNotifierWith(t, e, e.store, byCall)
-	n2.Changed(bg, before, before, Registered)
+	n2.Changed(bg, before, e.touched(before), Registered)
 	n2.Wait()
 	subs := e.subscriptions(impu1)
 	if len(subs) != 1 || subs[0].Dialog.CallID != "new-flow" {
@@ -1256,7 +1256,7 @@ func TestARefreshOfAnEndingSubscriptionIs481(t *testing.T) {
 	wantStatus(t, r, 481)
 	k := len(e.send.notifies())
 	reg, _ := e.store.Registration(bg, set1)
-	n.Changed(bg, reg, reg, Registered)
+	n.Changed(bg, reg, e.touched(reg), Registered)
 	n.Wait()
 	if got := len(e.send.notifies()) - k; got != 0 {
 		t.Errorf("%d NOTIFYs to a terminated subscription", got)
@@ -1275,7 +1275,7 @@ func TestASubscriptionWhoseCountersRanOutEndsWithoutANotify(t *testing.T) {
 		t.Fatal(err)
 	}
 	k := len(e.send.notifies())
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	n.Wait()
 	if got := len(e.send.notifies()) - k; got != 0 {
 		t.Errorf("%d NOTIFYs", got)
@@ -1298,7 +1298,7 @@ func TestVersionsContinueAcrossARestart(t *testing.T) {
 	n.Changed(bg, before, after, Registered)
 	n.Wait()
 	restarted := e.notifier(1)
-	restarted.Changed(bg, after, after, Registered)
+	restarted.Changed(bg, after, e.touched(after), Registered)
 	restarted.Wait()
 	r, f := restarted.Subscribe(bg, inDialog(t, res, impu1, pcscfPath, 2, 3600))
 	wantStatus(t, r, 200)
@@ -1428,7 +1428,7 @@ func TestManySubscriptionsUnderRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s := sets[i%4]
-			ns[i%2].Changed(bg, s, s, Registered)
+			ns[i%2].Changed(bg, s, e.touched(s), Registered)
 		}()
 	}
 	wg.Wait()
@@ -1455,7 +1455,7 @@ func TestManySubscriptionsUnderRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			s := sets[i%4]
-			ns[i%2].Changed(bg, s, s, Registered)
+			ns[i%2].Changed(bg, s, e.touched(s), Registered)
 			if i%5 == 0 {
 				_, _ = ns[i%2].Sweep(bg, 50)
 			}
@@ -1680,7 +1680,7 @@ func TestNextHopsAreBoundedApart(t *testing.T) {
 	g := newGate(4)
 	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.HopConcurrency = 1 })
 	for _, r := range sets {
-		n.Changed(bg, r, r, Registered)
+		n.Changed(bg, r, e.touched(r), Registered)
 	}
 	for range 2 {
 		select {
@@ -1709,7 +1709,7 @@ func TestTheQueueBoundsWhatWaitsForEveryHop(t *testing.T) {
 	m := &counts{}
 	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.HopConcurrency, c.Queue, c.Metrics = 1, queue, m })
 	for _, r := range sets {
-		n.Changed(bg, r, r, Registered)
+		n.Changed(bg, r, e.touched(r), Registered)
 	}
 	waitQuiet(t, n)
 	n.sc.mu.Lock()
@@ -1733,7 +1733,7 @@ func TestAnEndTakesTheWaitingNotifysPlace(t *testing.T) {
 	e.subscribedMany(2)
 	g := newGate(4)
 	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.SetConcurrency = 1 })
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	settled(t, n, 1)
 	n.Changed(bg, before, nil, Rejected)
 	settled(t, n, 2)
@@ -1882,7 +1882,7 @@ func TestWaitForGivesUpAtItsDeadline(t *testing.T) {
 	e.subscribedMany(1)
 	g := newGate(1)
 	n := newNotifierWith(t, e, e.store, g)
-	n.Changed(bg, before, before, Registered)
+	n.Changed(bg, before, e.touched(before), Registered)
 	<-g.entered
 	ctx, cancel := context.WithCancel(bg)
 	cancel()

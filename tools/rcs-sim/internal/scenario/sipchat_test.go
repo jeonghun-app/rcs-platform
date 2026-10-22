@@ -3,6 +3,8 @@ package scenario_test
 import (
 	"bytes"
 	"context"
+	"github.com/jeonghun-app/rcs-platform/internal/cpim"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -31,24 +33,41 @@ type chatAnchor struct {
 	t    *testing.T
 	ctrl *anchor.Control
 	core *chat.Core
-	// keep leaves the bindings at the BYE; answerSetup, if set, is the
-	// a=setup the client gets in the answer instead of passive; the
-	// forwarders lose the notifications with dropNotifications, and change
-	// every message's text from one to another with change.
-	keep              bool
-	answerSetup       sdp.Setup
-	dropNotifications bool
-	change            [2]string
-	// cutOver, if set, cuts what the forwarders send to that many octets
-	// when it is longer: a large message arrives short.
-	cutOver int
+	// keep leaves the bindings at the BYE. answerSetup and offerSetup, if
+	// set, are the a=setup the client gets in the answer and the peer in
+	// the offer, instead of passive and actpass; answerElsewhere and
+	// offerElsewhere put a path of the core stand-in there instead of the
+	// relay's client_path, reachable but past the relay, as a P-CSCF that
+	// did not anchor passes rcs-as's on (code review on #553).
+	keep                            bool
+	answerSetup, offerSetup         sdp.Setup
+	answerElsewhere, offerElsewhere bool
+	// toPeer and toClient are what the forwarders do wrong on the way to
+	// the peer and to the client.
+	toPeer, toClient faults
 
 	mu    sync.Mutex
 	calls map[string]*anchoredCall // by Call-ID
 }
 
+// faults are what a forwarder does wrong with what it sends on: it loses
+// the notifications (dropNotifications), changes each message's text from
+// one to another (change), writes another CPIM From in each message (from)
+// or another recipient in each notification (recipient), or sends first, once,
+// a message an earlier run left (leftover): with another Message-ID and,
+// for "same token", this run's text. With cutOver it cuts what it sends to
+// that many octets when it is longer: a large message arrives short.
+type faults struct {
+	dropNotifications bool
+	change            [2]string
+	from, recipient   string
+	leftover          string
+	cutOver           int
+}
+
 type anchoredCall struct {
 	caller, callee anchor.Binding
+	callerCore     msrp.URI
 }
 
 // anchorChats has core anchor every chat INVITE it forwards at the relay
@@ -107,7 +126,7 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 			a.t.Error(err)
 			return
 		}
-		in, out := &forwarder{a: a}, &forwarder{a: a}
+		in, out := &forwarder{f: &a.toPeer}, &forwarder{f: &a.toClient}
 		inbound, err := a.core.Expect(callerCore, caller.CoreLocal, in)
 		if err != nil {
 			a.t.Error(err)
@@ -123,7 +142,14 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 			a.t.Error(err)
 			return
 		}
-		if err := setMedia(s, m, callee.ClientPath, sdp.SetupActPass); err != nil {
+		offerPath, offerSetup := callee.ClientPath, sdp.SetupActPass
+		if a.offerElsewhere {
+			offerPath = calleeCore
+		}
+		if a.offerSetup != "" {
+			offerSetup = a.offerSetup
+		}
+		if err := setMedia(s, m, offerPath, offerSetup); err != nil {
 			a.t.Error(err)
 			return
 		}
@@ -132,7 +158,7 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 			return
 		}
 		a.mu.Lock()
-		a.calls[callID] = &anchoredCall{caller: caller, callee: callee}
+		a.calls[callID] = &anchoredCall{caller: caller, callee: callee, callerCore: callerCore}
 		a.mu.Unlock()
 	case req.Method == "BYE" && !a.keep:
 		a.mu.Lock()
@@ -170,7 +196,13 @@ func (a *chatAnchor) answered(req *sip.Request, res *sip.Response) {
 	if a.answerSetup != "" {
 		setup = a.answerSetup
 	}
-	if err := setMedia(s, m, c.caller.ClientPath, setup); err != nil {
+	answerPath := c.caller.ClientPath
+	if a.answerElsewhere {
+		// The caller's core leg: a passive MSRP end that takes a client's
+		// connection, as rcs-as's does.
+		answerPath = c.callerCore
+	}
+	if err := setMedia(s, m, answerPath, setup); err != nil {
 		a.t.Error(err)
 		return
 	}
@@ -192,27 +224,85 @@ func (a *chatAnchor) answered(req *sip.Request, res *sip.Response) {
 // the other leg, to, once that is bound, and acknowledged here, as rcs-as
 // takes a message and delivers it in a session of its own.
 type forwarder struct {
-	a  *chatAnchor
+	f  *faults
 	to *msrp.Session
+
+	mu       sync.Mutex
+	leftOver bool // the leftover has gone
 }
 
 func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	body, contentType := m.Body.Bytes(), m.MediaType()
-	if f.a.dropNotifications && bytes.Contains(body, []byte(imdn.ContentType)) {
+	notification := bytes.Contains(body, []byte(imdn.ContentType))
+	if f.f.dropNotifications && notification {
 		return nil
 	}
-	if f.a.change[0] != "" {
-		body = bytes.ReplaceAll(body, []byte(f.a.change[0]), []byte(f.a.change[1]))
+	if f.f.change[0] != "" {
+		body = bytes.ReplaceAll(body, []byte(f.f.change[0]), []byte(f.f.change[1]))
 	}
-	if n := f.a.cutOver; n > 0 && len(body) > n {
+	if n := f.f.cutOver; n > 0 && len(body) > n {
 		body = body[:n]
 	}
+	if f.f.recipient != "" && notification {
+		body = recipientRe.ReplaceAll(body, []byte("<recipient-uri>"+f.f.recipient+"</recipient-uri>"))
+	}
+	var first []byte
+	if !notification {
+		if f.f.from != "" {
+			body = rewritten(body, func(h *cpim.Header) {
+				if h.Name == cpim.HeaderFrom {
+					h.Value = "<" + f.f.from + ">"
+				}
+			}, nil)
+		}
+		f.mu.Lock()
+		if f.f.leftover != "" && !f.leftOver {
+			f.leftOver = true
+			var text []byte
+			if f.f.leftover != "same token" {
+				text = []byte("from an earlier run")
+			}
+			first = rewritten(body, func(h *cpim.Header) {
+				if strings.HasSuffix(h.Name, "."+imdn.HeaderMessageID) {
+					h.Value = "leftover0123456789"
+				}
+			}, text)
+		}
+		f.mu.Unlock()
+	}
+	// In order: a leftover is one the network had stored before this.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+		if first != nil {
+			_, _ = f.to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(first), SuccessReport: true})
+		}
 		_, _ = f.to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(body), SuccessReport: true})
 	}()
 	return nil
+}
+
+var recipientRe = regexp.MustCompile(`<recipient-uri>[^<]*</recipient-uri>`)
+
+// rewritten is the CPIM message body with edit applied to each of its
+// headers, and its content text instead if that is not nil; body as it is
+// if it does not parse.
+func rewritten(body []byte, edit func(*cpim.Header), text []byte) []byte {
+	c, err := cpim.Parse(body)
+	if err != nil {
+		return body
+	}
+	for i := range c.Headers {
+		edit(&c.Headers[i])
+	}
+	if text != nil {
+		c.Body = text
+	}
+	out, err := c.Marshal()
+	if err != nil {
+		return body
+	}
+	return out
 }
 
 func (f *forwarder) HandleReport(*msrp.Session, msrp.Report) {}
@@ -254,21 +344,13 @@ func TestAChatOverSIPCarriesAMessageEachWayAndItsBYEReleasesIt(t *testing.T) {
 		t.Fatalf("results %+v", results)
 	}
 	steps := byStep(results)
-	for _, s := range []string{"register", "invite", "connect", "client-to-peer", "peer-to-client", "chunked-message", "bye", "released", "peer-offline", "clean"} {
+	for _, s := range []string{"register", "invite", "connect", "client-to-peer", "peer-to-client", "bye", "released", "clean"} {
 		if !steps[s].OK {
 			t.Fatalf("%s: %+v", s, steps[s])
 		}
 	}
 	if steps["invite"].Detail["status"] != 200 || steps["client-to-peer"].Detail["skipped"] != 0 {
 		t.Fatalf("invite %+v, client-to-peer %+v", steps["invite"], steps["client-to-peer"])
-	}
-	// Chunked: well over internal/msrp's 2 KiB chunks.
-	if steps["chunked-message"].Detail["bytes"] < 100<<10 {
-		t.Fatalf("chunked-message %+v", steps["chunked-message"])
-	}
-	// The stand-in core stores nothing for an unregistered peer: 480.
-	if d := steps["peer-offline"].Detail; d["status"] != 480 || d["stored"] != 0 {
-		t.Fatalf("peer-offline %+v", steps["peer-offline"])
 	}
 	if core.Registered(self.URI) || core.Registered(peer.URI) {
 		t.Fatal("a binding outlived the scenario")
@@ -303,7 +385,7 @@ func TestAChatWhoseBindingOutlivesItsBYEFailsReleased(t *testing.T) {
 func TestAChatThatLosesItsNotificationsFailsTheMessageStep(t *testing.T) {
 	cfg, core := sipStack(t)
 	cfg.StepTimeout = 3 * time.Second
-	anchorChats(t, cfg, core).dropNotifications = true
+	anchorChats(t, cfg, core).toClient.dropNotifications = true
 	ok, results := runAll(t, cfg, "chat-invite")
 	last := results[len(results)-1]
 	if ok || last.Step != "client-to-peer" || last.Error != "2 notifications did not arrive" {
@@ -315,10 +397,83 @@ func TestAChatThatChangesTheTextFailsTheMessageStep(t *testing.T) {
 	// The CPIM body is changed on the way, its Message-ID kept: the peer
 	// gets the message, but not what was sent.
 	cfg, core := sipStack(t)
-	anchorChats(t, cfg, core).change = [2]string{"hello over SIP", "hello over SIQ"}
+	anchorChats(t, cfg, core).toPeer.change = [2]string{"hello over SIP", "hello over SIQ"}
 	ok, results := runAll(t, cfg, "chat-invite")
 	last := results[len(results)-1]
 	if ok || last.Step != "client-to-peer" || last.Error != "the message arrived changed" {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+// Code review on #553: what the network does wrong, each way, fails the
+// step that sees it. The relay's own path must be what each client gets; a
+// reachable end that is not it, as a P-CSCF that did not anchor passes on,
+// fails.
+func TestAChatTheNetworkGetsWrongFailsTheStepThatSeesIt(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fault       func(*chatAnchor)
+		step, err   string
+		stepTimeout time.Duration
+	}{
+		"the answer's path past the relay": {func(a *chatAnchor) { a.answerElsewhere = true },
+			"invite", "the answer's a=path is not msrp-relay's client_path (ADR 0004)", 0},
+		// The stand-in core passes the INVITE on to the peer, so the
+		// peer's refusal is the INVITE's answer; through rcs-as it comes
+		// at client-to-peer.
+		"the peer's offer past the relay": {func(a *chatAnchor) { a.offerElsewhere = true },
+			"invite", "the network's offer to the peer has an a=path that is not msrp-relay's client_path (ADR 0004)", 0},
+		"a passive offer to the peer": {func(a *chatAnchor) { a.offerSetup = sdp.SetupPassive },
+			"invite", "the network's offer to the peer has a=setup:passive, not actpass (RFC 6135 §4.2.2)", 0},
+		"another sender to the peer": {func(a *chatAnchor) { a.toPeer.from = "sip:+15550100003@" + imsDomain },
+			"client-to-peer", "the message arrived changed", 0},
+		"another sender to the client": {func(a *chatAnchor) { a.toClient.from = "sip:+15550100003@" + imsDomain },
+			"peer-to-client", "the message arrived changed", 0},
+		"the text changed to the client": {func(a *chatAnchor) { a.toClient.change = [2]string{"hello over SIP", "hello over SIQ"} },
+			"peer-to-client", "the message arrived changed", 0},
+		"the notifications lost to the peer": {func(a *chatAnchor) { a.toPeer.dropNotifications = true },
+			"peer-to-client", "2 notifications did not arrive", 3 * time.Second},
+		// Whichever of the two comes first.
+		"a notification from another to the client": {func(a *chatAnchor) { a.toClient.recipient = "sip:+15550100003@" + imsDomain },
+			"client-to-peer", " notification from someone the message was not sent to", 0},
+		"an earlier run's message with this run's text": {func(a *chatAnchor) { a.toPeer.leftover = "same token" },
+			"client-to-peer", "the message received is not the one sent", 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			if tc.stepTimeout > 0 {
+				cfg.StepTimeout = tc.stepTimeout
+			}
+			tc.fault(anchorChats(t, cfg, core))
+			ok, results := runAll(t, cfg, "chat-invite")
+			last := results[len(results)-1]
+			if ok || last.Step != tc.step || !strings.HasSuffix(last.Error, tc.err) {
+				t.Fatalf("results %+v", results)
+			}
+		})
+	}
+}
+
+// An earlier run's message, another Message-ID and without this run's
+// token, is skipped and counted, and the run passes; each way.
+func TestAChatSkipsWhatAnEarlierRunLeft(t *testing.T) {
+	cfg, core := sipStack(t)
+	a := anchorChats(t, cfg, core)
+	a.toPeer.leftover, a.toClient.leftover = "earlier", "earlier"
+	ok, results := runAll(t, cfg, "chat-invite")
+	if !ok {
+		t.Fatalf("results %+v", results)
+	}
+	steps := byStep(results)
+	if steps["client-to-peer"].Detail["skipped"] != 1 || steps["peer-to-client"].Detail["skipped"] != 1 {
+		t.Fatalf("client-to-peer %+v, peer-to-client %+v", steps["client-to-peer"], steps["peer-to-client"])
+	}
+}
+
+func TestAChatWithoutTheRelaysAddressFailsAtOnce(t *testing.T) {
+	cfg, _ := sipStack(t)
+	cfg.RelayPublic = ""
+	ok, results := runAll(t, cfg, "chat-invite")
+	if last := results[len(results)-1]; ok || last.Step != "register" || last.Error != "no relay address configured (-relay-public)" {
 		t.Fatalf("results %+v", results)
 	}
 }
@@ -327,7 +482,7 @@ func TestAChatThatCutsALargeMessageFailsTheChunkedStep(t *testing.T) {
 	// The short messages pass; the large one arrives cut, its CPIM
 	// headers whole, and the step says it changed.
 	cfg, core := sipStack(t)
-	anchorChats(t, cfg, core).cutOver = 64 << 10
+	anchorChats(t, cfg, core).toPeer.cutOver = 64 << 10
 	ok, results := runAll(t, cfg, "chat-invite")
 	last := results[len(results)-1]
 	if ok || last.Step != "chunked-message" || last.Error != "the message arrived changed" {

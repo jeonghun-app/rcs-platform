@@ -99,8 +99,8 @@ func TestConfigNeverPrintsItsSecrets(t *testing.T) {
 			t.Errorf("printed %q", s)
 		}
 	}
-	// Every verb, valid or not, over the whole Config: an invalid one, %p
-	// or %w, calls no method and prints the fields (#506).
+	// These verbs over the whole Config, valid ones and the invalid %p and
+	// %w, which call no method and print the fields (#506, #538).
 	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
 		for _, v := range []any{c, &c} {
@@ -138,6 +138,8 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 		"no rate":                   {with(devEnv, "HSS_ACS_RATE", "0"), "HSS_ACS_RATE"},
 		"no Cx timeout":             {with(devEnv, "HSS_CX_TIMEOUT", "0s"), "HSS_CX_TIMEOUT"},
 		"start-up beyond 240 s":     {with(devEnv, "HSS_START_TIMEOUT", "241s"), "HSS_START_TIMEOUT"},
+		"push timeout beyond 8 s":   {with(devEnv, "HSS_PUSH_TIMEOUT", "9s"), "HSS_PUSH_TIMEOUT"},
+		"API timeout beyond 10 s":   {with(devEnv, "HSS_API_TIMEOUT", "11s"), "HSS_API_TIMEOUT"},
 		"bad networks":              {with(devEnv, "HSS_DIAMETER_PEER_NETWORKS", "10.0.0.1/8"), "HSS_DIAMETER_PEER_NETWORKS"},
 		"no IMS domain":             {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
 	} {
@@ -155,6 +157,9 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 	}
 	if c, err := configure(with(devEnv, "HSS_START_TIMEOUT", "240s")); err != nil || c.StartTimeout != 240*time.Second {
 		t.Errorf("a 240 s start-up: %v %v", err, c.StartTimeout)
+	}
+	if c, err := configure(with(devEnv, "HSS_PUSH_TIMEOUT", "8s", "HSS_API_TIMEOUT", "10s")); err != nil || c.PushTimeout != 8*time.Second || c.APITimeout != 10*time.Second {
+		t.Errorf("an 8 s push and a 10 s API timeout: %v %v %v", err, c.PushTimeout, c.APITimeout)
 	}
 }
 
@@ -252,10 +257,12 @@ func TestAPIOptionsNeverPrintTheirTokens(t *testing.T) {
 		ACS:   TokenPair{Current: secret.NewString(acsToken)},
 		FT:    TokenPair{Current: secret.NewString(ftToken)},
 	}}
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
+	// These verbs, valid ones and the invalid %p and %w, and the tokens
+	// as text, in hex either case and as %d writes bytes (#538).
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%b", "%p", "%w", "%c", "%e"} {
 		for _, v := range []any{o, &o, o.Tokens, o.Tokens.Admin} {
 			out := fmt.Sprintf(verb, v)
-			for _, tok := range []string{adminToken[:12], adminTokenNext[:12], acsToken[:12], ftToken[:12], fmt.Sprintf("%x", adminToken[:6])} {
+			for _, tok := range []string{adminToken[:12], adminTokenNext[:12], acsToken[:12], ftToken[:12], fmt.Sprintf("%x", adminToken[:6]), fmt.Sprintf("%X", adminToken[:6]), strings.Trim(fmt.Sprint([]byte(adminToken[:6])), "[]")} {
 				if strings.Contains(out, tok) {
 					t.Errorf("%s printed a token: %s", verb, out)
 				}

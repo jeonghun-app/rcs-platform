@@ -29,6 +29,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -39,6 +40,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/buildinfo"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
@@ -84,6 +86,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		resumeSize    = fs.Int("resume-size", 12<<20, "size of the file ft-resume sends; must exceed FT_PART_SIZE")
 		uploadSettle  = fs.Duration("upload-settle", 3*time.Second, "how long ft-resume asks get_upload_info again for a broken upload to show")
 		control       = fs.String("relay-control", "", "msrp-relay control API base URL")
+		relayPublic   = fs.String("relay-public", "", "msrp-relay's public host:port, every client_path's; chat-invite checks the paths the network gives a client name it")
 		coreListen    = fs.String("core-listen", "127.0.0.1:0", "where the rcs-as stand-in listens")
 		coreAdvertise = fs.String("core-advertise", "", "host the relay connects to for the stand-in (default: the listener's)")
 		keepAlive     = fs.Duration("msrp-keepalive", defaultKeepAlive, "MSRP keep-alive interval of both ends; shorter than the relay's")
@@ -177,7 +180,14 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		if token == "" {
 			return usage("the relay control API needs RCS_SIM_RELAY_TOKEN")
 		}
-		cfg.Control = &anchor.Control{HTTP: httpClient, URL: u, Token: anchor.NewToken(token)}
+		cfg.Control = &anchor.Control{HTTP: httpClient, URL: u, Token: secret.NewString(token)}
+	}
+
+	if *relayPublic != "" {
+		if _, port, err := net.SplitHostPort(*relayPublic); err != nil || port == "" {
+			return usage("-relay-public must be host:port")
+		}
+		cfg.RelayPublic = *relayPublic
 	}
 
 	if sf.proxy == "" {

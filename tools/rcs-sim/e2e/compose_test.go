@@ -136,6 +136,9 @@ func TestE2EComposeStack(t *testing.T) {
 	sipCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
 		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
+		// The authority of every client_path, RELAY_PUBLIC_PORT 2855:
+		// chat-invite fails a path past the relay (code review on #553).
+		"-relay-public", net.JoinHostPort(env(t, "RELAY_PUBLIC_HOST"), "2855"),
 		"reg-event", "options", "pager-message", "chat-invite")
 	var sipOut, sipErr bytes.Buffer
 	sipCmd.Stdout, sipCmd.Stderr = &sipOut, &sipErr
