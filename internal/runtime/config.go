@@ -134,6 +134,10 @@ func serviceNamespace(shared *Env) string {
 type adminAddr struct {
 	listen   string
 	probeURL string
+	// proxyNetworks are the peers whose PROXY protocol v2 header the admin
+	// listener takes (RCS_ADMIN_PROXY_NETWORKS); empty, no header is
+	// taken from anyone (#230).
+	proxyNetworks []netip.Prefix
 }
 
 // loadAdminAddr reads RCS_ADMIN_ADDR as host:port with an IP literal or empty
@@ -146,6 +150,26 @@ func loadAdminAddr(e *Env) adminAddr {
 	if !ok {
 		e.Invalid("ADMIN_ADDR", "not host:port with an IP address or empty host and a port from 1 to 65535")
 		a, _ = parseAdminAddr(DefaultAdminAddr)
+	}
+	// Opt in, for the networks the NLB's health checks come from. The
+	// listener drops the header's source and uses none, so these networks
+	// are no trust boundary today; a /0 is refused all the same. A change
+	// that starts to use the source makes them one, and every core task in
+	// a subnet shared with the NLB would then be trusted to name any
+	// source. An IPv4-mapped IPv6 prefix is refused too: peers are matched
+	// unmapped, so it would match none, and every check would fail.
+	a.proxyNetworks = e.CIDRs("ADMIN_PROXY_NETWORKS", nil)
+	for _, p := range a.proxyNetworks {
+		if p.Bits() == 0 {
+			e.Invalid("ADMIN_PROXY_NETWORKS", "holds a /0 prefix, which would take a PROXY header from any address")
+			a.proxyNetworks = nil
+			break
+		}
+		if p.Addr().Is4In6() {
+			e.Invalid("ADMIN_PROXY_NETWORKS", "holds an IPv4-mapped IPv6 prefix, which no peer matches: write it as IPv4")
+			a.proxyNetworks = nil
+			break
+		}
 	}
 	return a
 }

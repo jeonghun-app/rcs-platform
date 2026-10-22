@@ -35,6 +35,7 @@ type subscriptionRecord struct {
 	ACSManaged  bool                 `json:"acs_managed,omitempty"`
 	ServerName  string               `json:"server_name,omitempty"`
 	AuthPending bool                 `json:"auth_pending,omitempty"`
+	StaleSets   []int                `json:"stale_sets,omitempty"`
 }
 
 type identityRecord struct {
@@ -73,7 +74,7 @@ func EncodeSubscription(s *Subscription) ([]byte, error) {
 	}
 	r := subscriptionRecord{
 		Schema: recordSchema, IMPI: s.IMPI, IMSI: s.IMSI, Profile: s.Profile, ACSManaged: s.ACSManaged,
-		ServerName: s.ServerName, AuthPending: s.AuthPending,
+		ServerName: s.ServerName, AuthPending: s.AuthPending, StaleSets: s.StaleSets,
 		IMPUs: make([]identityRecord, 0, len(s.PublicIdentities)),
 	}
 	for _, p := range s.PublicIdentities {
@@ -101,7 +102,7 @@ func DecodeSubscription(data []byte, version int64) (*Subscription, error) {
 	}
 	s := &Subscription{
 		IMPI: r.IMPI, IMSI: r.IMSI, Profile: r.Profile, ACSManaged: r.ACSManaged,
-		ServerName: r.ServerName, AuthPending: r.AuthPending, Version: version,
+		ServerName: r.ServerName, AuthPending: r.AuthPending, StaleSets: r.StaleSets, Version: version,
 	}
 	for _, p := range r.IMPUs {
 		s.PublicIdentities = append(s.PublicIdentities, PublicIdentity{p.IMPU, p.Barred, p.Type, p.ImplicitSet, p.State})

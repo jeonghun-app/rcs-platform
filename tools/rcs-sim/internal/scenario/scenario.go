@@ -20,6 +20,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -88,6 +89,11 @@ type Config struct {
 	// returns once it has stopped, for group-chat's owner steps (#121).
 	// Nil skips them, which RequireAll makes a failure.
 	StopOwner func(ctx context.Context, conf sip.URI) error
+	// RelayPublic is msrp-relay's public host:port, the authority of every
+	// client_path (RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT). chat-invite
+	// requires each a=path the network gives a client to name it, so a
+	// chat that went past the relay fails (ADR 0004, code review on #553).
+	RelayPublic string
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
@@ -194,6 +200,11 @@ type run struct {
 	report   Report
 	failed   bool
 	cleanups []func()
+
+	// refusal is why the peer last refused an offer the network sent it
+	// (answerCalls), which a step that then waits in vain reports.
+	refusalMu sync.Mutex
+	refusal   string
 }
 
 // errStepFailed stops a scenario after a failed or skipped step has been

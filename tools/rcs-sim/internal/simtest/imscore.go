@@ -68,12 +68,11 @@ type IMSCore struct {
 	// Offline, when set before any request, is what the core does with a
 	// request to an IMPU that has no binding.
 	Offline Offline
-	// RepeatFirstNotify, when set before any request, has the core send
-	// the first subscription's first NOTIFY twice, the state the same and
-	// the version raised, as scscf may when an initial registration's
-	// change reaches a subscription made after it (#473 QA).
-	RepeatFirstNotify bool
-	repeated          atomic.Bool
+	// RepeatNotifies, when set before any request, has the core send
+	// every NOTIFY that leaves its subscription active twice, the state the
+	// same and the version raised, as scscf did when a change reached a
+	// subscription made after it (#473 QA, #516).
+	RepeatNotifies bool
 
 	t     testing.TB
 	tr    *transport.Transport
@@ -97,8 +96,11 @@ type IMSCore struct {
 	// event subscriptions to it (RFC 3680), by aorKey.
 	contacts map[string]string
 	// events are the event that last changed each IMPU's contact, which a
-	// NOTIFY that does not change it writes again (RFC 3680 §4.7.1).
+	// NOTIFY that does not change it writes again (RFC 3680 §4.7.1), and
+	// cseqs the CSeq of the REGISTER that did, which a NOTIFY gives with
+	// the contact active (§5.1), as scscf does.
 	events map[string]string
+	cseqs  map[string]uint32
 	subs   map[string][]*regSub
 	// notifies sends NOTIFYs one at a time, in the order they were made,
 	// off the reading goroutine.
@@ -215,7 +217,7 @@ func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...ti
 		Domain: domain, t: t, ds: ds, users: users,
 		bindings: map[string]transport.FlowID{}, instances: map[string]string{}, stored: map[string][]*sip.Request{},
 		invites:  map[*transaction.ServerTransaction]*forwardedInvite{},
-		contacts: map[string]string{}, events: map[string]string{}, subs: map[string][]*regSub{}, notifies: make(chan func(), 256), stop: make(chan struct{}),
+		contacts: map[string]string{}, events: map[string]string{}, cseqs: map[string]uint32{}, subs: map[string][]*regSub{}, notifies: make(chan func(), 256), stop: make(chan struct{}),
 	}
 	go func() {
 		for {
@@ -306,6 +308,7 @@ func (c *IMSCore) end(impu, event string) {
 	delete(c.bindings, key)
 	delete(c.contacts, key)
 	delete(c.events, key)
+	delete(c.cseqs, key)
 	if bound {
 		c.queueChangeLocked(regChange{key: key, contact: contact, event: event}, closedGate)
 	}
@@ -530,8 +533,13 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (res *sip.Response
 		change.contact, change.event = c.contacts[key], "unregistered"
 		delete(c.contacts, key)
 		delete(c.events, key)
+		delete(c.cseqs, key)
 	} else {
 		c.events[key] = change.event
+		if cseq, err := req.Header.CSeq(); err == nil {
+			c.cseqs[key] = cseq.Seq
+		}
+		change.cseq = c.cseqs[key]
 		c.bindings[key] = tx.Source().Flow
 		if contacts, err := req.Header.Contact(); err == nil && len(contacts) > 0 {
 			c.contacts[key] = contacts[0].URI.String()
@@ -573,6 +581,7 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (res *sip.Response
 // contact, and the event that changed it (RFC 3680 §4.7.1).
 type regChange struct {
 	key, contact, event string
+	cseq                uint32
 }
 
 // queueChangeLocked queues a NOTIFY for every subscriber of the IMPU's reg
@@ -599,7 +608,7 @@ func (c *IMSCore) queueChangeLocked(ch regChange, gate <-chan struct{}) {
 		if gone {
 			state = terminated
 		}
-		c.notifyLocked(s, state, ch.contact, ch.event, !gone, gate)
+		c.notifyLocked(s, state, ch.contact, ch.event, ch.cseq, !gone, gate)
 	}
 	if gone {
 		delete(c.subs, ch.key)
@@ -660,16 +669,13 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 	// not change the registration. Queued with the subscription, ahead of
 	// any change after it, and sent after the 200.
 	contact, registered := c.contacts[key]
-	event := c.events[key]
+	event, cseq := c.events[key], c.cseqs[key]
 	gate := make(chan struct{})
 	switch {
 	case expires == 0:
-		c.notifyLocked(s, "terminated;reason=timeout", contact, event, registered, gate)
+		c.notifyLocked(s, "terminated;reason=timeout", contact, event, cseq, registered, gate)
 	default:
-		c.notifyLocked(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered, gate)
-		if c.RepeatFirstNotify && c.repeated.CompareAndSwap(false, true) {
-			c.notifyLocked(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered, gate)
-		}
+		c.notifyLocked(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, cseq, registered, gate)
 	}
 	c.mu.Unlock()
 	res, _ := sip.NewResponse(req, 200, "", s.tag)
@@ -695,11 +701,11 @@ func (c *IMSCore) awaitGate(gate <-chan struct{}, waiting func(<-chan struct{}))
 }
 
 // notifyLocked queues a NOTIFY of s's next version: the IMPU's one
-// contact, active with event, or terminated. It goes once gate is closed,
+// contact, active with event and, if not 0, cseq, or terminated. It goes once gate is closed,
 // after the 200 of the request that made it. c.mu is held, so NOTIFYs are
 // queued in the order of the changes; the queue is long enough that this
 // does not wait, and the notifier's goroutine never takes c.mu.
-func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, active bool, gate <-chan struct{}) {
+func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, cseq uint32, active bool, gate <-chan struct{}) {
 	waiting := c.waiting
 	send := func() {
 		if !c.awaitGate(gate, waiting) {
@@ -715,7 +721,11 @@ func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, active b
 		body := `<?xml version="1.0"?><reginfo xmlns="urn:ietf:params:xml:ns:reginfo" version="` + strconv.FormatUint(s.version, 10) + `" state="full">` +
 			`<registration aor="` + xmlText(s.impu) + `" id="r1" state="` + regState + `">`
 		if contact != "" {
-			body += `<contact id="c1" state="` + contactState + `" event="` + event + `" expires="3600"><uri>` + xmlText(contact) + `</uri></contact>`
+			body += `<contact id="c1" state="` + contactState + `" event="` + event + `" expires="3600"`
+			if active && cseq != 0 {
+				body += ` cseq="` + strconv.FormatUint(uint64(cseq), 10) + `"`
+			}
+			body += `><uri>` + xmlText(contact) + `</uri></contact>`
 		}
 		body += `</registration></reginfo>`
 		s.version++
@@ -760,9 +770,16 @@ func (c *IMSCore) notifyLocked(s *regSub, state, contact, event string, active b
 		case <-c.stop:
 		}
 	}
-	select {
-	case c.notifies <- send:
-	case <-c.stop:
+	times := 1
+	if c.RepeatNotifies && strings.HasPrefix(state, "active") {
+		times = 2
+	}
+	for range times {
+		select {
+		case c.notifies <- send:
+		case <-c.stop:
+			return
+		}
 	}
 }
 

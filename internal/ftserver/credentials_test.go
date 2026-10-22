@@ -165,8 +165,8 @@ func TestSecretsDoNotPrint(t *testing.T) {
 	c := Config{HSSToken: secretkey.NewString("token-value"), NonceKey: secretkey.NewString("nonce-key"), StaticUsers: map[string]secretkey.Key{"u": secretkey.NewString("static-password")}}
 	// And the HSS client run builds with the token (#533).
 	h := NewHSSCredentials(mustURL("http://hss.example.net"), c.HSSToken, realm, lookupTimeout, 4, nil)
-	// Every verb, valid or not: an invalid one, %p or %w, calls no method
-	// and prints the fields (#506).
+	// These verbs, valid ones and the invalid %p and %w, which call no
+	// method and print the fields (#506, #538).
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
 		for _, v := range []any{c, &c, *h, h} {
 			out := fmt.Sprintf(verb, v)

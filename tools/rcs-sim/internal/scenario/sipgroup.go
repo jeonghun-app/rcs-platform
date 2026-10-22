@@ -270,7 +270,12 @@ func (r *run) joinGroup(ctx context.Context, c *sipClient, req *sip.Request, loc
 		return res, sip.URI{}, groupLeg{}, err
 	}
 	path, setup, err := chatAnswer(res.Body)
-	if err == nil && setup != sdp.SetupPassive {
+	switch {
+	case err != nil:
+	case !r.atRelay(path):
+		// The session must be anchored at msrp-relay (ADR 0004).
+		err = errNotRelay
+	case setup != sdp.SetupPassive:
 		err = fmt.Errorf("the answer's a=setup is %s, want passive: the client connects (RFC 6135)", setup)
 	}
 	if err != nil {
@@ -398,9 +403,10 @@ func subscribeRoster(ctx context.Context, c *sipClient, conf sip.URI, who ...[]s
 
 // groupMessage sends a message from from on its leg to the group at conf,
 // and waits for its success report, its arrival at to's endpoint, and the
-// delivery and display notifications that come back. rcs-as rewrites the
-// CPIM From, so only the text and the Message-ID are compared.
-func groupMessage(ctx context.Context, from *chat.Endpoint, leg groupLeg, conf sip.URI, to *chat.Endpoint, text []byte, token string) (map[string]int64, error) {
+// delivery and display notifications that come back from to. rcs-as
+// rewrites the CPIM From, so only the text and the Message-ID are compared.
+// A session the peer refused is reported as such (peerRefused).
+func (r *run) groupMessage(ctx context.Context, from *chat.Endpoint, leg groupLeg, conf sip.URI, to *chat.Endpoint, text []byte, token string) (map[string]int64, error) {
 	sent, err := from.Send(ctx, leg.client.Session, cpim.Address{URI: groupIdentity(conf).String()}, "text/plain;charset=UTF-8", text, imdn.PositiveDelivery|imdn.Display)
 	if err != nil {
 		return nil, err
@@ -411,12 +417,12 @@ func groupMessage(ctx context.Context, from *chat.Endpoint, leg groupLeg, conf s
 	got, skipped, err := awaitChat(ctx, to, sent.IMDN, token)
 	detail := map[string]int64{"skipped": int64(skipped)}
 	if err != nil {
-		return detail, err
+		return detail, r.peerRefused(err)
 	}
 	if !bytes.Equal(got.Body, text) {
 		return detail, errors.New("the message arrived changed")
 	}
-	return detail, awaitNotifications(ctx, from, sent.IMDN)
+	return detail, awaitNotifications(ctx, from, sent.IMDN, to.Self.URI)
 }
 
 // groupChat is the group-chat scenario (#121 D4): the client makes a group
@@ -438,6 +444,8 @@ func groupChat(r *run) error {
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoPeer })
 	case r.cfg.ConferenceFactory.Host == "":
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoFactory })
+	case r.cfg.RelayPublic == "":
+		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoRelay })
 	}
 	calls := make(chan *sipua.IncomingCall, queueLength)
 	var a *sipClient
@@ -522,12 +530,12 @@ func groupChat(r *run) error {
 		// The focus invites the peer once the creator's session is up.
 		var err error
 		peerLeg, err = latestSession(ctx, sessions, peerSession{})
-		return nil, err
+		return nil, r.peerRefused(err)
 	}); err != nil {
 		return err
 	}
 	if err := r.step("message", func(ctx context.Context) (map[string]int64, error) {
-		return groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" to the group "+token), token)
+		return r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" to the group "+token), token)
 	}); err != nil {
 		return err
 	}
@@ -555,7 +563,7 @@ func groupChat(r *run) error {
 			aLeg = leg
 			n++
 		}
-		detail, err := groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after rejoining "+token), token)
+		detail, err := r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after rejoining "+token), token)
 		if detail == nil {
 			detail = map[string]int64{}
 		}
@@ -625,7 +633,7 @@ func groupChat(r *run) error {
 		return err
 	}
 	if err := r.step("message-after-loss", func(ctx context.Context) (map[string]int64, error) {
-		return groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after the owner stopped "+token), token)
+		return r.groupMessage(ctx, aEnd, aLeg, conf, bEnd, []byte(sipChatText+" after the owner stopped "+token), token)
 	}); err != nil {
 		return err
 	}

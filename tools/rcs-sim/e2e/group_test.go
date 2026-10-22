@@ -229,6 +229,8 @@ func TestE2EComposeGroupChat(t *testing.T) {
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
 		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
 		"-sip-conference-factory", doc.value("CHAT", "ConfFctyURI"),
+		// The authority of every client_path, RELAY_PUBLIC_PORT 2855.
+		"-relay-public", net.JoinHostPort(env(t, "RELAY_PUBLIC_HOST"), "2855"),
 		"-group-rejoins", "5", "-group-owner-stop-dir", h.dir, "-require-all",
 		"group-chat")
 	var stdout, stderr bytes.Buffer

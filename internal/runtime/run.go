@@ -388,6 +388,10 @@ func serve[C any](ctx context.Context, svc Service[C], p Process) int {
 		log.Error("admin listener failed", slog.String("error", pii.Redact(err.Error())))
 		return ExitFailure
 	}
+	if len(sh.admin.proxyNetworks) > 0 {
+		ln = proxyListener{Listener: ln, networks: sh.admin.proxyNetworks,
+			refusals: &proxyRefusals{metrics: rt.Metrics, log: log, now: p.Now}}
+	}
 	srv := &http.Server{
 		Handler:           rt.Admin,
 		ReadHeaderTimeout: 5 * time.Second,

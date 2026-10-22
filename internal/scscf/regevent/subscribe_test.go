@@ -183,6 +183,71 @@ func TestAFetchGetsOneNotifyAndNoSubscription(t *testing.T) {
 	}
 }
 
+// TestASubscriptionMadeAfterAChangeIsNotToldOfItAgain (#516): the
+// registrar's fan-out of an initial REGISTER runs on a worker, after the
+// SUBSCRIBE that followed the REGISTER may already have been answered. That
+// subscription's first NOTIFY had the state the change made, so the fan-out
+// sends it nothing; the next change is told as ever.
+func TestASubscriptionMadeAfterAChangeIsNotToldOfItAgain(t *testing.T) {
+	e := newEnv(t)
+	after := e.registered(binding(1, time.Hour))
+	n := e.notifier(1)
+	e.subscribed(n)
+	n.Changed(bg, nil, after, Registered)
+	n.Wait()
+	if got := len(e.send.notifies()); got != 1 {
+		t.Fatalf("%d NOTIFYs, want the first one only", got)
+	}
+	next := after.Clone()
+	next.Contacts = []state.Contact{binding(1, 2*time.Hour)}
+	next = e.saved(next)
+	n.Changed(bg, after, next, Registered)
+	n.Wait()
+	got := e.send.notifies()
+	if len(got) != 2 {
+		t.Fatalf("%d NOTIFYs after the next change, want 2", len(got))
+	}
+	if doc, cseq, _ := info(t, got[1]); cseq != 2 || doc.Version != 1 {
+		t.Errorf("the next change's NOTIFY: CSeq %d version %d, want 2 and 1", cseq, doc.Version)
+	}
+}
+
+// TestALateChangeStillTellsWhatItEnded (#516): a change's fan-out that runs
+// after a later change was notified is still sent, as the subscription has
+// had more than its first NOTIFY: the later one, from a state already
+// without the binding the earlier change ended, did not list that end.
+func TestALateChangeStillTellsWhatItEnded(t *testing.T) {
+	e := newEnv(t)
+	v0 := e.registered(binding(1, time.Hour), binding(2, time.Hour))
+	n := e.notifier(1)
+	e.subscribed(n)
+	v1 := v0.Clone()
+	v1.Contacts = []state.Contact{binding(1, time.Hour)}
+	v1 = e.saved(v1)
+	v2 := v1.Clone()
+	v2.Contacts = []state.Contact{binding(1, 2*time.Hour)}
+	v2 = e.saved(v2)
+	n.Changed(bg, v1, v2, Registered)
+	n.Wait()
+	n.Changed(bg, v0, v1, Unregistered)
+	n.Wait()
+	got := e.send.notifies()
+	if len(got) != 3 {
+		t.Fatalf("%d NOTIFYs, want the first, the later change's and the earlier's", len(got))
+	}
+	doc, _, _ := info(t, got[2])
+	reg, _ := doc.ByAOR(sip.URI{Scheme: "sip", User: "+15550100001", Host: realm})
+	for _, c := range reg.Contacts {
+		if c.URI == binding(2, 0).URI {
+			if c.State != reginfo.ContactTerminated || c.Event != reginfo.Unregistered {
+				t.Errorf("binding 2: %s %s, want terminated unregistered", c.State, c.Event)
+			}
+			return
+		}
+	}
+	t.Error("the earlier change's NOTIFY does not list the binding it ended")
+}
+
 // TestAChangeIsNotifiedWithTheFullStateAndStableIDs: a new binding is
 // registered, an old one unregistered and listed once as terminated; a
 // binding keeps its id across NOTIFYs, and its ids under the sip and tel
@@ -296,7 +361,7 @@ func TestASubscriberThatIsGoneEndsItsSubscription(t *testing.T) {
 			e.send.mu.Unlock()
 			after := before.Clone()
 			after.Contacts[0].Expires = t0.Add(2 * time.Hour)
-			n.Changed(bg, before, after, Registered)
+			n.Changed(bg, before, e.saved(after), Registered)
 			n.Wait()
 			subs, _ := e.store.SubscriptionsOf(bg, impu1)
 			if (len(subs) == 0) != c.ends {
@@ -315,14 +380,22 @@ func TestTwoInstancesNeverNumberTwoNotifiesAlike(t *testing.T) {
 	a := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.Metrics = m })
 	b := newNotifierWith(t, e, e.store, e.send, func(c *Config) { c.Metrics = m })
 	e.subscribed(a)
+	// The registrar saves each change before it tells of it.
+	afters := make([]*state.Registration, 20)
+	for i := range afters {
+		after := before.Clone()
+		if i > 0 {
+			after = afters[i-1].Clone()
+		}
+		after.Contacts[0].Expires = t0.Add(time.Duration(i+2) * time.Hour)
+		afters[i] = e.saved(after)
+	}
 	var wg sync.WaitGroup
 	for i := range 20 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			after := before.Clone()
-			after.Contacts[0].Expires = t0.Add(time.Duration(i+2) * time.Hour)
-			[]*Notifier{a, b}[i%2].Changed(bg, before, after, Registered)
+			[]*Notifier{a, b}[i%2].Changed(bg, before, afters[i], Registered)
 		}()
 	}
 	wg.Wait()

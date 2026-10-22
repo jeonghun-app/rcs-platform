@@ -171,8 +171,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer pc.subs.close()
 	defer stopSubs()
 	var relay *relayClient
-	if cfg.RelayToken.v != "" && cfg.RelayURL != nil {
-		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken.v, cfg.RelayTimeout, relayDialer(cfg))
+	if !cfg.RelayToken.IsZero() && cfg.RelayURL != nil {
+		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken, cfg.RelayTimeout, relayDialer(cfg))
 	}
 	anchorCtx, stopAnchor := context.WithCancel(context.Background())
 	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now).
