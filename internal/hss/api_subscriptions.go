@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -284,7 +285,7 @@ func (a *API) notifyChange(r *http.Request, s *store.Subscription, pushes []push
 	var p *store.ServiceProfile
 	if needsProfile(pushes) {
 		// Without the profile only the RTRs can go; h.send reports the PPRs.
-		pctx, cancel := context.WithTimeout(ctx, t.left(0))
+		pctx, cancel := context.WithDeadline(ctx, t.deadline(time.Now(), 0))
 		p, _ = a.h.store.Profile(pctx, s.Profile)
 		cancel()
 	}

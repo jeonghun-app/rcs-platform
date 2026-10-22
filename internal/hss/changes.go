@@ -271,12 +271,14 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 	}
 	var stale []push // cut short by the budget and failed, or left over
 	for i, ps := range pushes {
-		if t.bounded() && t.forPush(ps) < pushFloor {
+		now := time.Now()
+		end := t.forPush(now, ps)
+		if t.bounded() && end.Sub(now) < pushFloor {
 			h.overBudget(s, pushes[i:])
 			stale = append(stale, pushes[i:]...)
 			break
 		}
-		stopped, cut := h.notifyOne(ctx, n, s, p, ps, t)
+		stopped, cut := h.notifyOne(ctx, n, s, p, ps, t, end.Sub(now) < t.each, end)
 		if stopped {
 			// The user is no longer registered at the S-CSCF, which knows
 			// it no longer or is deregistering it: a set's PPR after this
@@ -309,24 +311,33 @@ type pushTimes struct {
 
 func (t pushTimes) bounded() bool { return !t.until.IsZero() }
 
-// left is how long a request may take that must leave keep before the end.
-func (t pushTimes) left(keep time.Duration) time.Duration {
-	if !t.bounded() {
-		return t.each
+// deadline is when a request that starts at now must end: each after now,
+// or earlier, so as to leave keep and the reserve before the end. It is
+// computed once from one clock reading, and the request's context made with
+// it (context.WithDeadline): a time left computed apart from the deadline
+// would read the clock twice, and a preemption between the readings would
+// carry the request past the budget (code review on #524).
+func (t pushTimes) deadline(now time.Time, keep time.Duration) time.Time {
+	end := now.Add(t.each)
+	if t.bounded() {
+		if last := t.until.Add(-t.reserve - keep); last.Before(end) {
+			end = last
+		}
 	}
-	return max(min(t.each, time.Until(t.until)-t.reserve-keep), 0)
+	return end
 }
 
-// forPush is how long ps may take: a PPR keeps each for its follow-up.
-func (t pushTimes) forPush(ps push) time.Duration {
+// forPush is when ps, starting at now, must end: a PPR keeps each for its
+// follow-up.
+func (t pushTimes) forPush(now time.Time, ps push) time.Time {
 	if ps.deregister {
-		return t.left(0)
+		return t.deadline(now, 0)
 	}
-	return t.left(t.each)
+	return t.deadline(now, t.each)
 }
 
-// followUp is how long a refused PPR's write and RTR may each take.
-func (t pushTimes) followUp() time.Duration { return t.left(0) }
+// followUp is when a refused PPR's write or RTR, starting at now, must end.
+func (t pushTimes) followUp(now time.Time) time.Time { return t.deadline(now, 0) }
 
 // overBudget counts and logs the pushes left when the budget ran out.
 func (h *HSS) overBudget(s *store.Subscription, left []push) {
@@ -383,13 +394,12 @@ func staleSets(pushes []push) []int {
 	return out
 }
 
-// notifyOne sends ps within t, and reports whether it left the user no
-// longer registered (pprRejected), and whether the budget cut it short and
-// it then failed without an answer: the budget's doing as much as a push
-// left over, whose set is marked stale too (code review on #524).
-func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, t pushTimes) (stopped, cut bool) {
-	given := t.forPush(ps)
-	pctx, cancel := context.WithTimeout(ctx, given)
+// notifyOne sends ps by end, and reports whether it left the user no
+// longer registered (pprRejected), and whether, short says, the budget cut
+// it short and it then failed without an answer: the budget's doing as much
+// as a push left over, whose set is marked stale too (code review on #524).
+func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, t pushTimes, short bool, end time.Time) (stopped, cut bool) {
+	pctx, cancel := context.WithDeadline(ctx, end)
 	defer cancel()
 	err := h.send(pctx, n, s, p, ps)
 	if err != nil {
@@ -404,7 +414,7 @@ func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, 
 	if errors.As(err, &rejected) {
 		return !ps.deregister && h.pprRejected(ctx, n, s, rejected.Result, t), false
 	}
-	return false, err != nil && t.bounded() && given < t.each
+	return false, err != nil && t.bounded() && short
 }
 
 // pprRejected acts on a PPA failure as TS 29.228 §6.2.2.1 asks of an HSS
@@ -435,7 +445,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	default:
 		return false
 	}
-	uctx, cancel := context.WithTimeout(ctx, t.followUp())
+	uctx, cancel := context.WithDeadline(ctx, t.followUp(time.Now()))
 	defer cancel()
 	_, err := h.update(uctx, s.IMPI, func(cur *store.Subscription) error {
 		if !served(cur) && !cur.AuthPending && cur.ServerName == "" {
@@ -459,7 +469,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 		return true
 	}
 	h.metrics.Count("push.ppr.data_refused", 1)
-	rctx, rcancel := context.WithTimeout(ctx, t.followUp())
+	rctx, rcancel := context.WithDeadline(ctx, t.followUp(time.Now()))
 	defer rcancel()
 	err = n.Deregister(rctx, &cx.RTR{UserName: s.IMPI, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}})
 	if err != nil {
