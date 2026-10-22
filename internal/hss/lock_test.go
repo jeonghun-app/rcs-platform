@@ -23,7 +23,11 @@ import (
 //
 // The lock is held all along, so TOO_BUSY can only be the wait giving up;
 // that it gives up at the Cx timeout is read from the deadline the wait
-// runs to, not from the clock, which a loaded host stretches (#268).
+// runs to, not from the clock, which a loaded host stretches (#268). That
+// the answer follows that deadline promptly is not checked: no wall-clock
+// bound on it survives a loaded host, and a wait that sleeps on once its
+// context has ended would need a clock seam to catch. A wait that ends on
+// a timer of its own is caught by TestALockWaitEndsOnlyWithItsContext.
 func TestABusySubscriptionAnswersTooBusyWithinTheCxTimeout(t *testing.T) {
 	const timeout = 200 * time.Millisecond
 	e := newEnv(t)
@@ -52,7 +56,14 @@ func TestABusySubscriptionAnswersTooBusyWithinTheCxTimeout(t *testing.T) {
 	}
 	// The handler started between the send and the wait, and its deadline
 	// is the Cx timeout from then.
-	w := <-waits
+	// The hook sends before the handler answers, so the wait has been
+	// recorded by now unless TOO_BUSY came without one.
+	var w wait
+	select {
+	case w = <-waits:
+	default:
+		t.Fatal("answered DIAMETER_TOO_BUSY without waiting for the lock")
+	}
 	if !w.ok || w.deadline.Before(sent.Add(timeout)) || w.deadline.After(w.at.Add(timeout)) {
 		t.Errorf("the wait ran to %v after the send (deadline set %v), want the Cx timeout %v", w.deadline.Sub(sent), w.ok, timeout)
 	}
@@ -62,6 +73,35 @@ func TestABusySubscriptionAnswersTooBusyWithinTheCxTimeout(t *testing.T) {
 	// Reads need no lock: LIR is still answered.
 	if lia := c.lir(impu1, false); lia.Result != exp(cx.UnregisteredService) {
 		t.Errorf("LIA = %v", lia.Result)
+	}
+}
+
+// A lock wait whose context has no deadline is given up by no other timer,
+// such as one of DefaultCxTimeout: the lock is held for longer than that,
+// and the wait still gets it (QA of #466). It is one-sided, so a loaded
+// host cannot fail the correct code; the sleep is a lower bound only.
+func TestALockWaitEndsOnlyWithItsContext(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1)
+	unlock, err := e.h.lock(context.Background(), impi1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{})
+	e.h.onLockWait = func(context.Context) { close(waiting) }
+	got := make(chan error, 1)
+	go func() {
+		u, err := e.h.lock(context.Background(), impi1)
+		if err == nil {
+			u()
+		}
+		got <- err
+	}()
+	<-waiting
+	time.Sleep(DefaultCxTimeout + 500*time.Millisecond)
+	unlock()
+	if err := <-got; err != nil {
+		t.Fatalf("a wait with no deadline gave up: %v", err)
 	}
 }
 
