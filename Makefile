@@ -92,6 +92,13 @@ test: volumes ## Unit tests with coverage summary
 race: volumes ## Unit tests under the race detector
 	$(RUNGO) -e CGO_ENABLED=1 $(GOIMAGE) go test -race ./... -count=1
 
+# The race detector turns on checkptr's basic checks; level 2 also checks
+# that every unsafe.Pointer conversion lands inside one allocation, which
+# msrp.Body's unsafe.Slice relies on (#530).
+.PHONY: checkptr
+checkptr: volumes ## internal/msrp's tests with checkptr=2
+	$(RUNGO) $(GOIMAGE) go test -gcflags=all=-d=checkptr=2 ./internal/msrp/... -count=1
+
 # cfn-lint and the platform policy checks (scripts/check_infra.py) in a pinned
 # tools image, built once per change of its Dockerfile or requirements, like
 # the Go toolchain.
@@ -229,7 +236,7 @@ privacy: ## Refuse long numeric identifiers that are not on the allow-list
 	scripts/check_identifiers.sh
 
 .PHONY: check
-check: fmt-check vet test race build docs privacy ## Everything the CI test job runs
+check: fmt-check vet test race checkptr build docs privacy ## Everything the CI test job runs
 
 .PHONY: clean
 clean:

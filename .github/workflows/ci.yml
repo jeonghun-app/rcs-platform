@@ -29,6 +29,7 @@ jobs:
       - run: make vet
       - run: make test
       - run: make race
+      - run: make checkptr
       - run: make build
 
   fuzz:
