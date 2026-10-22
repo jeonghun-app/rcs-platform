@@ -131,7 +131,7 @@ so that none, a rejoin `INVITE` without a resource list say, becomes a 1-to-1
 chat with a conference URI (security review on #252).
 
 scscf hands rcs-as a request with the AS URI of the iFC on top of its `Route`
-(TS 24.229 §5.4.3.2), `HSS_RCS_AS_URI` (`sip:rcs-as.<RCS_SERVICE_NAMESPACE>` by
+(TS 24.229 §5.4.3.2), `HSS_RCS_AS_URI` (`sip:rcs-as.<RCS_SERVICE_NAMESPACE>;transport=tcp` by
 default), and its own entry below. rcs-as takes as its own, and removes, a
 `Route` naming its service name (`RCSAS_SERVICE_NAME`, which must be the host
 of `HSS_RCS_AS_URI`) or its instance address (`RCSAS_SIP_HOST`), on

@@ -133,7 +133,9 @@ func Configure(s *runtime.Settings) Config {
 	}
 	c.PeerRealm = e.String("DIAMETER_PEER_REALM", c.OriginRealm)
 	c.SCSCFPattern = e.String("SCSCF_HOST_PATTERN", "scscf-*."+c.Namespace)
-	c.RCSASURI = e.String("RCS_AS_URI", "sip:rcs-as."+c.Namespace)
+	// Over TCP, rcs-as's only SIP transport: a URI without one would be
+	// sent over UDP (RFC 3263 §4.1), which scscf has no listener for (#14).
+	c.RCSASURI = e.String("RCS_AS_URI", "sip:rcs-as."+c.Namespace+";transport=tcp")
 
 	for _, addr := range []struct{ name, v string }{{"DIAMETER_ADDR", c.DiameterAddr}, {"API_ADDR", c.APIAddr}} {
 		if _, _, err := net.SplitHostPort(addr.v); err != nil {
@@ -159,7 +161,7 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("DEFAULT_PROFILE", err.Error())
 	}
 	if c.CreateDefaultProfile && !isSIPHostURI(c.RCSASURI) {
-		e.Invalid("RCS_AS_URI", "not a SIP URI sip:host[:port]")
+		e.Invalid("RCS_AS_URI", "not a SIP URI sip:host[:port][;transport=tcp|tls]")
 	}
 	if c.MaxAuthItems < 1 || c.MaxAuthItems > 16 {
 		e.Invalid("MAX_AUTH_ITEMS", "must be 1 to 16")
@@ -209,11 +211,19 @@ func Configure(s *runtime.Settings) Config {
 	return c
 }
 
-// isSIPHostURI accepts an AS address without a user part, sip:host[:port].
+// isSIPHostURI accepts an AS address without a user part,
+// sip:host[:port], with at most a transport parameter of tcp or tls.
 func isSIPHostURI(v string) bool {
 	host, ok := cutScheme(v)
 	if !ok {
 		return false
+	}
+	if h, params, found := strings.Cut(host, ";"); found {
+		name, value, _ := strings.Cut(params, "=")
+		if !strings.EqualFold(name, "transport") || !(strings.EqualFold(value, "tcp") || strings.EqualFold(value, "tls")) {
+			return false
+		}
+		host = h
 	}
 	if h, port, err := net.SplitHostPort(host); err == nil {
 		if n, err := strconv.Atoi(port); err != nil || n < 1 || n > 65535 {
