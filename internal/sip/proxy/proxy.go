@@ -373,7 +373,9 @@ func (p *Proxy) Layer() *transaction.Layer { return p.layer }
 // unless Config.DrainAnswer says otherwise, so its sender tries another
 // instance at once instead of waiting 64*T1 for its timers (#281). A request
 // a Serve handler is answering is the handler's: its context is cancelled,
-// and the handler answers, or the proxy for it once it returns. New
+// and the handler answers, or the proxy for it once it returns, and Drain
+// waits for that final, within DrainSendWait, as for its own answers
+// (#499). New
 // requests are still served meanwhile: a service's peers keep finding a
 // task until its Cloud Map registration and DNS answers age out, and pcscf
 // still reaches the clients it has not yet closed. It reports how many
@@ -427,8 +429,10 @@ func (p *Proxy) openContexts() []*respContext {
 
 // DrainSendWait bounds how long Drain waits, after the requests it waited
 // for, for the answers and CANCELs to be handed to the transport, which waits
-// at most its WriteTimeout for a slow peer, and then written. A service's
-// stop margin must leave room for it.
+// at most its WriteTimeout for a slow peer, and then written. The finals of
+// cancelled Serve handlers are waited for within it too, so a handler that
+// ignores its cancellation costs no more (#499). A service's stop margin
+// must leave room for it.
 const DrainSendWait = 2 * time.Second
 
 // drainDeadline is when a Drain that has answered or waited for its
