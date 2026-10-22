@@ -487,14 +487,17 @@ func TestListenerIdleTimeoutOverridesTheTransportDefault(t *testing.T) {
 // none, and the test makes the one it got pass once the keep-alive is
 // answered, so no order depends on a loaded host's timing (#463).
 func TestAcceptedConnectionThatSendsNoMessageIsClosedAfterTheReadTimeout(t *testing.T) {
-	server, _ := newTransport(t, Config{IdleTimeout: time.Hour, ReadTimeout: 50 * time.Millisecond})
+	const readTimeout = 50 * time.Millisecond
+	server, _ := newTransport(t, Config{IdleTimeout: time.Hour, ReadTimeout: readTimeout})
 	listen(t, server, ListenerConfig{Network: TCP})
 	near, peer := net.Pipe()
 	t.Cleanup(func() { peer.Close() })
+	_ = peer.SetDeadline(time.Now().Add(waitFor))
 	conn := &acceptedConn{readDeadlines: readDeadlines{Conn: near}}
 	server.mu.Lock()
 	l := server.listeners[0]
 	server.mu.Unlock()
+	before := time.Now()
 	l.take(conn)
 	if _, err := peer.Write([]byte("\r\n\r\n")); err != nil {
 		t.Fatal(err)
@@ -503,6 +506,7 @@ func TestAcceptedConnectionThatSendsNoMessageIsClosedAfterTheReadTimeout(t *test
 	if _, err := io.ReadFull(peer, pong); err != nil || string(pong) != "\r\n" {
 		t.Fatalf("pong %q, %v", pong, err)
 	}
+	after := time.Now()
 	// The deadline passes, at the next read after the keep-alive at the
 	// latest, which sets any deadline of its own first.
 	_ = near.SetReadDeadline(time.Unix(1, 0))
@@ -511,9 +515,14 @@ func TestAcceptedConnectionThatSendsNoMessageIsClosedAfterTheReadTimeout(t *test
 		t.Fatalf("stats = %+v", s)
 	}
 	// The accept clears any deadline (time.Time{}) before the stream sets its
-	// own.
-	if got := slices.DeleteFunc(conn.all(), time.Time.IsZero); len(got) != 1 {
-		t.Fatalf("read deadlines %v, want only the one set at the accept", got)
+	// own, at the first read, which came after the take and before the pong:
+	// ReadTimeout from then (QA of #481).
+	got := slices.DeleteFunc(conn.all(), time.Time.IsZero)
+	if len(got) != 1 {
+		t.Fatalf("read deadlines %v, want only the one set at the first read", got)
+	}
+	if got[0].Before(before.Add(readTimeout)) || got[0].After(after.Add(readTimeout)) {
+		t.Fatalf("read deadline %v after the take, want ReadTimeout %v from the first read, between %v and %v", got[0].Sub(before), readTimeout, readTimeout, after.Sub(before)+readTimeout)
 	}
 }
 
