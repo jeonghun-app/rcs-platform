@@ -34,7 +34,8 @@
 //	RCS_ADMIN_PROXY_NETWORKS
 //	                      CIDRs whose PROXY protocol v2 header the admin
 //	                      listener takes, as an NLB health check sends one;
-//	                      unset, none; a /0 is refused (#230)
+//	                      unset, none; a /0 or an IPv4-mapped IPv6
+//	                      prefix is refused (#230)
 //	RCS_SHUTDOWN_TIMEOUT  drain deadline after SIGTERM (default 20s)
 //	RCS_METRICS_NAMESPACE CloudWatch namespace for EMF metrics (default RCS)
 //	RCS_SERVICE_NAMESPACE Cloud Map namespace, a DNS name such as rcs.local
