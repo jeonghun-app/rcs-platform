@@ -589,3 +589,49 @@ func TestDrainWaitsForAHandlersAnswerStillOnItsWay(t *testing.T) {
 	}
 	check(t, "upstream", h.upstream(), codes(200))
 }
+
+// A Serve handler that ignores the stop's cancellation does not hold Drain
+// past DrainSendWait: the wait for its final ends with the timer of the
+// wait for Drain's own answers (code review of #518). The test fires that
+// timer itself (drainTimer), so no wall clock decides it; the handler
+// never answers until the test ends.
+func TestAServeHandlerThatIgnoresTheStopHoldsDrainOnlyForDrainSendWait(t *testing.T) {
+	h := newHarness(t, Config{})
+	stuck := make(chan struct{})
+	t.Cleanup(func() { close(stuck) })
+	serving := make(chan struct{})
+	h.decide(Decision{Serve: func(context.Context, *UAS) {
+		close(serving)
+		<-stuck // deaf to its context
+	}})
+	h.p.Receive(inboundFrom(request(t, "MESSAGE", "sip:bob@example.com"), "up"))
+	<-serving
+	armed := make(chan struct{}, 1)
+	fire := make(chan time.Time)
+	until := func(time.Time) <-chan time.Time {
+		select {
+		case armed <- struct{}{}:
+		default:
+		}
+		return fire
+	}
+	drainTimer.Store(&until)
+	t.Cleanup(func() { drainTimer.Store(nil) })
+	done := drainFor(h, 10*time.Millisecond)
+	select {
+	case <-armed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Drain armed no timer for the answers")
+	}
+	select {
+	case <-done:
+		t.Fatal("Drain returned before its DrainSendWait was over, with the handler's final still to come")
+	case <-time.After(200 * time.Millisecond): // a lower bound only
+	}
+	close(fire)
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Drain waits for a Serve handler that ignores its cancellation past DrainSendWait")
+	}
+}

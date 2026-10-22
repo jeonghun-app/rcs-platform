@@ -118,7 +118,10 @@ func (u *UAS) Respond(res *sip.Response) error {
 	err := u.tx.Respond(res)
 	if final {
 		// Only now is the request no longer in progress for Drain, as
-		// for the proxy's own answers (respContext.handed).
+		// for the proxy's own answers (respContext.handed). handedCh
+		// closes here too, after tx.Respond returned, not before: by
+		// then the transaction has handed the final to the transport,
+		// which counts it for the flush Drain goes on to (#499).
 		u.mu.Lock()
 		u.handed = true
 		close(u.handedCh)

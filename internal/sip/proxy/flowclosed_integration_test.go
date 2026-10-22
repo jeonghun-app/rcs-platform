@@ -1125,12 +1125,12 @@ func TestDrainWaitsForAServedFinalTheTransactionLayerHas(t *testing.T) {
 }
 
 // A Serve handler that answers once Drain's time is up and its context is
-// cancelled, as rcs-as does, still has its final reach the client: Drain
-// waits for it, within its own deadline, before the flush and the Close
-// (#499, whose repro this is: the 503 was lost 5 times in 5). The handler
-// takes 200 ms over its answer, a lower bound only, so that a Drain that did
-// not wait would be done by then; drainSendWait is long, so that only the
-// answer ends the wait.
+// cancelled, as scscf's and pcscf's do, still has its final reach the
+// client: Drain waits for it, within its own deadline, before the flush and
+// the Close (#499, whose repro this is: the 503 was lost 5 times in 5). The
+// handler takes 200 ms over its answer, a lower bound only, so that a Drain
+// that did not wait would be done by then; drainSendWait is long, so that
+// only the answer ends the wait.
 func TestDrainWaitsForAServeHandlerToAnswerItsCancellation(t *testing.T) {
 	drainSendWait = time.Hour
 	t.Cleanup(func() { drainSendWait = DrainSendWait })
