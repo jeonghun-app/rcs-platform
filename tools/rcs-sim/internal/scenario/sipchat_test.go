@@ -15,10 +15,12 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/chat"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
 // chatAnchor plays pcscf's MSRP anchoring and rcs-as's end of each leg in
@@ -48,14 +50,18 @@ type chatAnchor struct {
 	// peer's earlier chat, as a network that keeps no message and uses a
 	// chat the peer should have ended would (code review on #559).
 	answerOffline bool
+	// offlineOnFirst has answerOffline send on the peer's first chat
+	// rather than its latest.
+	offlineOnFirst bool
 	// toPeer and toClient are what the forwarders do wrong on the way to
 	// the peer and to the client.
 	toPeer, toClient faults
 
 	mu    sync.Mutex
 	calls map[string]*anchoredCall // by Call-ID
-	// toPeerLeg is the core leg toward the peer of the latest chat.
-	toPeerLeg *msrp.Session
+	// toPeerLegs are the core legs toward the peer, a chat's each, oldest
+	// first.
+	toPeerLegs []*msrp.Session
 }
 
 // faults are what a forwarder does wrong with what it sends on: it loses
@@ -129,7 +135,11 @@ func (a *chatAnchor) offline(req *sip.Request) []byte {
 		return nil
 	}
 	a.mu.Lock()
-	leg := &forwarder{f: &a.toPeer, to: a.toPeerLeg}
+	to := a.toPeerLegs[len(a.toPeerLegs)-1]
+	if a.offlineOnFirst {
+		to = a.toPeerLegs[0]
+	}
+	leg := &forwarder{f: &a.toPeer, to: to}
 	a.mu.Unlock()
 	if _, err := a.core.Expect(callerCore, caller.CoreLocal, leg); err != nil {
 		a.t.Error(err)
@@ -203,7 +213,7 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 		}
 		in.to, out.to = outbound, inbound
 		a.mu.Lock()
-		a.toPeerLeg = outbound
+		a.toPeerLegs = append(a.toPeerLegs, outbound)
 		a.mu.Unlock()
 		if err := a.ctrl.Complete(ctx, caller.ID, anchor.Paths{Core: callerCore}, 0); err != nil {
 			a.t.Error(err)
@@ -602,6 +612,11 @@ func TestAChatsChunkedAndOfflineStepsFailWhatTheyCheck(t *testing.T) {
 		// the peer has ended: the message never comes.
 		"the offline chat sent on the peer's earlier chat": {func(a *chatAnchor, _ *simtest.IMSCore) { a.answerOffline = true },
 			"peer-offline", "the message to the unregistered peer never arrived after it registered again"},
+		// The registrar keeps the peer's flow, so the client's chat
+		// reaches the peer at once, on a chat opened before it registers
+		// again: delivered, but never stored.
+		"the peer's binding kept after it unregistered": {func(_ *chatAnchor, c *simtest.IMSCore) { c.KeepBindings = true },
+			"peer-offline", "the stored message came on a chat the network opened before the peer registered again"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cfg, core := sipStack(t)
@@ -613,5 +628,88 @@ func TestAChatsChunkedAndOfflineStepsFailWhatTheyCheck(t *testing.T) {
 				t.Fatalf("results %+v", results)
 			}
 		})
+	}
+}
+
+func TestAChatsOfflineStepEndsEveryChatThePeerHad(t *testing.T) {
+	// Code review on #559: before it unregisters, the peer ends every chat
+	// the network opened to it, not just the latest and those still
+	// queued. A third subscriber opens chats to the peer once released
+	// has passed; the network then sends the offline message on one of
+	// them, which must have ended, so the message never arrives.
+	for name, tc := range map[string]struct {
+		extra   int
+		onFirst bool
+	}{
+		// The scenario's own chat, which later ones replaced.
+		"the peer's first chat": {extra: 2, onFirst: true},
+		// The last of 17, which found the queue of 16 full.
+		"a chat that was never queued": {extra: 17},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			cfg.StepTimeout = 3 * time.Second
+			a := anchorChats(t, cfg, core)
+			a.answerOffline, a.offlineOnFirst = true, tc.onFirst
+			third := thirdClient(t, core)
+			var results []scenario.Result
+			ok, err := scenario.Run(context.Background(), cfg, []string{"chat-invite"}, func(r scenario.Result) {
+				results = append(results, r)
+				if r.Step == "released" && r.OK {
+					chatToPeer(t, third, tc.extra)
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			last := results[len(results)-1]
+			if ok || last.Step != "peer-offline" || !strings.HasPrefix(last.Error, "the message to the unregistered peer never arrived after it registered again") {
+				t.Fatalf("results %+v", results)
+			}
+		})
+	}
+}
+
+// thirdClient registers the third subscriber with core.
+func thirdClient(t *testing.T, core *simtest.IMSCore) *sipua.UA {
+	t.Helper()
+	u, _ := sip.ParseURI(thirdIMPU)
+	creds, err := sipua.DigestCredentials(thirdIMPI, []byte(thirdToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	third, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: imsDomain, IMPU: u,
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000003", Credentials: creds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = third.Close() })
+	if _, err := third.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return third
+}
+
+// chatToPeer has from open n chats to the peer, one after another, each
+// answered 2xx before the next.
+func chatToPeer(t *testing.T, from *sipua.UA, n int) {
+	t.Helper()
+	pu, _ := sip.ParseURI(peer.URI)
+	offer := "v=0\r\no=- 1 1 IN IP4 192.0.2.3\r\ns=-\r\nc=IN IP4 192.0.2.3\r\nt=0 0\r\nm=message 9 TCP/MSRP *\r\n" +
+		"a=accept-types:message/cpim\r\na=path:msrp://192.0.2.3:9/third;tcp\r\na=setup:active\r\na=sendrecv\r\n"
+	for i := range n {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		req, err := from.NewInvite(pu, []byte(offer))
+		if err != nil {
+			cancel()
+			t.Fatal(err)
+		}
+		_, res, err := from.Invite(ctx, req, nil)
+		cancel()
+		if err != nil || res.StatusCode/100 != 2 {
+			t.Fatalf("chat %d to the peer: %v, %v", i, res, err)
+		}
 	}
 }

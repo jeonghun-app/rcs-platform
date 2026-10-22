@@ -63,6 +63,10 @@ type IMSCore struct {
 	// unregistered user does; nil leaves the INVITE to Offline. It runs on
 	// the sender's reading goroutine.
 	AnswerOffline func(req *sip.Request) []byte
+	// KeepBindings, when set before any request, answers a REGISTER with
+	// Expires: 0 as usual but keeps the binding, so that requests to the
+	// IMPU still reach its flow, as a faulty registrar would.
+	KeepBindings bool
 	// answered, if set (export_test.go), runs once a REGISTER that changed
 	// a registration has been answered.
 	answered func(*sip.Request)
@@ -535,7 +539,9 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (res *sip.Response
 		change.event = "refreshed"
 	}
 	if expires == 0 {
-		delete(c.bindings, key)
+		if !c.KeepBindings {
+			delete(c.bindings, key)
+		}
 		change.contact, change.event = c.contacts[key], "unregistered"
 		delete(c.contacts, key)
 		delete(c.events, key)

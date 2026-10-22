@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -73,10 +74,21 @@ const releasePoll = 50 * time.Millisecond
 const sipChatText = "hello over SIP"
 
 // peerSession is a chat the network opened to the peer: the INVITE's
-// dialog and the session the peer bound at the relay.
+// dialog, the session the peer bound at the relay, and the peer's
+// registration the INVITE came in.
 type peerSession struct {
-	dialog *sipua.Dialog
-	client *chat.Client
+	dialog       *sipua.Dialog
+	client       *chat.Client
+	registration int64
+}
+
+// peerCall is an INVITE to the peer, with the peer's registration when it
+// came: peer-offline counts the registrations, one more just before the
+// peer registers again, so that a chat opened before then is told from one
+// opened after (code review on #559).
+type peerCall struct {
+	call         *sipua.IncomingCall
+	registration int64
 }
 
 // chatInvite is the chat-invite scenario (#135 AC 4): the client sends an
@@ -97,7 +109,8 @@ func chatInvite(r *run) error {
 	case r.cfg.RelayPublic == "":
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoRelay })
 	}
-	calls := make(chan *sipua.IncomingCall, queueLength)
+	calls := make(chan peerCall, queueLength)
+	var registration atomic.Int64
 	var a, b *sipClient
 	if err := r.step("register", func(ctx context.Context) (map[string]int64, error) {
 		var err error
@@ -107,7 +120,7 @@ func chatInvite(r *run) error {
 		peer := *r.cfg.SIPPeer
 		peer.OnInvite = func(c *sipua.IncomingCall) {
 			select {
-			case calls <- c:
+			case calls <- peerCall{call: c, registration: registration.Load()}:
 			default:
 				_ = c.Reject(486)
 			}
@@ -129,11 +142,12 @@ func chatInvite(r *run) error {
 	// a step for them.
 	bEnd := r.endpoint(r.cfg.Peer, true)
 	sessions := make(chan peerSession, queueLength)
+	release := make(chan chan struct{})
 	answerer, stop := context.WithCancel(context.Background())
 	answering := make(chan struct{})
 	go func() {
 		defer close(answering)
-		r.answerCalls(answerer, calls, bEnd, sessions)
+		r.answerCalls(answerer, calls, bEnd, sessions, release)
 	}()
 	// The answerer ends what it opened once stopped; the scenario's end
 	// waits for that.
@@ -332,7 +346,7 @@ func chatInvite(r *run) error {
 		return err
 	}
 	if err := r.step("peer-offline", func(ctx context.Context) (map[string]int64, error) {
-		return r.chatToOfflinePeer(ctx, b, a, aEnd, bEnd, peer, sessions, token)
+		return r.chatToOfflinePeer(ctx, b, a, aEnd, bEnd, sessions, release, &registration, token)
 	}); err != nil {
 		return err
 	}
@@ -358,29 +372,32 @@ func chatInvite(r *run) error {
 // again the network opens a chat to it, and the message, its text and
 // Message-ID intact, arrives there, and its notifications come back to the
 // client (stored). One that accepts the chat and loses the message fails,
-// and so does one that sends it on a chat the peer had before (code review
-// on #559).
-func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, peer peerSession, sessions <-chan peerSession, token string) (map[string]int64, error) {
+// and so does one that sends it on a chat opened before the peer
+// registered again, whether the peer had it already or the network opened
+// it to a binding it kept (code review on #559).
+func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, sessions <-chan peerSession, release chan<- chan struct{}, registration *atomic.Int64, token string) (map[string]int64, error) {
 	// A UE releases the dialogs on its flow before it de-registers (TS
-	// 24.229 §5.1.1.6.1): the chats the network opened to the peer end
-	// here, those it opened for the earlier steps and any still queued.
-	// A chat left open would carry the message at once, and nothing would
-	// have been stored.
-	ended := []peerSession{peer}
+	// 24.229 §5.1.1.6.1): answerCalls ends every chat it opened to the
+	// peer. A chat left open would carry the message at once, and nothing
+	// would have been stored.
+	released := make(chan struct{})
+	select {
+	case release <- released:
+	case <-ctx.Done():
+		return nil, errors.New("the peer's chats could not be ended")
+	}
+	select {
+	case <-released:
+	case <-ctx.Done():
+		return nil, errors.New("the peer's chats could not be ended")
+	}
+	// The sessions queued so far have ended; dropped, they leave room in
+	// the queue for the chat that carries the stored message.
 	for queued := true; queued; {
 		select {
-		case s := <-sessions:
-			ended = append(ended, s)
+		case <-sessions:
 		default:
 			queued = false
-		}
-	}
-	for _, s := range ended {
-		if s.client != nil {
-			_ = s.client.Close()
-		}
-		if s.dialog != nil {
-			r.hangUp(s.dialog)
 		}
 	}
 	if _, err := b.ua.Unregister(ctx); err != nil {
@@ -434,6 +451,7 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	if err := waitReport(ctx, aEnd, sent.MSRP); err != nil {
 		return detail, err
 	}
+	again := registration.Add(1)
 	if _, err := b.ua.Register(ctx); err != nil {
 		return detail, fmt.Errorf("peer: %w", sipError(err))
 	}
@@ -446,13 +464,21 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 		return detail, errors.New("the stored message changed on the way")
 	}
 	// It came on a chat the network opened after the peer registered
-	// again: the peer's earlier chats have ended.
-	select {
-	case <-sessions:
-		detail["new_session"] = 1
-	case <-ctx.Done():
-		return detail, errors.New("the stored message came on no chat the network opened once the peer registered again")
+	// again: the chat it came on, which answerCalls queued with the rest,
+	// must be one of the new registration's, not an earlier one or one
+	// opened to a binding the network kept.
+	var on peerSession
+	for on.client == nil || on.client.Session != got.Session {
+		select {
+		case on = <-sessions:
+		case <-ctx.Done():
+			return detail, errors.New("the stored message came on no chat the network opened once the peer registered again")
+		}
 	}
+	if on.registration != again {
+		return detail, errors.New("the stored message came on a chat the network opened before the peer registered again")
+	}
+	detail["new_session"] = 1
 	if err := awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI); err != nil {
 		return detail, err
 	}
@@ -468,22 +494,31 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 // the peer (peerRefused). It runs on a goroutine of its own until ctx
 // ends, and then closes the sessions it opened and hangs up their dialogs
 // before it returns: the caller cancels ctx and waits for it at the
-// scenario's end (onEnd is the scenario goroutine's alone).
-func (r *run) answerCalls(ctx context.Context, calls <-chan *sipua.IncomingCall, end *chat.Endpoint, sessions chan<- peerSession) {
+// scenario's end (onEnd is the scenario goroutine's alone). A channel sent
+// on release has it do the same at once, for every session it has opened
+// so far, queued or not, and close the channel when it has.
+func (r *run) answerCalls(ctx context.Context, calls <-chan peerCall, end *chat.Endpoint, sessions chan<- peerSession, release <-chan chan struct{}) {
 	var opened []peerSession
-	defer func() {
+	endOpened := func() {
 		for _, s := range opened {
 			_ = s.client.Close()
 			r.hangUp(s.dialog)
 		}
-	}()
+		opened = nil
+	}
+	defer endOpened()
 	for {
-		var call *sipua.IncomingCall
+		var pc peerCall
 		select {
-		case call = <-calls:
+		case pc = <-calls:
+		case done := <-release:
+			endOpened()
+			close(done)
+			continue
 		case <-ctx.Done():
 			return
 		}
+		call := pc.call
 		// The network offers actpass (RFC 6135 §4.2.2 forbids passive in
 		// an offer) with the relay's client_path, as pcscf writes it.
 		path, setup, err := chatAnswer(call.Request().Body)
@@ -519,7 +554,7 @@ func (r *run) answerCalls(ctx context.Context, calls <-chan *sipua.IncomingCall,
 			r.hangUp(d)
 			continue
 		}
-		s := peerSession{dialog: d, client: c}
+		s := peerSession{dialog: d, client: c, registration: pc.registration}
 		opened = append(opened, s)
 		select {
 		case sessions <- s:
