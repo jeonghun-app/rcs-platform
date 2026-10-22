@@ -136,6 +136,22 @@ func (c *fakeCore) nextOf(t *testing.T, method string) *sip.Request {
 	}
 }
 
+// nextOfEach waits for a request of each method listed, as many as it
+// lists of each, in any order, skipping others.
+func (c *fakeCore) nextOfEach(t *testing.T, methods ...string) {
+	t.Helper()
+	want := map[string]int{}
+	for _, m := range methods {
+		want[m]++
+	}
+	for left := len(methods); left > 0; {
+		if req := c.next(t); want[req.Method] > 0 {
+			want[req.Method]--
+			left--
+		}
+	}
+}
+
 // uri is the core as rcs-as's Config.Core.
 func (c *fakeCore) uri() sip.URI {
 	u, err := sip.ParseURI("sip:" + c.l.Addr().String() + ";transport=tcp;lr")

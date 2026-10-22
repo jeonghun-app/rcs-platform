@@ -18,12 +18,16 @@
 // a barred identity, or beyond Config.MaxPerSet once the set has only the
 // P-CSCF's; one beyond Config.MaxPerSubscriber (per device for a UE)
 // replaces the subscriber's oldest, one beyond Config.MaxUEPerSet the UE's
-// oldest, and a P-CSCF's in a full set the UE's oldest. A subscription watches the set, by its key and
+// oldest, and a P-CSCF's in a full set the UE's oldest. The dialog's first
+// hop, its first route or without one the subscriber's Contact, must be the
+// P-CSCF of a live binding of the set, by host and port, or the SUBSCRIBE is
+// refused too: no SUBSCRIBE has the set's state sent where none of its
+// bindings came from. A subscription watches the set, by its key and
 // incarnation, that the identity was in when it was made, and ends, with a
-// NOTIFY that says terminated, deactivated, when that set's record goes,
-// the identity leaves it, it has no live binding, the UE's own binding
-// goes, or the P-CSCF serves none of its bindings; a NOTIFY never carries
-// another set's state, nor bindings to a P-CSCF that is not on them.
+// NOTIFY that says terminated, deactivated, when that set's record goes, the
+// identity leaves it, it has no live binding, the UE's own binding goes, or
+// the P-CSCF serves none of its bindings; a NOTIFY never carries another
+// set's state, nor bindings to a P-CSCF that is not on them.
 //
 // An in-dialog SUBSCRIBE, a refresh or Expires 0, must match a stored
 // subscription's dialog (Call-ID, tags, Event id and a CSeq above the

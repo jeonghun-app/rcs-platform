@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -112,7 +113,11 @@ func (p *plan) prepare(ctx context.Context, t proxy.Target, req *sip.Request) er
 // (final), unless a later branch succeeds.
 func (p *plan) failed(ctx context.Context, f proxy.BranchFailure) []proxy.Target {
 	h, ok := p.hop(f.Target)
-	if !ok || h.failed == nil {
+	// No hop for a target the request's Max-Breadth left no share for: the
+	// next would fail the same way (proxy.ErrMaxBreadth), and a server's
+	// default handling is for a server that did not answer, not for one the
+	// request never reached.
+	if !ok || h.failed == nil || errors.Is(f.Err, proxy.ErrMaxBreadth) {
 		return nil
 	}
 	s := h.failed(ctx, f)
@@ -224,10 +229,37 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 	odi := rt.signODI(pos, requestOf(req), expires)
 	back.Params.Set(odiParam, odi)
 	t := proxy.Target{URI: req.URI, Routes: []sip.Address{{URI: server}, {URI: back}}}
+	// fired is set as OnTimeout starts, timedOut once the timeout has taken
+	// the position. The branch lives on while OnTimeout waits on the store,
+	// so it may end meanwhile, with the 403 the server relays for a copy it
+	// sent back late: failed then asks the store itself (code review of
+	// #443).
+	var fired, timedOut atomic.Bool
 	if req.Method != "INVITE" {
 		// An INVITE's branch may ring for long, and Timeout would cancel
 		// it: the server's silence is Timer B's to find (RFC 3261 §17.1.1).
 		t.Timeout = rt.cfg.ASTimeout
+		// ASTimeout bounds only the wait for the server to answer or to
+		// send the request back. Once it has sent it back, the far end
+		// answers along this branch, on the transaction's own timers
+		// (#386). Which came first is settled as for the default handling:
+		// the timeout takes the position unless the return did, so a copy
+		// sent back after it is refused as late.
+		t.OnTimeout = func(ctx context.Context) bool {
+			fired.Store(true)
+			taken, err := rt.takeUp(ctx, odi, state.ODIDefault, expires)
+			switch {
+			case err != nil:
+				// The timeout applies, as it did before the store said.
+				rt.internalLog("taking up a position in an iFC chain", err)
+				return true
+			case !taken:
+				rt.count("routing.ifc.returned_before_timeout")
+				return false
+			}
+			timedOut.Store(true)
+			return true
+		}
 	}
 	return step{hops: []hop{{
 		target: t,
@@ -235,6 +267,26 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 			return b.Header.Set("P-Served-User", servedUser(pos))
 		},
 		failed: func(ctx context.Context, f proxy.BranchFailure) step {
+			if fired.Load() && !timedOut.Load() {
+				// The claim is the same side's again, so it is safe to
+				// repeat: true if OnTimeout's took the position. If the
+				// return took it, or the store fails, the branch's
+				// failure is handled as any other below.
+				if taken, err := rt.takeUp(ctx, odi, state.ODIDefault, expires); err == nil && taken {
+					timedOut.Store(true)
+				}
+			}
+			if timedOut.Load() {
+				// The timeout took the position, whatever the branch ended
+				// with meanwhile: a 403 the server relayed for a copy it
+				// sent back after it, refused as late, is no answer of its
+				// own (code review of #443).
+				if handling != ifc.SessionContinued {
+					return answer(504, sip.DefaultReason(504))
+				}
+				rt.count("routing.ifc.default_handling_continued")
+				return rt.next(ctx, req, pos, set, end)
+			}
 			switch {
 			case handling != ifc.SessionContinued || !unanswered(f):
 				return step{}

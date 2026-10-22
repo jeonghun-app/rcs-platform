@@ -138,6 +138,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// answers to the deliveries in flight that it waits for (bounded by
 	// RCSAS_DELIVERY_TIMEOUT).
 	defer engine.Close()
+	linkStores(st, gst, cfg.GroupsTable)
 	gcfg := cfg.Group
 	gcfg.SIP = hostPort(cfg.SIPHost, addr.Port())
 	groups, err := group.New(gcfg, gst, engine, srv, rt.Metrics)
@@ -194,6 +195,21 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 			return nil
 		}
 		return fmt.Errorf("rcs-as: MSRP listener: %w", err)
+	}
+}
+
+// linkStores lets the messages store check a group copy's fence in the
+// groups store (store.Message.Fence, #121): in DynamoDB, the groupchats
+// table, within the enqueue's transaction; in memory, the groups store
+// that stands for it.
+func linkStores(st store.Store, gst groupstore.Store, groupsTable string) {
+	switch q := st.(type) {
+	case *awsstore.Store:
+		q.SetGroupsTable(groupsTable)
+	case *store.Memory:
+		if g, ok := gst.(*groupstore.Memory); ok {
+			q.SetFence(func(f store.Fence) bool { return g.Fenced(f.Group, f.Task, f.Epoch) })
+		}
 	}
 }
 

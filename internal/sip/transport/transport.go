@@ -386,6 +386,11 @@ type Transport struct {
 	listeners []*listener
 	dialing   map[reuseKey]*dialCall
 	closed    bool
+	// dials is the context every dial runs under, which Close cancels, so
+	// that a send dialling at the stop fails at once rather than after
+	// DialTimeout, holding up its caller and a transaction's lock (#462).
+	dials       context.Context
+	cancelDials context.CancelFunc
 	// accepted counts accepted connections, from accept to close, against
 	// MaxConnections; each listener counts its own as well.
 	accepted int
@@ -425,6 +430,7 @@ func New(cfg Config, h Handler) (*Transport, error) {
 		dialing: make(map[reuseKey]*dialCall),
 		pending: make(map[net.Conn]struct{}),
 	}
+	t.dials, t.cancelDials = context.WithCancel(context.Background())
 	t.budget.max = int64(cfg.MaxQueuedBytes)
 	t.panics = panics.New(panics.Config{
 		Metric: MetricCallbackPanics, Message: "transport: a service callback panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
@@ -621,6 +627,8 @@ func (t *Transport) StopListening(names ...string) {
 // Close stops every listener and closes every connection, including those still
 // in their PROXY header or TLS handshake, then waits for the goroutines of the
 // transport to finish. Messages being delivered to the handler complete first.
+// A dial in progress, TLS handshake included, is cut: the sends waiting on it
+// fail with ErrClosed at once.
 func (t *Transport) Close() error {
 	t.mu.Lock()
 	if t.closed {
@@ -628,6 +636,7 @@ func (t *Transport) Close() error {
 		return nil
 	}
 	t.closed = true
+	t.cancelDials()
 	lis := t.listeners
 	for c := range t.pending {
 		c.Close()
@@ -734,9 +743,10 @@ type counters struct {
 
 // Flush waits until each stream connection has written the output it had
 // queued when Flush was called, and that of the senders then waiting for room
-// in its queue, until that connection's writer has made no
-// progress (a chunk written, see writeAll) for stall, counted from the call
-// at the earliest, or until deadline. Output queued meanwhile is not waited
+// in its queue or still finding their connection, a dial included, until
+// that connection's writer has made no progress (a chunk written, see
+// writeAll) for stall, counted from when those senders are in its count at
+// the earliest, or until deadline. Output queued meanwhile is not waited
 // for, so a busy connection ends the wait as soon as its earlier output is
 // out. A service that stops uses it before Close, which drops what the
 // queues hold: a peer that still reads gets its answers, however long they
@@ -748,27 +758,25 @@ type counters struct {
 func (t *Transport) Flush(deadline time.Time, stall time.Duration) {
 	// First the responses already being sent but not yet in a queue's
 	// count, such as one whose connection is being dialled again to its
-	// Via address (code review of #438): until each is counted, or none of
-	// them has got there for stall.
+	// Via address (code review of #438): until each is counted, however
+	// long that takes within deadline. Not stall: what keeps one from its
+	// queue is the dial, bounded by DialTimeout, and one lost SYN costs a
+	// second of it, so a stall that short would drop the answer (QA of
+	// #438).
 	t.sendsMu.Lock()
 	under := make([]uint64, 0, len(t.sends))
 	for id := range t.sends {
 		under = append(under, id)
 	}
 	t.sendsMu.Unlock()
-	moved := time.Now()
-	for len(under) > 0 && time.Now().Before(deadline) && time.Since(moved) < stall {
+	for len(under) > 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 		t.sendsMu.Lock()
-		n := len(under)
 		under = slices.DeleteFunc(under, func(id uint64) bool {
 			_, still := t.sends[id]
 			return !still
 		})
 		t.sendsMu.Unlock()
-		if len(under) < n {
-			moved = time.Now()
-		}
 	}
 	start := time.Now()
 	type pending struct {

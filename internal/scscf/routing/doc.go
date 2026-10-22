@@ -25,7 +25,9 @@
 // for the set: the request goes to its application server, the Request-URI
 // unchanged, with P-Served-User naming the served user and the session
 // case, and a Route back to the S-CSCF. A server that does not answer, by
-// a timeout (Config.ASTimeout, for any request but INVITE) or a transport
+// a timeout (Config.ASTimeout, for any request but INVITE, which bounds only
+// the wait for the server to answer or send the request back: once it has,
+// the branch follows its transaction's timers, #386) or a transport
 // failure, or answers 408 or 5xx, without a provisional response first and
 // before it sent the request back, has its criterion's default handling
 // apply: SESSION_CONTINUED passes it over, SESSION_TERMINATED sends its

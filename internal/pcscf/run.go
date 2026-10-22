@@ -49,6 +49,9 @@ type deps struct {
 	// icscfFirst and icscfTotal replace icscfFirstTimeout and
 	// icscfTotalTimeout when set.
 	icscfFirst, icscfTotal time.Duration
+	// clock, if set, runs the proxy's transaction timers, a branch's
+	// Target.Timeout among them; nil is the system clock.
+	clock transaction.Clock
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
 }
@@ -177,6 +180,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Supported: []string{"path", "outbound"},
 		Logger:    rt.Logger,
 		Metrics:   rt.Metrics,
+		// Clock alone: the other settings keep their defaults.
+		Transaction: transaction.Config{Clock: d.clock},
 	})
 	if err != nil {
 		return err
