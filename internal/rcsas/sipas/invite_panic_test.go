@@ -1,12 +1,16 @@
 package sipas
 
 import (
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // A panic in the work an answer to rcs-as's INVITE starts, here the
@@ -40,5 +44,66 @@ func TestAPanicInAnInvitesAnswerWorkEndsThatWorkOnly(t *testing.T) {
 	}
 	if err := r.e.nextFailure(t); err == nil {
 		t.Fatal("the next invitation did not fail as answered")
+	}
+}
+
+// ackPanics panics on the first ACK it is given to send, as a bug on the
+// way to the transport would.
+type ackPanics struct {
+	transaction.Sender
+	sent atomic.Bool
+}
+
+func (a *ackPanics) SendRequest(req *sip.Request, dst transport.Destination, opts ...transport.SendOption) (transport.Network, error) {
+	if req.Method == "ACK" && a.sent.CompareAndSwap(false, true) {
+		panic("ack")
+	}
+	return a.Sender.SendRequest(req, dst, opts...)
+}
+
+// A panic sending the ACK of a 2xx to rcs-as's INVITE, once the session
+// took its slot, ends the session as one that cannot be kept is: the
+// engine hears the invitation failed, the session is ended with a BYE, and
+// its slot is given back and settled, so that a stop does not wait for its
+// first answer (#471 code review).
+func TestAPanicSendingAnInvitesACKEndsTheSession(t *testing.T) {
+	// A stop waits up to closeWait for a session that is not settled:
+	// longer than the wait below, and short enough for the test's own
+	// stop to end if it fails.
+	r := newChatRigWith(t, messaging.Config{}, Config{closeWait: 3 * waitFor})
+	r.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "INVITE" {
+			return []*sip.Response{r.answerInvite(t, req, relayPath(), "active")}
+		}
+		return nil
+	})
+	r.a.srv.sender = &ackPanics{Sender: r.a.srv.sender}
+	if err := r.a.srv.Invite(t.Context(), invitation()); err != nil {
+		t.Fatal(err)
+	}
+	r.core.nextOf(t, "INVITE")
+	if err := r.e.nextFailure(t); !errors.Is(err, messaging.ErrOffline) {
+		t.Fatalf("the engine was told %v, want the message kept for the next session", err)
+	}
+	r.core.nextOf(t, "BYE")
+	deadline := time.Now().Add(waitFor)
+	for {
+		r.a.srv.mu.Lock()
+		left := len(r.a.srv.sessions)
+		r.a.srv.mu.Unlock()
+		if left == 0 && r.metrics.get(MetricBackgroundPanics) == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d sessions left, %s = %d", left, MetricBackgroundPanics, r.metrics.get(MetricBackgroundPanics))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	closed := make(chan struct{})
+	go func() { r.a.srv.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(waitFor):
+		t.Fatal("Close waits for the session's first answer")
 	}
 }

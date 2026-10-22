@@ -73,23 +73,22 @@ func TestRcsAsCountsItsMSRPPanics(t *testing.T) {
 		}
 		defer c.Close()
 	}
+	// The Guard counts before it logs: both are waited for (#471 QA).
 	deadline := time.Now().Add(waitFor)
 	for {
-		if v, ok := h.Metric(msrp.MetricCallbackPanics); ok {
+		v, ok := h.Metric(msrp.MetricCallbackPanics)
+		if ok && strings.Contains(h.Output(), "rcs-as: an MSRP callback panicked") {
 			if v != 1 {
 				t.Errorf("%s = %v", msrp.MetricCallbackPanics, v)
 			}
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s never written", msrp.MetricCallbackPanics)
+			t.Fatalf("%s = %v (%v), log:\n%s", msrp.MetricCallbackPanics, v, ok, h.Output())
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	if strings.Contains(h.Output(), "msrp-secret") {
 		t.Error("output holds the value")
-	}
-	if !strings.Contains(h.Output(), "rcs-as: an MSRP callback panicked") {
-		t.Errorf("no log line:\n%s", h.Output())
 	}
 }

@@ -153,7 +153,9 @@ func TestAPanicInABindingCreateGivesItsShareBack(t *testing.T) {
 	client := a.p.msrp.relay.client
 	client.Transport = &panicRoundTripper{next: client.Transport, method: http.MethodPost}
 	sh := share{flow: "FLOW-A"}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	// Bounded only so that a create that waits for it fails with a
+	// message (#471 QA).
+	ctx, cancel := context.WithTimeout(context.Background(), waitFor)
 	defer cancel()
 	if _, err := a.p.create(ctx, sh, relayPaths{ExpiresIn: bindingExpiresIn}); !errors.Is(err, errRelayPanicked) {
 		t.Fatalf("create: %v, want errRelayPanicked", err)

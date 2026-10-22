@@ -228,6 +228,10 @@ func sameDialog(d *dialog.Dialog, res *sip.Response) bool {
 	return err == nil && to.Tag() == d.RemoteTag()
 }
 
+// errAnswerPanicked is the failure of an invitation whose answer's
+// handling panicked after its session took a slot (established).
+var errAnswerPanicked = errors.New("sipas: handling the answer to the INVITE panicked")
+
 // established acknowledges the 2xx that set up ss and gives its SDP answer
 // to the leg. An answer rcs-as cannot use ends the session: one in which
 // the client is passive, which msrp-relay never dials, says it takes no
@@ -245,11 +249,25 @@ func (s *Server) established(ss *session, res *sip.Response) {
 	// Known before the ACK leaves, so that a BYE right behind it finds
 	// the session.
 	answered, added := s.addSession(ss)
+	// A panic in the ACK's send or the confirm, which goRun contains,
+	// leaves no session half set up: it is ended as one that cannot be
+	// kept is, and its slot is settled (#471 code review). Deferred in
+	// this order, answered runs first, as it does below.
+	settled := false
+	defer func() {
+		if !settled && added == nil {
+			s.referDone(ss.group, ss.user, false)
+			s.engine.InviteFailed(ss.inv, fmt.Errorf("%w: %w", errAnswerPanicked, messaging.ErrOffline))
+			ss.bye("")
+		}
+	}()
+	defer answered()
 	s.sendACK(ack, next)
 	if added == nil {
 		ss.confirm()
 	}
 	answered()
+	settled = true
 	if added != nil {
 		// The session cannot be kept: it is ended, and the message waits
 		// for the next one.
