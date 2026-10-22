@@ -189,6 +189,8 @@ registered and sends RTR `SERVER_CHANGE`, so the user registers again
 (`push.ppr.data_refused`). Either way, once the user is marked not
 registered, the change's later pushes for that subscription are not sent:
 the S-CSCF no longer holds the user. If that write fails, they still go.
+The write and the RTR each have `HSS_PUSH_TIMEOUT` of their own, so a PPR
+refused near the end of its time still leaves the RTR a whole one.
 
 One change's pushes go one at a time, each once the one before is answered
 or its own `HSS_PUSH_TIMEOUT` has passed, so a push left unanswered does not

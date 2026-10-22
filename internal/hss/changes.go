@@ -246,9 +246,9 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 // notifyOne sends ps within each, and reports whether it left the user no
 // longer registered (pprRejected).
 func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, each time.Duration) bool {
-	ctx, cancel := context.WithTimeout(ctx, each)
+	pctx, cancel := context.WithTimeout(ctx, each)
 	defer cancel()
-	err := h.send(ctx, n, s, p, ps)
+	err := h.send(pctx, n, s, p, ps)
 	if err != nil {
 		kind := "ppr"
 		if ps.deregister {
@@ -258,7 +258,7 @@ func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, 
 			pii.Identity("impi", s.IMPI), slog.String("request", kind), slog.String("error", pii.Redact(err.Error())))
 	}
 	var rejected *RejectedError
-	return !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result)
+	return !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result, each)
 }
 
 // pprRejected acts on a PPA failure as TS 29.228 §6.2.2.1 asks of an HSS
@@ -274,7 +274,12 @@ func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, 
 //
 // It reports whether it acted on the failure: once the user is marked not
 // registered here, it is no longer registered at the S-CSCF either.
-func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result) bool {
+//
+// The not-registered write and the RTR each get each of their own, from
+// when they start, rather than what the refused PPR left of its own: an
+// S-CSCF that refuses late would otherwise leave the RTR almost none, and
+// the user registered there with the old data (code review on #476).
+func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result, each time.Duration) bool {
 	if r.Vendor != cx.Vendor3GPP {
 		return false
 	}
@@ -283,13 +288,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	default:
 		return false
 	}
-	// The update gets half of the time left, so that one that wins only at
-	// its deadline, behind another task's writes, still leaves the RTR some.
-	uctx, cancel := ctx, context.CancelFunc(func() {})
-	if d, ok := ctx.Deadline(); ok {
-		now := time.Now()
-		uctx, cancel = context.WithDeadline(ctx, now.Add(d.Sub(now)/2))
-	}
+	uctx, cancel := context.WithTimeout(ctx, each)
 	defer cancel()
 	_, err := h.update(uctx, s.IMPI, func(cur *store.Subscription) error {
 		if !served(cur) && !cur.AuthPending && cur.ServerName == "" {
@@ -313,7 +312,9 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 		return true
 	}
 	h.metrics.Count("push.ppr.data_refused", 1)
-	err = n.Deregister(ctx, &cx.RTR{UserName: s.IMPI, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}})
+	rctx, rcancel := context.WithTimeout(ctx, each)
+	defer rcancel()
+	err = n.Deregister(rctx, &cx.RTR{UserName: s.IMPI, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}})
 	if err != nil {
 		h.log.Warn("could not deregister a user whose S-CSCF refused new data", pii.Identity("impi", s.IMPI),
 			slog.String("error", pii.Redact(err.Error())))
