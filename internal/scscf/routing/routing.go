@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
@@ -99,6 +100,10 @@ type Config struct {
 	Rand    io.Reader
 	Logger  *slog.Logger
 	Metrics Metrics
+	// Panics recovers a panic in the work this package runs on goroutines
+	// of its own, which ends that work only and releases what it held
+	// (#488). Nil only recovers.
+	Panics *panics.Guard
 }
 
 // maxDialogKeys are the current key and the previous one: a rotation keeps

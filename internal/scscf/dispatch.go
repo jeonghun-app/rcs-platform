@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
@@ -69,6 +70,8 @@ type firstNotifies struct {
 	mu      sync.Mutex
 	waiting bool
 	wg      sync.WaitGroup
+	// panics recovers a panic in a NOTIFY, which ends that one only (#488).
+	panics *panics.Guard
 }
 
 // hold counts a first NOTIFY for wait, unless wait has begun: a WaitGroup
@@ -79,13 +82,13 @@ func (f *firstNotifies) hold() func(run func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.waiting {
-		return func(run func()) { go run() }
+		return func(run func()) { go f.panics.Run("scscf: first NOTIFY", run) }
 	}
 	f.wg.Add(1)
 	return func(run func()) {
 		go func() {
 			defer f.wg.Done()
-			run()
+			f.panics.Run("scscf: first NOTIFY", run)
 		}()
 	}
 }

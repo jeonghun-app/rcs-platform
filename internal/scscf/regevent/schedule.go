@@ -149,14 +149,17 @@ func (n *Notifier) dispatchLocked() {
 func (n *Notifier) runTask(t *task) {
 	defer n.wg.Done()
 	defer finish(t)
-	rest := t.run(t.ctx)
+	// A panic ends this task only: the counts below are kept either way,
+	// so its set and hop take the next (#488).
+	var rest func()
+	n.cfg.Panics.Run("regevent: task", func() { rest = t.run(t.ctx) })
 	sc := &n.sc
 	sc.mu.Lock()
 	sc.working--
 	n.dispatchLocked()
 	sc.mu.Unlock()
 	if rest != nil {
-		rest()
+		n.cfg.Panics.Run("regevent: NOTIFY", rest)
 	}
 	if t.sub == "" {
 		return
