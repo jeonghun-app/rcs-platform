@@ -741,6 +741,50 @@ func TestAReferReportsAnInviteWithoutADialogAsAFailure(t *testing.T) {
 	}
 }
 
+// A referrer that refuses the REFER's first NOTIFY (RFC 6665 §4.2.2) has
+// ended its implicit subscription: the outcome of the INVITE is not sent
+// (#429). The core holds its answer to that INVITE until the refusal has
+// been taken, so the outcome comes after it; then the test waits for the
+// outcome's NOTIFY, which fails it, or the count of one not sent.
+func TestAReferWhoseFirstNotifyIsRefusedSendsNoOutcome(t *testing.T) {
+	g := newGroupRig(t, bob)
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		code := 200
+		switch {
+		case req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Event"), "refer"):
+			code = 481
+		case req.Method == "INVITE":
+			<-hold
+			code = 486
+		}
+		res, _ := sip.NewResponse(req, code, "", "core1")
+		return []*sip.Response{res}
+	})
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	waitUntil(t, "the refusal", func() bool { return g.metrics.get("sip.refer.notify_failed") == 1 })
+	release()
+	deadline := time.After(waitFor)
+	for g.metrics.get("sip.refer.notify_after_refusal") == 0 {
+		select {
+		case req := <-g.core.got:
+			if req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Subscription-State"), "terminated") {
+				t.Fatalf("the outcome %q went after the referrer refused the subscription", req.Body)
+			}
+		case <-deadline:
+			t.Fatal("the INVITE's outcome was neither sent nor dropped")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if n := g.metrics.get("sip.refer.notified"); n != 0 {
+		t.Fatalf("%d REFER subscriptions counted as told their outcome", n)
+	}
+}
+
 // Code review and QA on #340: Referred-By names whoever sent the REFER,
 // here bob, who is not the group's creator.
 func TestAReferredInviteNamesTheReferrerNotTheCreator(t *testing.T) {
