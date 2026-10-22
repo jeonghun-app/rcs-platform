@@ -90,7 +90,7 @@ func TestARequestForAGroupIsServedByItsOwner(t *testing.T) {
 	if s.path.Port != ga.msrpPort() {
 		t.Fatalf("the session's MSRP path is at port %d, not the owner's %d", s.path.Port, ga.msrpPort())
 	}
-	if c, _ := sip.ParseAddress(s.res.Header.Get("Contact")); c.URI.String() != ga.uri {
+	if c, _ := sip.ParseAddress(s.res.Header.Get("Contact")); groupURIOf(c) != ga.uri {
 		t.Fatalf("Contact %q", s.res.Header.Get("Contact"))
 	}
 	waitUntil(t, "the ACK at the owner", func() bool {

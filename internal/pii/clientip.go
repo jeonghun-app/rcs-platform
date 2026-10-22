@@ -138,7 +138,37 @@ func parseDottedQuad(s string) (netip.Addr, bool) {
 // (00:11:22:ff:fe:33:44:55), a hex word with "::" (dead::beef), a lone
 // "::". That fails safe: the line says less, and nothing more leaks.
 func TruncateIPsIn(s string) string {
-	return truncateIPv4In(truncateIPv6In(s))
+	out, _ := truncateRounds(s, nil)
+	return out
+}
+
+// maxRounds bounds the rounds of truncateRounds, so that TruncateIPsIn
+// stays linear. A search of five million texts found none that needs more
+// than three, the last of which only confirms the second
+// (TestTruncateIPsInIsLinear's "three rounds"); one that is not stable
+// within maxRounds fails FuzzTruncateIPsIn.
+const maxRounds = 6
+
+// truncateRounds truncates s in rounds of both passes, each reading the
+// text the one before wrote, until a round changes nothing, and returns the
+// result and whether it is stable, that is, truncated again it reads the
+// same (#512): a network written next to text that was no address can make
+// one, as "0.0.0.0/24::/48::" did. A round only replaces more text with
+// networks, so nothing a round truncated comes back. each, when not nil,
+// sees every round's output, for the tests.
+func truncateRounds(s string, each func(string)) (out string, stable bool) {
+	out = s
+	for range maxRounds {
+		next := truncateIPv4In(truncateIPv6In(out))
+		if each != nil {
+			each(next)
+		}
+		if next == out {
+			return out, true
+		}
+		out = next
+	}
+	return out, false
 }
 
 // truncateIPv6In truncates the IPv6 addresses of s: "[address]" with or
@@ -190,7 +220,19 @@ func truncateIPv6In(s string) string {
 		if prev := t.prevByte(i); !wordByte(prev) && !(prev == '/' && digit(t.prevByte(i-1))) {
 			addStart(i)
 		}
-		for k := max(i, jt-maxAddressToken-1); k < jt; k++ {
+		w := max(i, jt-maxAddressToken-1)
+		// A colon before the window whose dots reach into it starts
+		// there, its dots trimmed (":" and 61 dots and "0::1", #520): the
+		// dots are scanned once, so this stays linear.
+		if d := w; d > i && s[d] == '.' {
+			for d > i && s[d-1] == '.' {
+				d--
+			}
+			if d > i && s[d-1] == ':' {
+				addStart(d)
+			}
+		}
+		for k := w; k < jt; k++ {
 			if s[k] == ':' && k+1 < jt {
 				addStart(k + 1)
 			}
