@@ -804,17 +804,17 @@ func startsWithFoldPast(s, p string) bool {
 // dropInvisibles removes the invisible format characters that sit inside a
 // number (#154): a run of characters of category Cf, Default_Ignorable or a
 // variation selector (U+200B ZWSP, U+2060 WJ, U+00AD SHY, U+FEFF), and of
-// combining marks (Mn, Me) when it follows a digit (#413), between
-// two number characters, one of them a digit; between two number characters
-// of a tel or urn:gsma:imei URI, which Redact masks all of; or where at most
-// two separators lead to a digit after it, and before it to a digit or the
-// end of a URI's number, as numberAt and continueWritten join groups, or a
-// "+" is just before it ("+1 <ZWSP>(555)", "+<ZWSP>(81)"). A log viewer shows
-// such a number with its digits joined, and so it is masked as if written
-// without them, with the same hint. Every such run inside the user of a sip,
-// sips, im or pres URI that reaches its "@" is removed too, so that the
-// user's hint is the plain user's (#413). Elsewhere they are text and are
-// kept.
+// combining marks (Mn, Me) when it follows a number character (#413, #453),
+// between two number characters, one of them a digit; between two number
+// characters of a tel or urn:gsma:imei URI, which Redact masks all of; or
+// where at most two separators lead to a digit after it, and before it to a
+// digit or the end of a URI's number, as numberAt and continueWritten join
+// groups, or a "+" is just before it ("+1 <ZWSP>(555)", "+<ZWSP>(81)"). A
+// log viewer shows such a number with its digits joined, and so it is masked
+// as if written without them, with the same hint. Every such run inside the
+// user of a sip, sips, im or pres URI that reaches its "@" is removed too,
+// so that the user's hint is the plain user's (#413). Elsewhere they are
+// text and are kept.
 //
 // It returns, in increasing order, the positions in its result before which
 // it removed a run: there a removed run still ends a word (startsWord), as it
@@ -852,9 +852,11 @@ func dropInvisibles(s string) (string, []int) {
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(s[i:])
-		// A combining mark right after a digit is drawn over it, and so
-		// joins the run (a keycap "1<VS16><U+20E3>", #413).
-		marks := digitRune(prev)
+		// A combining mark right after a number character is drawn over
+		// it, and so joins the run (a keycap "1<VS16><U+20E3>", #413, or
+		// "*<VS16><U+20E3>", #453); whether the run is dropped is still
+		// for the rules below, so "café" stays.
+		marks := numberSide(prev) || inURI && uriNumberRune(prev)
 		if !isInvisible(r) && !(marks && isMark(r)) {
 			inURI = inURI && uriNumberRune(r)
 			switch {
@@ -906,13 +908,14 @@ func dropInvisibles(s string) (string, []int) {
 }
 
 // digitAfter reports whether a digit comes at or after s[i] with at most two
-// separators, and any invisible characters, before it.
+// separators, and any invisible characters and the marks on the separators
+// (#453), before it.
 func digitAfter(s string, i int) bool {
 	for seps := 0; i < len(s); {
 		r, size := utf8.DecodeRuneInString(s[i:])
 		i += size
 		switch {
-		case isInvisible(r):
+		case isInvisible(r), isMark(r):
 		case digitRune(r):
 			return true
 		case separatorRune(r) && seps < 2:

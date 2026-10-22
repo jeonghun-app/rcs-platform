@@ -614,6 +614,18 @@ func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 	// In a user that is not a number, a hidden character is dropped too,
 	// so the hint is the plain user's.
 	userTemplates := []string{"sip:Xalice.smith@" + testDomain, "sip:alice.smiXth@" + testDomain, "sip:alice.smithX@" + testDomain}
+	// A mark on another character of a number joins it too (#453): on a
+	// tel number's "*", "#" or hex digit, an IMEI's dash, a separator or
+	// the "+".
+	markTemplates := []string{
+		"tel:*X31#",
+		"tel:123456*X78#9",
+		"tel:1234abX5678",
+		"urn:gsma:imei:00101000-X000003-1",
+		"call +1 X555 010 0001",
+		"call +1 (555) 010-X0001",
+		"call +X15550100001",
+	}
 	type class struct {
 		name  string
 		table *unicode.RangeTable
@@ -644,6 +656,9 @@ func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 						ts := templates
 						if cl.user {
 							ts = append(slices.Clone(templates), userTemplates...)
+						}
+						if cl.plain == "" {
+							ts = append(slices.Clone(ts), markTemplates...)
 						}
 						for _, tmpl := range ts {
 							wide := strings.Replace(tmpl, "X", string(r), 1)
@@ -735,6 +750,12 @@ func TestRedactKeepsTheTextAroundANumber(t *testing.T) {
 		"id\u200b 7",
 		"x\u200b1",
 		"1\u200bx",
+		// Marks on text, and on a number character no number is next to,
+		// stay (#453).
+		"cafe\u0301 10",
+		"x\u0301-1",
+		"(\u0301注)",
+		"* \u20e3 #",
 	} {
 		if got := r.Redact(in); got != in {
 			t.Errorf("Redact(%q) = %q, want it unchanged", in, got)
@@ -926,6 +947,10 @@ func anyFormOf(rng *rand.Rand, s string) string {
 		case otherForms[c] != nil:
 			forms := otherForms[c]
 			b.WriteRune(forms[rng.IntN(len(forms))])
+			// And one a separator or "+" carries (#453).
+			if rng.IntN(8) == 0 {
+				b.WriteRune(marks[rng.IntN(len(marks))])
+			}
 		default:
 			b.WriteByte(c)
 			continue
