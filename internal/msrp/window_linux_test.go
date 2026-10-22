@@ -75,7 +75,7 @@ func TestTheRigsSharedConnectionCarriesOnPastAShrunkWindow(t *testing.T) {
 		clients = append(clients, h)
 		go func() {
 			for ctx.Err() == nil {
-				if _, err := cs.Send(ctx, Outgoing{ContentType: "text/plain", Body: bodyOf(200)}); err != nil {
+				if _, err := cs.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf(bodyOf(200))}); err != nil {
 					return
 				}
 				time.Sleep(10 * time.Millisecond)

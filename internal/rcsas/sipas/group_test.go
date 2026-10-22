@@ -179,7 +179,7 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 		t.Fatalf("alice's message reported %d", code)
 	}
 	for who, relay := range map[string]*relayEnd{bob: relayB, carol: relayC} {
-		c, err := cpim.Parse(relay.next(t).Body)
+		c, err := cpim.Parse(relay.next(t).Body.Bytes())
 		if err != nil {
 			t.Fatal(err)
 		}

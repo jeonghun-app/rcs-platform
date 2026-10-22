@@ -456,11 +456,11 @@ func TestALargeModeSessionCarriesItsOneMessage(t *testing.T) {
 	waitDone(t, leg.Finished())
 	select {
 	case m := <-b.got:
-		t.Fatalf("a second message on one session: %d bytes", len(m.Body))
+		t.Fatalf("a second message on one session: %d bytes", m.Body.Len())
 	case <-time.After(50 * time.Millisecond):
 	}
 	b2, leg2 := r.largeMode(t, l, inv2)
-	if got2 := b2.next(t); bytes.Equal(got2.Body, got.Body) {
+	if got2 := b2.next(t); bytes.Equal(got2.Body.Bytes(), got.Body.Bytes()) {
 		t.Fatal("both sessions carried the same message")
 	}
 	waitDone(t, leg2.Finished())
@@ -832,8 +832,8 @@ func TestAChatMessageGoesOnItsLegAfterAFailedLargeModeAttempt(t *testing.T) {
 	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: msg}); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.next(t); !bytes.Equal(got.Body, msg) {
-		t.Fatalf("bob got %q", got.Body)
+	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), msg) {
+		t.Fatalf("bob got %q", got.Body.Bytes())
 	}
 }
 
@@ -867,7 +867,7 @@ func TestALargeModeSessionNeverCarriesTheOtherDirection(t *testing.T) {
 	}
 	select {
 	case m := <-a.got:
-		t.Fatalf("delivered on alice's own session: %d bytes", len(m.Body))
+		t.Fatalf("delivered on alice's own session: %d bytes", m.Body.Len())
 	case <-time.After(50 * time.Millisecond):
 	}
 	// Nor does a standalone message go into a chat session.
@@ -881,7 +881,7 @@ func TestALargeModeSessionNeverCarriesTheOtherDirection(t *testing.T) {
 	}
 	select {
 	case m := <-chatLeg.got:
-		t.Fatalf("a standalone message in a chat session: %q", m.Body)
+		t.Fatalf("a standalone message in a chat session: %q", m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 }
@@ -1135,8 +1135,8 @@ func TestMessagesBeyondTheHeldQueueSingleListAreNotLost(t *testing.T) {
 		}
 	}
 	for i := range n {
-		if got := b.next(t); !bytes.HasSuffix(got.Body, []byte(fmt.Sprintf("#%04d", i))) {
-			t.Fatalf("delivery %d: %q", i, got.Body)
+		if got := b.next(t); !bytes.HasSuffix(got.Body.Bytes(), []byte(fmt.Sprintf("#%04d", i))) {
+			t.Fatalf("delivery %d: %q", i, got.Body.Bytes())
 		}
 	}
 }
@@ -1190,7 +1190,7 @@ func TestADroppedSingleDoesNotLetALaterMessageOvertake(t *testing.T) {
 	<-entered
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
 	close(g3)
-	if first := b.next(t); !bytes.HasSuffix(first.Body, []byte("a1")) {
-		t.Fatalf("bob's first message from alice is %q, want a1", first.Body[len(first.Body)-2:])
+	if first := b.next(t); !bytes.HasSuffix(first.Body.Bytes(), []byte("a1")) {
+		t.Fatalf("bob's first message from alice is %q, want a1", first.Body.Bytes()[first.Body.Len()-2:])
 	}
 }

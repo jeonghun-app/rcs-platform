@@ -68,7 +68,7 @@ func transcript(t *testing.T, src io.Reader) string {
 		if err != nil {
 			// The reader accepts an end-line lookalike inside a body that
 			// a sender must never produce (§7.1); nothing else may fail.
-			if !bodyHasBoundary(m.Body, m.TransactionID) {
+			if !bodyHasBoundary(m.Body.Bytes(), m.TransactionID) {
 				t.Fatalf("accepted message does not marshal: %v", err)
 			}
 			fmt.Fprintf(&out, "lookalike %s\n", m.TransactionID)
@@ -164,7 +164,7 @@ func FuzzReassembler(f *testing.F) {
 				MessageID:    fmt.Sprintf("msg%d", data[i+2]%4),
 				ByteRange:    &br,
 				ContentType:  "text/plain",
-				Body:         bytes.Repeat([]byte{data[i]}, int(data[i+1]%24)),
+				Body:         BodyOf(bytes.Repeat([]byte{data[i]}, int(data[i+1]%24))),
 				Continuation: flags[int(data[i+2]>>4)%3],
 			}
 			whole, err := asm.Add(m, t0)
@@ -175,7 +175,7 @@ func FuzzReassembler(f *testing.F) {
 				}
 			}
 			if whole != nil {
-				n := int64(len(whole.Body))
+				n := int64(whole.Body.Len())
 				if n > asm.MaxSize || *whole.ByteRange != (ByteRange{Start: 1, End: n, Total: n}) {
 					t.Fatalf("delivered %d octets as %v", n, whole.ByteRange)
 				}
