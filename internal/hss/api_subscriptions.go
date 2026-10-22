@@ -276,14 +276,17 @@ func (a *API) notifyChange(r *http.Request, s *store.Subscription, pushes []push
 	if len(pushes) == 0 {
 		return
 	}
-	ctx, cancel := a.pushContext(r)
-	defer cancel()
+	// After the change is stored: a client that goes away does not cut the
+	// pushes short. Each has PushTimeout of its own (notify).
+	ctx := context.WithoutCancel(r.Context())
 	var p *store.ServiceProfile
 	if needsProfile(pushes) {
 		// Without the profile only the RTRs can go; h.send reports the PPRs.
-		p, _ = a.h.store.Profile(ctx, s.Profile)
+		pctx, cancel := context.WithTimeout(ctx, a.pushTimeout)
+		p, _ = a.h.store.Profile(pctx, s.Profile)
+		cancel()
 	}
-	a.h.notify(ctx, a.notifier, s, p, pushes)
+	a.h.notify(ctx, a.notifier, s, p, pushes, a.pushTimeout)
 }
 
 func needsProfile(pushes []push) bool {

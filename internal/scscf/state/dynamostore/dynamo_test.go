@@ -16,11 +16,12 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state/statetest"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 var (
-	testKey  = ChallengeKey{ID: "k1", Key: bytes.Repeat([]byte{0x42}, KeySize)}
-	otherKey = ChallengeKey{ID: "k2", Key: bytes.Repeat([]byte{0x43}, KeySize)}
+	testKey  = ChallengeKey{ID: "k1", Key: secret.NewKey(bytes.Repeat([]byte{0x42}, KeySize))}
+	otherKey = ChallengeKey{ID: "k2", Key: secret.NewKey(bytes.Repeat([]byte{0x43}, KeySize))}
 )
 
 // newTestStore returns a store over f that seals with the first key given, or
@@ -356,7 +357,7 @@ func TestEachStepOfAKeyRotationOpensWhatTheOthersSeal(t *testing.T) {
 }
 
 func TestNewRefusesBadChallengeKeys(t *testing.T) {
-	short := ChallengeKey{ID: "k", Key: make([]byte, 16)}
+	short := ChallengeKey{ID: "k", Key: secret.NewKey(make([]byte, 16))}
 	for name, c := range map[string]Config{
 		"no key":              {},
 		"a short key":         {ChallengeKeys: []ChallengeKey{short}},

@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -48,15 +49,21 @@ type deps struct {
 	// icscfFirst and icscfTotal replace icscfFirstTimeout and
 	// icscfTotalTimeout when set.
 	icscfFirst, icscfTotal time.Duration
-	// serverTransactionBytes and contextBytes, when set, bound the
-	// transaction layer's and the proxy's memory below their defaults, so
-	// that a test meets each overload refusal.
+	// serverTransactionBytes and contextBytes, when set, replace the
+	// transaction layer's and the proxy's memory bounds cfg gives, so that
+	// a test meets each overload refusal on its own.
 	serverTransactionBytes, contextBytes int64
 	// clock, if set, runs the proxy's transaction timers, a branch's
 	// Target.Timeout among them; nil is the system clock.
 	clock transaction.Clock
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
+	// transportConfig, if set, sees the transport's configuration before
+	// the transport is made.
+	transportConfig func(transport.Config)
+	// proxyConfig, if set, sees the proxy's configuration before the proxy
+	// is made.
+	proxyConfig func(proxy.Config)
 }
 
 // bound are the addresses the listeners bound; udp is zero without one.
@@ -93,10 +100,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// reason to reach a pcscf that is not ready, and a request that does
 	// arrive is dropped: its sender times out and tries another task.
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{
+	trCfg := transport.Config{
 		TLS:            tlsCfg,
 		MaxConnections: cfg.MaxConnections,
 		Admit:          fl.admit,
+		Metrics:        rt.Metrics,
 		OnFlowClosed: func(id transport.FlowID, info transport.FlowInfo) {
 			fl.closed(id, info)
 			// A request the core sent the client over this flow gets 430
@@ -105,9 +113,14 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 				px.FlowClosed(id)
 			}
 		},
-		WriteTimeout: d.writeTimeout,
-		Logger:       rt.Logger,
-	}, func(in transport.Inbound) {
+		WriteTimeout:   cmp.Or(d.writeTimeout, cfg.WriteTimeout),
+		MaxQueuedBytes: cfg.MaxQueuedBytes,
+		Logger:         rt.Logger,
+	}
+	if d.transportConfig != nil {
+		d.transportConfig(trCfg)
+	}
+	tr, err := transport.New(trCfg, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			fromClientMessage(in)
 			px.Receive(in)
@@ -148,6 +161,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	pc.clientFlow = func(id transport.FlowID) bool { return isClientFlow(tr, id) }
 	subCtx, stopSubs := context.WithCancel(context.Background())
 	pc.subs = newSubscriptions(subCtx)
+	bgPanics := panics.New(panics.Config{
+		Metric: metricBackgroundPanics, Message: "pcscf: background work panicked", Log: rt.Logger, Metrics: rt.Metrics,
+	})
+	pc.subs.name, pc.subs.panics = "regevent", bgPanics
 	// After the proxy closes, so that every SUBSCRIBE under way has ended.
 	defer pc.subs.close()
 	defer stopSubs()
@@ -158,6 +175,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	anchorCtx, stopAnchor := context.WithCancel(context.Background())
 	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now).
 		coreOfferShare(cfg.MaxCoreOfferBindingsPerFlow, cfg.CoreOfferBindingsPerMinute))
+	pc.msrp.name, pc.msrp.panics = "msrp", bgPanics
 	defer pc.msrp.close()
 	defer stopAnchor()
 	// A closed flow's registrations and MSRP sessions are gone (RFC 5626
@@ -170,19 +188,29 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	if router == nil {
 		router = pc
 	}
-	px, err := proxy.New(tr, proxy.Config{
-		Self:      selfURIs(cfg, int(coreAddr.Port())),
-		Router:    router,
-		Resolver:  resolver,
-		Supported: []string{"path", "outbound"},
-		Logger:    rt.Logger,
-		Metrics:   rt.Metrics,
-		// Zero: the defaults, and the system clock.
-		Transaction: transaction.Config{
-			Clock: d.clock, MaxServerTransactionBytes: d.serverTransactionBytes,
-		},
-		MaxContextBytes: d.contextBytes,
-	})
+	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
+	tcfg.Clock = d.clock
+	if d.serverTransactionBytes != 0 {
+		tcfg.MaxServerTransactionBytes = d.serverTransactionBytes
+	}
+	if d.contextBytes != 0 {
+		maxContextBytes = d.contextBytes
+	}
+	pcfg := proxy.Config{
+		Self:            selfURIs(cfg, int(coreAddr.Port())),
+		Router:          router,
+		Resolver:        resolver,
+		Supported:       []string{"path", "outbound"},
+		Logger:          rt.Logger,
+		Metrics:         rt.Metrics,
+		Transaction:     tcfg,
+		MaxContexts:     maxContexts,
+		MaxContextBytes: maxContextBytes,
+	}
+	if d.proxyConfig != nil {
+		d.proxyConfig(pcfg)
+	}
+	px, err := proxy.New(tr, pcfg)
 	if err != nil {
 		return err
 	}
@@ -365,6 +393,19 @@ func coreListenerConfig(cfg Config) transport.ListenerConfig {
 		Name: coreListener, Network: transport.TCP, Addr: cfg.CoreAddr,
 		AdvertisedHost: hostOf(cfg.CoreHost), MaxConnections: cfg.CoreConnections,
 	}
+}
+
+// proxyLimits are the bounds of pcscf's proxy, as icscf's are: its layer's
+// server transaction caps; as many contexts as server transactions, so that
+// the layer's count, not the proxy's, is the one a burst meets; and the same
+// bytes for the proxy's own memory bound, which it charges differently, so
+// either may refuse first (#482). Zero settings take the defaults.
+func proxyLimits(cfg Config) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
+	tcfg = transaction.Config{
+		MaxServerTransactions:     cfg.MaxServerTransactions,
+		MaxServerTransactionBytes: cfg.MaxServerTransactionBytes,
+	}
+	return tcfg, cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes
 }
 
 // checkListenerLimits checks the listeners pcscf opens against the

@@ -11,6 +11,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -317,12 +318,12 @@ func (failingStore) Identity(context.Context, string, time.Time) (*state.Identit
 
 func TestNewRefusesAnInconsistentConfig(t *testing.T) {
 	u, _ := sip.ParseURI("sip:scscf." + realm)
-	base := Config{Store: state.NewMemory(), HSS: newFakeHSS(), Realm: realm, ServiceRoute: u, NonceKey: testKey}
+	base := Config{Store: state.NewMemory(), HSS: newFakeHSS(), Realm: realm, ServiceRoute: u, NonceKey: secret.NewKey(testKey)}
 	for name, tweak := range map[string]func(*Config){
 		"no store":                      func(c *Config) { c.Store = nil },
 		"no HSS":                        func(c *Config) { c.HSS = nil },
 		"a tel service route":           func(c *Config) { c.ServiceRoute = sip.URI{Scheme: "tel", User: "+1"} },
-		"a short nonce key":             func(c *Config) { c.NonceKey = testKey[:8] },
+		"a short nonce key":             func(c *Config) { c.NonceKey = secret.NewKey(testKey[:8]) },
 		"min above max":                 func(c *Config) { c.MinExpires, c.MaxExpires = time.Hour, time.Minute },
 		"a challenge lifetime too long": func(c *Config) { c.ChallengeLifetime = time.Hour },
 	} {

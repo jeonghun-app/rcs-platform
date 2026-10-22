@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
@@ -35,8 +36,9 @@ const MinDialogKeyBytes = 32
 // it in the values, so that the key can be rotated: the first of
 // Config.DialogKeys signs, and each verifies.
 type DialogKey struct {
-	ID  string
-	Key []byte
+	ID string
+	// Key is the key's bytes, which no output reaches (internal/secret).
+	Key secret.Key
 }
 
 // redactedKey is what a DialogKey prints as: its ID, never its key.
@@ -86,7 +88,7 @@ func hopKey(u sip.URI) string {
 // hopMAC is the MAC under k of hop as a hop of the dialog with callID, at
 // this S-CSCF, named by its Record-Route host.
 func (rt *Router) hopMAC(k DialogKey, callID, hop string) []byte {
-	m := hmac.New(sha256.New, k.Key)
+	m := hmac.New(sha256.New, k.Key.Reveal())
 	for _, part := range []string{dlgLabel, rt.cfg.RecordRoute.URI.Host, callID, hop} {
 		var n [4]byte
 		binary.BigEndian.PutUint32(n[:], uint32(len(part)))

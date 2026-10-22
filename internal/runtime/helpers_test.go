@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"log"
 	"log/slog"
 	"strings"
 	"sync"
@@ -150,9 +151,11 @@ func (f *fakeTimers) Made() []time.Duration {
 // restoreDefaults undoes the process-wide defaults Run sets.
 func restoreDefaults(t *testing.T) {
 	t.Helper()
-	old := slog.Default()
+	old, oldOut, oldFlags := slog.Default(), log.Writer(), log.Flags()
 	t.Cleanup(func() {
 		slog.SetDefault(old)
+		log.SetOutput(oldOut)
+		log.SetFlags(oldFlags)
 		pii.SetDefault(nil)
 	})
 }

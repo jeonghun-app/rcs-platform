@@ -8,6 +8,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // CreateTables creates the three tables as the package documentation defines
@@ -17,7 +19,7 @@ import (
 func CreateTables(ctx context.Context, api *dynamodb.Client, c Config) error {
 	d, err := New(api, Config{
 		RegistrationsTable: c.RegistrationsTable, ChallengesTable: c.ChallengesTable,
-		SubscriptionsTable: c.SubscriptionsTable, ChallengeKeys: []ChallengeKey{{ID: "tables", Key: make([]byte, KeySize)}},
+		SubscriptionsTable: c.SubscriptionsTable, ChallengeKeys: []ChallengeKey{{ID: "tables", Key: secret.NewKey(make([]byte, KeySize))}},
 	})
 	if err != nil {
 		return err

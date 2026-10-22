@@ -12,6 +12,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -88,7 +90,7 @@ func StartFT(t testing.TB, partSize int64) *FT {
 	download, _ := url.Parse(base + "/dl")
 	h := runtimetest.New(t, "ft-server")
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: FTRealm, NonceKey: bytes.Repeat([]byte("k"), digest.MinNonceKeySize),
+		Realm: FTRealm, NonceKey: secret.NewKey(bytes.Repeat([]byte("k"), digest.MinNonceKeySize)),
 		NonceCounts: digest.NewMemoryNonceCounts(nil), HTTPPathOnlyURI: true,
 	})
 	if err != nil {
@@ -133,7 +135,7 @@ func StartFT(t testing.TB, partSize int64) *FT {
 		}
 		srv.ServeHTTP(w, r)
 	})
-	f.Server = &httptest.Server{Listener: ln, Config: &http.Server{Handler: counted}}
+	f.Server = &httptest.Server{Listener: ln, Config: &http.Server{Handler: counted, ErrorLog: runtime.HTTPErrorLog(slog.Default())}}
 	f.Server.Start()
 	t.Cleanup(f.Server.Close)
 	return f

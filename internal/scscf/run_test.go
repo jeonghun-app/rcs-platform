@@ -22,6 +22,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -193,6 +194,13 @@ type running struct {
 	h    *runtimetest.Harness
 }
 
+// testCxTimeout bounds a Cx request in the service tests, none of which
+// exercises the bound: at the 2 s these had, a loaded host held the test
+// HSS's MAA or SAA past it, and the REGISTER was answered 480 HSS
+// unavailable (#498, #504). The tests that do exercise a silent HSS set
+// their own (stop_test.go).
+const testCxTimeout = time.Minute
+
 // testConfig is a configuration as Configure would give it, with the
 // memory store.
 func testConfig() ServiceConfig {
@@ -200,10 +208,10 @@ func testConfig() ServiceConfig {
 		HomeDomain: realm, Namespace: "rcs.local",
 		CoreAddr: "127.0.0.1:0", CoreHost: netip.MustParseAddr("127.0.0.2"),
 		OriginRealm: realm, HSSRealm: realm, HSSDiscovery: DiscoveryDNS,
-		HSSHostPattern: "hss-*.rcs.local", CxTimeout: 2 * time.Second,
+		HSSHostPattern: "hss-*.rcs.local", CxTimeout: testCxTimeout,
 		Store:         StoreMemory,
-		NonceKey:      []byte("0123456789abcdef0123456789abcdef"),
-		DialogKeys:    []routing.DialogKey{{ID: "k1", Key: []byte("fedcba9876543210fedcba9876543210")}},
+		NonceKey:      secret.NewKey([]byte("0123456789abcdef0123456789abcdef")),
+		DialogKeys:    []routing.DialogKey{{ID: "k1", Key: secret.NewKey([]byte("fedcba9876543210fedcba9876543210"))}},
 		ICSCF:         mustURI("sip:icscf.rcs.local:5060;transport=tcp;lr"),
 		PCSCFCorePort: DefaultPCSCFCorePort,
 		ASTimeout:     routing.DefaultASTimeout, ThirdPartyTimeout: routing.DefaultThirdPartyTimeout,

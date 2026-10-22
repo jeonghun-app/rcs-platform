@@ -88,12 +88,18 @@ func (u *UAS) Source() transport.Source { return u.tx.Source() }
 // not queued but the flow stays open, as when the transport-wide budget is
 // full, so the client is still reachable for the next request.
 func (u *UAS) Respond(res *sip.Response) error {
+	final := res.StatusCode >= 200
+	if final {
+		// Held before answered, which ends it for Drain, can be seen, as
+		// respondFinal does for the proxy's own (#469, code review of
+		// #493).
+		defer u.c.p.holdFinal(res)()
+	}
 	u.mu.Lock()
 	if u.answered {
 		u.mu.Unlock()
 		return transaction.ErrState
 	}
-	final := res.StatusCode >= 200
 	if final {
 		u.answered = true
 	}
@@ -103,6 +109,9 @@ func (u *UAS) Respond(res *sip.Response) error {
 		// Waiting for the ACK before the 2xx leaves, so an ACK that comes
 		// back at once is not taken for one to forward.
 		u.retransmit(res)
+	}
+	if f := handingFinal.Load(); final && f != nil {
+		(*f)()
 	}
 	err := u.tx.Respond(res)
 	if final {

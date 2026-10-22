@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -84,7 +86,10 @@ type Config struct {
 	// MaxContextBytes bounds the bytes of the requests the contexts hold
 	// (see DefaultMaxContextBytes): a request that would take the total past
 	// it is answered 503 with Retry-After, and a branch that would fails as a
-	// 503 of its own.
+	// 503 of its own. A request from a client-facing listener, and its
+	// branches, may take the total only to Transaction.ClientShare of it, as
+	// at the layer's bounds, so that a flood of clients cannot turn away the
+	// core's terminating requests (#489).
 	MaxContextBytes int64
 	// Rand is the source of branch IDs and of the key behind the proxy's
 	// hashes; nil is crypto/rand. Branches start concurrently, so it must be
@@ -122,6 +127,9 @@ type Proxy struct {
 	maxCtx    int
 	maxBranch int
 	maxBytes  int64
+	// clientBytes is the part of maxBytes the contexts of requests from
+	// client-facing listeners may take the total to.
+	clientBytes int64
 	// bytes is what the contexts hold of maxBytes.
 	bytes atomic.Int64
 	// silent holds the responses the layer may hand to the sender but that
@@ -140,14 +148,13 @@ type Proxy struct {
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
-	key     []byte
-	log     *slog.Logger
-	metrics Metrics
-	// panicLogs limits the log lines of each hook's panics, by its name
-	// (panicLog); now is their clock, read against started.
-	panicLogs sync.Map
-	now       func() time.Time
-	started   time.Time
+	key []byte
+	log *slog.Logger
+	// panics recovers, counts and logs the hooks' panics (hook); now is
+	// the clock of its log limit, read against started.
+	panics  *panics.Guard
+	now     func() time.Time
+	started time.Time
 	// ctx is the parent of every request's context; Close cancels it.
 	ctx  context.Context
 	stop context.CancelFunc
@@ -213,6 +220,13 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	}
 	tcfg := cfg.Transaction
 	tcfg.DelayTrying = true
+	// The layer's panics go where the proxy's do, unless set apart.
+	if tcfg.Logger == nil {
+		tcfg.Logger = cfg.Logger
+	}
+	if tcfg.Metrics == nil {
+		tcfg.Metrics = cfg.Metrics
+	}
 	if tcfg.Clock == nil {
 		tcfg.Clock = transaction.SystemClock
 	}
@@ -258,13 +272,17 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
 		key:       key,
 		log:       cfg.Logger,
-		metrics:   cfg.Metrics,
 		now:       time.Now,
 		started:   time.Now(),
 		drainAns:  cfg.DrainAnswer,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
 	}
+	p.clientBytes = transaction.ClientShareOf(cfg.MaxContextBytes, cmp.Or(tcfg.ClientShare, transaction.DefaultClientShare))
+	p.panics = panics.New(panics.Config{
+		Metric: MetricHookPanics, Message: "proxy: a service hook panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
+		Now: func() time.Time { return p.now() }, Start: p.started,
+	})
 	for _, tag := range cfg.Supported {
 		p.supported[strings.ToLower(tag)] = true
 	}
@@ -293,6 +311,16 @@ func (q quietSender) SendResponse(res *sip.Response, src transport.Source, opts 
 	return q.Sender.SendResponse(res, src, opts...)
 }
 
+// holdFinal holds res for a *transport.Transport sender's Flush until its
+// SendResponse begins, and returns the release, which respondFinal calls
+// once the transaction has done with it, whether it sent it or not.
+func (p *Proxy) holdFinal(res *sip.Response) (release func()) {
+	if tr, ok := p.sender.(*transport.Transport); ok {
+		return tr.HoldResponse(res)
+	}
+	return func() {}
+}
+
 // silence ends a server transaction without a response (RFC 4320 §4.2, and
 // Decision.Discard): the transaction is given res, which quietSender never
 // sends, so it completes and absorbs retransmissions as if it had answered.
@@ -306,11 +334,15 @@ func (p *Proxy) silence(tx *transaction.ServerTransaction, res *sip.Response) {
 }
 
 // reserve takes n bytes of MaxContextBytes, or reports false if they are not
-// free.
-func (p *Proxy) reserve(n int64) bool {
+// free: for a request from a client-facing listener, within its share.
+func (p *Proxy) reserve(n int64, client bool) bool {
+	limit := p.maxBytes
+	if client {
+		limit = p.clientBytes
+	}
 	for {
 		cur := p.bytes.Load()
-		if cur+n > p.maxBytes {
+		if cur+n > limit {
 			return false
 		}
 		if p.bytes.CompareAndSwap(cur, cur+n) {
@@ -647,7 +679,7 @@ func (p *Proxy) newContext(tx *transaction.ServerTransaction) *respContext {
 	cost := int64(len(req.Body)) + 2*header
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed || len(p.contexts) >= p.maxCtx || !p.reserve(cost) {
+	if p.closed || len(p.contexts) >= p.maxCtx || !p.reserve(cost, tx.Source().ClientFacing) {
 		return nil
 	}
 	c := newRespContext(p, tx, cost, header)
@@ -791,7 +823,7 @@ type Stats struct {
 type counters struct {
 	branches, targetsDropped, breadthExceeded, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
-	upstreamErrors, hookPanics, drained atomic.Uint64
+	upstreamErrors, drained atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -821,7 +853,7 @@ func (p *Proxy) Stats() Stats {
 		ACKsMissing:            s.acksMissing.Load(),
 		ACKsDropped:            s.acksDropped.Load(),
 		UpstreamErrors:         s.upstreamErrors.Load(),
-		HookPanics:             s.hookPanics.Load(),
+		HookPanics:             p.panics.Panics(),
 
 		Drained: s.drained.Load(),
 	}

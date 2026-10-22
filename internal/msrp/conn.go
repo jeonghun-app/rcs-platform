@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 )
 
 // Defaults for Config.
@@ -151,6 +153,14 @@ type Config struct {
 	// (see Event), for metrics. It runs on the connection's goroutines and
 	// must not block.
 	OnEvent func(Event)
+	// Panics recovers a panic in what the connection runs for the service
+	// (#445): a Handler's calls, which end as the handler's error would
+	// (HandleMessage and HandleRequest answer 403, a report is dropped),
+	// OnEvent and the Binder, and the reading of the peer's input, which
+	// ends that connection only (EventClosed with ErrPanicked). A service
+	// shares one Guard among its connections, so that its log limit holds
+	// for all of them. Nil recovers, and only that.
+	Panics *panics.Guard
 	// MaxInFlight bounds the requests awaiting an answer on one
 	// connection. A sender that reaches it waits, which slows whoever feeds
 	// it (a relay stops reading its other side); every wait ends within
@@ -549,6 +559,13 @@ func (c *Conn) armUnboundLocked() {
 }
 
 func (c *Conn) readLoop() {
+	if !c.cfg.Panics.Run("read", c.read) {
+		c.fail(ErrPanicked)
+	}
+}
+
+// read reads and handles what the peer sends until the connection fails.
+func (c *Conn) read() {
 	for {
 		m, err := c.r.ReadHeader()
 		if err != nil {

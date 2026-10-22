@@ -231,8 +231,11 @@ Every table has a memory backend for unit tests and local runs; the compose stac
 - **Logging**: JSON lines through `log/slog`. SIP URIs, `tel:` URIs, IMSI, IMEI and
   MSISDN pass through `internal/pii` before they are logged. Client IP
   addresses, private ones included, are logged only as their network, through
-  `pii.ClientIP` or the sip and msrp log values (IPv4 /24, IPv6 /48). Message bodies,
-  credentials, nonces, RAND/AUTN, keys and tokens are never logged.
+  `pii.ClientIP` or the sip and msrp log values (IPv4 /24, IPv6 /48). Every
+  `http.Server` logs its errors through `runtime.HTTPErrorLog`, which does the
+  same for the addresses `net/http` writes into them (`pii.TruncateIPsIn`).
+  Message bodies, credentials, nonces, RAND/AUTN, keys and tokens are never
+  logged.
 - **Metrics**: CloudWatch Embedded Metric Format lines on stdout, so no agent is
   needed. They are aggregated in memory and written once a minute, when
   shutdown starts and when it ends, one line per metric, so log volume does

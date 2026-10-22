@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -83,7 +84,7 @@ type authRegistrar struct {
 func newAuthRegistrar(t *testing.T, algorithms ...digest.Algorithm) *authRegistrar {
 	t.Helper()
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: testDomain, NonceKey: []byte(strings.Repeat("k", digest.MinNonceKeySize)),
+		Realm: testDomain, NonceKey: secret.NewKey([]byte(strings.Repeat("k", digest.MinNonceKeySize))),
 		NonceCounts: digest.NewMemoryNonceCounts(nil),
 	})
 	if err != nil {
