@@ -183,12 +183,18 @@ logs: compose-env ## Logs of the local stack (LOGS="-f hss" to follow one servic
 # rcs-sim and acs checks against the stack `make up` started
 # (tools/rcs-sim/e2e, build tag e2ecompose), from the toolchain container on
 # the stack's network, so it reaches every service by its compose name.
+# scripts/e2e-compose.sh runs it and stops a group's owner task when the
+# test asks, through files in E2E_HANDSHAKE (the container sees the
+# worktree at /src), and starts it again afterwards, pass or fail (#121).
+E2E_HANDSHAKE := tmp/e2e-compose
 .PHONY: e2e-compose
 e2e-compose: volumes ## End-to-end: rcs-sim against the running local stack
 	@$(DOCKER) network inspect $(COMPOSE_PROJECT)_default >/dev/null 2>&1 && [ -f $(COMPOSE_ENV) ] || \
 	  { echo "no local stack $(COMPOSE_PROJECT) is running: run make up first" >&2; exit 1; }
-	$(RUNGO) --network $(COMPOSE_PROJECT)_default --env-file $(COMPOSE_ENV) -e CGO_ENABLED=0 \
-	  $(GOIMAGE) go test -tags e2ecompose -count=1 -v ./tools/rcs-sim/e2e/
+	scripts/e2e-compose.sh $(COMPOSE_PROJECT) $(E2E_HANDSHAKE) $(COMPOSE_PROJECT)-e2e \
+	  $(RUNGO) --name $(COMPOSE_PROJECT)-e2e --network $(COMPOSE_PROJECT)_default --env-file $(COMPOSE_ENV) -e CGO_ENABLED=0 \
+	  -e RCS_E2E_HANDSHAKE=/src/$(E2E_HANDSHAKE) \
+	  $(GOIMAGE) go test -tags e2ecompose -count=1 -timeout 15m -v ./tools/rcs-sim/e2e/
 
 # Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
 .PHONY: fuzz

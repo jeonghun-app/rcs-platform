@@ -61,6 +61,10 @@ x-rcs-as: &rcs-as
   # Not RCS_IMS_DOMAIN, which rcs-as refuses. A compose-only name: a
   # deployment sets its own.
   RCSAS_CONFERENCE_HOST: conf.rcs.local
+  # On here only: its default stays off, and turning it on in a deployment
+  # is the operator's choice (#121). Each group is served by the task that
+  # owns it, and the others forward its requests there.
+  RCSAS_GROUP_CHAT_ENABLED: "true"
 
 # What the platform services share: the image, and starting once their
 # tables exist. Each one's health check runs its own binary with
@@ -321,8 +325,10 @@ services:
   # rcs-as, the application server: chat, pager messages and
   # conferences, its queue and groups in DynamoDB Local (docs/rcs-as.md).
   # scscf reaches it as the default profile's AS, and msrp-relay connects
-  # to it on RELAY_CORE_PORTS (2855). One task, rcs-as-a; a second one
-  # takes the same settings and aliases with an MSRP host of its own (#121).
+  # to it on RELAY_CORE_PORTS (2855). Two tasks, rcs-as-a and rcs-as-b, as
+  # a deployment runs at least two: the same settings and shared aliases,
+  # each with an MSRP host of its own, so that a group's requests reach
+  # either task and are served on its owner (#121).
   rcs-as-a:
     <<: *platform
     command: ["rcs-as"]
@@ -334,6 +340,21 @@ services:
         # The AS URI and the conference host, which every task has, and
         # this task's own MSRP host.
         aliases: ["rcs-as.rcs.local", "conf.rcs.local", "rcs-as-a.rcs.local"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rcs-as", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  rcs-as-b:
+    <<: *platform
+    command: ["rcs-as"]
+    environment:
+      <<: *rcs-as
+      RCSAS_MSRP_HOST: rcs-as-b.rcs.local
+    networks:
+      default:
+        aliases: ["rcs-as.rcs.local", "conf.rcs.local", "rcs-as-b.rcs.local"]
     healthcheck:
       test: ["CMD", "/usr/local/bin/rcs-as", "-healthcheck"]
       interval: 2s

@@ -80,7 +80,7 @@ DynamoDB Local or S3Mock.
 | `icscf` | platform image | I-CSCF; finds `hss` as `hss.rcs.local` by DNS ([icscf](icscf.md#settings)), SIP on 5060 | `icscf -healthcheck` |
 | `scscf` | platform image | S-CSCF; its state in DynamoDB Local, `hss` by DNS as `icscf` finds it ([scscf](scscf.md)), SIP on 5060 | `scscf -healthcheck` |
 | `pcscf` | platform image | P-CSCF; clients' SIP on plain TCP 5060, the core listener on 5070 (`RCS_PCSCF_CORE_PORT`, [pcscf](pcscf.md)) | `pcscf -healthcheck` |
-| `rcs-as-a` | platform image | rcs-as, the default profile's application server: chat, pager messages, group chat (off); its queue and groups in DynamoDB Local ([rcs-as](rcs-as.md)), SIP on 5060, MSRP on 2855 | `rcs-as -healthcheck` |
+| `rcs-as-a`, `rcs-as-b` | platform image | rcs-as, two tasks of the default profile's application server: chat, pager messages, group chat; their queue and groups in DynamoDB Local ([rcs-as](rcs-as.md)), SIP on 5060, MSRP on 2855 | `rcs-as -healthcheck` |
 | `acs` | `ACS_IMAGE` (Makefile) | auto-configuration, memory store, mock SMS | the image's own `/healthz` check |
 | `stack-seed` | `deploy/stack-init.Dockerfile` | one-shot, after the services are healthy: the test subscriber ([Bootstrap](#bootstrap)) | exits 0 |
 
@@ -92,8 +92,9 @@ stores.
 
 ### rcs-as
 
-`rcs-as` runs as one task, `rcs-as-a`, addressed as the D4 design on #121 sets
-out, so that a second task can join it with the same settings:
+`rcs-as` runs as two tasks, `rcs-as-a` and `rcs-as-b`, as a deployment runs at
+least two, addressed as the D4 design on #121 sets out. They have the same
+settings (the `x-rcs-as` anchor) but their own MSRP host:
 
 - **Names.** Every task has two network aliases:
   - `rcs-as.rcs.local`, the host of the AS URI `hss` gives `scscf` in the
@@ -109,13 +110,17 @@ out, so that a second task can join it with the same settings:
     `RCSAS_SIP_HOST` is unset, so each task finds the one private IPv4 address
     of its container, as staging and prod with group chat require.
   - MSRP: each task names itself by an alias only it has, `rcs-as-a.rcs.local`
-    (`RCSAS_MSRP_HOST`). `msrp-relay` has the namespace
+    or `rcs-as-b.rcs.local` (`RCSAS_MSRP_HOST`). `msrp-relay` has the namespace
     (`RCS_SERVICE_NAMESPACE`), so it accepts that name in a `core_path`, and it
     connects on `RELAY_CORE_PORTS` (2855).
 - **What it sends** goes to `scscf.rcs.local` (`RCSAS_CORE_URI`'s default in
   the namespace).
-- **Group chat** is off (`RCSAS_GROUP_CHAT_ENABLED`): the factory and
-  conference URIs are answered 404.
+- **Group chat** is on (`RCSAS_GROUP_CHAT_ENABLED`), here only: its default
+  is off, and a deployment turns it on by choice (#121). Each group is served
+  by the task that owns it, and the other task forwards the group's requests
+  there ([Which task serves a group](rcs-as.md#which-task-serves-a-group)).
+  The core gives each request to either task, so a group's requests go both
+  ways.
 
 The default profile's criteria send each REGISTER's third-party REGISTER, a
 capability query's OPTIONS, a chat INVITE and a MESSAGE to `rcs-as` ([hss](hss.md#default-service-profile)).
@@ -274,10 +279,12 @@ Both keys were checked by hand against the v1.4.0 catalogue.
 
 The test (`tools/rcs-sim/e2e`, build tag `e2ecompose`) runs in the toolchain
 container on the stack's network (`<COMPOSE_PROJECT>_default`), with
-`deploy/compose.env` as its environment. It:
+`deploy/compose.env` as its environment. `scripts/e2e-compose.sh` runs it, and
+beside it does what the test asks of the host: the test container has no
+docker access. It:
 
 1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf`,
-   `scscf`, `pcscf`, `rcs-as-a` and `acs`;
+   `scscf`, `pcscf`, `rcs-as-a`, `rcs-as-b` and `acs`;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
 4. runs `rcs-sim ft ft-resume`: the FT scenarios go to the `ftHTTPCSURI`
@@ -316,7 +323,32 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
    with those criteria first, `SESSION_TERMINATED`, and puts the default
    back at the end (as `stack-seed` does at every `make up`). Each stub must
    have taken both OPTIONS, the second after the first.
-7. checks the results of every run by the same rules as `make e2e`: every
+7. runs `rcs-sim group-chat` over SIP (#121 D4). The client makes a group
+   with the peer at the conference factory, the focus invites the peer, and
+   a message goes through the group with its notifications. The client
+   subscribes to the roster, and rejoins five times: the core gives each
+   request to either `rcs-as` task, and the one that does not own the group
+   forwards it to the owner. Then the group's owner is stopped:
+   - `rcs-sim` writes the conference URI to `tmp/e2e-compose/conference`;
+   - the test reads the group's owner from the `groupchats` table and writes
+     its address to `tmp/e2e-compose/stop`;
+   - the host stops the `rcs-as` container of this stack with that address
+     (`docker stop`, a clean stop) and writes `stopped`.
+
+   Both sessions get the owner's BYE and the roster subscription ends. The
+   client rejoins, answered 500 with `Retry-After` until the other task has
+   taken the group over, then 200; its roster is back, and its next message
+   reaches the peer, whom the new owner invites again. The test checks that
+   the group's owner item names the other task, one epoch up, and that the
+   `rcs-as` logs (`tmp/e2e-compose/logs`, which the host writes when asked)
+   count a forwarded request (`group.forwarded`) and the takeover
+   (`group.owner_takeover`). The surviving task writes its counters once a
+   minute, so this can take that long.
+
+   Whatever the outcome, the host starts the stopped task again and waits
+   until it is healthy before `make e2e-compose` returns. Every wait in the
+   handshake is bounded. The docker socket is never given to the test.
+8. checks the results of every run by the same rules as `make e2e`: every
    step, the resume bounds, no busy retries, nothing secret or identifying
    in the output.
 

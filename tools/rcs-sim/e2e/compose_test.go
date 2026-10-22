@@ -43,7 +43,7 @@ func TestE2EComposeStack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf", "scscf", "pcscf", "rcs-as-a"} {
+	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf", "scscf", "pcscf", "rcs-as-a", "rcs-as-b"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
 	waitReady(ctx, t, acsURL+"/readyz")
