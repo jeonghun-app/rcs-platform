@@ -205,6 +205,10 @@ func (h everyGroup) Member(ctx context.Context, _, user string) (bool, error) {
 	return h.members.Member(ctx, groupURI, user)
 }
 
+func (h everyGroup) Owns(ctx context.Context, _ string) (bool, error) {
+	return h.members.Owns(ctx, groupURI)
+}
+
 // The reviews' reproduction (PR #118, round 3): with a share per group, an
 // offline author of one message in each of nine full groups had its queue
 // filled by receipts, and a 1-to-1 message to it was refused. All groups'

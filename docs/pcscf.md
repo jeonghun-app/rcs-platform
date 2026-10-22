@@ -652,7 +652,8 @@ start with that value.
 | `PCSCF_CLIENT_ADDR` | `0.0.0.0:5061`, or `:5060` with `tcp` | client listener (NLB target) |
 | `PCSCF_TLS_CERT_FILE`, `PCSCF_TLS_KEY_FILE` | none | certificate of `tls`, required with it |
 | `PCSCF_CLIENT_UDP_ADDR` | none | UDP client listener; refused |
-| `PCSCF_CORE_ADDR` | `0.0.0.0:5070` | core listener |
+| `PCSCF_CORE_ADDR` | `0.0.0.0:<RCS_PCSCF_CORE_PORT>` | core listener; while `RCS_PCSCF_CORE_PORT` is set, its port must be that one |
+| `RCS_PCSCF_CORE_PORT` | `5070` | the core listener's port, shared with `scscf`, which sends requests inside a dialog to a P-CSCF only on it |
 | `PCSCF_CORE_HOST` | this task's one private IPv4 | the task address `pcscf` names itself by |
 | `RCS_PROXY_PROTOCOL` | `false` | require PROXY v2 on the client listener; `false` is refused |
 | `PCSCF_MAX_FLOWS_PER_IP` | `1024` | client flows per client (IPv4 address or IPv6 /64) |

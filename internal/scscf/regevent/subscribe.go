@@ -91,6 +91,13 @@ func (n *Notifier) subscribe(ctx context.Context, req *sip.Request, ev sip.Event
 	if err != nil {
 		return n.response(req, 400, "Bad Request", ""), nil
 	}
+	if !onLiveHop(set, firstHop(d), now) {
+		// The NOTIFYs would go somewhere no binding of the set came from:
+		// only a platform P-CSCF a live binding came over is a first hop
+		// (#256 security review).
+		n.count("regevent.refused_route")
+		return n.refused(req), nil
+	}
 	sub := &state.Subscription{
 		ID: subscriptionID(d.ID()), IMPU: impu, Set: set.Key, Incarnation: set.Incarnation,
 		Subscriber: subscriber.String(), Kind: kind, EventID: ev.ID(),
@@ -172,6 +179,43 @@ func onLivePath(set *state.Registration, u sip.URI, now time.Time, anyUser bool)
 		}
 	}
 	return false
+}
+
+// firstHop is where a dialog's requests go first: its first route, or
+// without one its remote target (RFC 3261 §12.2.1.1).
+func firstHop(d *dialog.Dialog) sip.URI {
+	if len(d.RouteSet) > 0 {
+		return d.RouteSet[0].URI
+	}
+	return d.RemoteTarget
+}
+
+// onLiveHop reports whether u is, by host and port, a port left out being
+// its scheme's default, the first Path URI of a live binding of set: the
+// P-CSCF that binding came over.
+func onLiveHop(set *state.Registration, u sip.URI, now time.Time) bool {
+	for _, c := range set.Contacts {
+		if c.Expired(now) || len(c.Path) == 0 {
+			continue
+		}
+		p, err := sip.ParseAddress(c.Path[0])
+		if err == nil && strings.EqualFold(p.URI.Host, u.Host) && portOf(p.URI) == portOf(u) {
+			return true
+		}
+	}
+	return false
+}
+
+// portOf is u's port, or the one its scheme's transport defaults to
+// (RFC 3261 §19.1.2).
+func portOf(u sip.URI) int {
+	switch {
+	case u.Port != 0:
+		return u.Port
+	case strings.EqualFold(u.Scheme, "sips"):
+		return 5061
+	}
+	return 5060
 }
 
 // ueKey names what a UE's subscription ends with: its device, by

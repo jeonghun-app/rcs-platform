@@ -59,6 +59,9 @@ type deps struct {
 	transport func(*transport.Transport)
 	// writeTimeout replaces the transport's WriteTimeout when set.
 	writeTimeout time.Duration
+	// draining, if set, hears that the stop has begun, just before the
+	// drain.
+	draining func()
 }
 
 // Run serves cfg until ctx ends.
@@ -141,6 +144,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		d.listening(coreAddr)
 	}
 	<-ctx.Done()
+	if d.draining != nil {
+		d.draining()
+	}
 	// The listener stays open meanwhile, since Cloud Map's DNS answers name
 	// this task for their TTL after it is deregistered (review of #276).
 	drainCtx, cancel := context.WithTimeout(context.Background(), cfg.DrainTimeout)

@@ -154,6 +154,14 @@ func (s *Memory) Task(_ context.Context, id string) (Task, error) {
 	return t, nil
 }
 
+// Fenced reports whether uri's owner is still task at epoch, for a
+// store.Memory beside s (store.Memory.SetFence).
+func (s *Memory) Fenced(uri, task string, epoch int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fenced(uri, Owner{Task: task, Epoch: epoch})
+}
+
 // Disown forgets uri's owner, as for a group stored before #121, for
 // tests.
 func (s *Memory) Disown(uri string) {
