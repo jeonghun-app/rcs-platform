@@ -101,7 +101,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
-		ErrorLog:          slog.NewLogLogger(rt.Logger.Handler(), slog.LevelWarn),
+		ErrorLog:          runtime.HTTPErrorLog(rt.Logger),
 	}
 	served := make(chan error, 1)
 	go func() { served <- hs.Serve(ln) }()
