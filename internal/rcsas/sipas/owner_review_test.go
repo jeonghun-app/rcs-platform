@@ -284,3 +284,39 @@ func TestTheForwardAndACKWaitsAreTheTransactions(t *testing.T) {
 		t.Errorf("ackWait %v, Timer H is %v", ackWait, 64*transaction.DefaultT1)
 	}
 }
+
+// QA's reproduction (#464, third round): the creator's INVITE to the factory
+// tried again before its ACK, which the core gives b in the moment b takes
+// a miss for the group's URI for granted, is not taken up on b, which does
+// not own the group: 500 with Retry-After, and the creator's session stays
+// on a.
+func TestQAR3InlineCreatorRetryWhilePendingThroughNonOwner(t *testing.T) {
+	ga, gb := twoTasks(t, carol)
+	uri := gb.groups.URIFor("qapend")
+	m := gb.groupInvite(uri, sdpType, offerSDP(relayPath(), "active"))
+	m.to = "<" + uri + ">"
+	if res := gb.p.send(m); res.StatusCode != 404 { // b remembers: no group
+		t.Fatalf("rejoin of no group answered %d", res.StatusCode)
+	}
+	cid := func(m msg) msg {
+		for i, x := range m.fields {
+			if x == "Contribution-ID: gch4t1" {
+				m.fields[i] = "Contribution-ID: qapend"
+			}
+		}
+		return m
+	}
+	if res := ga.p.send(cid(ga.factoryInvite(relayPath(), bob))); res.StatusCode != 200 {
+		t.Fatalf("factory on a answered %d", res.StatusCode)
+	}
+	// No ACK yet: the creator tries again, and the core gives b the retry.
+	f2 := cid(gb.factoryInvite(relayPath(), bob))
+	f2.from, f2.to = `"Alice" <`+alice+">;tag=a2", "<"+confFactory+">"
+	res := gb.p.send(f2)
+	if n := sessionsOf(gb.a.srv, uri); n != 0 {
+		t.Fatalf("b, not the owner, holds %d of the group's sessions", n)
+	}
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("the retry on b answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}

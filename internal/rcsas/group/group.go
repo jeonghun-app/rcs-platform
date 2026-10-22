@@ -479,6 +479,11 @@ func (s *Service) retried(ctx context.Context, uri, creator string) (groupstore.
 		s.metrics.Count("group.rejected.taken", 1)
 		return groupstore.Group{}, ErrTaken
 	}
+	// Taken up with no write, so no fence to refuse it: the creator's
+	// session is the owner's to hold, as for a no-op change (QA on #464).
+	if _, err := s.owner(ctx, g); err != nil {
+		return groupstore.Group{}, err
+	}
 	s.metrics.Count("group.create_retried", 1)
 	return g, nil
 }
