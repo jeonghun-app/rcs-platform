@@ -31,6 +31,10 @@
 //	                      settings declared unsafe with Settings.ForbidInProduction
 //	RCS_LOG_LEVEL         debug, info (default), warn or error
 //	RCS_ADMIN_ADDR        admin listener, IP:port or :port (default :8080)
+//	RCS_ADMIN_PROXY_NETWORKS
+//	                      CIDRs whose PROXY protocol v2 header the admin
+//	                      listener takes, as an NLB health check sends one;
+//	                      unset, none; a /0 is refused (#230)
 //	RCS_SHUTDOWN_TIMEOUT  drain deadline after SIGTERM (default 20s)
 //	RCS_METRICS_NAMESPACE CloudWatch namespace for EMF metrics (default RCS)
 //	RCS_SERVICE_NAMESPACE Cloud Map namespace, a DNS name such as rcs.local
