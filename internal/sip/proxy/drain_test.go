@@ -466,8 +466,10 @@ func TestARequestAfterDrainHasAnsweredGetsItsAnswer(t *testing.T) {
 
 // However many answers cannot go out, Drain gives them DrainSendWait in all,
 // not each (QA of #310). The test stands in for that timer (drainTimer): it
-// must be armed once, for DrainSendWait, and Drain must wait for it and
-// return once it fires, which no bound on wall clock decides (#408).
+// must be armed once, for DrainSendWait from when Drain gave up on its
+// context, and Drain must wait for it and return once it fires, which no
+// bound on wall clock decides (#408). The deadline the timer is armed for
+// is the flush's as well (QA of #472).
 func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.decide(Decision{Targets: []Target{target("sip:bob@192.0.2.2")}})
@@ -480,24 +482,32 @@ func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
 	h.net.stallUpstream = stall
 	h.net.mu.Unlock()
 	t.Cleanup(func() { close(stall) })
+	// Each deadline Drain arms, with how long it was until then as the
+	// timer was armed: no more than DrainSendWait.
 	var mu sync.Mutex
-	var armed []time.Duration
+	var armed []time.Time
+	var left []time.Duration
 	fire := make(chan time.Time)
-	after := func(d time.Duration) <-chan time.Time {
+	until := func(deadline time.Time) <-chan time.Time {
 		mu.Lock()
 		defer mu.Unlock()
-		armed = append(armed, d)
+		armed = append(armed, deadline)
+		left = append(left, time.Until(deadline))
 		return fire
 	}
-	drainTimer.Store(&after)
+	drainTimer.Store(&until)
 	t.Cleanup(func() { drainTimer.Store(nil) })
-	timers := func() []time.Duration {
+	timers := func() ([]time.Time, []time.Duration) {
 		mu.Lock()
 		defer mu.Unlock()
-		return slices.Clone(armed)
+		return slices.Clone(armed), slices.Clone(left)
 	}
+	start := time.Now()
 	done := drainFor(h, 50*time.Millisecond)
-	for deadline := time.Now().Add(5 * time.Second); len(timers()) == 0; time.Sleep(time.Millisecond) {
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		if got, _ := timers(); len(got) > 0 {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("Drain armed no timer for its answers")
 		}
@@ -517,8 +527,11 @@ func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Drain did not return once its DrainSendWait was over")
 	}
-	if got := timers(); len(got) != 1 || got[0] != DrainSendWait {
-		t.Fatalf("Drain armed %v for five answers, want one DrainSendWait (%v) in all", got, DrainSendWait)
+	// Drain gives up on its context after start, and arms the deadline
+	// after that: so DrainSendWait from start at least, and no more than
+	// DrainSendWait from when it was armed.
+	if got, left := timers(); len(got) != 1 || got[0].Before(start.Add(DrainSendWait)) || left[0] > DrainSendWait {
+		t.Fatalf("Drain armed %v for five answers (%v away), want one DrainSendWait (%v) in all", got, left, DrainSendWait)
 	}
 }
 
