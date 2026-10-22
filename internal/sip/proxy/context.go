@@ -369,9 +369,9 @@ func (c *respContext) respondFinal(res *sip.Response) error {
 	return c.tx.Respond(res)
 }
 
-// handingFinal, empty but in tests, runs in respondFinal once a final is on
-// its way and before the transaction has it, so that a test can hold it in
-// that gap (#469). It is atomic since a proxy may outlive the test that set
+// handingFinal, empty but in tests, runs in respondFinal and UAS.Respond
+// once a final is on its way and before the transaction has it, so that a
+// test can hold it in that gap (#469). It is atomic since a proxy may outlive the test that set
 // it.
 var handingFinal atomic.Pointer[func()]
 

@@ -800,10 +800,14 @@ func (t *Transport) beginSend() uint64 {
 }
 
 // HoldResponse counts res, about to be sent, for Flush as a send under way,
-// from now until a SendResponse of it begins and counts it itself, or until
-// release, whichever is first. A proxy holds a final response it hands to a
-// transaction this way, so that a Flush while the transaction layer has it,
-// before it calls SendResponse, still waits for it (#469).
+// from now on. A SendResponse of it that begins takes the hold over as its
+// own count, under the same number, so that a Flush that saw the hold waits
+// for the send as well, a dial to the Via address included (code review of
+// #493). A proxy holds a final response it hands to a transaction this way,
+// so that a Flush while the transaction layer has it, before it calls
+// SendResponse, still waits for it (#469). release must always be called,
+// once the response has been sent or will not be: it ends a hold no send
+// took over, which Flush would otherwise wait for until its deadline.
 func (t *Transport) HoldResponse(res *sip.Response) (release func()) {
 	id := t.beginSend()
 	t.sendsMu.Lock()
@@ -825,14 +829,17 @@ func (t *Transport) unhold(res *sip.Response, id uint64) {
 	t.sendsMu.Unlock()
 }
 
-// takeHold ends the hold of res, which a send of it now counts.
-func (t *Transport) takeHold(res *sip.Response) {
+// takeHold returns the number of the hold of res, if it has one, for a send
+// of it to count itself under: the number stays in sends, and only the hold
+// ends.
+func (t *Transport) takeHold(res *sip.Response) (uint64, bool) {
 	t.sendsMu.Lock()
-	if id, ok := t.holds[res]; ok {
+	defer t.sendsMu.Unlock()
+	id, ok := t.holds[res]
+	if ok {
 		delete(t.holds, res)
-		delete(t.sends, id)
 	}
-	t.sendsMu.Unlock()
+	return id, ok
 }
 
 func (t *Transport) endSend(id uint64) {

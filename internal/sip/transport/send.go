@@ -179,10 +179,14 @@ func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOpti
 	}
 	// Under way for Flush until the response is in a queue's count, however
 	// long finding its connection takes.
-	id := t.beginSend()
+	// Under the number of its hold, if it has one, which a Flush may have
+	// seen already (HoldResponse).
+	id, held := t.takeHold(res)
+	if !held {
+		id = t.beginSend()
+	}
 	counted := func() { t.endSend(id) }
 	defer counted()
-	t.takeHold(res)
 	vias, err := res.Header.Via()
 	if err != nil {
 		return err
