@@ -126,8 +126,9 @@ func TestE2EComposeStack(t *testing.T) {
 	// msrp-relay and scscf takes to rcs-as; rcs-as opens a chat to the peer
 	// for the client's message, and a message goes each way, each with its
 	// report and notifications, and one in 2 KiB chunks, before the
-	// client's BYE ends the chat and its relay binding. Then a chat to the
-	// peer unregistered, whose message rcs-as keeps until it registers.
+	// client's BYE ends the chat and its relay binding. Then the peer ends
+	// its chats and unregisters, and a chat to it has its message kept by
+	// rcs-as until the peer registers again.
 	// The client's default profile first: a run cut short before it put
 	// it back would leave the stub's, whose AS is gone, and fail the
 	// first OPTIONS with a 500 that says nothing of why (#473 code review).
@@ -165,10 +166,12 @@ func TestE2EComposeStack(t *testing.T) {
 		t.Errorf("the MESSAGE was answered %d, not rcs-as's 202", r.Detail["status"])
 	}
 	// rcs-as took the chat to the peer unregistered, kept the message and
-	// delivered it in a chat of its own once the peer registered again.
-	if r := sipResults["chat-invite/peer-offline"]; r.Detail["status"] != 200 || r.Detail["stored"] != 1 {
-		t.Errorf("the chat to the unregistered peer was answered %d (stored and delivered: %d), want rcs-as's 200 and its delivery once the peer registered",
-			r.Detail["status"], r.Detail["stored"])
+	// delivered it on a chat it opened once the peer registered again: the
+	// peer had ended its chats before it unregistered, so the message came
+	// on no earlier one (code review on #559).
+	if r := sipResults["chat-invite/peer-offline"]; r.Detail["status"] != 200 || r.Detail["new_session"] != 1 || r.Detail["stored"] != 1 {
+		t.Errorf("the chat to the unregistered peer was answered %d (on a new chat: %d, stored and delivered: %d), want rcs-as's 200 and its delivery on a chat opened once the peer registered",
+			r.Detail["status"], r.Detail["new_session"], r.Detail["stored"])
 	}
 	// So did the peer's delivery notification, a MESSAGE of its own.
 	if r := sipResults["pager-message/delivery-notification"]; r.Detail["status"] != 202 {

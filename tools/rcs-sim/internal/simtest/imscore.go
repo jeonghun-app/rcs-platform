@@ -57,6 +57,12 @@ type IMSCore struct {
 	// 3261 §9.1).
 	Forwarding  func(*sip.Request)
 	CancelTaken func()
+	// AnswerOffline, when set before any request, answers an INVITE to an
+	// IMPU without a binding itself, 200 with the SDP it returns and the
+	// core's Contact, as a network element that takes a chat for an
+	// unregistered user does; nil leaves the INVITE to Offline. It runs on
+	// the sender's reading goroutine.
+	AnswerOffline func(req *sip.Request) []byte
 	// answered, if set (export_test.go), runs once a REGISTER that changed
 	// a registration has been answered.
 	answered func(*sip.Request)
@@ -835,6 +841,18 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	}
 	flow, ok := c.flowFor(req.URI)
 	fwd, err := c.forwarded(req)
+	if !ok && err == nil && req.Method == "INVITE" && c.AnswerOffline != nil {
+		if body := c.AnswerOffline(req); body != nil {
+			tag, _ := c.ids.Tag()
+			if res, err := sip.NewResponse(req, 200, "", tag); err == nil &&
+				res.Header.Add("Contact", "<sip:core.invalid:5060;transport=tcp>") == nil &&
+				res.Header.Add("Content-Type", "application/sdp") == nil {
+				res.Body = body
+				c.respond(tx, res)
+			}
+			return
+		}
+	}
 	switch {
 	case err != nil:
 		answer(500)

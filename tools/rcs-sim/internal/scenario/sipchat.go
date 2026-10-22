@@ -332,7 +332,7 @@ func chatInvite(r *run) error {
 		return err
 	}
 	if err := r.step("peer-offline", func(ctx context.Context) (map[string]int64, error) {
-		return r.chatToOfflinePeer(ctx, b, a, aEnd, bEnd, token)
+		return r.chatToOfflinePeer(ctx, b, a, aEnd, bEnd, peer, sessions, token)
 	}); err != nil {
 		return err
 	}
@@ -350,15 +350,39 @@ func chatInvite(r *run) error {
 	})
 }
 
-// chatToOfflinePeer is the peer-offline step (#135 AC 4): the peer
-// unregisters and the client opens a chat to it and sends a message. A
-// network without store-and-forward, as the unit tests' stand-in core,
-// answers the INVITE 480, which passes. One that answers it 2xx, as rcs-as
-// does, must store the message: once the peer registers again the network
-// opens a chat to it, and the message, its text and Message-ID intact,
-// arrives there, and its notifications come back to the client (stored).
-// One that accepts the chat and loses the message fails.
-func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, token string) (map[string]int64, error) {
+// chatToOfflinePeer is the peer-offline step (#135 AC 4): the peer ends its
+// chats and unregisters, and the client opens a chat to it and sends a
+// message. A network without store-and-forward, as the unit tests'
+// stand-in core, answers the INVITE 480, which passes. One that answers it
+// 2xx, as rcs-as does, must store the message: once the peer registers
+// again the network opens a chat to it, and the message, its text and
+// Message-ID intact, arrives there, and its notifications come back to the
+// client (stored). One that accepts the chat and loses the message fails,
+// and so does one that sends it on a chat the peer had before (code review
+// on #559).
+func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, peer peerSession, sessions <-chan peerSession, token string) (map[string]int64, error) {
+	// A UE releases the dialogs on its flow before it de-registers (TS
+	// 24.229 §5.1.1.6.1): the chats the network opened to the peer end
+	// here, those it opened for the earlier steps and any still queued.
+	// A chat left open would carry the message at once, and nothing would
+	// have been stored.
+	ended := []peerSession{peer}
+	for queued := true; queued; {
+		select {
+		case s := <-sessions:
+			ended = append(ended, s)
+		default:
+			queued = false
+		}
+	}
+	for _, s := range ended {
+		if s.client != nil {
+			_ = s.client.Close()
+		}
+		if s.dialog != nil {
+			r.hangUp(s.dialog)
+		}
+	}
 	if _, err := b.ua.Unregister(ctx); err != nil {
 		return nil, fmt.Errorf("peer: %w", sipError(err))
 	}
@@ -420,6 +444,14 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	}
 	if !bytes.Equal(got.Body, text) {
 		return detail, errors.New("the stored message changed on the way")
+	}
+	// It came on a chat the network opened after the peer registered
+	// again: the peer's earlier chats have ended.
+	select {
+	case <-sessions:
+		detail["new_session"] = 1
+	case <-ctx.Done():
+		return detail, errors.New("the stored message came on no chat the network opened once the peer registered again")
 	}
 	if err := awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI); err != nil {
 		return detail, err
