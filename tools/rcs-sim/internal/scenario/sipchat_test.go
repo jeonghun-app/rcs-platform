@@ -3,11 +3,13 @@ package scenario_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,10 +17,12 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/chat"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/simtest"
+	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/sipua"
 )
 
 // chatAnchor plays pcscf's MSRP anchoring and rcs-as's end of each leg in
@@ -43,12 +47,28 @@ type chatAnchor struct {
 	keep                            bool
 	answerSetup, offerSetup         sdp.Setup
 	answerElsewhere, offerElsewhere bool
+	// answerOffline has the core answer the client's INVITE to the peer
+	// unregistered itself, and send what the client sends there on the
+	// peer's earlier chat, as a network that keeps no message and uses a
+	// chat the peer should have ended would (code review on #559).
+	answerOffline bool
+	// offlineOnFirst has answerOffline send on the peer's first chat
+	// rather than its latest. With offlineOnLater, it sends on a chat a
+	// third subscriber opens to the peer as it registers again, before its
+	// REGISTER is answered (deliverOnRegister), rcs-as's order: the client
+	// answered, the message stored, then the peer invited (code review on
+	// #559).
+	offlineOnFirst bool
+	offlineOnLater chan struct{} // closed once that chat is open
 	// toPeer and toClient are what the forwarders do wrong on the way to
 	// the peer and to the client.
 	toPeer, toClient faults
 
 	mu    sync.Mutex
 	calls map[string]*anchoredCall // by Call-ID
+	// toPeerLegs are the core legs toward the peer, a chat's each, oldest
+	// first.
+	toPeerLegs []*msrp.Session
 }
 
 // faults are what a forwarder does wrong with what it sends on: it loses
@@ -56,12 +76,19 @@ type chatAnchor struct {
 // one to another (change), writes another CPIM From in each message (from)
 // or another recipient in each notification (recipient), or sends first, once,
 // a message an earlier run left (leftover): with another Message-ID and,
-// for "same token", this run's text.
+// for "same token", this run's text. With cutOver it cuts what it sends to
+// that many octets when it is longer: a large message arrives short. With
+// dropNotificationsAfter it passes that many notifications on and loses
+// the rest, and with failReportOver it sends a message longer than that
+// on but reports its delivery failed.
 type faults struct {
-	dropNotifications bool
-	change            [2]string
-	from, recipient   string
-	leftover          string
+	dropNotifications      bool
+	change                 [2]string
+	from, recipient        string
+	leftover               string
+	cutOver                int
+	dropNotificationsAfter int
+	failReportOver         int
 }
 
 type anchoredCall struct {
@@ -83,7 +110,74 @@ func anchorChats(t *testing.T, cfg scenario.Config, core *simtest.IMSCore) *chat
 	// rewrite must not, so its one call goes on a goroutine of its own.
 	core.Forwarding = a.forwarding
 	core.RewriteResponse = a.answered
+	core.AnswerOffline = a.offline
 	return a
+}
+
+// offline answers the client's INVITE to the peer unregistered, with
+// answerOffline: the client's binding as forwarding allocates it, and a
+// core leg that sends on the peer's earlier chat.
+func (a *chatAnchor) offline(req *sip.Request) []byte {
+	if !a.answerOffline {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s, m, err := msrpMedia(req.Body)
+	if err != nil {
+		return nil
+	}
+	path, err := mediaPath(m)
+	if err != nil {
+		return nil
+	}
+	callerCore, err := a.core.NewURI(nil)
+	if err != nil {
+		a.t.Error(err)
+		return nil
+	}
+	caller, err := a.ctrl.Allocate(ctx, anchor.Paths{Client: path}, 10*time.Minute)
+	if err != nil {
+		a.t.Error(err)
+		return nil
+	}
+	a.mu.Lock()
+	to := a.toPeerLegs[len(a.toPeerLegs)-1]
+	if a.offlineOnFirst {
+		to = a.toPeerLegs[0]
+	}
+	leg := &forwarder{f: &a.toPeer, to: to}
+	if a.offlineOnLater != nil {
+		leg.later = func() *msrp.Session {
+			select {
+			case <-a.offlineOnLater:
+			case <-time.After(10 * time.Second):
+				return nil
+			}
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			return a.toPeerLegs[len(a.toPeerLegs)-1]
+		}
+	}
+	a.mu.Unlock()
+	if _, err := a.core.Expect(callerCore, caller.CoreLocal, leg); err != nil {
+		a.t.Error(err)
+		return nil
+	}
+	if err := a.ctrl.Complete(ctx, caller.ID, anchor.Paths{Core: callerCore}, 0); err != nil {
+		a.t.Error(err)
+		return nil
+	}
+	if err := setMedia(s, m, caller.ClientPath, sdp.SetupPassive); err != nil {
+		a.t.Error(err)
+		return nil
+	}
+	body, err := s.Marshal()
+	if err != nil {
+		a.t.Error(err)
+		return nil
+	}
+	return body
 }
 
 func (a *chatAnchor) forwarding(req *sip.Request) {
@@ -137,6 +231,9 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 			return
 		}
 		in.to, out.to = outbound, inbound
+		a.mu.Lock()
+		a.toPeerLegs = append(a.toPeerLegs, outbound)
+		a.mu.Unlock()
 		if err := a.ctrl.Complete(ctx, caller.ID, anchor.Paths{Core: callerCore}, 0); err != nil {
 			a.t.Error(err)
 			return
@@ -221,13 +318,16 @@ func (a *chatAnchor) answered(req *sip.Request, res *sip.Response) {
 
 // forwarder is one of the core stand-in's legs: what it receives is sent on
 // the other leg, to, once that is bound, and acknowledged here, as rcs-as
-// takes a message and delivers it in a session of its own.
+// takes a message and delivers it in a session of its own. With later set,
+// the other leg is not known yet: it is what later returns once it does.
 type forwarder struct {
-	f  *faults
-	to *msrp.Session
+	f     *faults
+	to    *msrp.Session
+	later func() *msrp.Session
 
 	mu       sync.Mutex
 	leftOver bool // the leftover has gone
+	notes    int  // notifications seen
 }
 
 func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
@@ -236,8 +336,26 @@ func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	if f.f.dropNotifications && notification {
 		return nil
 	}
+	if n := f.f.dropNotificationsAfter; n > 0 && notification {
+		f.mu.Lock()
+		f.notes++
+		drop := f.notes > n
+		f.mu.Unlock()
+		if drop {
+			return nil
+		}
+	}
+	// Sent on, but its success report fails (a REPORT with the error,
+	// the transaction itself answered 200).
+	var reportErr error
+	if n := f.f.failReportOver; n > 0 && len(body) > n {
+		reportErr = &msrp.StatusError{Code: msrp.StatusForbidden}
+	}
 	if f.f.change[0] != "" {
 		body = bytes.ReplaceAll(body, []byte(f.f.change[0]), []byte(f.f.change[1]))
+	}
+	if n := f.f.cutOver; n > 0 && len(body) > n {
+		body = body[:n]
 	}
 	if f.f.recipient != "" && notification {
 		body = recipientRe.ReplaceAll(body, []byte("<recipient-uri>"+f.f.recipient+"</recipient-uri>"))
@@ -270,12 +388,18 @@ func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if first != nil {
-			_, _ = f.to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(first), SuccessReport: true})
+		to := f.to
+		if f.later != nil {
+			if to = f.later(); to == nil {
+				return
+			}
 		}
-		_, _ = f.to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(body), SuccessReport: true})
+		if first != nil {
+			_, _ = to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(first), SuccessReport: true})
+		}
+		_, _ = to.Send(ctx, msrp.Outgoing{ContentType: contentType, Body: msrp.BodyOf(body), SuccessReport: true})
 	}()
-	return nil
+	return reportErr
 }
 
 var recipientRe = regexp.MustCompile(`<recipient-uri>[^<]*</recipient-uri>`)
@@ -340,13 +464,21 @@ func TestAChatOverSIPCarriesAMessageEachWayAndItsBYEReleasesIt(t *testing.T) {
 		t.Fatalf("results %+v", results)
 	}
 	steps := byStep(results)
-	for _, s := range []string{"register", "invite", "connect", "client-to-peer", "peer-to-client", "bye", "released", "clean"} {
+	for _, s := range []string{"register", "invite", "connect", "client-to-peer", "peer-to-client", "chunked-message", "bye", "released", "peer-offline", "clean"} {
 		if !steps[s].OK {
 			t.Fatalf("%s: %+v", s, steps[s])
 		}
 	}
 	if steps["invite"].Detail["status"] != 200 || steps["client-to-peer"].Detail["skipped"] != 0 {
 		t.Fatalf("invite %+v, client-to-peer %+v", steps["invite"], steps["client-to-peer"])
+	}
+	// Chunked: well over internal/msrp's 2 KiB chunks.
+	if steps["chunked-message"].Detail["bytes"] < 100<<10 {
+		t.Fatalf("chunked-message %+v", steps["chunked-message"])
+	}
+	// The stand-in core stores nothing for an unregistered peer: 480.
+	if d := steps["peer-offline"].Detail; d["status"] != 480 || d["stored"] != 0 {
+		t.Fatalf("peer-offline %+v", steps["peer-offline"])
 	}
 	if core.Registered(self.URI) || core.Registered(peer.URI) {
 		t.Fatal("a binding outlived the scenario")
@@ -470,6 +602,190 @@ func TestAChatWithoutTheRelaysAddressFailsAtOnce(t *testing.T) {
 	cfg.RelayPublic = ""
 	ok, results := runAll(t, cfg, "chat-invite")
 	if last := results[len(results)-1]; ok || last.Step != "register" || last.Error != "no relay address configured (-relay-public)" {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestAChatThatCutsALargeMessageFailsTheChunkedStep(t *testing.T) {
+	// The short messages pass; the large one arrives cut, its CPIM
+	// headers whole, and the step says it changed.
+	cfg, core := sipStack(t)
+	anchorChats(t, cfg, core).toPeer.cutOver = 64 << 10
+	ok, results := runAll(t, cfg, "chat-invite")
+	last := results[len(results)-1]
+	if ok || last.Step != "chunked-message" || last.Error != "the message arrived changed" {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+// Code review on #559: the chunked and peer-offline steps fail what they
+// exist to see.
+func TestAChatsChunkedAndOfflineStepsFailWhatTheyCheck(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fault func(*chatAnchor, *simtest.IMSCore)
+		step  string
+		err   string
+	}{
+		// The first two notifications, client-to-peer's, pass; the large
+		// message's are lost.
+		"the large message's notifications lost": {func(a *chatAnchor, _ *simtest.IMSCore) { a.toClient.dropNotificationsAfter = 2 },
+			"chunked-message", "2 notifications did not arrive"},
+		"the large message's delivery reported failed": {func(a *chatAnchor, _ *simtest.IMSCore) { a.toPeer.failReportOver = 64 << 10 },
+			"chunked-message", "delivery failed with 403"},
+		// A refusal other than 480 for the peer unregistered.
+		"the offline chat refused 404": {func(_ *chatAnchor, c *simtest.IMSCore) { c.Offline = simtest.RefuseNotFound },
+			"peer-offline", "INVITE to the unregistered peer answered 404, want 480 or store-and-forward"},
+		// Taken, kept nowhere, and sent on the peer's earlier chat, which
+		// the peer has ended: the message never comes.
+		"the offline chat sent on the peer's earlier chat": {func(a *chatAnchor, _ *simtest.IMSCore) { a.answerOffline = true },
+			"peer-offline", "the message to the unregistered peer never arrived after it registered again"},
+		// The registrar keeps the peer's flow, so the client's chat
+		// reaches the peer at once, on a chat opened before it registers
+		// again: delivered, but never stored.
+		"the peer's binding kept after it unregistered": {func(_ *chatAnchor, c *simtest.IMSCore) { c.KeepBindings = true },
+			"peer-offline", "the stored message came on a chat the network opened before the peer registered again"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			cfg.StepTimeout = 3 * time.Second
+			tc.fault(anchorChats(t, cfg, core), core)
+			ok, results := runAll(t, cfg, "chat-invite")
+			last := results[len(results)-1]
+			if ok || last.Step != tc.step || !strings.HasPrefix(last.Error, tc.err) {
+				t.Fatalf("results %+v", results)
+			}
+		})
+	}
+}
+
+func TestAChatsOfflineStepEndsEveryChatThePeerHad(t *testing.T) {
+	// Code review on #559: before it unregisters, the peer ends every chat
+	// the network opened to it, not just the latest and those still
+	// queued. A third subscriber opens chats to the peer once released
+	// has passed; the network then sends the offline message on one of
+	// them, which must have ended, so the message never arrives.
+	for name, tc := range map[string]struct {
+		extra   int
+		onFirst bool
+	}{
+		// The scenario's own chat, which later ones replaced.
+		"the peer's first chat": {extra: 2, onFirst: true},
+		// The last of 17, which found the queue of 16 full.
+		"a chat that was never queued": {extra: 17},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			cfg.StepTimeout = 3 * time.Second
+			a := anchorChats(t, cfg, core)
+			a.answerOffline, a.offlineOnFirst = true, tc.onFirst
+			third := thirdClient(t, core)
+			var results []scenario.Result
+			ok, err := scenario.Run(context.Background(), cfg, []string{"chat-invite"}, func(r scenario.Result) {
+				results = append(results, r)
+				if r.Step == "released" && r.OK {
+					chatToPeer(t, third, tc.extra)
+				}
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			last := results[len(results)-1]
+			if ok || last.Step != "peer-offline" || !strings.HasPrefix(last.Error, "the message to the unregistered peer never arrived after it registered again") {
+				t.Fatalf("results %+v", results)
+			}
+		})
+	}
+}
+
+// thirdClient registers the third subscriber with core.
+func thirdClient(t *testing.T, core *simtest.IMSCore) *sipua.UA {
+	t.Helper()
+	u, _ := sip.ParseURI(thirdIMPU)
+	creds, err := sipua.DigestCredentials(thirdIMPI, []byte(thirdToken))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	third, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: imsDomain, IMPU: u,
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000003", Credentials: creds})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = third.Close() })
+	if _, err := third.Register(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return third
+}
+
+// chatToPeer has from open n chats to the peer, one after another, each
+// answered 2xx before the next.
+func chatToPeer(t *testing.T, from *sipua.UA, n int) {
+	t.Helper()
+	if err := openChats(from, n); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func openChats(from *sipua.UA, n int) error {
+	pu, _ := sip.ParseURI(peer.URI)
+	offer := "v=0\r\no=- 1 1 IN IP4 192.0.2.3\r\ns=-\r\nc=IN IP4 192.0.2.3\r\nt=0 0\r\nm=message 9 TCP/MSRP *\r\n" +
+		"a=accept-types:message/cpim\r\na=path:msrp://192.0.2.3:9/third;tcp\r\na=setup:active\r\na=sendrecv\r\n"
+	for i := range n {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		req, err := from.NewInvite(pu, []byte(offer))
+		if err != nil {
+			cancel()
+			return err
+		}
+		_, res, err := from.Invite(ctx, req, nil)
+		cancel()
+		if err != nil || res.StatusCode/100 != 2 {
+			return fmt.Errorf("chat %d to the peer: %v, %v", i, res, err)
+		}
+	}
+	return nil
+}
+
+func TestAChatStoredThenSentBeforeThePeersRegistrationIsAnsweredFails(t *testing.T) {
+	// Code review on #559, in rcs-as's order: the network answers the
+	// client's chat to the unregistered peer and takes the message; as the
+	// peer registers again it invites the peer on a binding it kept, and
+	// sends the message there, before the REGISTER's 200. The chat was
+	// opened before the peer registered again, and nothing proves the
+	// message was stored.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	a := anchorChats(t, cfg, core)
+	a.answerOffline, a.offlineOnLater = true, make(chan struct{})
+	third := thirdClient(t, core)
+	var armed atomic.Bool
+	offline := core.AnswerOffline
+	core.AnswerOffline = func(req *sip.Request) []byte {
+		body := offline(req)
+		if body != nil {
+			armed.Store(true)
+		}
+		return body
+	}
+	core.HoldRegister = func(req *sip.Request) <-chan struct{} {
+		if to, err := req.Header.To(); err != nil || to.URI.String() != peer.URI || !armed.CompareAndSwap(true, false) {
+			return nil
+		}
+		gate := make(chan struct{})
+		go func() {
+			defer close(gate)
+			if err := openChats(third, 1); err != nil {
+				t.Error(err)
+			}
+			close(a.offlineOnLater)
+		}()
+		return gate
+	}
+	ok, results := runAll(t, cfg, "chat-invite")
+	last := results[len(results)-1]
+	if ok || last.Step != "peer-offline" || last.Error != "the stored message came on a chat the network opened before the peer registered again" {
 		t.Fatalf("results %+v", results)
 	}
 }
