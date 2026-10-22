@@ -15,6 +15,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/store"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 const nextToken = "next-token-0123456789-0123456789-0123456789"
@@ -30,7 +31,7 @@ func newTestControl(t *testing.T, st store.Store) (*control, *fakeClock, *counte
 		Public:       msrp.URI{Secure: true, Host: publicHost, Port: DefaultPublicPort, Transport: "tcp"},
 		CoreHost:     coreHostAddr,
 		CoreNetworks: privateRanges, CorePorts: []uint16{DefaultCorePort}, Namespace: "rcs.internal",
-		MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []string{testToken, nextToken},
+		MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []secret.Key{secret.NewString(testToken), secret.NewString(nextToken)},
 		Clock: clock, Rand: &sequence{}, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Metrics: m,
 	}), clock, m
 }
@@ -179,7 +180,7 @@ func TestTokenOutsideItsScopeIsForbidden(t *testing.T) {
 	c, _, m := newTestControl(t, store.NewMemory())
 	reader := "reader-token-0123456789-0123456789-01234567"
 	c.auth.callers = append(c.auth.callers, caller{
-		name: "reader", digests: newAuthorizer([]string{reader}).callers[0].digests, scope: map[string]bool{opDelete: true},
+		name: "reader", digests: newAuthorizer([]secret.Key{secret.NewString(reader)}).callers[0].digests, scope: map[string]bool{opDelete: true},
 	})
 	if code, _ := callControl(t, c, "POST", "/v1/bindings", reader, map[string]any{"expires_in": 60}); code != http.StatusForbidden {
 		t.Fatalf("POST with a delete-only token = %d, want 403", code)

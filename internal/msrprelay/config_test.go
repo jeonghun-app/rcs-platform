@@ -196,7 +196,8 @@ func TestConfigNeverPrintsTokens(t *testing.T) {
 	// Every verb, valid or not: an invalid one, %p or %w, calls no method
 	// and prints the fields (#506).
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
-		for _, v := range []any{c, &c, c.Tokens} {
+		opts := controlOptions{Namespace: "rcs.local", Tokens: c.Tokens}
+		for _, v := range []any{c, &c, c.Tokens, opts, &opts} {
 			s := fmt.Sprintf(verb, v)
 			for _, secret := range []string{testToken[:12], nextToken[:12], strings.Trim(fmt.Sprint([]byte(testToken[:6])), "[]"), fmt.Sprintf("%x", testToken[:6])} {
 				if strings.Contains(s, secret) {
