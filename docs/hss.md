@@ -102,6 +102,22 @@ the same AKA sequence numbers or overwrite each other's S-CSCF assignment: the
 loser reads again and decides afresh. A subscription and its IMPU items are
 written in one transaction, so an IMPU never belongs to two subscriptions.
 
+### Stored document format
+
+A subscription or a profile is stored as a JSON document with a schema number
+(`internal/hss/store/codec.go`), the same bytes in DynamoDB and in memory. A
+task decodes it strictly: a field it does not know makes the record unreadable
+to it. A new field therefore ships in two releases, so that no task of the
+release still running during a rolling deploy meets a field it refuses:
+
+1. a release whose decoder accepts the field, and does not write it;
+2. the next release, which may write it.
+
+A field written only when it has a value (`omitempty`) leaves every other
+record readable by the older decoder, but the records that carry it are not.
+`stale_sets` (#491) shipped with its writer in one release, as no `hss` was
+deployed yet; later fields follow the two releases.
+
 ## Secrets
 
 K, OPc and every HA1 are sealed with AES-256-GCM under a data key before they are
