@@ -20,7 +20,7 @@ import (
 	hssstore "github.com/jeonghun-app/rcs-platform/internal/hss/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/dynamostore"
 	scscfstore "github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
-	"github.com/jeonghun-app/rcs-platform/internal/secret"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Against DynamoDB Local and S3Mock (make test-integration): the tables are
@@ -60,7 +60,7 @@ func TestIntegrationTablesAreCreatedOnceAndAcceptedByTheStores(t *testing.T) {
 		t.Fatalf("the HSS store does not accept its tables: %v", err)
 	}
 	sc := c.scscf
-	sc.ChallengeKeys = []scscfstore.ChallengeKey{{ID: "it", Key: secret.NewKey(make([]byte, scscfstore.KeySize))}}
+	sc.ChallengeKeys = []scscfstore.ChallengeKey{{ID: "it", Key: secretkey.NewKey(make([]byte, scscfstore.KeySize))}}
 	scscf, err := scscfstore.New(ddb, sc)
 	if err == nil {
 		err = scscf.Ready(ctx)
