@@ -8,14 +8,18 @@ import (
 	"log/slog"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go/logging"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store/storetest"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
 func fakeStores(t *testing.T) (*Stores, *fakeS3, *fakeDynamo) {
@@ -63,7 +67,7 @@ func TestObjectsAreEncryptedAndPrefixed(t *testing.T) {
 	}
 }
 
-func TestNonceCountsOnlyAdvance(t *testing.T) {
+func TestNonceCountsAcceptEachCountOnceInsideTheWindow(t *testing.T) {
 	s, _, _ := fakeStores(t)
 	ctx := t.Context()
 	n := s.NonceCounts
@@ -76,9 +80,14 @@ func TestNonceCountsOnlyAdvance(t *testing.T) {
 		{"alice", "n1", 1, true},
 		{"alice", "n1", 1, false},
 		{"alice", "n1", 3, true},
+		{"alice", "n1", 2, true}, // late, inside the window
 		{"alice", "n1", 2, false},
 		{"bob", "n1", 1, true},
 		{"alice", "n2", 1, true},
+		{"alice", "n1", 4 + digest.NonceCountWindow, true},
+		{"alice", "n1", 4, false}, // never used, but below the window
+		{"alice", "n1", 5, true},  // the lowest count inside it
+		{"alice", "n1", 5, false},
 	} {
 		got, err := n.Advance(ctx, c.user, c.nonce, c.nc, later)
 		if err != nil || got != c.want {
@@ -90,6 +99,141 @@ func TestNonceCountsOnlyAdvance(t *testing.T) {
 	n.now = func() time.Time { return later.Add(time.Second) }
 	if ok, err := n.Advance(ctx, "alice", "n1", 1, later.Add(time.Hour)); err != nil || !ok {
 		t.Fatalf("Advance after expiry = %v, %v", ok, err)
+	}
+}
+
+func TestNonceCountsAcceptEachCountOnceUnderConcurrency(t *testing.T) {
+	// maxNonceCountAttempts requests in flight on one nonce, each sent
+	// twice: every count is accepted exactly once, and none runs out of
+	// attempts, since each lost race is a win for another count.
+	s, _, _ := fakeStores(t)
+	var accepted [maxNonceCountAttempts + 1]atomic.Int32
+	var wg sync.WaitGroup
+	for nc := uint32(1); nc <= maxNonceCountAttempts; nc++ {
+		for range 2 {
+			wg.Go(func() {
+				ok, err := s.NonceCounts.Advance(context.Background(), "alice", "n", nc, storetest.T0.Add(time.Minute))
+				if err != nil {
+					t.Errorf("Advance(%d): %v", nc, err)
+				}
+				if ok {
+					accepted[nc].Add(1)
+				}
+			})
+		}
+	}
+	wg.Wait()
+	for nc := 1; nc <= maxNonceCountAttempts; nc++ {
+		if got := accepted[nc].Load(); got != 1 {
+			t.Errorf("nc %d accepted %d times", nc, got)
+		}
+	}
+}
+
+// racingDynamo records another count with the same nonce, through other,
+// before each of the next races updates reaches the table, as a request
+// verified on another task at that moment would.
+type racingDynamo struct {
+	*fakeDynamo
+	other *NonceCounts
+	races int
+	nc    uint32
+}
+
+func (r *racingDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	if r.races > 0 {
+		r.races--
+		r.nc++
+		if ok, err := r.other.Advance(ctx, "alice", "n", r.nc, storetest.T0.Add(time.Minute)); !ok || err != nil {
+			r.t.Fatalf("the racing Advance(%d) = %v, %v", r.nc, ok, err)
+		}
+	}
+	return r.fakeDynamo.UpdateItem(ctx, in, opts...)
+}
+
+func TestNonceCountsReadAgainAfterLosingARace(t *testing.T) {
+	s, _, ddb := fakeStores(t)
+	racing := &racingDynamo{fakeDynamo: ddb, other: s.NonceCounts, races: 3, nc: 100}
+	n := &NonceCounts{api: racing, table: s.NonceCounts.table, now: s.NonceCounts.now}
+	ctx := t.Context()
+	exp := storetest.T0.Add(time.Minute)
+	if ok, err := n.Advance(ctx, "alice", "n", 90, exp); !ok || err != nil {
+		t.Fatalf("Advance after losing 3 races = %v, %v", ok, err)
+	}
+	// The window the winners and this request left: 101-103 and 90 used.
+	for _, nc := range []uint32{90, 101, 103} {
+		if ok, err := s.NonceCounts.Advance(ctx, "alice", "n", nc, exp); ok || err != nil {
+			t.Fatalf("nc %d again = %v, %v", nc, ok, err)
+		}
+	}
+	if ok, err := s.NonceCounts.Advance(ctx, "alice", "n", 91, exp); !ok || err != nil {
+		t.Fatalf("unused nc 91 = %v, %v", ok, err)
+	}
+
+	// Losing every attempt is an error, not a replay: the count is unused.
+	racing.races = maxNonceCountAttempts
+	if ok, err := n.Advance(ctx, "alice", "n", 92, exp); ok || !errors.Is(err, errNonceCountContended) {
+		t.Fatalf("Advance losing every race = %v, %v", ok, err)
+	}
+	if ok, err := n.Advance(ctx, "alice", "n", 92, exp); !ok || err != nil {
+		t.Fatalf("nc 92 once the races stop = %v, %v", ok, err)
+	}
+}
+
+func TestNonceCountsWrittenByThePreviousVersionCountAsUsedUpToTheirHighest(t *testing.T) {
+	// The version before #66 stores only nc and advances it alone; the
+	// window is trusted only where it was written for the nc stored.
+	s, _, ddb := fakeStores(t)
+	ctx := t.Context()
+	exp := storetest.T0.Add(time.Minute)
+	advance := func(nonce string, nc uint32, want bool) {
+		t.Helper()
+		if ok, err := s.NonceCounts.Advance(ctx, "alice", nonce, nc, exp); ok != want || err != nil {
+			t.Fatalf("Advance(%s, %d) = %v, %v; want %v", nonce, nc, ok, err, want)
+		}
+	}
+	old := nonceKey("alice", "old")
+	ddb.rows[old] = map[string]dtypes.AttributeValue{
+		attrPK: str(old), attrNC: num(5), attrExpires: num(exp.UnixMilli()), attrTTL: num(exp.Add(time.Hour).Unix()),
+	}
+	advance("old", 4, false)
+	advance("old", 6, true)
+	advance("old", 3, false)
+
+	advance("mixed", 10, true)
+	advance("mixed", 8, true)
+	// The previous version accepts 12 and moves nc, not the window.
+	ddb.rows[nonceKey("alice", "mixed")][attrNC] = num(12)
+	advance("mixed", 9, false)
+	advance("mixed", 11, false)
+	advance("mixed", 13, true)
+
+	// Nor is a window without the highest count's bit, which no version
+	// writes.
+	odd := nonceKey("alice", "odd")
+	ddb.rows[odd] = map[string]dtypes.AttributeValue{
+		attrPK: str(odd), attrNC: num(5), attrNCWindow: num(0), attrNCWindowAt: num(5),
+		attrExpires: num(exp.UnixMilli()), attrTTL: num(exp.Add(time.Hour).Unix()),
+	}
+	advance("odd", 5, false)
+	advance("odd", 4, false)
+}
+
+func TestMalformedNonceCountItemIsAnError(t *testing.T) {
+	s, _, ddb := fakeStores(t)
+	k := nonceKey("alice", "n")
+	exp := storetest.T0.Add(time.Minute)
+	for name, item := range map[string]map[string]dtypes.AttributeValue{
+		"no expiry":       {attrPK: str(k), attrNC: num(1)},
+		"no count":        {attrPK: str(k), attrExpires: num(exp.UnixMilli())},
+		"count too large": {attrPK: str(k), attrNC: num(1 << 32), attrExpires: num(exp.UnixMilli())},
+		"negative window": {attrPK: str(k), attrNC: num(1), attrNCWindow: num(-1), attrNCWindowAt: num(1), attrExpires: num(exp.UnixMilli())},
+		"string count":    {attrPK: str(k), attrNC: str("1"), attrExpires: num(exp.UnixMilli())},
+	} {
+		ddb.rows[k] = item
+		if ok, err := s.NonceCounts.Advance(t.Context(), "alice", "n", 2, exp); ok || err == nil {
+			t.Errorf("%s: Advance = %v, %v", name, ok, err)
+		}
 	}
 }
 

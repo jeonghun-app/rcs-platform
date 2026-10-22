@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
 // DynamoAPI is the part of the DynamoDB client the stores use;
@@ -58,6 +61,8 @@ const (
 	attrLeaseUntil = "lease_until"
 	attrVersion    = "version"
 	attrNC         = "nc"
+	attrNCWindow   = "nc_window"
+	attrNCWindowAt = "nc_window_at"
 )
 
 // PartitionKey is the name of the table's partition key, for whoever
@@ -262,32 +267,112 @@ type NonceCounts struct {
 	now   func() time.Time
 }
 
-// Advance implements digest.NonceCountStore with one conditional update:
-// written only if no count is stored, the stored one is lower, or it has
-// expired (DynamoDB deletes expired items late, so expiry is checked here).
+// maxNonceCountAttempts bounds the reads and conditional writes of one
+// Advance. A write fails only if another request recorded a count with the
+// same (user, nonce) after the read, so this many requests in flight on one
+// nonce all get through.
+const maxNonceCountAttempts = 16
+
+// errNonceCountContended ends an Advance that lost maxNonceCountAttempts
+// races. It is not a replay: the count is still unused.
+var errNonceCountContended = errors.New("awsstore: advance nonce count: too many concurrent updates")
+
+// nonceCountAttrs are the attributes an Advance reads, by the names its
+// expressions give them. It writes them back only if none has changed.
+var nonceCountAttrs = []struct{ name, attr string }{
+	{"#nc", attrNC}, {"#w", attrNCWindow}, {"#at", attrNCWindowAt}, {"#e", attrExpires},
+}
+
+// Advance implements digest.NonceCountStore. It reads the counts recorded
+// (digest.UsedCounts), and writes them back with nc added on condition that
+// the item is still as read; when another request got in between, it reads
+// again. The item holds the highest count in nc, the window in nc_window and,
+// in nc_window_at, the highest count nc_window was written for: a task
+// running the version before #66 advances nc alone, which would misplace the
+// window, so the window counts only where nc_window_at equals nc. Elsewhere
+// every count up to nc is taken as used, as that version did. DynamoDB
+// deletes expired items late, so expiry is checked here.
 func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
-	_, err := n.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:        aws.String(n.table),
-		Key:              key(nonceKey(username, nonce)),
-		UpdateExpression: aws.String("SET #nc = :nc, #e = :e, #ttl = :ttl"),
-		ConditionExpression: aws.String(
-			"attribute_not_exists(#nc) OR #nc < :nc OR #e < :now"),
-		ExpressionAttributeNames: map[string]string{"#nc": attrNC, "#e": attrExpires, "#ttl": attrTTL},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":nc":  num(int64(nc)),
+	k := key(nonceKey(username, nonce))
+	for range maxNonceCountAttempts {
+		out, err := n.api.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:      aws.String(n.table),
+			Key:            k,
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			return false, sanitize("read nonce count", err)
+		}
+		used, err := n.usedCounts(out.Item)
+		if err != nil {
+			return false, err
+		}
+		next, ok := used.Use(nc)
+		if !ok {
+			return false, nil
+		}
+		names := map[string]string{"#ttl": attrTTL}
+		values := map[string]types.AttributeValue{
+			":nc":  num(int64(next.Highest)),
+			":w":   num(int64(next.Window)),
 			":e":   num(expires.UnixMilli()),
 			":ttl": num(expires.Add(time.Hour).Unix()),
-			":now": num(n.now().UnixMilli()),
-		},
-	})
-	var failed *types.ConditionalCheckFailedException
-	if errors.As(err, &failed) {
-		return false, nil
+		}
+		var unchanged []string
+		for _, a := range nonceCountAttrs {
+			names[a.name] = a.attr
+			if v, ok := out.Item[a.attr]; ok {
+				values[":was_"+a.attr] = v
+				unchanged = append(unchanged, a.name+" = :was_"+a.attr)
+			} else {
+				unchanged = append(unchanged, "attribute_not_exists("+a.name+")")
+			}
+		}
+		_, err = n.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                 aws.String(n.table),
+			Key:                       k,
+			UpdateExpression:          aws.String("SET #nc = :nc, #w = :w, #at = :nc, #e = :e, #ttl = :ttl"),
+			ConditionExpression:       aws.String(strings.Join(unchanged, " AND ")),
+			ExpressionAttributeNames:  names,
+			ExpressionAttributeValues: values,
+		})
+		var failed *types.ConditionalCheckFailedException
+		if errors.As(err, &failed) {
+			continue
+		}
+		if err != nil {
+			return false, sanitize("advance nonce count", err)
+		}
+		return true, nil
 	}
-	if err != nil {
-		return false, sanitize("advance nonce count", err)
+	return false, errNonceCountContended
+}
+
+// usedCounts decodes the counts a nonce-count item records: none if there is
+// no item or it has expired.
+func (n *NonceCounts) usedCounts(item map[string]types.AttributeValue) (digest.UsedCounts, error) {
+	if len(item) == 0 {
+		return digest.UsedCounts{}, nil
 	}
-	return true, nil
+	d := decoder{item: item}
+	expires := d.num(attrExpires, true)
+	highest := d.num(attrNC, true)
+	window := d.num(attrNCWindow, false)
+	at := d.num(attrNCWindowAt, false)
+	switch {
+	case d.err != nil:
+		return digest.UsedCounts{}, d.err
+	case highest < 0 || highest > math.MaxUint32 || window < 0 || window > math.MaxUint32:
+		return digest.UsedCounts{}, errors.New("awsstore: nonce count item is malformed")
+	case expires < n.now().UnixMilli():
+		return digest.UsedCounts{}, nil
+	case item[attrNCWindowAt] == nil || at != highest || window&1 == 0:
+		// Written by the version before #66, or advanced by it since: the
+		// window is missing or misplaced. (A window always has the highest
+		// count's bit set.)
+		return digest.UsedCounts{Highest: uint32(highest), Window: math.MaxUint32}, nil
+	}
+	return digest.UsedCounts{Highest: uint32(highest), Window: uint32(window)}, nil
 }
 
 // encodeRecord is the item of r. Optional values are left out rather than
