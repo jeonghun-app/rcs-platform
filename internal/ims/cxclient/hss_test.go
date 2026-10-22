@@ -18,6 +18,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/hss"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // adminToken is a test bearer token of the provisioning API, long enough for
@@ -69,7 +70,7 @@ func provision(t *testing.T, h *hss.HSS, st store.Store) {
 	if _, err := st.CreateProfile(context.Background(), hss.DefaultRCSProfile(hss.DefaultProfileID, "sip:rcs-as.rcs.local")); err != nil {
 		t.Fatal(err)
 	}
-	api := h.NewAPI(hss.APIOptions{Tokens: hss.Tokens{Admin: hss.TokenPair{Current: adminToken}}, DefaultProfile: hss.DefaultProfileID})
+	api := h.NewAPI(hss.APIOptions{Tokens: hss.Tokens{Admin: hss.TokenPair{Current: secret.NewString(adminToken)}}, DefaultProfile: hss.DefaultProfileID})
 	t.Cleanup(func() { _ = api.Close(context.Background()) })
 	call := func(method, path string, body any) {
 		t.Helper()

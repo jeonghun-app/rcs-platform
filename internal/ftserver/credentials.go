@@ -56,10 +56,10 @@ type StaticCredentials struct {
 
 // NewStaticCredentials returns a source for users, a map from user name to
 // password.
-func NewStaticCredentials(users map[string]string) *StaticCredentials {
+func NewStaticCredentials(users map[string]secretkey.Key) *StaticCredentials {
 	s := &StaticCredentials{users: make(map[string]digest.Secret, len(users))}
 	for name, password := range users {
-		s.users[name] = digest.Password([]byte(password))
+		s.users[name] = digest.Password(password.Reveal())
 	}
 	return s
 }
@@ -84,7 +84,7 @@ const maxHSSResponse = 16 << 10
 // The Digest user name is the IMPI.
 type HSSCredentials struct {
 	base   *url.URL
-	token  secret
+	token  secretkey.Key
 	realm  string
 	client *http.Client
 }
@@ -96,7 +96,7 @@ type HSSCredentials struct {
 // in staging and prod it is a runtime.InternalDialer's, so that the token
 // reaches only a private address whatever the HSS's name resolves to, and
 // nil means the default dialer.
-func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration, maxConns int, dial func(ctx context.Context, network, address string) (net.Conn, error)) *HSSCredentials {
+func NewHSSCredentials(base *url.URL, token secretkey.Key, realm string, timeout time.Duration, maxConns int, dial func(ctx context.Context, network, address string) (net.Conn, error)) *HSSCredentials {
 	// A transport of its own: the default one has no connection limit and
 	// is shared with whatever else uses it.
 	transport := &http.Transport{
@@ -112,7 +112,7 @@ func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration
 	}
 	return &HSSCredentials{
 		base:  base,
-		token: newSecret(token),
+		token: token,
 		realm: realm,
 		client: &http.Client{
 			Transport: transport,
@@ -142,7 +142,7 @@ func (h *HSSCredentials) Lookup(ctx context.Context, username string, alg digest
 	if err != nil {
 		return Credential{}, fmt.Errorf("ftserver: hss request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+h.token.value())
+	req.Header.Set("Authorization", "Bearer "+h.token.RevealString())
 	req.Header.Set("Accept", "application/json")
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -214,18 +214,3 @@ func redactURL(err error) error {
 	}
 	return err
 }
-
-// secret holds a configuration secret so that printing a Config cannot
-// reveal it, under every verb: its text is in a secret.Key, which an
-// invalid verb, %p or %w, does not print either (#506).
-type secret struct{ k secretkey.Key }
-
-// newSecret is a secret of v.
-func newSecret(v string) secret { return secret{k: secretkey.NewString(v)} }
-
-// value is the secret's text.
-func (s secret) value() string { return s.k.RevealString() }
-
-func (secret) String() string             { return "[redacted]" }
-func (secret) GoString() string           { return "[redacted]" }
-func (secret) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "[redacted]") }

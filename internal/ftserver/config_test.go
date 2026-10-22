@@ -57,7 +57,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		c.DownloadAuth || c.UploadsPerMinute != DefaultUploadsPerMinute || c.SweepInterval != time.Minute {
 		t.Fatalf("config = %+v", c)
 	}
-	if c.UploadURI.String() != "http://localhost:8081/ft" || len(c.StaticUsers) != 2 || c.StaticUsers["bob"].value() != "other" {
+	if c.UploadURI.String() != "http://localhost:8081/ft" || len(c.StaticUsers) != 2 || c.StaticUsers["bob"].RevealString() != "other" {
 		t.Fatalf("config = %+v", c)
 	}
 }
