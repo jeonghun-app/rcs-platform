@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 )
 
@@ -15,7 +16,7 @@ func Example() {
 	_ = m.Declare("ext", "urn:example:ext")
 	_ = m.Add("urn:example:ext", "Note", "kept as is")
 	m.ContentHeaders = []cpim.Field{{Name: "Content-Type", Value: "text/plain;charset=UTF-8"}}
-	m.Body = []byte("Hello")
+	m.Body = content.BodyOf([]byte("Hello"))
 
 	data, err := m.Marshal()
 	if err != nil {
@@ -29,7 +30,7 @@ func Example() {
 	note, _ := parsed.Get("urn:example:ext", "Note")
 	fmt.Println(from.Name, from.URI)
 	fmt.Println(note.Name, "=", note.Value)
-	fmt.Println(parsed.ContentType(), string(parsed.Body))
+	fmt.Println(parsed.ContentType(), string(parsed.Body.Bytes()))
 	// Output:
 	// Alice sip:alice@example.com
 	// ext.Note = kept as is

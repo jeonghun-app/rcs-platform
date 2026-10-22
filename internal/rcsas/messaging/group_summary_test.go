@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -164,7 +165,7 @@ func receiptsFrom(t *testing.T, r *rig, group string, everyone []string, id stri
 			kind   imdn.Kind
 			status imdn.Status
 		}{{imdn.DeliveryNotification, imdn.Delivered}, {imdn.DisplayNotification, imdn.Displayed}} {
-			o := GroupOrigin{Group: group, Sender: p, Conversation: conv, CPIM: receipt(t, id, k.kind, k.status)}
+			o := GroupOrigin{Group: group, Sender: p, Conversation: conv, CPIM: content.BodyOf(receipt(t, id, k.kind, k.status))}
 			if err := r.e.SubmitGroup(t.Context(), o); err != nil {
 				t.Fatalf("%s's receipt: %v", p, err)
 			}
@@ -221,7 +222,7 @@ func TestNineGroupsOfReceiptsAreAllReadByAll(t *testing.T) {
 	r.d.onInvite(func(Invitation) error { return ErrOffline })
 	group := func(g int) string { return fmt.Sprintf("sip:chat-%d@conf.example.net", g) }
 	for g := range 9 {
-		o := GroupOrigin{Group: group(g), Sender: alice, Conversation: conv, CPIM: chat(t, fmt.Sprint("g", g), "hi", imdn.PositiveDelivery|imdn.Display)}
+		o := GroupOrigin{Group: group(g), Sender: alice, Conversation: conv, CPIM: content.BodyOf(chat(t, fmt.Sprint("g", g), "hi", imdn.PositiveDelivery|imdn.Display))}
 		if err := r.e.SubmitGroup(t.Context(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -421,7 +422,7 @@ func TestASummaryCarriesOnlyAcceptedReceipts(t *testing.T) {
 		o    GroupOrigin
 		want Reason
 	}{
-		"from no recipient": {GroupOrigin{Group: groupURI, Sender: intermediary, CPIM: receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)}, ReasonIMDNForged},
+		"from no recipient": {GroupOrigin{Group: groupURI, Sender: intermediary, CPIM: content.BodyOf(receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))}, ReasonIMDNForged},
 		"not asked for":     {groupFrom(bob, receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)), ReasonIMDNNotRequested},
 	} {
 		if got := rejected(r.e.SubmitGroup(t.Context(), c.o)); got != c.want {

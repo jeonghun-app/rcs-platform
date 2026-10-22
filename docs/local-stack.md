@@ -118,7 +118,8 @@ out, so that a second task can join it with the same settings:
   conference URIs are answered 404.
 
 The default profile's criteria send each REGISTER's third-party REGISTER, a
-capability query's OPTIONS, a chat INVITE and a MESSAGE to `rcs-as` ([hss](hss.md#default-service-profile)).
+capability query's OPTIONS, a chat INVITE, a MESSAGE and a group chat's roster
+SUBSCRIBE to `rcs-as` ([hss](hss.md#default-service-profile)).
 
 ### Ports
 

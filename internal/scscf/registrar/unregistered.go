@@ -28,8 +28,9 @@ var (
 // the identities pointing at it, as a REGISTER saves them. Later requests
 // find the record until a sweep ends that state with the HSS, and a REGISTER
 // turns it into a registration. A record another request saved meanwhile is
-// returned as it is; if it is a registration, the HSS, which the SAR made
-// hold the user unregistered, is told again (reassign).
+// returned with the SAA's profile applied (applySAAProfile); if it is a
+// registration, the HSS, which the SAR made hold the user unregistered, is
+// told again (reassign).
 //
 // It fails with ErrUnknownUser, ErrServedElsewhere or ErrHSSUnavailable for
 // what the HSS answered, or with the store's error.
@@ -67,6 +68,11 @@ func (g *Registrar) Unregistered(ctx context.Context, impu string) (*state.Regis
 	if cur, f := g.set(ctx, key); f != nil {
 		return nil, f
 	} else if cur != nil {
+		// The SAA's profile may be newer than the record's (#536).
+		// The key is the SAA's default, so its profile never moves the set.
+		if cur = g.applySAAProfile(ctx, cur, saa.UserData, received); cur == nil {
+			return nil, errors.New("registrar: the set ended as its profile was applied")
+		}
 		if isRegistered(cur) {
 			// The set is registered here after all, and only impu's item
 			// was missing (a REGISTER cut short between its save and its

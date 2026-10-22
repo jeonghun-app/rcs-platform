@@ -35,10 +35,11 @@ const (
 )
 
 // Chunk is one piece of an outgoing message: its place in the message, its
-// octets and the end-line flag it is sent with.
+// octets and the end-line flag it is sent with. Data is chat content, held
+// where no verb or encoder shows it, as a Message's Body is (#547).
 type Chunk struct {
 	Range ByteRange
-	Data  []byte
+	Data  Body
 	Flag  byte
 }
 
@@ -51,7 +52,7 @@ func Split(body []byte, size int) ([]Chunk, error) {
 	}
 	total := int64(len(body))
 	if total == 0 {
-		return []Chunk{{Range: ByteRange{Start: 1, End: 0, Total: 0}, Data: body, Flag: FlagEnd}}, nil
+		return []Chunk{{Range: ByteRange{Start: 1, End: 0, Total: 0}, Flag: FlagEnd}}, nil
 	}
 	chunks := make([]Chunk, 0, (len(body)+size-1)/size)
 	for off := 0; off < len(body); off += size {
@@ -62,7 +63,7 @@ func Split(body []byte, size int) ([]Chunk, error) {
 		}
 		chunks = append(chunks, Chunk{
 			Range: ByteRange{Start: int64(off) + 1, End: int64(end), Total: total},
-			Data:  body[off:end],
+			Data:  BodyOf(body[off:end]),
 			Flag:  flag,
 		})
 	}

@@ -235,7 +235,11 @@ Every table has a memory backend for unit tests and local runs; the compose stac
   `http.Server` logs its errors through `runtime.HTTPErrorLog`, which does the
   same for the addresses `net/http` writes into them (`pii.TruncateIPsIn`).
   Message bodies, credentials, nonces, RAND/AUTN, keys and tokens are never
-  logged.
+  logged. Chat content is held in `content.Body` (MSRP bodies and chunks,
+  CPIM bodies, rcs-as's queued and in-flight CPIM), which no `fmt` verb,
+  slog record or JSON encoding shows, and keys in `secret.Key`, so a stray
+  log line or `%v` cannot print them either (#530, #547). SIP message
+  bodies log only their length so far (#573).
 - **Metrics**: CloudWatch Embedded Metric Format lines on stdout, so no agent is
   needed. They are aggregated in memory and written once a minute, when
   shutdown starts and when it ends, one line per metric, so log volume does

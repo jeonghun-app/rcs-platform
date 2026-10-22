@@ -12,6 +12,7 @@ import (
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore/storetest"
@@ -221,7 +222,7 @@ func TestAFencedEnqueueChecksTheGroupsOwnerItem(t *testing.T) {
 		t.Fatal(err)
 	}
 	copyOf := func(id string, owner groupstore.Owner) store.Message {
-		return store.Message{Recipient: "tel:+15550100002", ID: id, Sender: g.URI, Mode: store.Group, CPIM: []byte("x"),
+		return store.Message{Recipient: "tel:+15550100002", ID: id, Sender: g.URI, Mode: store.Group, CPIM: content.BodyOf([]byte("x")),
 			Enqueued: t0, Expires: t0.Add(time.Hour), Fence: &store.Fence{Group: g.URI, Task: owner.Task, Epoch: owner.Epoch}}
 	}
 	if err := queues.Enqueue(ctx, copyOf("1", testOwner), store.Limit{}); err != nil {

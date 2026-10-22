@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
@@ -445,7 +446,7 @@ func (s *Server) origin(req *sip.Request) (messaging.Origin, int) {
 	}
 	return messaging.Origin{
 		Sender: sender, Identities: identities, Recipient: recipient, Conversation: conv,
-		Mode: store.Standalone, Pager: true, CPIM: req.Body,
+		Mode: store.Standalone, Pager: true, CPIM: content.BodyOf(req.Body),
 	}, 0
 }
 

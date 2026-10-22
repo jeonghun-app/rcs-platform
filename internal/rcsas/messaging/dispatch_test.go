@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -42,7 +43,7 @@ func TestAnOfflineChatQueueIsNotReReadForEveryNewMessage(t *testing.T) {
 	r.d.onInvite(func(Invitation) error { return ErrOffline })
 	drainInvites(t, r.d)
 	for i := range n {
-		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("m", i), "hi", 0)}
+		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, fmt.Sprint("m", i), "hi", 0))}
 		if err := r.e.Submit(t.Context(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -90,7 +91,7 @@ func TestAQueueThatCannotBeDeliveredIsTriedAgainWithBackoff(t *testing.T) {
 
 func TestARegistrationOnANewFlowInvitesAgainAtOnce(t *testing.T) {
 	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
-	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}
 	if err := r.e.Submit(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +117,7 @@ func TestARegistrationOvertakesALateInvitationFailure(t *testing.T) {
 		once.Do(func() { asked <- inv; <-release })
 		return nil
 	})
-	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+	o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}
 	if err := r.e.Submit(t.Context(), o); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +149,7 @@ func TestAFailureOfTheCurrentFlowIsMarked(t *testing.T) {
 			once.Do(func() { asked <- inv; <-release })
 			return nil
 		})
-		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}
+		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}
 		if err := r.e.Submit(t.Context(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -261,7 +262,7 @@ func TestAMessageDeliveredWhileClosingIsNotDeliveredAgain(t *testing.T) {
 	r2 := newRigWith(t, Config{InstanceID: "task-2", Rand: seeded(2)}, st, clock)
 	r2.e.UserRegistered(bob, false)
 	d := r2.d.nextPager(t)
-	if !bytes.Contains(d.CPIM, []byte("late")) {
+	if !bytes.Contains(d.CPIM.Bytes(), []byte("late")) {
 		t.Fatalf("task-2 delivered %q again", d.CPIM)
 	}
 	select {
@@ -429,7 +430,7 @@ func TestAFullQueueRefusesTheMessageAndTellsTheSender(t *testing.T) {
 	var d Delivery
 	for d = r.d.nextPager(t); d.Recipient != alice; d = r.d.nextPager(t) {
 	}
-	if n := readNotification(t, d.CPIM); n.MessageID != "m2" || n.Status != imdn.Failed {
+	if n := readNotification(t, d.CPIM.Bytes()); n.MessageID != "m2" || n.Status != imdn.Failed {
 		t.Fatalf("notification %+v", n)
 	}
 	if r.m.get("message.rejected.queue_full") != 1 {
@@ -442,7 +443,7 @@ func TestALargeModeSessionCarriesItsOneMessage(t *testing.T) {
 	l := r.listen(t)
 	large := func(id string) []byte { return chat(t, id, strings.Repeat(id, 400), 0) }
 	for _, id := range []string{"L1", "L2"} {
-		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: large(id)}); err != nil {
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(large(id))}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -481,7 +482,7 @@ func TestNoSecondLargeModeSessionIsAskedForWhileOneDelivers(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			// Retries stay far off, so that only this test asks for sessions.
 			r := newRig(t, Config{PagerLimit: 600, InviteTimeout: mark, RetryInterval: time.Hour})
-			if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+			if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 				t.Fatal(err)
 			}
 			inv := r.d.nextInvite(t)
@@ -528,7 +529,7 @@ func TestNoSecondLargeModeSessionIsAskedForWhileOneDelivers(t *testing.T) {
 // leave that newer invitation's mark, or yet another session is asked for.
 func TestALargeModeLegsEndLeavesANewerInvitationsMark(t *testing.T) {
 	r := newRig(t, Config{PagerLimit: 600, RetryInterval: time.Hour})
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
@@ -589,7 +590,7 @@ func TestAFailedLargeModeAttemptsMarkGoesBeforeItsRelease(t *testing.T) {
 		}
 	}}
 	r = newRigWith(t, Config{PagerLimit: 600}, spy, newFakeClock())
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
@@ -618,7 +619,7 @@ func TestAFailedLargeModeAttemptsMarkGoesBeforeItsRelease(t *testing.T) {
 // next event for the recipient.
 func TestAReleasedLargeModeMessageIsTriedAgain(t *testing.T) {
 	r := newRig(t, Config{PagerLimit: 600, InviteTimeout: time.Minute})
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
@@ -684,7 +685,7 @@ func TestAReleaseDuringAPassHasTheQueueReadAgain(t *testing.T) {
 	// and Close waiting on it, until the package's timeout.
 	release := sync.OnceFunc(func() { close(st.release) })
 	t.Cleanup(release)
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
@@ -749,7 +750,7 @@ func TestAReleaseMarksTheQueueOnlyOnceTheMessageIsBack(t *testing.T) {
 	proceed := sync.OnceFunc(func() { close(st.proceed) })
 	t.Cleanup(release)
 	t.Cleanup(proceed)
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
@@ -787,7 +788,7 @@ func TestAReleaseMarksTheQueueOnlyOnceTheMessageIsBack(t *testing.T) {
 // client answers and never binds.
 func failLargeAttempt(t *testing.T, r *rig) {
 	t.Helper()
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
@@ -814,10 +815,10 @@ func TestAPagerMessageGoesAtOnceAfterAFailedLargeModeAttempt(t *testing.T) {
 	r := newRig(t, Config{PagerLimit: 600})
 	failLargeAttempt(t, r)
 	short := chat(t, "S1", "short", 0)
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: short}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(short)}); err != nil {
 		t.Fatal(err)
 	}
-	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, short) {
+	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM.Bytes(), short) {
 		t.Fatalf("pager delivery %q", d.CPIM)
 	}
 }
@@ -829,7 +830,7 @@ func TestAChatMessageGoesOnItsLegAfterAFailedLargeModeAttempt(t *testing.T) {
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
 	failLargeAttempt(t, r)
 	msg := chat(t, "C1", "on the open leg", 0)
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: msg}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(msg)}); err != nil {
 		t.Fatal(err)
 	}
 	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), msg) {
@@ -844,7 +845,7 @@ func TestALargeModeSessionIsAskedForBesideAnOpenChatLeg(t *testing.T) {
 	r := newRig(t, Config{PagerLimit: 600})
 	l := r.listen(t)
 	r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: chat(t, "L1", strings.Repeat("L", 800), 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
 		t.Fatal(err)
 	}
 	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Mode != store.Standalone || inv.QueueID == "" {
@@ -859,7 +860,7 @@ func TestALargeModeSessionNeverCarriesTheOtherDirection(t *testing.T) {
 	l := r.listen(t)
 	_, a := r.connect(t, l, LegParams{User: alice, Peer: bob, Conversation: conv, Mode: store.Standalone, Direction: Originating})
 	reply := chat(t, "R1", strings.Repeat("r", 800), 0)
-	if err := r.e.Submit(t.Context(), Origin{Sender: bob, Recipient: alice, Conversation: conv, Mode: store.Standalone, CPIM: reply}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: bob, Recipient: alice, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(reply)}); err != nil {
 		t.Fatal(err)
 	}
 	if inv := r.d.nextInvite(t); inv.Recipient != alice || inv.QueueID == "" {
@@ -876,7 +877,7 @@ func TestALargeModeSessionNeverCarriesTheOtherDirection(t *testing.T) {
 	if err := r.e.Submit(t.Context(), standalone(bob, alice, short)); err != nil {
 		t.Fatal(err)
 	}
-	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM, short) {
+	if d := r.d.nextPager(t); !bytes.Equal(d.CPIM.Bytes(), short) {
 		t.Fatalf("pager delivery %q", d.CPIM)
 	}
 	select {
@@ -967,7 +968,7 @@ func TestOneSenderCannotLockOthersOutOfAQueue(t *testing.T) {
 	var d Delivery
 	for d = r.d.nextPager(t); d.Recipient != alice; d = r.d.nextPager(t) {
 	}
-	if n := readNotification(t, d.CPIM); n.MessageID != "a2" || n.Status != imdn.Failed {
+	if n := readNotification(t, d.CPIM.Bytes()); n.MessageID != "a2" || n.Status != imdn.Failed {
 		t.Fatalf("notification %+v", n)
 	}
 	for i := range 2 {
@@ -994,7 +995,7 @@ func TestTheMessagesKeptForAHeldQueueAreBounded(t *testing.T) {
 	drainInvites(t, r.d)
 	// The first message leaves the queue waiting for a session; the next
 	// attempt is held up so that new messages pile up meanwhile.
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m0", "hi", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m0", "hi", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "idle", r.idle)
@@ -1003,13 +1004,13 @@ func TestTheMessagesKeptForAHeldQueueAreBounded(t *testing.T) {
 	delete(r.e.invites, inviteKey{bob, alice, store.Chat, ""})
 	r.e.mu.Unlock()
 	// One message starts a pass whose invitation is held up...
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "hi", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	<-blocked
 	// ...and the rest arrive while it is.
 	for i := 1; i < 10; i++ {
-		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("m", i+1), "hi", 0)}); err != nil {
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, fmt.Sprint("m", i+1), "hi", 0))}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1098,7 +1099,7 @@ func TestALiveChatDoesNotReReadAQueueHeldByAnotherSender(t *testing.T) {
 	drainInvites(t, r.d)
 	l := r.listen(t)
 	for i := range 100 {
-		if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("c", i), "from carol", 0)}); err != nil {
+		if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, fmt.Sprint("c", i), "from carol", 0))}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1107,7 +1108,7 @@ func TestALiveChatDoesNotReReadAQueueHeldByAnotherSender(t *testing.T) {
 	waitFor(t, "idle", r.idle)
 	before := st.items.Load()
 	for i := range 100 {
-		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("a", i), "live", 0)}); err != nil {
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, fmt.Sprint("a", i), "live", 0))}); err != nil {
 			t.Fatal(err)
 		}
 		b.next(t)
@@ -1129,7 +1130,7 @@ func TestMessagesBeyondTheHeldQueueSingleListAreNotLost(t *testing.T) {
 		if i == n/3 {
 			_, b = r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
 		}
-		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, fmt.Sprint("m", i), fmt.Sprintf("#%04d", i), 0)}
+		o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, fmt.Sprint("m", i), fmt.Sprintf("#%04d", i), 0))}
 		if err := r.e.Submit(t.Context(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -1167,7 +1168,7 @@ func TestADroppedSingleDoesNotLetALaterMessageOvertake(t *testing.T) {
 	drainInvites(t, r.d)
 	submit := func(from, id string) {
 		t.Helper()
-		if err := r.e.Submit(t.Context(), Origin{Sender: from, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, id, id, 0)}); err != nil {
+		if err := r.e.Submit(t.Context(), Origin{Sender: from, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, id, id, 0))}); err != nil {
 			t.Fatal(err)
 		}
 	}

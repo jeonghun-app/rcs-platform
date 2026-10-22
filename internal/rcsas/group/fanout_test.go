@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -67,7 +68,7 @@ func TestAMessageReachesEveryParticipantWithoutWaitingForTheSlowOrTheOffline(t *
 	// From is alice's asserted identity, under her name in the roster
 	// rather than the one her client wrote; To is the group; everything
 	// else is hers.
-	if from.URI != alice || from.Name != "Alice" || to != g.URI || string(got.Body) != "hello all" {
+	if from.URI != alice || from.Name != "Alice" || to != g.URI || string(got.Body.Bytes()) != "hello all" {
 		t.Fatalf("bob got From %v To %s: %q", from, to, got.Body)
 	}
 	if h, ok := got.Get(imdn.Namespace, imdn.HeaderMessageID); !ok || h.Value != "m1" {
@@ -77,7 +78,7 @@ func TestAMessageReachesEveryParticipantWithoutWaitingForTheSlowOrTheOffline(t *
 	expectNothing(t, c, "carol before she reads")
 	waitFor(t, "dave's copy queued", func() bool { return r.queues.Len(dave) == 1 })
 	close(slow)
-	if got := asSeen(t, c.next(t)); string(got.Body) != "hello all" {
+	if got := asSeen(t, c.next(t)); string(got.Body.Bytes()) != "hello all" {
 		t.Fatalf("carol got %q", got.Body)
 	}
 	expectNothing(t, a, "alice, the author")
@@ -87,7 +88,7 @@ func TestAMessageReachesEveryParticipantWithoutWaitingForTheSlowOrTheOffline(t *
 		t.Fatalf("pagers %d, invites %+v", pagers, invites)
 	}
 	d := r.connect(g, dave, nil)
-	if got := asSeen(t, d.next(t)); string(got.Body) != "hello all" {
+	if got := asSeen(t, d.next(t)); string(got.Body.Bytes()) != "hello all" {
 		t.Fatalf("dave got %q", got.Body)
 	}
 	waitFor(t, "every copy delivered", func() bool { return r.m.get("delivery.msrp") == 3 })
@@ -158,7 +159,7 @@ func TestOnlyJoinedParticipantsWriteInAGroup(t *testing.T) {
 	}
 	expectNothing(t, b, "bob")
 	// Nor does anyone write to a group that is not there.
-	err := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: "sip:chat-none@" + host, Sender: bob, CPIM: message(t, bob, "m2", "x", 0)})
+	err := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: "sip:chat-none@" + host, Sender: bob, CPIM: content.BodyOf(message(t, bob, "m2", "x", 0))})
 	if rej, ok := err.(*messaging.Rejection); !ok || rej.Reason != messaging.ReasonNoGroup {
 		t.Fatalf("to no group: %v", err)
 	}
@@ -169,7 +170,7 @@ func TestOnlyJoinedParticipantsWriteInAGroup(t *testing.T) {
 
 func TestAGroupBoundsEachSenderAndItsFanOut(t *testing.T) {
 	send := func(r *rig, g groupstore.Group, from, id string) error {
-		return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: from, CPIM: message(t, from, id, "x", 0)})
+		return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: from, CPIM: content.BodyOf(message(t, from, id, "x", 0))})
 	}
 	// Each participant's own rate in the group.
 	r := newRig(t, Config{SenderRate: messaging.Rate{PerMinute: 60, Burst: 2}, FanoutRate: rateOff})
@@ -215,7 +216,7 @@ func TestAGroupBoundsEachSenderAndItsFanOut(t *testing.T) {
 	}
 	// The engine's size limit applies to group messages too.
 	big := message(t, alice, "big", strings.Repeat("x", messaging.DefaultMaxMessageSize), 0)
-	if rej, ok := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: bob, CPIM: big}).(*messaging.Rejection); !ok ||
+	if rej, ok := r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: g.URI, Sender: bob, CPIM: content.BodyOf(big)}).(*messaging.Rejection); !ok ||
 		rej.Reason != messaging.ReasonTooLarge {
 		t.Fatalf("a large message: %v", rej)
 	}
@@ -320,7 +321,7 @@ func TestIsComposingReachesTheOthersWithoutBeingStored(t *testing.T) {
 		t.Fatalf("answered %d", code)
 	}
 	got := asSeen(t, b.next(t))
-	if from, to := fromTo(t, got); from.URI != alice || to != g.URI || string(got.Body) != ind {
+	if from, to := fromTo(t, got); from.URI != alice || to != g.URI || string(got.Body.Bytes()) != ind {
 		t.Fatalf("bob got From %v To %s: %q", from, to, got.Body)
 	}
 	// A bare indication is wrapped for the others.
@@ -328,7 +329,7 @@ func TestIsComposingReachesTheOthersWithoutBeingStored(t *testing.T) {
 		t.Fatalf("answered %d", code)
 	}
 	got = asSeen(t, a.next(t))
-	if from, _ := fromTo(t, got); from.URI != bob || !bytes.Contains(got.Body, []byte("isComposing")) {
+	if from, _ := fromTo(t, got); from.URI != bob || !bytes.Contains(got.Body.Bytes(), []byte("isComposing")) {
 		t.Fatalf("alice got %v", got)
 	}
 	if r.queues.Len(bob) != 0 || r.queues.Len(carol) != 0 || r.m.get("group.message.accepted") != 0 {

@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -276,7 +277,7 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 }
 
 func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) error {
-	if len(m.CPIM) > MaxCPIMSize {
+	if m.CPIM.Len() > MaxCPIMSize {
 		return ErrTooLarge
 	}
 	switch {
@@ -300,8 +301,15 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		attrTTL:          ttlOf(ttl),
 	}
 	if !m.Summary {
-		// A summary has no body of its own.
-		item[attrCPIM] = &types.AttributeValueMemberB{Value: m.CPIM}
+		// A summary has no body of its own. The Bytes of an empty Body are
+		// nil, which the SDK would write as null: an empty CPIM, nil or
+		// not, goes out as an empty binary. Before #547 a nil one went out
+		// as null.
+		cpim := m.CPIM.Bytes()
+		if cpim == nil {
+			cpim = []byte{}
+		}
+		item[attrCPIM] = &types.AttributeValueMemberB{Value: cpim}
 	}
 	for name, v := range map[string]string{
 		attrConversation: m.Conversation, attrContribution: m.Contribution,
@@ -1051,7 +1059,7 @@ func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) 
 		m.Summary = b.Value
 	}
 	if b, ok := item[attrCPIM].(*types.AttributeValueMemberB); ok {
-		m.CPIM = b.Value
+		m.CPIM = content.BodyOf(b.Value)
 	} else if !m.Summary {
 		err = errors.Join(err, errors.New("cpim missing"))
 	}

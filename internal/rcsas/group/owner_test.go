@@ -7,8 +7,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -309,7 +311,7 @@ func TestTwoRequestsOfOneTaskTakeAGroupOverAtOnce(t *testing.T) {
 // write has who write text in uri through r's engine.
 func (r *rig) write(t *testing.T, uri, who, id string) error {
 	t.Helper()
-	return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: uri, Sender: who, CPIM: message(t, who, id, "x", 0)})
+	return r.e.SubmitGroup(t.Context(), messaging.GroupOrigin{Group: uri, Sender: who, CPIM: content.BodyOf(message(t, who, id, "x", 0))})
 }
 
 // #121 D2: a message written on a task that does not own the group, its
@@ -584,35 +586,45 @@ func TestAGroupTakenOverIsDisownedOnce(t *testing.T) {
 func TestALapseDisownsEveryGroupHeld(t *testing.T) {
 	for _, outage := range []string{"every task", "this task only"} {
 		t.Run(outage, func(t *testing.T) {
-			a, b, sa, sb := twoTasks(t, Config{}, Config{})
-			g1, g2 := a.create(bob), a.create(carol)
-			sa.failBeats.Store(true)
-			if outage == "every task" {
-				sb.failBeats.Store(true)
-			}
-			a.passFailing(t, sa, DefaultTaskLease-DefaultTaskSkew-time.Second)
-			if got := a.n.disownedOnes(); len(got) != 0 {
-				t.Fatalf("disowned %v while the lease held", got)
-			}
-			a.passFailing(t, sa, DefaultTaskHeartbeat)
-			got := a.n.disownedOnes()
-			slices.Sort(got)
-			want := []string{g1.URI, g2.URI}
-			slices.Sort(want)
-			if !slices.Equal(got, want) {
-				t.Fatalf("disowned %v once the lease ran out, want %v", got, want)
-			}
-			if outage == "this task only" {
-				b.pass(t, DefaultTaskLease+DefaultTaskSkew)
-				if err := b.add(t, g1.URI, dave); err != nil {
-					t.Fatalf("b's takeover: %v", err)
+			// In a bubble: synctest.Wait returns once every goroutine is
+			// blocked, so the beat a pass has the fake clock fire has been
+			// tried and acted on, its groups given up or not, when the test
+			// looks. Seeing it tried (passFailing) is not enough: the groups
+			// are given up after the store's call returns (#571).
+			synctest.Test(t, func(t *testing.T) {
+				a, b, sa, sb := twoTasks(t, Config{}, Config{})
+				g1, g2 := a.create(bob), a.create(carol)
+				sa.failBeats.Store(true)
+				if outage == "every task" {
+					sb.failBeats.Store(true)
 				}
-			}
-			sa.failBeats.Store(false)
-			a.pass(t, DefaultTaskHeartbeat)
-			if got := a.n.disownedOnes(); len(got) != 2 {
-				t.Errorf("disowned %v once a beat landed, want the two only", got)
-			}
+				a.passFailing(t, sa, DefaultTaskLease-DefaultTaskSkew-time.Second)
+				synctest.Wait()
+				if got := a.n.disownedOnes(); len(got) != 0 {
+					t.Fatalf("disowned %v while the lease held", got)
+				}
+				a.passFailing(t, sa, DefaultTaskHeartbeat)
+				synctest.Wait()
+				got := a.n.disownedOnes()
+				slices.Sort(got)
+				want := []string{g1.URI, g2.URI}
+				slices.Sort(want)
+				if !slices.Equal(got, want) {
+					t.Fatalf("disowned %v once the lease ran out, want %v", got, want)
+				}
+				if outage == "this task only" {
+					b.pass(t, DefaultTaskLease+DefaultTaskSkew)
+					if err := b.add(t, g1.URI, dave); err != nil {
+						t.Fatalf("b's takeover: %v", err)
+					}
+				}
+				sa.failBeats.Store(false)
+				a.pass(t, DefaultTaskHeartbeat)
+				synctest.Wait()
+				if got := a.n.disownedOnes(); len(got) != 2 {
+					t.Errorf("disowned %v once a beat landed, want the two only", got)
+				}
+			})
 		})
 	}
 }

@@ -270,8 +270,17 @@ participating function and store messages for users who are offline
 |---|---|---|
 | 10 | INVITE with an OMA CPM ICSI, an RCS IARI or the OMA SIMPLE IM tag `+g.oma.sip-im` (rcsjta's chat) in `Accept-Contact`/`Contact`, a CPM ICSI in `P-Preferred-Service`/`P-Asserted-Service`, or an MSRP stream (`m=message … TCP/MSRP` or `TCP/TLS/MSRP`, in any case) in its SDP unless a feature tag names image share, video share or MMTEL (below) | SESSION_TERMINATED |
 | 20 | MESSAGE | SESSION_TERMINATED |
+| 25 | SUBSCRIBE with `Event: conference` (RFC 4575), a group chat's roster subscription at its conference URI: the whole event type, in any case, with or without parameters | SESSION_TERMINATED |
 | 30 | OPTIONS with the same RCS service tags (capability discovery) | SESSION_CONTINUED |
 | 40 | REGISTER (third-party registration) | SESSION_CONTINUED |
+
+A roster SUBSCRIBE goes to a conference URI (`RCSAS_CONFERENCE_HOST`), whose host
+is not the home domain: without its own trigger the S-CSCF finds no route for it
+and answers 404 (#557). The trigger reads the `Event` value as the S-CSCF
+presents it, the compact form `o` by its full name. A rejoin INVITE to that URI
+takes trigger 10 as a chat. The reg event SUBSCRIBE a client sends to its own
+IMPU (`Event: reg`) is not taken, nor is a package whose name only starts with
+`conference`.
 
 Every trigger also requires that the request has no `P-Served-User`. `rcs-as`
 sends requests of its own: stored messages it delivers later, notifications the
@@ -312,8 +321,11 @@ can have that name, as it holds a space.
 
 The profile is created at start if missing; an operator's changes to it are kept.
 So a profile created before the `P-Served-User` check or the OMA SIMPLE IM tag
-(#137) keeps its old triggers until an operator updates it through the API. No
-deployment had one.
+(#137), or before the roster trigger (#557), keeps its old triggers until an
+operator updates it through the API. No deployment had one. A local stack
+started before #557 holds one too, as DynamoDB Local keeps its data across
+`make up`: `make down` then `make up`, or a PUT of the profile through the API,
+gives it the roster trigger ([local stack](local-stack.md)).
 
 ### Writing iFC
 
@@ -355,7 +367,7 @@ some inputs grows with the square of their length. A profile's patterns
 together may cost at most `MaxSetCompileCost` (1 000 000 units) to compile,
 counted in bytes and instructions processed rather than timed. A profile of
 64 ordinary RCS criteria uses about 92% of it and the default RCS profile
-about 2%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
+about 3.6%; ten 4 KiB patterns of the costliest shape exceed it. On a 32-core
 development host at load 140 to 230, a profile at the limit took 39 to 48 ms
 of CPU (33 to 70 ms wall) to compile when made of 4 KiB patterns, and about
 2 to 2.3 times as long when made of hundreds of short ones; other hosts and

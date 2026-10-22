@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -180,7 +181,9 @@ type GroupOrigin struct {
 	Sender       string
 	Identities   []string
 	Conversation Conversation
-	CPIM         []byte
+	// CPIM is the message/cpim body as received: chat content, held where
+	// no verb or encoder shows it (#547).
+	CPIM content.Body
 }
 
 // SubmitGroup runs a participant's message in a group through the
@@ -230,7 +233,7 @@ func (e *Engine) submitGroup(ctx context.Context, o GroupOrigin) error {
 	}
 	o.Identities = append(slices.Clip(o.Identities), o.Sender)
 	o.Sender = sender
-	m, err := ParseMessage(o.CPIM, e.cfg.MaxMessageSize)
+	m, err := ParseMessage(o.CPIM.Bytes(), e.cfg.MaxMessageSize)
 	if err != nil {
 		return err
 	}
@@ -243,7 +246,7 @@ func (e *Engine) submitGroup(ctx context.Context, o GroupOrigin) error {
 	case isComposing(m.CPIM):
 		return e.groupComposing(ctx, h, o, m, now)
 	case m.Notification != nil:
-		if len(o.CPIM) > e.cfg.PagerLimit {
+		if o.CPIM.Len() > e.cfg.PagerLimit {
 			return reject(ReasonTooLarge, nil)
 		}
 		if !e.notifiers.allow(o.Sender, now) {
@@ -352,7 +355,7 @@ func (e *Engine) submitGroupMessage(ctx context.Context, o GroupOrigin, m *Messa
 		q := store.Message{
 			Recipient: r, ID: id, Sender: o.Group, Author: o.Sender, Mode: store.Group, MessageID: m.Request.MessageID,
 			Conversation: o.Conversation.ID, Contribution: o.Conversation.Contribution, InReplyTo: o.Conversation.InReplyTo,
-			CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL), Fence: aud.Fence,
+			CPIM: content.BodyOf(body), Enqueued: now, Expires: now.Add(e.cfg.StoreTTL), Fence: aud.Fence,
 		}
 		sctx, cancel := e.withTimeout(fctx, e.cfg.StoreTimeout)
 		err = e.enqueue(sctx, q)
@@ -484,7 +487,7 @@ func (e *Engine) submitGroupNotification(ctx context.Context, h GroupHandler, o 
 	q := store.Message{
 		Recipient: sent.Author, ID: id, Sender: o.Group, Author: o.Sender, Mode: store.Group, Notification: true,
 		Conversation: o.Conversation.ID, Contribution: o.Conversation.Contribution, InReplyTo: o.Conversation.InReplyTo,
-		CPIM: body, Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
+		CPIM: content.BodyOf(body), Enqueued: now, Expires: now.Add(e.cfg.StoreTTL),
 	}
 	err = e.enqueue(ctx, q)
 	switch {
@@ -805,7 +808,7 @@ func (e *Engine) summaryNotifications(sent store.Sent, now time.Time) ([]summary
 // group open here there is nobody to pass it to, and the group's item is
 // not read.
 func (e *Engine) groupComposing(ctx context.Context, h GroupHandler, o GroupOrigin, m *Message, now time.Time) error {
-	if len(o.CPIM) > MaxIsComposingSize || !e.composing.allow(o.Group+"\x00"+o.Sender, now) || !e.othersHere(o.Group, o.Sender) {
+	if o.CPIM.Len() > MaxIsComposingSize || !e.composing.allow(o.Group+"\x00"+o.Sender, now) || !e.othersHere(o.Group, o.Sender) {
 		e.metrics.Count("iscomposing.dropped", 1)
 		return nil
 	}
@@ -874,7 +877,7 @@ func (e *Engine) groupReceived(l *Leg, m *msrp.Message) error {
 				{Name: cpim.HeaderDateTime, Value: cpim.FormatDateTime(e.clock.Now())},
 			},
 			ContentHeaders: []cpim.Field{{Name: "Content-Type", Value: IsComposingType}},
-			Body:           body,
+			Body:           content.BodyOf(body),
 		}
 		var err error
 		if body, err = c.Marshal(); err != nil {
@@ -886,7 +889,7 @@ func (e *Engine) groupReceived(l *Leg, m *msrp.Message) error {
 		return &msrp.StatusError{Code: msrp.StatusUnsupportedMediaType}
 	}
 	err := e.SubmitGroup(e.ctx, GroupOrigin{
-		Group: l.p.Peer, Sender: l.p.User, Identities: l.p.Identities, Conversation: l.p.Conversation, CPIM: body,
+		Group: l.p.Peer, Sender: l.p.User, Identities: l.p.Identities, Conversation: l.p.Conversation, CPIM: content.BodyOf(body),
 	})
 	var r *Rejection
 	switch {
