@@ -137,8 +137,8 @@ func TestSIPDigestMARReturnsBothHA1sForTheIMSRealm(t *testing.T) {
 		item := maa.AuthDataItems[0]
 		d := item.Digest
 		if item.Scheme != cx.SchemeSIPDigest || item.ItemNumber != 0 || d == nil || d.Realm != domain || d.QoP != "auth" ||
-			d.Algorithm != "MD5" || d.HA1 != ha1(t, digest.MD5, impi1, domain) ||
-			d.AlternateAlgorithm != "SHA-256" || d.AlternateHA1 != ha1(t, digest.SHA256, impi1, domain) {
+			d.Algorithm != "MD5" || d.HA1.RevealString() != ha1(t, digest.MD5, impi1, domain) ||
+			d.AlternateAlgorithm != "SHA-256" || d.AlternateHA1.RevealString() != ha1(t, digest.SHA256, impi1, domain) {
 			t.Fatalf("%s: item %+v, digest %#v", scheme, item, d)
 		}
 	}
@@ -487,7 +487,7 @@ func TestCxAnswersCarryNoSecretInLogs(t *testing.T) {
 	logs := e.logs.String()
 	item := maa.AuthDataItems[0]
 	assertNoSecrets(t, "logs", logs, string(hexOf(item.Authorization.Reveal())), string(hexOf(item.ConfidentialityKey.Reveal())),
-		dmaa.AuthDataItems[0].Digest.HA1, "15550100001", imsi1)
+		dmaa.AuthDataItems[0].Digest.HA1.RevealString(), "15550100001", imsi1)
 }
 
 func hexOf(b []byte) []byte {
