@@ -474,7 +474,7 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 	}
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
 	if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), "one") {
-		t.Fatalf("bob got %q", got.Body)
+		t.Fatalf("bob got %q", got.Body.Bytes())
 	}
 	// With the mark gone, a copy goes on the open session unasked.
 	before := reads.Load()
@@ -482,7 +482,7 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), "again") || reads.Load() != before+1 {
-		t.Fatalf("bob got %q after %d reads, want the Recipients one alone", got.Body, reads.Load()-before)
+		t.Fatalf("bob got %q after %d reads, want the Recipients one alone", got.Body.Bytes(), reads.Load()-before)
 	}
 	// Gone now, with the session still open: the next copy is not sent on
 	// it.
@@ -494,7 +494,7 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 	waitFor(t, "the copy given up", func() bool { return r.m.get("delivery.not_participant") == 1 })
 	select {
 	case m := <-b.got:
-		t.Fatalf("a former participant got %q", m.Body)
+		t.Fatalf("a former participant got %q", m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 	// The marks are bounded.
@@ -631,7 +631,7 @@ func TestANewGroupMessageDoesNotOvertakeOnesWaitingForTheSession(t *testing.T) {
 	proceed <- struct{}{}
 	for _, want := range []string{"g1", "g2"} {
 		if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), want) {
-			t.Fatalf("got %q, want %s", got.Body, want)
+			t.Fatalf("got %q, want %s", got.Body.Bytes(), want)
 		}
 	}
 }

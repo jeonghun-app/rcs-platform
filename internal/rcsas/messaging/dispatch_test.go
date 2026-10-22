@@ -833,7 +833,7 @@ func TestAChatMessageGoesOnItsLegAfterAFailedLargeModeAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), msg) {
-		t.Fatalf("bob got %q", got.Body)
+		t.Fatalf("bob got %q", got.Body.Bytes())
 	}
 }
 
@@ -881,7 +881,7 @@ func TestALargeModeSessionNeverCarriesTheOtherDirection(t *testing.T) {
 	}
 	select {
 	case m := <-chatLeg.got:
-		t.Fatalf("a standalone message in a chat session: %q", m.Body)
+		t.Fatalf("a standalone message in a chat session: %q", m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 }
@@ -1136,7 +1136,7 @@ func TestMessagesBeyondTheHeldQueueSingleListAreNotLost(t *testing.T) {
 	}
 	for i := range n {
 		if got := b.next(t); !bytes.HasSuffix(got.Body.Bytes(), []byte(fmt.Sprintf("#%04d", i))) {
-			t.Fatalf("delivery %d: %q", i, got.Body)
+			t.Fatalf("delivery %d: %q", i, got.Body.Bytes())
 		}
 	}
 }

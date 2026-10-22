@@ -108,7 +108,7 @@ func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 	}
 	send(t, s, "through Run")
 	if m := asH.message(t); string(m.Body.Bytes()) != "through Run" {
-		t.Fatalf("rcs-as got %q", m.Body)
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 
 	// Metrics are flushed every interval, not per event.
@@ -131,7 +131,7 @@ func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 	}
 	send(t, s, "while draining")
 	if m := asH.message(t); string(m.Body.Bytes()) != "while draining" {
-		t.Fatalf("rcs-as got %q", m.Body)
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 	r.clock.Advance(5 * time.Second)
 	select {

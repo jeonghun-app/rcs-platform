@@ -61,7 +61,7 @@ func TestReadMessageParsesASendWithABody(t *testing.T) {
 		t.Fatalf("Content-Disposition = %q", v)
 	}
 	if string(m.Body.Bytes()) != "hello there" || m.Continuation != FlagEnd {
-		t.Fatalf("body %q flag %q", m.Body, m.Continuation)
+		t.Fatalf("body %q flag %q", m.Body.Bytes(), m.Continuation)
 	}
 }
 
@@ -168,7 +168,7 @@ func TestBodyKeepsBytesThatOnlyLookLikeAnEndLine(t *testing.T) {
 		)
 		m := readOne(t, in)
 		if string(m.Body.Bytes()) != body || m.Continuation != FlagMore {
-			t.Errorf("body %q read as %q, flag %q", body, m.Body, m.Continuation)
+			t.Errorf("body %q read as %q, flag %q", body, m.Body.Bytes(), m.Continuation)
 		}
 	}
 }

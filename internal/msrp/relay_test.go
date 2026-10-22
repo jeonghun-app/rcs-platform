@@ -162,7 +162,7 @@ func TestRelayCarriesAMessageBetweenTwoEndpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 	if m := aliceH.message(t); string(m.Body.Bytes()) != "back" || m.FromPath[0].String() != relayPublicURI {
-		t.Fatalf("client got %q from %v", m.Body, m.FromPath)
+		t.Fatalf("client got %q from %v", m.Body.Bytes(), m.FromPath)
 	}
 }
 

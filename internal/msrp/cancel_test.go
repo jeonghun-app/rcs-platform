@@ -72,7 +72,7 @@ func TestASendCancelledWhileQueuedEndsWithItsContextsError(t *testing.T) {
 	}()
 	m := p.next(t)
 	if string(m.Body.Bytes()) != "third" {
-		t.Fatalf("after the first message the peer read %q, want the third", m.Body)
+		t.Fatalf("after the first message the peer read %q, want the third", m.Body.Bytes())
 	}
 	p.respond(t, m, StatusOK)
 	if err := <-third; err != nil {
@@ -144,7 +144,7 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	p.r = NewReader(io.MultiReader(bytes.NewReader(octet), theirs), 0)
 	b1 := p.next(t)
 	if string(b1.Body.Bytes()) != "bbbbbbbb" {
-		t.Fatalf("first chunk %q", b1.Body)
+		t.Fatalf("first chunk %q", b1.Body.Bytes())
 	}
 	if _, err := io.ReadFull(theirs, octet); err != nil { // A is being written
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	p.r = NewReader(io.MultiReader(bytes.NewReader(octet), theirs), 0)
 	am := p.next(t)
 	if string(am.Body.Bytes()) != "aaaa" {
-		t.Fatalf("after B's first chunk the peer read %q, want A", am.Body)
+		t.Fatalf("after B's first chunk the peer read %q, want A", am.Body.Bytes())
 	}
 	p.respond(t, am, StatusOK)
 	p.respond(t, b1, StatusOK)
@@ -172,6 +172,6 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	m := p.next(t)
 	if m.Continuation != FlagAbort || m.MessageID != b1.MessageID || m.Range() != (ByteRange{Start: 9, End: 8, Total: 16}) || m.Body.Len() != 0 {
 		t.Fatalf("after A the peer read %q flag %q range %+v (id %s, B's %s); want B's abort chunk 9-8/16",
-			m.Body, m.Continuation, m.ByteRange, m.MessageID, b1.MessageID)
+			m.Body.Bytes(), m.Continuation, m.ByteRange, m.MessageID, b1.MessageID)
 	}
 }

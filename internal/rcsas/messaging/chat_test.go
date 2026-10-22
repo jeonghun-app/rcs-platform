@@ -25,7 +25,7 @@ func TestChatFlowsBetweenTwoClientsOverLoopbackMSRP(t *testing.T) {
 	}
 	got := b.next(t)
 	if !bytes.Equal(got.Body.Bytes(), msg) || got.MediaType() != cpim.ContentType {
-		t.Fatalf("bob got %q", got.Body)
+		t.Fatalf("bob got %q", got.Body.Bytes())
 	}
 
 	// Bob's client confirms delivery and display; both reach alice.
@@ -41,7 +41,7 @@ func TestChatFlowsBetweenTwoClientsOverLoopbackMSRP(t *testing.T) {
 		}
 		got := a.next(t)
 		if !bytes.Equal(got.Body.Bytes(), rcpt) {
-			t.Fatalf("alice got %q", got.Body)
+			t.Fatalf("alice got %q", got.Body.Bytes())
 		}
 		if n := readNotification(t, got.Body.Bytes()); n.Status != s || n.MessageID != "Xs8kLz1" {
 			t.Fatalf("alice got %+v", n)
@@ -76,10 +76,10 @@ func TestChatQueuedForAnAbsentRecipientWaitsForItsSession(t *testing.T) {
 	// messages arrive in order.
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
 	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), first) {
-		t.Fatalf("first delivery %q", got.Body)
+		t.Fatalf("first delivery %q", got.Body.Bytes())
 	}
 	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), second) {
-		t.Fatalf("second delivery %q", got.Body)
+		t.Fatalf("second delivery %q", got.Body.Bytes())
 	}
 	waitFor(t, "both deliveries to be confirmed", func() bool { return r.m.get("delivery.msrp") == 2 })
 }
@@ -173,18 +173,18 @@ func TestARelayConnectingBeforeTheAnswerIsServed(t *testing.T) {
 	b := r.dial(t, l, bobURI, leg.Local())
 	b.send(t, chat(t, "m2", "early from bob", 0))
 	if got := a.next(t); !bytes.Equal(got.Body.Bytes(), chat(t, "m2", "early from bob", 0)) {
-		t.Fatalf("alice got %q", got.Body)
+		t.Fatalf("alice got %q", got.Body.Bytes())
 	}
 	select {
 	case m := <-b.got:
-		t.Fatalf("delivered before the answer: %q", m.Body)
+		t.Fatalf("delivered before the answer: %q", m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 	if err := leg.Answer([]msrp.URI{bobURI}); err != nil {
 		t.Fatal(err)
 	}
 	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), chat(t, "m1", "for bob", 0)) {
-		t.Fatalf("bob got %q", got.Body)
+		t.Fatalf("bob got %q", got.Body.Bytes())
 	}
 	if err := leg.Answer([]msrp.URI{bobURI}); err == nil {
 		t.Fatal("answered twice")
@@ -240,7 +240,7 @@ func TestNoSecondSessionIsAskedForOnceOneHasOpened(t *testing.T) {
 			}
 			b := r.dial(t, l, bobURI, leg.Local())
 			if got := b.next(t); !bytes.Contains(got.Body.Bytes(), []byte("for bob")) {
-				t.Fatalf("bob got %q", got.Body)
+				t.Fatalf("bob got %q", got.Body.Bytes())
 			}
 		})
 	}
@@ -379,7 +379,7 @@ func TestIsComposingIsForwardedToThePeerWithoutBeingStored(t *testing.T) {
 	}
 	got := b.next(t)
 	if got.MediaType() != IsComposingType || !bytes.Equal(got.Body.Bytes(), body) {
-		t.Fatalf("bob got %s %q", got.MediaType(), got.Body)
+		t.Fatalf("bob got %s %q", got.MediaType(), got.Body.Bytes())
 	}
 	waitFor(t, "the count", func() bool { return r.m.get("iscomposing.forwarded") == 1 })
 	if r.queued(t, bob) != 0 || r.m.get("iscomposing.dropped") != 1 || r.m.get("message.accepted") != 0 {
@@ -512,7 +512,7 @@ func TestASessionOpeningMidwayKeepsTheQueueInOrder(t *testing.T) {
 	b := <-opened
 	for _, want := range []string{"m1", "m2", "m3"} {
 		if got := b.next(t); !bytes.HasSuffix(got.Body.Bytes(), []byte(want)) {
-			t.Fatalf("got %q, want %s", got.Body, want)
+			t.Fatalf("got %q, want %s", got.Body.Bytes(), want)
 		}
 	}
 }
@@ -552,7 +552,7 @@ func TestANewMessageDoesNotOvertakeOnesWaitingForTheSameSession(t *testing.T) {
 	proceed <- struct{}{}
 	for _, want := range []string{"m1", "m2"} {
 		if got := b.next(t); !bytes.HasSuffix(got.Body.Bytes(), []byte(want)) {
-			t.Fatalf("got %q, want %s", got.Body, want)
+			t.Fatalf("got %q, want %s", got.Body.Bytes(), want)
 		}
 	}
 }

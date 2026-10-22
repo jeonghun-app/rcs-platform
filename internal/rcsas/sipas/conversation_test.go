@@ -192,7 +192,7 @@ func TestChatInviteConversationShapes(t *testing.T) {
 				t.Fatalf("follow-up reported %d", code)
 			}
 			if got := relayB.next(t); !strings.Contains(string(got.Body.Bytes()), "follow-up") {
-				t.Fatalf("bob got %q", got.Body)
+				t.Fatalf("bob got %q", got.Body.Bytes())
 			}
 			select {
 			case req := <-r.core.got:

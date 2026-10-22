@@ -1094,7 +1094,7 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 	select {
 	case m := <-lateH.got:
 		if string(m.Body.Bytes()) != "kept for you" {
-			t.Fatalf("got %q", m.Body)
+			t.Fatalf("got %q", m.Body.Bytes())
 		}
 	case <-time.After(hangGuard):
 		t.Fatal("the held message was not delivered")

@@ -95,7 +95,7 @@ func TestAChatMessageGoesThroughTwoSessionsRcsASAnchors(t *testing.T) {
 	}
 	relayB := r.connect(t, toBob, toLeg)
 	if m := relayB.next(t); !strings.Contains(string(m.Body.Bytes()), "hi bob") {
-		t.Fatalf("bob's leg got %q", m.Body)
+		t.Fatalf("bob's leg got %q", m.Body.Bytes())
 	}
 
 	// bob hangs up: his BYE comes in the dialog rcs-as started.

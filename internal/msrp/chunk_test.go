@@ -245,7 +245,7 @@ func TestReassemblerKeepsMessagesApartByMessageID(t *testing.T) {
 	one := mustAdd(t, &r, chunkMsg("msg1", ByteRange{3, 4, 4}, "cd", FlagEnd))
 	two := mustAdd(t, &r, chunkMsg("msg2", ByteRange{3, 4, 4}, "CD", FlagEnd))
 	if string(one.Body.Bytes()) != "abcd" || string(two.Body.Bytes()) != "ABCD" {
-		t.Fatalf("got %q and %q", one.Body, two.Body)
+		t.Fatalf("got %q and %q", one.Body.Bytes(), two.Body)
 	}
 }
 

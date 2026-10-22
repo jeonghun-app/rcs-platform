@@ -42,7 +42,7 @@ func expectNothing(t *testing.T, c *client, what string) {
 	t.Helper()
 	select {
 	case m := <-c.got:
-		t.Fatalf("%s: got %q", what, m.Body)
+		t.Fatalf("%s: got %q", what, m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 }

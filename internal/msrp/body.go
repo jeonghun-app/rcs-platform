@@ -20,13 +20,19 @@ import (
 // as its address. A Body's own String, Format, LogValue and MarshalJSON
 // cover the valid verbs and the other encoders.
 //
+// Bodies do not compare with ==, which would compare addresses: use
+// bytes.Equal on their Bytes.
+//
 // This file is the package's only use of unsafe. It relies on two rules
 // of the unsafe package: unsafe.SliceData returns the address of a
 // slice's first element (nil for a nil slice), and unsafe.Slice(p, n),
 // then a reslice to its capacity, rebuilds a slice from that address,
 // which keeps the backing array reachable for the garbage collector as
-// any interior pointer does. No address goes through a uintptr.
+// any interior pointer does. No address goes through a uintptr. The race
+// detector's checkptr, on in make race, checks each unsafe.Slice stays
+// inside its allocation.
 type Body struct {
+	_    [0]func() // no ==
 	p    *byte
 	n, c int
 }

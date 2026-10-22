@@ -62,7 +62,7 @@ func TestABodyIsItsSlice(t *testing.T) {
 		t.Fatalf("Bytes = %q len %d cap %d, want b itself", got, body.Len(), cap(got))
 	}
 	for _, empty := range [][]byte{nil, {}, b[:0]} {
-		if e := BodyOf(empty); e != (Body{}) || e.Bytes() != nil || e.Len() != 0 {
+		if e := BodyOf(empty); e.p != nil || e.Bytes() != nil || e.Len() != 0 {
 			t.Errorf("BodyOf(%#v) = a non-zero Body", empty)
 		}
 	}

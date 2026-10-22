@@ -51,7 +51,7 @@ func TestASessionWhosePathComesLaterBindsAndSendsOnceItIsSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	if m := bobH.message(t); string(m.Body.Bytes()) != "early" {
-		t.Fatalf("got %q", m.Body)
+		t.Fatalf("got %q", m.Body.Bytes())
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	_, err = bob.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("too soon"))})
@@ -71,7 +71,7 @@ func TestASessionWhosePathComesLaterBindsAndSendsOnceItIsSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	if m := aliceH.message(t); string(m.Body.Bytes()) != "reply" {
-		t.Fatalf("got %q", m.Body)
+		t.Fatalf("got %q", m.Body.Bytes())
 	}
 	if !bob.Remote()[0].Equal(mustURI(t, clientURI)) {
 		t.Fatalf("Remote = %v", bob.Remote())

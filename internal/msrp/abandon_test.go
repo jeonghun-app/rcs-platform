@@ -74,7 +74,7 @@ func (r *abandonRig) abortBeforeC(t *testing.T, b1 *Message) {
 	m := r.p.next(t)
 	if m.Continuation != FlagAbort || m.MessageID != b1.MessageID || m.Range() != (ByteRange{Start: 9, End: 8, Total: 16}) || m.Body.Len() != 0 {
 		t.Fatalf("after B the peer read %q flag %q range %+v (id %s, B's %s); want B's abort chunk 9-8/16",
-			m.Body, m.Continuation, m.ByteRange, m.MessageID, b1.MessageID)
+			m.Body.Bytes(), m.Continuation, m.ByteRange, m.MessageID, b1.MessageID)
 	}
 }
 
@@ -82,7 +82,7 @@ func (r *abandonRig) firstChunk(t *testing.T) *Message {
 	t.Helper()
 	b1 := r.p.next(t)
 	if string(b1.Body.Bytes()) != "bbbbbbbb" {
-		t.Fatalf("first chunk %q", b1.Body)
+		t.Fatalf("first chunk %q", b1.Body.Bytes())
 	}
 	return b1
 }

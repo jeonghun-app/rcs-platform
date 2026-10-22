@@ -692,7 +692,7 @@ func TestASummaryWithoutItsRecord(t *testing.T) {
 	waitFor(t, "alice's queue empty", func() bool { return st.Store.(*store.Memory).Len(alice) == 0 && r.idle() })
 	select {
 	case m := <-c.got:
-		t.Fatalf("a summary without its record sent %q", m.Body)
+		t.Fatalf("a summary without its record sent %q", m.Body.Bytes())
 	default:
 	}
 	if r.m.get("group.summary.sent") != 0 || r.m.get("group.summary.expanded") != 0 {

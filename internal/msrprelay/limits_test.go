@@ -193,7 +193,7 @@ func TestFailedBindOnAConnectionWithBridgesRefusesOnlyTheNewSession(t *testing.T
 	}
 	send(t, a, "first survives")
 	if m := asH.message(t); string(m.Body.Bytes()) != "first survives" {
-		t.Fatalf("rcs-as got %q", m.Body)
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 }
 
@@ -375,7 +375,7 @@ func trafficKeepsTheClientConnected(t *testing.T, name string, mode msrp.ReportM
 		select {
 		case m := <-clientH.msgs:
 			if string(m.Body.Bytes()) != "to a quiet client" {
-				t.Fatalf("client got %q", m.Body)
+				t.Fatalf("client got %q", m.Body.Bytes())
 			}
 		case <-c.conn.Done():
 			return cut()
