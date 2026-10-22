@@ -742,6 +742,14 @@ group's sessions and subscriptions is its conference URI.
   responses come back the same way. A task that does not know the group, or
   owns it, serves the request itself; one whose owner has stopped takes it over
   first.
+- **A takeover reads the queues.** The task that takes a group over has the
+  queues of its current participants (invited and joined) read at once
+  (`Engine.ReadQueues`). The copies the old owner queued and had not delivered
+  when it stopped are then delivered on a session open here, or invited for
+  as an owner does, rather than waiting for the next message written in the
+  group, the recipient's next registration on a new flow, or
+  `RCSAS_STORE_TTL` (#607): the old owner's retries ended with it. A
+  participant's queue that holds none of the group's copies costs one read.
 - **No 404 for a group that exists.** A request that cannot reach the owner
   now is answered 500 with `Retry-After` (`group.forward_refused`): one
   forwarded here already, which is never forwarded again, so that two tasks
