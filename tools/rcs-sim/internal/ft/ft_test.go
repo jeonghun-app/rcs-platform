@@ -380,6 +380,44 @@ func TestUploadInfoSettlesOnlyAfterAQuietTime(t *testing.T) {
 	}
 }
 
+func TestUploadInfoTimesTheServerShowingWhatItHoldsNotItsAnswers(t *testing.T) {
+	// #286: Showed runs to the last request sent that did not get the bytes
+	// held: the server read what it holds somewhere between that request
+	// and its answer, so it is known not to have shown them only as that
+	// request was sent. No answer's own time counts, a slow 404's no more
+	// than a slow final answer's. On the server clock every answer takes an
+	// hour, and request n is sent at n-1 hours.
+	for _, c := range []struct {
+		name   string
+		held   func(n int) int
+		within time.Duration
+		want   time.Duration
+	}{
+		{"held at once", func(int) int { return 20 }, 10 * time.Hour, 0},
+		{"a 404 first", func(n int) int { return heldFrom(n, 2) }, 10 * time.Hour, 0},
+		{"two 404s first", func(n int) int { return heldFrom(n, 3) }, 10 * time.Hour, time.Hour},
+		{"held bytes change", func(n int) int {
+			if n < 3 {
+				return 12
+			}
+			return 20
+		}, 10 * time.Hour, time.Hour},
+		// #356: first shown to a request sent past the deadline, at 4 h.
+		{"shown past the deadline", func(n int) int { return heldFrom(n, 5) }, 3 * time.Hour, 3 * time.Hour},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cl, _ := serverClocked(t, c.held)
+			_, st, err := cl.SettledUploadInfo(ctx(t), "x", c.within, time.Millisecond, 90*time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if st.Showed != c.want {
+				t.Fatalf("Showed %v, want %v", st.Showed, c.want)
+			}
+		})
+	}
+}
+
 func TestUploadInfoSettlesThoughAnAnswerComesAfterItsTime(t *testing.T) {
 	// #344: a server that holds the parts from the start but takes longer
 	// than within to answer once is not still storing: the deadline bounds
