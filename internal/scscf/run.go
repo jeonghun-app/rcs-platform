@@ -80,6 +80,8 @@ type deps struct {
 	// subscribeAnswered, if set, runs once a SUBSCRIBE's 200 is written,
 	// before its first NOTIFY goes.
 	subscribeAnswered func()
+	// reported, if set, runs at each metrics report.
+	reported func()
 	// transportMade, if set, hears of the transport once it is made.
 	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
@@ -243,6 +245,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// it rises, and once more after the drain.
 	var om proxy.OverloadMeter
 	report := func() {
+		if d.reported != nil {
+			d.reported()
+		}
 		if rt.Metrics != nil {
 			om.Record(rt.Metrics, px)
 		}
@@ -275,7 +280,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// requests are answered, and the sweeps stop.
 	stopSweeps()
 	sweeps.Wait()
-	report()
+	// Guarded as at every interval: a report that panics must not skip
+	// the waits and the goodbye after it (#527 code review).
+	bgPanics.Run("scscf: metrics report", report)
 	// The router, the first NOTIFYs and the notifier's queue share what is
 	// left of the budget but closeMargin: an application server or a P-CSCF
 	// that does not answer holds none of them past it (#439 QA and code

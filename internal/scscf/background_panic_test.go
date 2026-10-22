@@ -62,8 +62,7 @@ func TestAPanickingSubscriptionSweepEndsThatRoundOnly(t *testing.T) {
 // stop's wait for the first NOTIFYs returns.
 func TestAPanickingFirstNOTIFYIsWaitedForNoMore(t *testing.T) {
 	f := firstNotifies{panics: testGuard()}
-	run := f.hold()
-	run(func() { panic("scscf test panic") })
+	f.hold().run(func() { panic("scscf test panic") })
 	ctx, cancel := context.WithTimeout(bg, realWait)
 	defer cancel()
 	if !f.wait(ctx) {
@@ -129,5 +128,71 @@ func TestScscfCountsAPanicInItsBackgroundWork(t *testing.T) {
 	}
 	if strings.Contains(r.h.Output(), "scscf test panic") {
 		t.Error("the output holds the panic's value")
+	}
+}
+
+// TestAHoldWhoseNOTIFYNeverStartedIsReleased (#527 code review): a hold
+// dropped before its NOTIFY ran, as a panic in the SUBSCRIBE's answer
+// drops it, is waited for no more; one that ran is not released twice.
+func TestAHoldWhoseNOTIFYNeverStartedIsReleased(t *testing.T) {
+	f := firstNotifies{panics: testGuard()}
+	f.hold().drop()
+	ran := f.hold()
+	done := make(chan struct{})
+	ran.run(func() { close(done) })
+	ran.drop()
+	<-done
+	ctx, cancel := context.WithTimeout(bg, realWait)
+	defer cancel()
+	if !f.wait(ctx) {
+		t.Fatal("the wait for the first NOTIFYs did not return")
+	}
+}
+
+// TestAPanicAfterASUBSCRIBEsAnswerLeavesTheStopNothingToWaitFor (#527 code
+// review): the hook after the SUBSCRIBE's 200 panics, before its first
+// NOTIFY starts. The stop does not wait out its budget for that NOTIFY.
+func TestAPanicAfterASUBSCRIBEsAnswerLeavesTheStopNothingToWaitFor(t *testing.T) {
+	hss := startHSS(t)
+	silent := startSilentPeer(t)
+	var once atomic.Bool
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+		d.subscribeAnswered = func() {
+			if once.CompareAndSwap(false, true) {
+				panic("scscf test panic")
+			}
+		}
+	})
+	p := dialSCSCF(t, r)
+	dv := deviceAt(silent.addr, 1)
+	p.registerFully(t, dv, 600)
+	p.subscribeReg(t, dv.path, silent.addr, "panic-sub")
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if logs := r.h.Logs("left NOTIFYs to the sweeps of the other tasks"); len(logs) != 0 {
+		t.Errorf("the stop waited out the first NOTIFY that never started: %v", logs)
+	}
+}
+
+// TestAPanickingReportAtTheStopEndsItAsEver (#527 code review): the metrics
+// report panics, at every interval and at the stop; the stop goes on to
+// its goodbye all the same.
+func TestAPanickingReportAtTheStopEndsItAsEver(t *testing.T) {
+	hss := startHSS(t)
+	var dprs atomic.Int64
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
+		c.CxTimeout = 25 * time.Second
+		d.dial = dprDial(hss, true, &dprs)
+		d.reported = func() { panic("scscf test panic") }
+	})
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	if dprs.Load() == 0 {
+		t.Error("no DPR was written: the panicking report ended the stop")
+	}
+	if n, _ := r.h.Metric(metricBackgroundPanics); n < 1 {
+		t.Errorf("%v panics counted, want the report's", n)
 	}
 }
