@@ -386,6 +386,10 @@ type Transport struct {
 	// or TLS handshake in progress), so Close can close them at once.
 	pending map[net.Conn]struct{}
 
+	// holds are the responses HoldResponse counts in sends, under sendsMu,
+	// until their SendResponse begins.
+	holds map[*sip.Response]uint64
+
 	wg sync.WaitGroup
 }
 
@@ -793,6 +797,42 @@ func (t *Transport) beginSend() uint64 {
 	t.sendNext++
 	t.sends[t.sendNext] = struct{}{}
 	return t.sendNext
+}
+
+// HoldResponse counts res, about to be sent, for Flush as a send under way,
+// from now until a SendResponse of it begins and counts it itself, or until
+// release, whichever is first. A proxy holds a final response it hands to a
+// transaction this way, so that a Flush while the transaction layer has it,
+// before it calls SendResponse, still waits for it (#469).
+func (t *Transport) HoldResponse(res *sip.Response) (release func()) {
+	id := t.beginSend()
+	t.sendsMu.Lock()
+	if t.holds == nil {
+		t.holds = map[*sip.Response]uint64{}
+	}
+	t.holds[res] = id
+	t.sendsMu.Unlock()
+	return func() { t.unhold(res, id) }
+}
+
+// unhold ends the hold id of res, if it is still held.
+func (t *Transport) unhold(res *sip.Response, id uint64) {
+	t.sendsMu.Lock()
+	if t.holds[res] == id {
+		delete(t.holds, res)
+	}
+	delete(t.sends, id)
+	t.sendsMu.Unlock()
+}
+
+// takeHold ends the hold of res, which a send of it now counts.
+func (t *Transport) takeHold(res *sip.Response) {
+	t.sendsMu.Lock()
+	if id, ok := t.holds[res]; ok {
+		delete(t.holds, res)
+		delete(t.sends, id)
+	}
+	t.sendsMu.Unlock()
 }
 
 func (t *Transport) endSend(id uint64) {

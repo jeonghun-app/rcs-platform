@@ -340,10 +340,9 @@ func (c *respContext) answer(res *sip.Response) {
 // Transport.Flush, which Drain ends with, waits for it anyway: from the
 // start of SendResponse, its connection dialled again to the Via address
 // included, as a send under way, then as a sender waiting for room, giving
-// up only once it stops getting anywhere (#375). The gap is the transaction
-// layer's few lines between taking the response and calling SendResponse:
-// a final caught there when Flush looks is not waited for, and Close may
-// drop it.
+// up only once it stops getting anywhere (#375). Between the proxy handing
+// it over and the transaction layer calling SendResponse, respondFinal's
+// hold counts it for Flush in the same way (#469).
 func (c *respContext) inProgress() bool {
 	c.mu.Lock()
 	uas := c.uas
@@ -354,6 +353,27 @@ func (c *respContext) inProgress() bool {
 	}
 	return uas == nil || !uas.handedFinal() && !(flushed && uas.hasAnswered())
 }
+
+// respondFinal hands a final response to the server transaction. From here
+// it is on its way, and not in progress for Drain (responding), so it is
+// first held for the transport's Flush as a send under way until
+// SendResponse counts it itself: otherwise a Flush between the two, while
+// the transaction layer had it, would see no send and leave it to Close to
+// drop (#469).
+func (c *respContext) respondFinal(res *sip.Response) error {
+	defer c.p.holdFinal(res)()
+	c.responding.Store(true)
+	if f := handingFinal.Load(); f != nil {
+		(*f)()
+	}
+	return c.tx.Respond(res)
+}
+
+// handingFinal, empty but in tests, runs in respondFinal once a final is on
+// its way and before the transaction has it, so that a test can hold it in
+// that gap (#469). It is atomic since a proxy may outlive the test that set
+// it.
+var handingFinal atomic.Pointer[func()]
 
 // answerForStop answers a request still without a final response 500 with
 // Retry-After, and closes its branches: INVITE branches are cancelled
@@ -433,8 +453,7 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 					return
 				}
 			}
-			c.responding.Store(true)
-			err := c.tx.Respond(res)
+			err := c.respondFinal(res)
 			c.handed.Store(true)
 			if err != nil {
 				c.p.stats.upstreamErrors.Add(1)
@@ -1249,10 +1268,11 @@ func (c *respContext) forwardAs(res *sip.Response, again bool) func() {
 
 		// §16.9: a response that cannot be sent is dropped, and the
 		// branches are left alone.
+		respond := c.tx.Respond
 		if code >= 200 {
-			c.responding.Store(true)
+			respond = c.respondFinal
 		}
-		if err := c.tx.Respond(res); err != nil {
+		if err := respond(res); err != nil {
 			c.p.stats.upstreamErrors.Add(1)
 		}
 		if code >= 200 {
@@ -1322,8 +1342,7 @@ func (c *respContext) sendBest() []func() {
 			}
 			// On its way, as the other finals (inProgress; code review of
 			// #438).
-			c.responding.Store(true)
-			if err := c.tx.Respond(res); err != nil {
+			if err := c.respondFinal(res); err != nil {
 				c.p.stats.upstreamErrors.Add(1)
 			}
 		})

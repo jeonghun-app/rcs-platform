@@ -182,6 +182,7 @@ func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOpti
 	id := t.beginSend()
 	counted := func() { t.endSend(id) }
 	defer counted()
+	t.takeHold(res)
 	vias, err := res.Header.Via()
 	if err != nil {
 		return err
