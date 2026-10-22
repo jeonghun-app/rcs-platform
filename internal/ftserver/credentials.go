@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -111,7 +112,7 @@ func NewHSSCredentials(base *url.URL, token, realm string, timeout time.Duration
 	}
 	return &HSSCredentials{
 		base:  base,
-		token: secret{token},
+		token: newSecret(token),
 		realm: realm,
 		client: &http.Client{
 			Transport: transport,
@@ -141,7 +142,7 @@ func (h *HSSCredentials) Lookup(ctx context.Context, username string, alg digest
 	if err != nil {
 		return Credential{}, fmt.Errorf("ftserver: hss request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+h.token.v)
+	req.Header.Set("Authorization", "Bearer "+h.token.value())
 	req.Header.Set("Accept", "application/json")
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -215,8 +216,16 @@ func redactURL(err error) error {
 }
 
 // secret holds a configuration secret so that printing a Config cannot
-// reveal it.
-type secret struct{ v string }
+// reveal it, under every verb: its text is in a secret.Key, which an
+// invalid verb, %p or %w, does not print either (#506).
+type secret struct{ k secretkey.Key }
 
-func (secret) String() string   { return "[redacted]" }
-func (secret) GoString() string { return "[redacted]" }
+// newSecret is a secret of v.
+func newSecret(v string) secret { return secret{k: secretkey.NewString(v)} }
+
+// value is the secret's text.
+func (s secret) value() string { return s.k.RevealString() }
+
+func (secret) String() string             { return "[redacted]" }
+func (secret) GoString() string           { return "[redacted]" }
+func (secret) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, "[redacted]") }

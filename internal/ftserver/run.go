@@ -36,7 +36,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 	if err != nil {
 		return err
 	}
-	nonceKey := []byte(cfg.NonceKey.v)
+	nonceKey := []byte(cfg.NonceKey.value())
 	if len(nonceKey) == 0 {
 		// Dev and test only (Configure refuses it in production): one task's
 		// nonces are then valid nowhere else, which a single task never
@@ -200,7 +200,7 @@ func credentialSource(cfg Config, production bool) CredentialSource {
 	if cfg.Credentials == CredentialsStatic {
 		users := make(map[string]string, len(cfg.StaticUsers))
 		for name, password := range cfg.StaticUsers {
-			users[name] = password.v
+			users[name] = password.value()
 		}
 		return NewStaticCredentials(users)
 	}
@@ -208,7 +208,7 @@ func credentialSource(cfg Config, production bool) CredentialSource {
 	if production {
 		dial = hssDialer(cfg).DialContext
 	}
-	return NewHSSCredentials(cfg.HSSURL, cfg.HSSToken.v, cfg.Realm, cfg.HSSTimeout, cfg.MaxLookups, dial)
+	return NewHSSCredentials(cfg.HSSURL, cfg.HSSToken.value(), cfg.Realm, cfg.HSSTimeout, cfg.MaxLookups, dial)
 }
 
 // hssDialer is the production HSS client's dialer: private addresses only,

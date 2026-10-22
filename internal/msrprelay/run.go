@@ -71,7 +71,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	m := newCounters()
 	tokens := make([]string, len(cfg.Tokens))
 	for i, t := range cfg.Tokens {
-		tokens[i] = t.v
+		tokens[i] = t.value()
 	}
 	relay, err := newRelay(relayOptions{
 		Store:                   st,
