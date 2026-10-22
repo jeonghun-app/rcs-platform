@@ -91,6 +91,9 @@ type Invitation struct {
 	Referrer string
 	// flow is the recipient's registration on a new flow the engine had
 	// heard of when it asked for the session (Engine.flows), so that
-	// InviteFailed can tell a failure that a later registration overtook.
-	flow uint64
+	// InviteFailed can tell a failure that a later registration overtook,
+	// and asked the registration number of that moment (flowSeq), which a
+	// wake telling of a registration elsewhere is compared to
+	// (Engine.wokeAt).
+	flow, asked uint64
 }

@@ -84,17 +84,24 @@ type Audience struct {
 // flow, which the owner takes as UserRegistered does for the group: the
 // invitation it last asked for user, which would hold its copies back
 // until InviteTimeout, and its pager-only mark, are forgotten (code review
-// on #464). The registration also gets a new number here, as
-// UserRegistered gives one, so that the failure of an invitation asked
-// before it, which may come in after the wake, is not marked and does not
-// hold the copies back again (#564).
+// on #464). The failure of that invitation, which may come in after the
+// wake, is overtaken and not marked, as a registration here overtakes one
+// (InviteFailed, #564). Only this group's: the user's other invitations
+// were not forgotten, so their failures still count, and the
+// registration is not told on to other owners, whom the task that saw it
+// wakes itself (code review of #576).
 func (e *Engine) Wake(user, group string, registered bool) {
 	e.metrics.Count("group.wake", 1)
 	if registered {
+		key := inviteKey{user, group, store.Group, ""}
 		e.mu.Lock()
-		e.numberFlowLocked(user)
 		delete(e.pagerOnly, user)
-		delete(e.invites, inviteKey{user, group, store.Group, ""})
+		delete(e.invites, key)
+		if _, ok := e.wokeAt[key]; !ok && len(e.wokeAt) >= e.cfg.MaxTracked {
+			clear(e.wokeAt)
+		}
+		e.flowSeq++
+		e.wokeAt[key] = e.flowSeq
 		e.mu.Unlock()
 	}
 	e.kickEvent(user)
