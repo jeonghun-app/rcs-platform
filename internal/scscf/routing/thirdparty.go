@@ -3,6 +3,7 @@ package routing
 import (
 	"bytes"
 	"context"
+	"errors"
 	"mime/multipart"
 	"net/textproto"
 	"slices"
@@ -13,6 +14,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // Sender sends a request in a client transaction to the next hop its
@@ -23,6 +25,19 @@ import (
 type Sender interface {
 	Send(ctx context.Context, req *sip.Request) (*sip.Response, error)
 }
+
+// DestinationSender is a Sender that can send to an address given, which
+// lets a third-party REGISTER go on to the next address of its server
+// (#580). An error that wraps ErrNotSent is a send that failed before the
+// request was written, a connection not made say: only that one goes on.
+type DestinationSender interface {
+	Sender
+	SendTo(ctx context.Context, req *sip.Request, dst transport.Destination) (*sip.Response, error)
+}
+
+// ErrNotSent is a DestinationSender's error for a request it never wrote,
+// so that the server cannot have it.
+var ErrNotSent = errors.New("routing: the request was not sent")
 
 // thirdParty is the third-party registrations under way, queued per
 // application server so that one that does not answer holds up no other
@@ -353,7 +368,7 @@ func (rt *Router) registerWith(ctx context.Context, r registrar.ThirdPartyRegist
 	}
 	ctx, cancel := rt.bounded(ctx, rt.cfg.ThirdPartyTimeout)
 	defer cancel()
-	res, err := rt.cfg.Sender.Send(ctx, req)
+	res, err := rt.sendThirdParty(ctx, req, as)
 	if err != nil && rt.halted.Err() != nil {
 		// Cut short by the stop, not unanswered: no default handling.
 		rt.count("routing.third_party.dropped_at_stop")
@@ -373,6 +388,50 @@ func (rt *Router) registerWith(ctx context.Context, r registrar.ThirdPartyRegist
 		rt.count("routing.third_party.terminated_unanswered")
 		rt.log.Warn("routing: a third-party REGISTER whose default handling ends the session had no answer; the user stays registered")
 	}
+}
+
+// sendThirdParty sends req, a third-party REGISTER, to server: to each of
+// its addresses in turn, those that just failed last (asAddresses), as
+// long as a send fails before the request is written (ErrNotSent), as a
+// request to a server goes on to its next address (toAS, #580). One that
+// was written is not sent again elsewhere, as the server may have it: a
+// timeout or a lost connection after it is the default handling's. Without
+// a resolver, or a Sender that takes an address, the Sender resolves it.
+func (rt *Router) sendThirdParty(ctx context.Context, req *sip.Request, server sip.URI) (*sip.Response, error) {
+	ds, ok := rt.cfg.Sender.(DestinationSender)
+	var addrs []transport.Destination
+	if ok {
+		addrs = rt.asAddresses(ctx, server)
+	}
+	if len(addrs) == 0 {
+		return rt.cfg.Sender.Send(ctx, req)
+	}
+	var err error
+	for i, dst := range addrs {
+		var res *sip.Response
+		// A copy each time: the send puts its own Via on it.
+		if res, err = ds.SendTo(ctx, req.Clone(), dst); !failsOverSend(err) {
+			return res, err
+		}
+		rt.down.mark(dst.Addr, rt.cfg.Now().Add(rt.cfg.ASDownFor))
+		if ctx.Err() != nil {
+			// The REGISTER's time ran out, or the stop cut it, while this
+			// address took its dial: none is left for another (#592 code
+			// review), and a send would only be written and abandoned.
+			return nil, err
+		}
+		if i+1 < len(addrs) {
+			rt.count("routing.as_failover")
+		}
+	}
+	return nil, err
+}
+
+// failsOverSend reports a send that failed before its request was
+// written, for want of a connection, as failsOver does for a branch: a
+// local want of capacity is not, as no other address helps it.
+func failsOverSend(err error) bool {
+	return errors.Is(err, ErrNotSent) && !errors.Is(err, transport.ErrQueueFull) && !errors.Is(err, transport.ErrTooManyConnections)
 }
 
 // thirdPartyRequest is the third-party REGISTER to as for r (§5.4.1.7): from
