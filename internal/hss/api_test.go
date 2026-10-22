@@ -21,6 +21,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -80,7 +81,7 @@ func newAPIEnv(t *testing.T, mutate ...func(*APIOptions)) *apiEnv {
 	t.Helper()
 	a := &apiEnv{env: newEnv(t), notifier: newRecorder(), now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	o := APIOptions{
-		Tokens:         Tokens{Admin: TokenPair{adminToken, adminTokenNext}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}},
+		Tokens:         Tokens{Admin: TokenPair{secret.NewString(adminToken), secret.NewString(adminTokenNext)}, ACS: TokenPair{Current: secret.NewString(acsToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}},
 		Notifier:       a.notifier,
 		DefaultProfile: DefaultProfileID,
 		Now:            func() time.Time { a.mu.Lock(); defer a.mu.Unlock(); return a.now },
@@ -160,7 +161,7 @@ func (a *apiEnv) create(impi string, managed bool, impus ...string) {
 }
 
 func TestAPIAnswers503WhenNoTokenIsConfigured(t *testing.T) {
-	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens = Tokens{FT: TokenPair{Current: ftToken}} })
+	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens = Tokens{FT: TokenPair{Current: secret.NewString(ftToken)}} })
 	for _, path := range []string{"/v1/subscriptions/" + impi1, "/v1/service-profiles/" + DefaultProfileID} {
 		code, body, h := a.do("GET", path, adminToken, "")
 		if code != http.StatusServiceUnavailable || body["error"] == nil || h.Get("Retry-After") == "" {
@@ -596,7 +597,7 @@ func TestFTCredentialFollowsFtServersContract(t *testing.T) {
 func TestFTCredentialsNeedAnFTRealm(t *testing.T) {
 	e := newEnv(t)
 	h := e.newHSS(func(o *Options) { o.FTRealm = "" })
-	a := &apiEnv{env: e, api: h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: adminToken}, FT: TokenPair{Current: ftToken}}, DefaultProfile: DefaultProfileID})}
+	a := &apiEnv{env: e, api: h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: secret.NewString(adminToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}}, DefaultProfile: DefaultProfileID})}
 	a.create(impi1, true, impu1)
 	if code, _, _ := a.do("POST", subPath(impi1, "/ft-credential"), adminToken, ""); code != http.StatusNotImplemented {
 		t.Errorf("issue = %d", code)
@@ -609,7 +610,7 @@ func TestFTCredentialsNeedAnFTRealm(t *testing.T) {
 func TestStoreFailuresAre503SoCallersRetry(t *testing.T) {
 	fs := &failingStore{Store: store.NewMemory()}
 	e := newEnvWith(t, fs)
-	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: adminToken}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}}, DefaultProfile: DefaultProfileID})}
+	a := &apiEnv{env: e, api: e.h.NewAPI(APIOptions{Tokens: Tokens{Admin: TokenPair{Current: secret.NewString(adminToken)}, ACS: TokenPair{Current: secret.NewString(acsToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}}, DefaultProfile: DefaultProfileID})}
 	a.create(impi1, true, impu1)
 	fs.fail.Store(true)
 	for _, c := range []struct{ method, path, token, body string }{
@@ -973,7 +974,7 @@ func TestARefusedPPRWhoseStateCannotBeWrittenLetsTheNextGo(t *testing.T) {
 				t.Fatal(err)
 			}
 			n := &refusingOnce{recordingNotifier: newRecorder(), result: result, fs: fs}
-			e.h.notify(t.Context(), n, next, p, pushes, time.Second)
+			e.h.notify(t.Context(), n, next, p, pushes, pushTimes{each: time.Second})
 			if rtrs, pprs := n.got(); len(pprs) != 2 || len(rtrs) != 0 {
 				t.Fatalf("%d PPRs, %d RTRs; want both PPRs and no RTR", len(pprs), len(rtrs))
 			}
@@ -982,20 +983,25 @@ func TestARefusedPPRWhoseStateCannotBeWrittenLetsTheNextGo(t *testing.T) {
 }
 
 // QA on #476: an S-CSCF slow to answer the old set's PPR, past the push
-// timeout, leaves the new set's PPR its own time: it is still sent.
+// timeout, leaves the new set's PPR its own time: it is still sent. The old
+// set's answer is held until the test ends, so it is late however loaded
+// the host, and the time each PPR had is read from its own deadline, which
+// no load shortens (#540).
 func TestASlowAnswerLeavesTheNextPushItsOwnTime(t *testing.T) {
 	const timeout = time.Second
 	a := newAPIEnv(t, func(o *APIOptions) { o.PushTimeout = timeout })
 	n := serveHSS(t, a.h, "hss-a.rcs.local")
+	held := make(chan struct{})
 	scscf := connectScriptedSCSCF(t, n, "scscf-1.rcs.local", func(i int) time.Duration {
 		if i == 0 {
-			return timeout + timeout/2
+			<-held
 		}
 		return 0
 	})
-	p := NewPusher(n.node, PusherOptions{SCSCFHostPattern: "scscf-*.rcs.local", Timeout: timeout, Metrics: a.metrics})
+	t.Cleanup(func() { close(held) })
+	p := &deadlines{Notifier: NewPusher(n.node, PusherOptions{SCSCFHostPattern: "scscf-*.rcs.local", Timeout: timeout, Metrics: a.metrics})}
 	a.api = a.h.NewAPI(APIOptions{
-		Tokens:   Tokens{Admin: TokenPair{adminToken, adminTokenNext}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}},
+		Tokens:   Tokens{Admin: TokenPair{secret.NewString(adminToken), secret.NewString(adminTokenNext)}, ACS: TokenPair{Current: secret.NewString(acsToken)}, FT: TokenPair{Current: secret.NewString(ftToken)}},
 		Notifier: p, DefaultProfile: DefaultProfileID, PushTimeout: timeout,
 	})
 	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, impu2, 1, impu1, 0, tel1, 0)); code != http.StatusCreated {
@@ -1010,9 +1016,42 @@ func TestASlowAnswerLeavesTheNextPushItsOwnTime(t *testing.T) {
 	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, impu2, 1, tel1, 1, impu1, 0)); code != http.StatusOK {
 		t.Fatalf("put = %d %v", code, body)
 	}
-	if got := scscf.pprs.Load(); got != 2 {
-		t.Fatalf("the S-CSCF got %d PPRs, want the old set's and the new set's", got)
+	got := p.all()
+	if len(got) != 2 {
+		t.Fatalf("%d PPRs were pushed, want the old set's and the new set's", len(got))
 	}
+	// Sharing the first's time, the second would have its deadline.
+	if !got[1].After(got[0].Add(timeout / 2)) {
+		t.Errorf("the new set's PPR had until %v, the old set's until %v: not a time of its own", got[1], got[0])
+	}
+	deadline := time.Now().Add(realWait)
+	for scscf.pprs.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the S-CSCF got %d PPRs, want the old set's and the new set's", scscf.pprs.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// deadlines records the deadline of each PPR's context, and passes it on.
+type deadlines struct {
+	Notifier
+	mu  sync.Mutex
+	got []time.Time
+}
+
+func (d *deadlines) PushProfile(ctx context.Context, r *cx.PPR) error {
+	dl, _ := ctx.Deadline()
+	d.mu.Lock()
+	d.got = append(d.got, dl)
+	d.mu.Unlock()
+	return d.Notifier.PushProfile(ctx, r)
+}
+
+func (d *deadlines) all() []time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.got)
 }
 
 // connectScriptedSCSCF connects an S-CSCF to the HSS node to, which answers
@@ -1117,7 +1156,7 @@ func TestReKeyingWithoutASequenceNumberKeepsTheCounter(t *testing.T) {
 // The audit slot comes from the variable a token was set in, so a rotation
 // that empties HSS_*_TOKEN first still shows the next token as "next".
 func TestAuditSlotFollowsTheTokenVariable(t *testing.T) {
-	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens.ACS = TokenPair{Next: acsToken} })
+	a := newAPIEnv(t, func(o *APIOptions) { o.Tokens.ACS = TokenPair{Next: secret.NewString(acsToken)} })
 	a.create(impi1, true, impu1)
 	a.do("GET", subPath(impi1), acsToken, "")
 	var last map[string]any
@@ -1139,5 +1178,253 @@ func TestDecodeStrictRefusesKeysThatDifferOnlyInCase(t *testing.T) {
 		if code, resp, _ := a.do("POST", "/v1/subscriptions", adminToken, body); code != http.StatusBadRequest {
 			t.Fatalf("variant %q = %d, acs_managed %v; want 400", variant, code, resp["acs_managed"])
 		}
+	}
+}
+
+// silentNotifier holds every push until its context ends, as an S-CSCF
+// that keeps the connection and never answers. It records when the first
+// push came and the latest deadline of any.
+type silentNotifier struct {
+	mu       sync.Mutex
+	sent     int
+	first    time.Time
+	deadline time.Time
+}
+
+func (n *silentNotifier) hold(ctx context.Context) error {
+	d, _ := ctx.Deadline()
+	n.mu.Lock()
+	if n.sent == 0 {
+		n.first = time.Now()
+	}
+	n.sent++
+	if d.After(n.deadline) {
+		n.deadline = d
+	}
+	n.mu.Unlock()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (n *silentNotifier) Deregister(ctx context.Context, _ *cx.RTR) error { return n.hold(ctx) }
+
+func (n *silentNotifier) PushProfile(ctx context.Context, _ *cx.PPR) error { return n.hold(ctx) }
+
+// sevenSets provisions impi1 in seven implicit sets, all registered, and a
+// second profile, chat, to move it to.
+func (a *apiEnv) sevenSets(t *testing.T) []any {
+	t.Helper()
+	ids := []any{impu1, 0, tel1, 1, impu2, 2, "tel:+15550100002", 3, impu3, 4, "tel:+15550100003", 5, impu4, 6}
+	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, ids...)); code != http.StatusCreated {
+		t.Fatalf("create = %d %v", code, body)
+	}
+	a.modify(impi1, func(s *store.Subscription) {
+		s.ServerName = scscfName
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].State = store.Registered
+		}
+	})
+	if code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, chatProfile); code != http.StatusCreated {
+		t.Fatalf("profile = %d %v", code, body)
+	}
+	return ids
+}
+
+// chatProfile is a second service profile, chat, whose iFC sends MESSAGE
+// to rcs-as.
+const chatProfile = `{"id":"chat","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[{"group":[0],"method":"MESSAGE"}]},` +
+	`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_TERMINATED"}}],"mandatory_capabilities":[1]}`
+
+// toChat is ids moved to the chat profile: a PPR for each served set.
+func toChat(ids []any) string {
+	return strings.Replace(setsBody(impi1, ids...), `"acs_managed":true}`, `"acs_managed":true,"service_profile":"chat"}`, 1)
+}
+
+// #491: a change of a subscription served in seven implicit sets, at an
+// S-CSCF that never answers, takes no longer than the push budget, which
+// keeps the API's answer within its write timeout: the pushes left when it
+// runs out are not sent, are counted and logged once, without any
+// identifier in the clear, and their sets are marked stale.
+func TestAChangesPushesStayWithinTheBudget(t *testing.T) {
+	const each, budget, reserve = 200 * time.Millisecond, 600 * time.Millisecond, 50 * time.Millisecond
+	silent := &silentNotifier{}
+	a := newAPIEnv(t, func(o *APIOptions) {
+		o.Notifier, o.PushTimeout, o.PushBudget, o.staleReserve = silent, each, budget, reserve
+	})
+	ids := a.sevenSets(t)
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	silent.mu.Lock()
+	defer silent.mu.Unlock()
+	sent, skipped := int64(silent.sent), a.metrics.get("push.over_budget")
+	// The first PPR has its timeout and the second what is left before the
+	// end, less a timeout kept for a refusal's follow-up: the five after
+	// have less than pushFloor.
+	if sent+skipped != 7 || sent > 2 {
+		t.Fatalf("%d pushes sent, %d left over budget; want the seven, at most two sent", sent, skipped)
+	}
+	// No push had longer than the budget, less what it keeps, from the
+	// change's start, which is before the first push: the deadlines are
+	// compared, not the time the host took (#275).
+	if late := silent.deadline.Sub(silent.first.Add(budget - reserve - each)); late > 0 {
+		t.Errorf("a push's deadline is %v past what the budget leaves it", late)
+	}
+	// Stale: the sets left over, and the one the budget cut short; not the
+	// first, which had its whole timeout and failed as any push may.
+	if s := a.sub(impi1); !slices.Equal(s.StaleSets, []int{1, 2, 3, 4, 5, 6}) {
+		t.Errorf("stale sets %v, %d pushes left over", s.StaleSets, skipped)
+	}
+	var lines []string
+	for _, l := range strings.Split(a.logs.String(), "\n") {
+		if strings.Contains(l, "ran out of time") {
+			lines = append(lines, l)
+		}
+	}
+	if len(lines) != 1 || !strings.Contains(lines[0], `"left":`+strconv.FormatInt(skipped, 10)) || !strings.Contains(lines[0], `"impi":"***`) {
+		t.Fatalf("over-budget log lines %q", lines)
+	}
+	for _, clear := range []string{impi1, imsi1, "15550100", domain} {
+		if strings.Contains(lines[0], clear) {
+			t.Errorf("the log line names %q in the clear: %s", clear, lines[0])
+		}
+	}
+}
+
+// #491, the lead's decision on #524: what an over-budget change left out
+// reaches the S-CSCF with the next registration or re-registration of each
+// set, though the S-CSCF says it holds the data (TS 29.228 §6.6), once;
+// any other SAR gets the data too, and leaves the set stale.
+func TestAStaleSetsNextRegistrationGetsItsUserData(t *testing.T) {
+	const each, budget, reserve = 200 * time.Millisecond, 600 * time.Millisecond, 50 * time.Millisecond
+	silent := &silentNotifier{}
+	a := newAPIEnv(t, func(o *APIOptions) {
+		o.Notifier, o.PushTimeout, o.PushBudget, o.staleReserve = silent, each, budget, reserve
+	})
+	ids := a.sevenSets(t)
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	s := a.sub(impi1)
+	if len(s.StaleSets) == 0 || !slices.Contains(s.StaleSets, 6) {
+		t.Fatalf("stale sets %v", s.StaleSets)
+	}
+	c := connectCSCF(t, serveHSS(t, a.h, "hss-a.rcs.local"), "scscf-1.rcs.local")
+	reregister := func() *cx.SAA {
+		r := &cx.SAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentities: []string{impu4},
+			ServerName: scscfName, AssignmentType: cx.ReRegistration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable}
+		saa, err := cx.ParseSAA(c.send(r.Message(c.node)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return saa
+	}
+	// An UNREGISTERED_USER SAR gets the data too, but our S-CSCF drops it
+	// (#536): the set stays stale (code review on #524).
+	unr := &cx.SAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentities: []string{impu4},
+		ServerName: scscfName, AssignmentType: cx.UnregisteredUser}
+	if saa, err := cx.ParseSAA(c.send(unr.Message(c.node))); err != nil || saa.UserData == nil {
+		t.Fatalf("the stale set's UNREGISTERED_USER SAR got %+v, %v", saa, err)
+	}
+	if s := a.sub(impi1); !slices.Contains(s.StaleSets, 6) {
+		t.Fatalf("an UNREGISTERED_USER SAR cleared set 6: %v", s.StaleSets)
+	}
+	saa := reregister() // impu4's set, 6, was left over
+	if saa.Result != resSuccess || saa.UserData == nil {
+		t.Fatalf("the stale set's re-registration got %+v", saa)
+	}
+	doc, err := ifc.ParseSubscription(saa.UserData)
+	if err != nil || len(doc.ServiceProfiles) != 1 || len(doc.ServiceProfiles[0].InitialFilterCriteria) != 1 ||
+		doc.ServiceProfiles[0].InitialFilterCriteria[0].ApplicationServer.ServerName != asURI {
+		t.Fatalf("User-Data %v %+v, want chat's", err, doc)
+	}
+	if s := a.sub(impi1); slices.Contains(s.StaleSets, 6) {
+		t.Errorf("set 6 still stale: %v", s.StaleSets)
+	}
+	if saa := reregister(); saa.UserData != nil {
+		t.Error("User-Data again, once the set had it")
+	}
+}
+
+// Code review on #524: the shared profile's fan-out runs in the background
+// and answers no request, so it has no budget: a subscriber's pushes each
+// have the push timeout, however long they all take.
+func TestTheFanOutHasNoBudget(t *testing.T) {
+	slow := &slowNotifier{wait: 50 * time.Millisecond}
+	a := newAPIEnv(t, func(o *APIOptions) {
+		o.Notifier, o.PushTimeout, o.PushBudget, o.staleReserve = slow, time.Second, 100*time.Millisecond, 10*time.Millisecond
+	})
+	ids := a.sevenSets(t)
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	before := slow.count()
+	updated := strings.Replace(chatProfile, `"MESSAGE"`, `"INVITE"`, 1)
+	if code, body, _ := a.do("PUT", "/v1/service-profiles/chat", adminToken, updated, "If-Match", `"1"`); code != http.StatusOK {
+		t.Fatalf("profile put = %d %v", code, body)
+	}
+	deadline := time.Now().Add(realWait)
+	for slow.count()-before < 7 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the fan-out pushed %d of the seven sets", slow.count()-before)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// slowNotifier answers every push after wait.
+type slowNotifier struct {
+	wait time.Duration
+	mu   sync.Mutex
+	n    int
+}
+
+func (n *slowNotifier) count() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.n
+}
+
+func (n *slowNotifier) Deregister(_ context.Context, _ *cx.RTR) error { return n.answer() }
+
+func (n *slowNotifier) PushProfile(_ context.Context, _ *cx.PPR) error { return n.answer() }
+
+func (n *slowNotifier) answer() error {
+	time.Sleep(n.wait)
+	n.mu.Lock()
+	n.n++
+	n.mu.Unlock()
+	return nil
+}
+
+// #491: HSS_PUSH_TIMEOUT is at most MaxPushTimeout, so that a PPR and what
+// its refusal brings fit in the change's budget, and HSS_API_TIMEOUT at most
+// MaxAPITimeout, so that the change's store work and the budget fit in the
+// API's write timeout.
+func TestThePushTimeoutIsBounded(t *testing.T) {
+	if 2*MaxPushTimeout+staleReserve > PushBudget || MaxAPITimeout+PushBudget >= apiWriteTimeout {
+		t.Fatalf("timeout %v, budget %v, store work %v, write timeout %v", MaxPushTimeout, PushBudget, MaxAPITimeout, apiWriteTimeout)
+	}
+}
+
+// Code review on #524 (round 2): the profile read for a change's pushes is
+// within the change's budget, not a push timeout of its own.
+func TestTheProfileReadIsWithinTheBudget(t *testing.T) {
+	const each, budget = time.Second, 300 * time.Millisecond
+	a := newAPIEnv(t, func(o *APIOptions) { o.PushTimeout, o.PushBudget, o.staleReserve = each, budget, 10*time.Millisecond })
+	ids := a.sevenSets(t)
+	cs := &ctxStore{Store: a.store}
+	a.h.store = cs
+	start := time.Now()
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, toChat(ids)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if len(cs.reads) == 0 {
+		t.Fatal("no profile read")
+	}
+	if d := cs.reads[len(cs.reads)-1]; d.After(time.Now().Add(budget)) || d.Sub(start) >= each {
+		t.Errorf("the profile read's deadline is %v after the change began, the budget %v", d.Sub(start), budget)
 	}
 }

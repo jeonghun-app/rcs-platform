@@ -189,7 +189,7 @@ func userOf(t *testing.T, doc *conference.Info, entity string) conference.User {
 func TestASubscriberGetsTheRosterThenEachChange(t *testing.T) {
 	g := newGroupRig(t, bob, carol)
 	res, _ := g.subscribe(t, alice, "600")
-	if res.StatusCode != 200 || res.Header.Get("Expires") != "600" || res.Header.Get("Contact") != "<"+g.uri+">" {
+	if res.StatusCode != 200 || res.Header.Get("Expires") != "600" || res.Header.Get("Contact") != "<"+g.uri+";transport=tcp>" {
 		t.Fatalf("SUBSCRIBE answered %d, Expires %q, Contact %q", res.StatusCode, res.Header.Get("Expires"), res.Header.Get("Contact"))
 	}
 	first := g.nextNotify(t)

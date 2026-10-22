@@ -1,8 +1,10 @@
 package hss
 
 import (
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
@@ -18,6 +20,9 @@ func TestConcurrentMARsOnTwoTasksNeverShareASequenceNumber(t *testing.T) {
 	concurrentMARs(t, e, e.h, e.newHSS(nil))
 }
 
+// marWait is the Cx timeout of the concurrent MARs: only a hang guard.
+const marWait = 30 * time.Second
+
 // concurrentMARs runs the check with two HSS tasks over e's store.
 func concurrentMARs(t *testing.T, e *env, a, b *HSS) {
 	e.provision(impi1, impu1)
@@ -25,10 +30,23 @@ func concurrentMARs(t *testing.T, e *env, a, b *HSS) {
 	// the other clients' MARs on the same task, as well as its own reads
 	// and writes, and the retries of a write that lost to the other task,
 	// which run until that deadline (#200). On a loaded host DynamoDB Local
-	// takes more than DefaultCxTimeout for that. The property here is the
-	// sequence numbers, so the bound is only the hang guard.
-	taskA := serveHSSWith(t, a, "hss-a.rcs.local", realWait)
-	taskB := serveHSSWith(t, b, "hss-b.rcs.local", realWait)
+	// takes more than DefaultCxTimeout for that, and more than 10 s when
+	// make test-integration's other packages share it (#487). The property
+	// here is the sequence numbers, so the bound is only the hang guard.
+	taskA := serveHSSWith(t, a, "hss-a.rcs.local", marWait)
+	taskB := serveHSSWith(t, b, "hss-b.rcs.local", marWait)
+	t.Cleanup(func() {
+		if t.Failed() {
+			// What made a MAR fail: a deadline or a write that kept
+			// losing to the other task (errContention) (#487).
+			t.Logf("store.conflict %d, cx.mar.error %d", e.metrics.get("store.conflict"), e.metrics.get("cx.mar.error"))
+			for _, l := range strings.Split(e.logs.String(), "\n") {
+				if strings.Contains(l, "Cx request failed") {
+					t.Log(l)
+				}
+			}
+		}
+	})
 	clients := []*cscf{
 		connectCSCF(t, taskA, "scscf-1.rcs.local"),
 		connectCSCF(t, taskB, "scscf-2.rcs.local"),

@@ -49,8 +49,9 @@ func build(t *testing.T, pkgs ...string) string {
 
 // checkResults checks rcs-sim's output: every line a successful result, the
 // steps in want among them, the resume and busy rules below, and none of
-// leaks, test numbers, URLs or MSRP URIs on either stream.
-func checkResults(t *testing.T, stdout, stderr string, want []string, leaks ...string) {
+// leaks, test numbers, URLs or MSRP URIs on either stream. It returns the
+// results by scenario/step.
+func checkResults(t *testing.T, stdout, stderr string, want []string, leaks ...string) map[string]result {
 	t.Helper()
 	seen := map[string]result{}
 	sc := bufio.NewScanner(strings.NewReader(stdout))
@@ -97,4 +98,5 @@ func checkResults(t *testing.T, stdout, stderr string, want []string, leaks ...s
 			t.Errorf("rcs-sim printed %q", leak)
 		}
 	}
+	return seen
 }

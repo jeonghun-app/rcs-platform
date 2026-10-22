@@ -113,7 +113,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Shuffle: func(p []*diameter.Peer) { mathrand.Shuffle(len(p), func(i, j int) { p[i], p[j] = p[j], p[i] }) },
 	})
 	api := h.NewAPI(APIOptions{
-		Tokens: cfg.Tokens.t, ACSRate: float64(cfg.ACSRate), ACSBurst: cfg.ACSBurst, Notifier: pusher,
+		Tokens: cfg.Tokens, ACSRate: float64(cfg.ACSRate), ACSBurst: cfg.ACSBurst, Notifier: pusher,
 		DefaultProfile: cfg.DefaultProfile, PushTimeout: cfg.PushTimeout, StoreTimeout: cfg.APITimeout,
 	})
 
@@ -130,7 +130,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Handler:           api,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      apiWriteTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
 		ErrorLog:          runtime.HTTPErrorLog(rt.Logger),
@@ -195,8 +195,8 @@ func start(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (store.
 // openStore opens the store and the keyring the configuration names.
 func openStore(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) (store.Store, *keyring.Keyring, error) {
 	localKey := func() ([]byte, error) {
-		if cfg.DataKey.v != "" {
-			return base64.StdEncoding.DecodeString(cfg.DataKey.v)
+		if cfg.DataKey.RevealString() != "" {
+			return base64.StdEncoding.DecodeString(cfg.DataKey.RevealString())
 		}
 		// Memory store only (Configure requires the key otherwise): secrets
 		// live as long as the process, and so may the key.

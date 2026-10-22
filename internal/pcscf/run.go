@@ -16,6 +16,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
@@ -154,10 +155,11 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		flows: tr, now: d.now, log: rt.Logger, metrics: rt.Metrics,
 	}
 	pc.registry.perClient = cfg.MaxPendingRegistersPerIP
-	pc.dialogKey = make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, pc.dialogKey); err != nil {
+	dialogKey := make([]byte, 32)
+	if _, err := io.ReadFull(rand.Reader, dialogKey); err != nil {
 		return fmt.Errorf("pcscf: dialog key: %w", err)
 	}
+	pc.dialogKey = secret.NewKey(dialogKey)
 	pc.clientFlow = func(id transport.FlowID) bool { return isClientFlow(tr, id) }
 	subCtx, stopSubs := context.WithCancel(context.Background())
 	pc.subs = newSubscriptions(subCtx)
@@ -169,8 +171,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer pc.subs.close()
 	defer stopSubs()
 	var relay *relayClient
-	if cfg.RelayToken.v != "" && cfg.RelayURL != nil {
-		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken.v, cfg.RelayTimeout, relayDialer(cfg))
+	if !cfg.RelayToken.IsZero() && cfg.RelayURL != nil {
+		relay = newRelayClient(cfg.RelayURL, cfg.RelayToken, cfg.RelayTimeout, relayDialer(cfg))
 	}
 	anchorCtx, stopAnchor := context.WithCancel(context.Background())
 	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now).

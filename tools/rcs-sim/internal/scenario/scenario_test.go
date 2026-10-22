@@ -16,6 +16,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
@@ -56,7 +57,7 @@ func stackFT(t *testing.T) (scenario.Config, *simtest.FT) {
 		UploadSettle: time.Hour,
 		FileSize:     100 << 10,
 		ResumeSize:   5*part + 123,
-		Control:      &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)},
+		Control:      &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: secret.NewString(simtest.RelayToken)},
 		CoreListener: core.Lend,
 		MSRP:         msrp.Config{KeepAliveInterval: 100 * time.Millisecond},
 		IdleWait:     600 * time.Millisecond,
@@ -141,7 +142,7 @@ func TestUnknownScenariosAreRefusedBeforeAnythingRuns(t *testing.T) {
 	if !errors.Is(err, scenario.ErrUnknown) || ran {
 		t.Fatalf("Run = %v, ran %v", err, ran)
 	}
-	if names := scenario.Names(); strings.Join(names, " ") != "chat-client-originated chat-core-originated ft ft-resume pager-message reg-event" {
+	if names := scenario.Names(); strings.Join(names, " ") != "chat-client-originated chat-core-originated ft ft-resume options pager-message reg-event" {
 		t.Fatalf("Names = %v", names)
 	}
 }
@@ -501,7 +502,7 @@ func tlsStack(t *testing.T) scenario.Config {
 	cfg := stack(t)
 	core := simtest.ListenStandIn(t)
 	r := simtest.StartRelayBehindTLS(t, core.Port())
-	cfg.Control = &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)}
+	cfg.Control = &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: secret.NewString(simtest.RelayToken)}
 	cfg.CoreListener = core.Lend
 	cfg.TLS = &tls.Config{RootCAs: r.TLSRoots, MinVersion: tls.VersionTLS12}
 	return cfg
@@ -542,7 +543,7 @@ func TestAClientWithoutKeepAlivesFailsOverTLSToo(t *testing.T) {
 
 func TestAWrongRelayTokenFailsTheChatAtAllocation(t *testing.T) {
 	cfg := stack(t)
-	cfg.Control.Token = anchor.NewToken("wrong-wrong-wrong-wrong-wrong-wrong-wrong-xx")
+	cfg.Control.Token = secret.NewString("wrong-wrong-wrong-wrong-wrong-wrong-wrong-xx")
 	ok, results := runAll(t, cfg, "chat-client-originated")
 	last := results[len(results)-1]
 	if ok || last.Step != "allocate" || !strings.Contains(last.Error, "401") {

@@ -17,7 +17,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
-	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	groupstoretest "github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore/storetest"
@@ -52,31 +51,7 @@ func integrationTable(t *testing.T) (store.Store, *Store) {
 	}
 	ddb := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(endpoint) })
 	// The table as docs/rcs-as.md describes it for the infrastructure.
-	if _, err := ddb.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName:   aws.String(table),
-		BillingMode: dtypes.BillingModePayPerRequest,
-		AttributeDefinitions: []dtypes.AttributeDefinition{
-			{AttributeName: aws.String(attrPK), AttributeType: dtypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String(attrSK), AttributeType: dtypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String(attrBucket), AttributeType: dtypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String(attrExpires), AttributeType: dtypes.ScalarAttributeTypeN},
-		},
-		KeySchema: []dtypes.KeySchemaElement{
-			{AttributeName: aws.String(attrPK), KeyType: dtypes.KeyTypeHash},
-			{AttributeName: aws.String(attrSK), KeyType: dtypes.KeyTypeRange},
-		},
-		GlobalSecondaryIndexes: []dtypes.GlobalSecondaryIndex{{
-			IndexName: aws.String(IndexExpiry),
-			KeySchema: []dtypes.KeySchemaElement{
-				{AttributeName: aws.String(attrBucket), KeyType: dtypes.KeyTypeHash},
-				{AttributeName: aws.String(attrExpires), KeyType: dtypes.KeyTypeRange},
-			},
-			Projection: &dtypes.Projection{
-				ProjectionType:   dtypes.ProjectionTypeInclude,
-				NonKeyAttributes: []string{attrOwner, attrLease},
-			},
-		}},
-	}); err != nil {
+	if err := CreateMessagesTable(ctx, ddb, table); err != nil {
 		t.Fatalf("creating the table: %v", err)
 	}
 	s, err := New(ctx, Config{Table: table, Endpoint: endpoint})
@@ -223,18 +198,7 @@ func integrationGroups(t *testing.T) *Groups {
 		t.Fatal(err)
 	}
 	ddb := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(endpoint) })
-	if _, err := ddb.CreateTable(ctx, &dynamodb.CreateTableInput{
-		TableName:   aws.String(table),
-		BillingMode: dtypes.BillingModePayPerRequest,
-		AttributeDefinitions: []dtypes.AttributeDefinition{
-			{AttributeName: aws.String(attrPK), AttributeType: dtypes.ScalarAttributeTypeS},
-			{AttributeName: aws.String(attrSK), AttributeType: dtypes.ScalarAttributeTypeS},
-		},
-		KeySchema: []dtypes.KeySchemaElement{
-			{AttributeName: aws.String(attrPK), KeyType: dtypes.KeyTypeHash},
-			{AttributeName: aws.String(attrSK), KeyType: dtypes.KeyTypeRange},
-		},
-	}); err != nil {
+	if err := CreateGroupsTable(ctx, ddb, table); err != nil {
 		t.Fatalf("creating the table: %v", err)
 	}
 	g, err := NewGroups(ctx, Config{Table: table, Endpoint: endpoint})

@@ -58,18 +58,30 @@ const (
 	// notifier's queues, the Cx client and the transport, inside
 	// RCS_SHUTDOWN_TIMEOUT.
 	stopMargin = 5 * time.Second
-	// returnMargin is the end of stopMargin Run keeps for returning, the
-	// proxy's Close above all, so that it ends before the runtime's own
-	// deadline, which the default drain puts at the end of stopMargin
-	// (#439 QA).
-	returnMargin = 500 * time.Millisecond
+	// returnMargin is the end of stopMargin Run keeps for returning, so that
+	// it ends before the runtime's own deadline, which the default drain
+	// puts at the end of stopMargin (#439 QA). It holds the proxy's Close,
+	// a late end of the last wait (lateWake) and the goodbye's floor.
+	returnMargin = 1500 * time.Millisecond
+	// lateWake is how late the stop's last wait was seen to end on a
+	// loaded host, where the process may not run for a while: the goodbye
+	// up to 1.35 s past its deadline under the race detector, 2 CPUs and 16
+	// busy loops (#502, #549 code review). returnMargin is sized from it.
+	lateWake = 1350 * time.Millisecond
+	// goodbyeFloor is the least time the goodbye has to send its DPR, past
+	// stopBy if it starts that late (goodbyeDeadline).
+	goodbyeFloor = 100 * time.Millisecond
 	// closeMargin is the part of stopMargin before returnMargin kept for
 	// the closes: the transport's, the sends the router gave up on, and the
-	// Cx client's goodbye to the HSS. It is longer than coreDialTimeout, so
-	// that a send that began to open its connection just before the waits
-	// ended, which neither its context nor the transport's Close ends, is
-	// done within it (#439 code review; #462).
-	closeMargin = 3 * time.Second
+	// Cx client's goodbye to the HSS. The sends get all of it but
+	// goodbyeMargin: the transport's Close cuts a dial in progress (#474),
+	// so they return at once, within 1 ms in 86 of 90 loaded stops and
+	// 1.0 s at the slowest (#502). One still under way is waited for by the
+	// proxy's Close.
+	closeMargin = 2 * time.Second
+	// goodbyeMargin is the end of closeMargin the Cx client's goodbye (DPR)
+	// always has, however long the router's sends take to return (#502).
+	goodbyeMargin = time.Second
 	// coreDialTimeout bounds opening a connection to a P-CSCF, an
 	// application server or the I-CSCF: inside the VPC, where a stopped
 	// task drops the SYN, as icscf's.

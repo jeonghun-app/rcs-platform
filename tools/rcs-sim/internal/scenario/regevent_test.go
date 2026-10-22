@@ -1,11 +1,13 @@
 package scenario_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -399,4 +401,57 @@ func staleContact(body string) string {
 	body = strings.Replace(body, `id="r1" state="terminated"`, `id="r1" state="active"`, 1)
 	return strings.Replace(body, `</registration>`,
 		`<contact id="c9" state="active" event="registered" expires="600"><uri>sip:192.0.2.9:5060;transport=tcp</uri></contact></registration>`, 1)
+}
+
+// TestTheRegEventSkipsAContactWrittenRegisteredAgain (#543 code review):
+// scscf writes a contact that did not change as "registered", so after the
+// refresh's "refreshed" another binding's change brings the client's
+// contact as "registered" at the same CSeq. Nothing changed for it: the
+// unregister step skips that NOTIFY too.
+func TestTheRegEventSkipsAContactWrittenRegisteredAgain(t *testing.T) {
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	core.RepeatNotifies = true
+	var mu sync.Mutex
+	refreshed := 0
+	core.Rewrite = func(req *sip.Request) {
+		if req.Method != "NOTIFY" || !bytes.Contains(req.Body, []byte(`event="refreshed"`)) {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if refreshed++; refreshed == 2 {
+			// The refresh's repeat, as scscf writes it.
+			req.Body = bytes.Replace(req.Body, []byte(`event="refreshed"`), []byte(`event="registered"`), 1)
+		}
+	}
+	ok, results := runAll(t, cfg, "reg-event")
+	if !ok {
+		t.Fatalf("results %+v", results)
+	}
+	if got := byStep(results)["unregister"].Detail["skipped"]; got != 1 {
+		t.Errorf("unregister skipped %d NOTIFYs, want the one written registered again", got)
+	}
+}
+
+// TestTheRegEventToleratesRepeatedNotifies (#473 QA, #516): a network
+// that sends every NOTIFY of an active subscription twice, the state the
+// same and the version raised, still passes: each step waits for the
+// NOTIFY of the change it made, and skips, counted, the repeat before it.
+// The core gives each active contact its REGISTER's CSeq, as scscf does,
+// so re-register accepts its NOTIFY by the CSeq.
+func TestTheRegEventToleratesRepeatedNotifies(t *testing.T) {
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	core.RepeatNotifies = true
+	ok, results := runAll(t, cfg, "reg-event")
+	if !ok {
+		t.Fatalf("results %+v", results)
+	}
+	steps := byStep(results)
+	for _, step := range []string{"re-register", "unregister", "network-deregister"} {
+		if got := steps[step].Detail["skipped"]; got != 1 {
+			t.Errorf("%s skipped %d NOTIFYs, want the repeated one", step, got)
+		}
+	}
 }

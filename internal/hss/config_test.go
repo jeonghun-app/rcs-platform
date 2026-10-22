@@ -5,12 +5,14 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 var devEnv = map[string]string{
@@ -62,7 +64,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		c.SubscribersTable != "subscribers" || c.ProfilesTable != "service-profiles" || c.OriginHost != "" {
 		t.Fatalf("config = %+v", c)
 	}
-	if c.Tokens.t.Admin.Current != adminToken || c.Tokens.t.ACS.Current != acsToken || c.Tokens.t.FT.Current != ftToken || c.Tokens.t.Admin.Next != "" {
+	if c.Tokens.Admin.Current.RevealString() != adminToken || c.Tokens.ACS.Current.RevealString() != acsToken || c.Tokens.FT.Current.RevealString() != ftToken || !c.Tokens.Admin.Next.IsZero() {
 		t.Fatal("tokens not read")
 	}
 }
@@ -92,9 +94,22 @@ func TestConfigNeverPrintsItsSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []string{c.Tokens.String(), c.DataKey.String(), c.Tokens.GoString(), c.DataKey.GoString()} {
+	for _, s := range []string{c.Tokens.Admin.Current.String(), c.DataKey.String(), c.Tokens.ACS.Current.GoString(), c.DataKey.GoString()} {
 		if s != "[redacted]" {
 			t.Errorf("printed %q", s)
+		}
+	}
+	// These verbs over the whole Config, valid ones and the invalid %p and
+	// %w, which call no method and print the fields (#506, #538).
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{c, &c} {
+			out := fmt.Sprintf(verb, v)
+			for _, secret := range []string{adminToken[:12], acsToken[:12], ftToken[:12], key[:12], strings.Trim(fmt.Sprint([]byte(adminToken[:6])), "[]"), fmt.Sprintf("%x", adminToken[:6])} {
+				if strings.Contains(out, secret) {
+					t.Errorf("%s printed a secret: %s", verb, out)
+				}
+			}
 		}
 	}
 }
@@ -123,6 +138,8 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 		"no rate":                   {with(devEnv, "HSS_ACS_RATE", "0"), "HSS_ACS_RATE"},
 		"no Cx timeout":             {with(devEnv, "HSS_CX_TIMEOUT", "0s"), "HSS_CX_TIMEOUT"},
 		"start-up beyond 240 s":     {with(devEnv, "HSS_START_TIMEOUT", "241s"), "HSS_START_TIMEOUT"},
+		"push timeout beyond 8 s":   {with(devEnv, "HSS_PUSH_TIMEOUT", "9s"), "HSS_PUSH_TIMEOUT"},
+		"API timeout beyond 10 s":   {with(devEnv, "HSS_API_TIMEOUT", "11s"), "HSS_API_TIMEOUT"},
 		"bad networks":              {with(devEnv, "HSS_DIAMETER_PEER_NETWORKS", "10.0.0.1/8"), "HSS_DIAMETER_PEER_NETWORKS"},
 		"no IMS domain":             {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
 	} {
@@ -140,6 +157,9 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 	}
 	if c, err := configure(with(devEnv, "HSS_START_TIMEOUT", "240s")); err != nil || c.StartTimeout != 240*time.Second {
 		t.Errorf("a 240 s start-up: %v %v", err, c.StartTimeout)
+	}
+	if c, err := configure(with(devEnv, "HSS_PUSH_TIMEOUT", "8s", "HSS_API_TIMEOUT", "10s")); err != nil || c.PushTimeout != 8*time.Second || c.APITimeout != 10*time.Second {
+		t.Errorf("an 8 s push and a 10 s API timeout: %v %v %v", err, c.PushTimeout, c.APITimeout)
 	}
 }
 
@@ -225,6 +245,28 @@ func TestProductionRefusesOpenNetworksAndHalfRotations(t *testing.T) {
 		code, out := startUp(c.env)
 		if code != runtime.ExitFailure || !strings.Contains(out, "configuration rejected") || !strings.Contains(out, c.want) {
 			t.Errorf("%s: exit %d\n%s", name, code, out)
+		}
+	}
+}
+
+// The API's options, which run hands the tokens to, print none of them
+// either, under any verb, as the Config they come from (#533).
+func TestAPIOptionsNeverPrintTheirTokens(t *testing.T) {
+	o := APIOptions{Tokens: Tokens{
+		Admin: TokenPair{secret.NewString(adminToken), secret.NewString(adminTokenNext)},
+		ACS:   TokenPair{Current: secret.NewString(acsToken)},
+		FT:    TokenPair{Current: secret.NewString(ftToken)},
+	}}
+	// These verbs, valid ones and the invalid %p and %w, and the tokens
+	// as text, in hex either case and as %d writes bytes (#538).
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{o, &o, o.Tokens, o.Tokens.Admin} {
+			out := fmt.Sprintf(verb, v)
+			for _, tok := range []string{adminToken[:12], adminTokenNext[:12], acsToken[:12], ftToken[:12], fmt.Sprintf("%x", adminToken[:6]), fmt.Sprintf("%X", adminToken[:6]), strings.Trim(fmt.Sprint([]byte(adminToken[:6])), "[]")} {
+				if strings.Contains(out, tok) {
+					t.Errorf("%s printed a token: %s", verb, out)
+				}
+			}
 		}
 	}
 }

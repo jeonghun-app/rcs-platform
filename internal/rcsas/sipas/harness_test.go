@@ -57,7 +57,19 @@ func newFakeCore(t *testing.T) *fakeCore {
 	c := &fakeCore{t: t, l: l, got: make(chan *sip.Request, 64)}
 	c.setAnswer(func(*sip.Request) int { return 200 })
 	var wg sync.WaitGroup
-	t.Cleanup(func() { _ = l.Close(); wg.Wait() })
+	// The connections are closed here too: with two tasks (twoTasks), one
+	// may still hold a connection to the other's core when it ends.
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		_ = l.Close()
+		mu.Lock()
+		for _, nc := range conns {
+			_ = nc.Close()
+		}
+		mu.Unlock()
+		wg.Wait()
+	})
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -66,6 +78,9 @@ func newFakeCore(t *testing.T) *fakeCore {
 			if err != nil {
 				return
 			}
+			mu.Lock()
+			conns = append(conns, nc)
+			mu.Unlock()
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -204,6 +219,18 @@ const (
 // cfg without a conference factory or host gets the tests' own.
 func startASOn(t *testing.T, e Engine, groups Groups, cfg Config, tc transport.Config, tune ...func(*proxy.Config)) *as {
 	t.Helper()
+	var mk func(string) (Groups, error)
+	if groups != nil {
+		mk = func(string) (Groups, error) { return groups, nil }
+	}
+	return startASGroups(t, e, mk, cfg, tc, tune...)
+}
+
+// startASGroups is startASOn with the groups mk makes, if any, for the
+// task at the SIP instance address it is given: a group's owner names its
+// own (#121).
+func startASGroups(t *testing.T, e Engine, mk func(at string) (Groups, error), cfg Config, tc transport.Config, tune ...func(*proxy.Config)) *as {
+	t.Helper()
 	var p atomic.Pointer[proxy.Proxy]
 	tr, err := transport.New(tc, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
@@ -223,6 +250,12 @@ func startASOn(t *testing.T, e Engine, groups Groups, cfg Config, tc transport.C
 		t.Fatal(err)
 	}
 	cfg.Host, cfg.Listener, cfg.Contact, cfg.HomeDomain = "127.0.0.1", "core", self, domain
+	var groups Groups
+	if mk != nil {
+		if groups, err = mk(addr.String()); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if groups != nil && !cfg.groupChatOff {
 		cfg.GroupChat = true
 	}
@@ -468,6 +501,7 @@ func (e *fakeEngine) OpenLeg(messaging.LegParams) (*messaging.Leg, error) { retu
 func (e *fakeEngine) Offer(messaging.LegParams) (*messaging.Leg, error)   { return nil, errFakeLeg }
 func (e *fakeEngine) InviteFailed(messaging.Invitation, error)            {}
 func (e *fakeEngine) Invite(context.Context, messaging.Invitation)        {}
+func (e *fakeEngine) Wake(string, string, bool)                           {}
 
 func (e *fakeEngine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -85,7 +86,10 @@ type Config struct {
 	// MaxContextBytes bounds the bytes of the requests the contexts hold
 	// (see DefaultMaxContextBytes): a request that would take the total past
 	// it is answered 503 with Retry-After, and a branch that would fails as a
-	// 503 of its own.
+	// 503 of its own. A request from a client-facing listener, and its
+	// branches, may take the total only to Transaction.ClientShare of it, as
+	// at the layer's bounds, so that a flood of clients cannot turn away the
+	// core's terminating requests (#489).
 	MaxContextBytes int64
 	// Rand is the source of branch IDs and of the key behind the proxy's
 	// hashes; nil is crypto/rand. Branches start concurrently, so it must be
@@ -123,6 +127,9 @@ type Proxy struct {
 	maxCtx    int
 	maxBranch int
 	maxBytes  int64
+	// clientBytes is the part of maxBytes the contexts of requests from
+	// client-facing listeners may take the total to.
+	clientBytes int64
 	// bytes is what the contexts hold of maxBytes.
 	bytes atomic.Int64
 	// silent holds the responses the layer may hand to the sender but that
@@ -271,6 +278,7 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
 	}
+	p.clientBytes = transaction.ClientShareOf(cfg.MaxContextBytes, cmp.Or(tcfg.ClientShare, transaction.DefaultClientShare))
 	p.panics = panics.New(panics.Config{
 		Metric: MetricHookPanics, Message: "proxy: a service hook panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
 		Now: func() time.Time { return p.now() }, Start: p.started,
@@ -303,6 +311,16 @@ func (q quietSender) SendResponse(res *sip.Response, src transport.Source, opts 
 	return q.Sender.SendResponse(res, src, opts...)
 }
 
+// holdFinal holds res for a *transport.Transport sender's Flush until its
+// SendResponse begins, and returns the release, which respondFinal calls
+// once the transaction has done with it, whether it sent it or not.
+func (p *Proxy) holdFinal(res *sip.Response) (release func()) {
+	if tr, ok := p.sender.(*transport.Transport); ok {
+		return tr.HoldResponse(res)
+	}
+	return func() {}
+}
+
 // silence ends a server transaction without a response (RFC 4320 §4.2, and
 // Decision.Discard): the transaction is given res, which quietSender never
 // sends, so it completes and absorbs retransmissions as if it had answered.
@@ -316,11 +334,15 @@ func (p *Proxy) silence(tx *transaction.ServerTransaction, res *sip.Response) {
 }
 
 // reserve takes n bytes of MaxContextBytes, or reports false if they are not
-// free.
-func (p *Proxy) reserve(n int64) bool {
+// free: for a request from a client-facing listener, within its share.
+func (p *Proxy) reserve(n int64, client bool) bool {
+	limit := p.maxBytes
+	if client {
+		limit = p.clientBytes
+	}
 	for {
 		cur := p.bytes.Load()
-		if cur+n > p.maxBytes {
+		if cur+n > limit {
 			return false
 		}
 		if p.bytes.CompareAndSwap(cur, cur+n) {
@@ -351,7 +373,9 @@ func (p *Proxy) Layer() *transaction.Layer { return p.layer }
 // unless Config.DrainAnswer says otherwise, so its sender tries another
 // instance at once instead of waiting 64*T1 for its timers (#281). A request
 // a Serve handler is answering is the handler's: its context is cancelled,
-// and the handler answers, or the proxy for it once it returns. New
+// and the handler answers, or the proxy for it once it returns, and Drain
+// waits for that final, within DrainSendWait, as for its own answers
+// (#499). New
 // requests are still served meanwhile: a service's peers keep finding a
 // task until its Cloud Map registration and DNS answers age out, and pcscf
 // still reaches the clients it has not yet closed. It reports how many
@@ -405,8 +429,10 @@ func (p *Proxy) openContexts() []*respContext {
 
 // DrainSendWait bounds how long Drain waits, after the requests it waited
 // for, for the answers and CANCELs to be handed to the transport, which waits
-// at most its WriteTimeout for a slow peer, and then written. A service's
-// stop margin must leave room for it.
+// at most its WriteTimeout for a slow peer, and then written. The finals of
+// cancelled Serve handlers are waited for within it too, so a handler that
+// ignores its cancellation costs no more (#499). A service's stop margin
+// must leave room for it.
 const DrainSendWait = 2 * time.Second
 
 // drainDeadline is when a Drain that has answered or waited for its
@@ -657,7 +683,7 @@ func (p *Proxy) newContext(tx *transaction.ServerTransaction) *respContext {
 	cost := int64(len(req.Body)) + 2*header
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed || len(p.contexts) >= p.maxCtx || !p.reserve(cost) {
+	if p.closed || len(p.contexts) >= p.maxCtx || !p.reserve(cost, tx.Source().ClientFacing) {
 		return nil
 	}
 	c := newRespContext(p, tx, cost, header)

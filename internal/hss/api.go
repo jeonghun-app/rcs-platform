@@ -1,6 +1,7 @@
 package hss
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -19,6 +20,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Scope is what a caller of the provisioning API may do (ADR 0007 §3; the
@@ -59,8 +61,11 @@ type Tokens struct {
 // HSS_<CALLER>_TOKEN_NEXT); either may be empty. The audit log names the
 // slot a request used by the variable it came from, so it shows when the old
 // token is no longer used whichever order the rotation empties them in.
+// The tokens are secret.Keys, which print as "[redacted]" under every verb,
+// so a Tokens or an APIOptions printed by mistake shows none; NewAPI keeps
+// only their SHA-256 (#533).
 type TokenPair struct {
-	Current, Next string
+	Current, Next secret.Key
 }
 
 // MinTokenLength is the shortest token accepted in staging and prod: 256
@@ -76,8 +81,21 @@ const (
 	maxSmallBody        = 4 << 10
 )
 
-// DefaultPushTimeout bounds each RTR and PPR a provisioning request causes.
-const DefaultPushTimeout = 5 * time.Second
+// DefaultPushTimeout bounds each RTR and PPR a provisioning request causes,
+// and MaxPushTimeout is the most HSS_PUSH_TIMEOUT may be. PushBudget bounds
+// them all together, the profile read for them included: the API answers a
+// change once its pushes are done, and must do so within apiWriteTimeout,
+// the HTTP server's, after the change's store work, which MaxAPITimeout
+// bounds (#491). staleReserve is kept at the budget's end for marking the
+// sets of the pushes left over stale.
+const (
+	DefaultPushTimeout = 5 * time.Second
+	MaxPushTimeout     = 8 * time.Second
+	PushBudget         = 18 * time.Second
+	MaxAPITimeout      = 10 * time.Second
+	apiWriteTimeout    = 30 * time.Second
+	staleReserve       = time.Second
+)
 
 // APIOptions configures the provisioning API.
 type APIOptions struct {
@@ -92,8 +110,12 @@ type APIOptions struct {
 	Notifier Notifier
 	// DefaultProfile is used by subscriptions created without one.
 	DefaultProfile string
-	// PushTimeout bounds each request one change causes, each on its own.
+	// PushTimeout bounds each request one change causes, each on its own,
+	// and PushBudget, PushBudget when zero, all of them together.
 	PushTimeout time.Duration
+	PushBudget  time.Duration
+	// staleReserve, when a test sets it, replaces staleReserve.
+	staleReserve time.Duration
 	// FanoutWorkers bounds the PPRs sent at once after a shared profile
 	// changes; 8 when zero.
 	FanoutWorkers int
@@ -134,6 +156,8 @@ type API struct {
 	notifier       Notifier
 	defaultProfile string
 	pushTimeout    time.Duration
+	pushBudget     time.Duration
+	staleReserve   time.Duration
 	storeTimeout   time.Duration
 	workers        int
 
@@ -148,11 +172,15 @@ type API struct {
 func (h *HSS) NewAPI(o APIOptions) *API {
 	a := &API{
 		h: h, mux: http.NewServeMux(), notifier: o.Notifier, defaultProfile: o.DefaultProfile,
-		pushTimeout: o.PushTimeout, workers: o.FanoutWorkers, fanouts: map[string]context.CancelFunc{},
+		pushTimeout: o.PushTimeout, pushBudget: o.PushBudget, workers: o.FanoutWorkers, fanouts: map[string]context.CancelFunc{},
 	}
 	if a.pushTimeout <= 0 {
 		a.pushTimeout = DefaultPushTimeout
 	}
+	if a.pushBudget <= 0 {
+		a.pushBudget = PushBudget
+	}
+	a.staleReserve = cmp.Or(o.staleReserve, staleReserve)
 	if a.workers <= 0 {
 		a.workers = 8
 	}
@@ -173,11 +201,14 @@ func (h *HSS) NewAPI(o APIOptions) *API {
 	}
 	a.closing, a.close = context.WithCancel(context.Background())
 	add := func(scope Scope, pair TokenPair) {
-		for _, t := range []struct{ value, slot string }{{pair.Current, "current"}, {pair.Next, "next"}} {
-			if t.value == "" {
+		for _, t := range []struct {
+			value secret.Key
+			slot  string
+		}{{pair.Current, "current"}, {pair.Next, "next"}} {
+			if t.value.IsZero() {
 				continue
 			}
-			at := &acceptedToken{digest: sha256.Sum256([]byte(t.value)), scope: scope, slot: t.slot}
+			at := &acceptedToken{digest: sha256.Sum256(t.value.Reveal()), scope: scope, slot: t.slot}
 			if scope == ScopeACS {
 				at.limit = newBucket(rate, burst, now)
 			}
@@ -471,4 +502,10 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.status = http.StatusOK
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+// pushTimes are the bounds of one change's pushes (HSS.notify), its
+// budget running from now.
+func (a *API) pushTimes() pushTimes {
+	return pushTimes{each: a.pushTimeout, until: time.Now().Add(a.pushBudget), reserve: a.staleReserve}
 }

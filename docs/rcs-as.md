@@ -104,12 +104,12 @@ only the core reaches ([ADR 0007](adr/0007-internal-transport.md) §2). Its
 | Request | What rcs-as does |
 |---|---|
 | `MESSAGE` outside a dialog (pager mode, RFC 3428) | `Submit` with `Pager: true`, `Mode: Standalone`; answered as below |
-| any request to the conference factory or a conference URI, outside a dialog | a group chat's, told apart before anything else: an `INVITE` creates or joins the group, a `SUBSCRIBE` subscribes to its roster ([Group chat](#group-chat)), any other method is 405 with `Allow` |
+| any request to the conference factory or a conference URI, outside a dialog | a group chat's, told apart before anything else: an `INVITE` creates or joins the group, a `SUBSCRIBE` subscribes to its roster ([Group chat](#group-chat)), on the task that owns the group, to which another task forwards it ([Which task serves a group](#which-task-serves-a-group)); another task's wake `MESSAGE` has the owner read a queue; any other method is 405 with `Allow` |
 | `INVITE` outside a dialog | a chat or large-mode session, answered as in [Sessions](#sessions) |
 | `REGISTER` (scscf's third-party registration) | 200, and `UserRegistered` (see [Sessions](#sessions)) |
 | `OPTIONS` outside a dialog | forwarded along its `Route`, back to `scscf`: the default profile hands it to `rcs-as` with SESSION_CONTINUED, and capability discovery must not stop there |
-| any request in a dialog | served in its session (`BYE`, `INVITE`, `UPDATE`, `OPTIONS`, and `REFER` in a session with a group; any other method 405), or in its subscription to a group's roster (`SUBSCRIBE`); 481 when there is no such session, as for a `MESSAGE` in a dialog, since pager mode has none |
-| `ACK` | the ACK of a 2xx rcs-as sent is taken by its UAS; any other is dropped |
+| any request in a dialog | served in its session (`BYE`, `INVITE`, `UPDATE`, `OPTIONS`, and `REFER` in a session with a group; any other method 405), or in its subscription to a group's roster (`SUBSCRIBE`); one to a conference URI whose dialog this task does not hold goes to the group's owner; 481 when there is no such session, as for a `MESSAGE` in a dialog, since pager mode has none |
+| `ACK` | the ACK of a 2xx rcs-as sent is taken by its UAS; one to a conference URI goes to the group's owner; any other is dropped |
 | anything else | 405 with `Allow` |
 
 A request that rcs-as originated itself and that comes back to it is answered
@@ -264,6 +264,22 @@ relay's core path ([ADR 0004](adr/0004-msrp-anchoring.md)). rcs-as therefore
 always answers `passive` and listens: `msrp-relay` connects to
 `RCSAS_MSRP_LISTEN_ADDR`, where the engine's `Serve` binds the connection to
 the leg its To-Path names.
+
+The 200 with which rcs-as answers a chat, large-mode or group INVITE carries
+the request's `Record-Route` in order (RFC 3261 §12.1.1). It is the client's
+route set. `pcscf` refuses a client's request in a dialog on any other route,
+so without it the client could not send its BYE (#541). So does the 200 to a
+roster SUBSCRIBE, for a client that takes its route set from that 200, as
+rcsjta does: RFC 6665 §4.4.1 has a subscriber take it from the first NOTIFY's
+`Record-Route` instead, which the CSCFs do not add (#550).
+
+In a session with a group, and in a subscription to its roster, rcs-as's
+`Contact` is the group's conference URI with `transport=tcp`. `scscf` sends
+the requests in the dialog to that Contact and checks it is an application
+server's listener by port and transport. Without a transport it would read
+UDP on 5060 and refuse them 403. The transport does not change the URI as
+compared (RFC 3261 §19.1.4), so a client rejoins at the Contact it was given,
+and rcs-as reads the group from the user part.
 
 A client's INVITE (the originating session):
 
@@ -576,9 +592,8 @@ request to the conference factory or to a URI at the conference host is
 answered 404 (`sip.group.disabled`), before anything is read or created; it is
 not taken for a 1-to-1 request either. Group messages already queued are kept:
 their recipients are taken as offline, so the messages wait up to
-`RCSAS_STORE_TTL` and go once group chat is on again. Turn it on with rcs-as on
-a single task until
-[#121](https://github.com/jeonghun-app/rcs-platform/issues/121) (see below).
+`RCSAS_STORE_TTL` and go once group chat is on again. Each group is served by one
+task, its owner ([Which task serves a group](#which-task-serves-a-group)).
 
 How the SIP layer serves it:
 
@@ -680,7 +695,7 @@ How the SIP layer serves it:
   the change that says so, and its subscriptions end with it. On
   shutdown each subscription ends with `reason=deactivated`, so that the
   subscriber may subscribe again at once, to another task. Subscriptions are
-  kept in the task's memory only, as groups are single-task.
+  kept in the memory of the task that owns the group.
 - **REFER.** A participant adds someone by a REFER in its session with the
   group (RFC 4579 §5.5, rcsjta's `GroupChatSession.inviteParticipants`):
   `Refer-To` naming them, or a `cid:` URI with `Require: multiple-refer` and a
@@ -706,10 +721,86 @@ How the SIP layer serves it:
   the group cannot take (nobody else in the list), 500 with `Retry-After: 1`
   when the group kept changing under the request or the store was busy.
 
-Group mode is single-task for now: run it on one rcs-as task until
-[#121](https://github.com/jeonghun-app/rcs-platform/issues/121) anchors each
-group on one task (see [Assumptions and
-limitations](#assumptions-and-limitations)).
+### Which task serves a group
+
+Each group has one owner task (#121, the amendment to
+[ADR 0005](adr/0005-shared-state-and-instance-addressing.md); the store side is
+under [DynamoDB `groupchats` table](#dynamodb-groupchats-table)), and everything the group has
+on rcs-as is there: its participants' sessions and MSRP legs, its roster
+subscriptions, its fan-out and the invitations for its queued copies. The core
+may give a group's request to any task, a dialog's included: the Contact of a
+group's sessions and subscriptions is its conference URI.
+
+- **Forwarding.** A task that gets a request for a group another task owns,
+  alive, forwards it to the owner's SIP instance address, once
+  (`group.forwarded`): an `INVITE` or `SUBSCRIBE` to the conference URI, an
+  `INVITE` to the factory whose `Contribution-ID` names an existing group
+  (the creator's tried again, or anyone else's, which the owner refuses), and a
+  request in one of the group's dialogs, its `ACK` included, that this task does
+  not hold. The forwarded request carries a `Route` to the owner marked
+  `rcsas-fwd`, and no `Record-Route`; the owner serves it as any other, and the
+  responses come back the same way. A task that does not know the group, or
+  owns it, serves the request itself; one whose owner has stopped takes it over
+  first.
+- **No 404 for a group that exists.** A request that cannot reach the owner
+  now is answered 500 with `Retry-After` (`group.forward_refused`): one
+  forwarded here already, which is never forwarded again, so that two tasks
+  whose views of the owner differ for a moment cannot pass it between them; one
+  that arrives while this task's own heartbeat has lapsed, in a dialog it does
+  not hold too (never 481); one whose owner's stored address is not a private
+  address (RFC 1918, or IPv6 unique local, mapped addresses compared unmapped,
+  none with an interface zone) on rcs-as's own SIP port, which is checked
+  before anything is sent there (`group.forward_refused.address`); and one
+  forwarded to an owner that does not answer it, a closed port or a dial that
+  times out, whose 408 or the proxy's own 5xx becomes 500 with
+  `Retry-After` (the owner's own answers, a 404 for an ended group among
+  them, go as they are). rcsjta takes a 404 to its rejoin
+  for the group's end and restarts it at the factory, where the group's live
+  Contribution-ID is refused (403) and the chat fails; any other failure it
+  tries again later.
+- **A task that loses a group** ends what it holds of it: the sessions with
+  a BYE, once their 2xx is acknowledged (RFC 3261 §15) or Timer H has run
+  out, the subscriptions with `reason=deactivated` (`group.owner_lost`,
+  `sip.group.disowned.sessions`). The participants rejoin, and subscribe
+  again, through the owner. It loses a group when another task took it over,
+  when it drops the group from those it remembers owning, at
+  100 000 of them (`group.owned_dropped`), and every group when its
+  own lease runs out with no beat stored: at the first beat that fails past
+  `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after the last one stored,
+  whether the store is out for every task or for this one alone, as the
+  sessions can deliver nothing meanwhile (the lead's decision on #464), or
+  when a beat is stored that late.
+- **Wake.** A task's queue pass that finds a copy of another task's group
+  leaves it alone (`delivery.group_not_owned`), and has the owner read the
+  participant's queue: as when the participant registers on that task, which
+  the owner would otherwise only learn of at its next retry. It sends the
+  owner a `MESSAGE` to the conference URI, with the same marked `Route`, its
+  own address in `From` (never a conference URI or rcs-as's `rcsas-` tag,
+  which the loop guard refuses), and an
+  `application/vnd.rcsplatform.group-wake+json` body naming the participant,
+  and saying whether it registered on a new flow there since the last wake;
+  at most once per participant and group every `RCSAS_INVITE_TIMEOUT`, and
+  at once after such a registration (`group.wake_sent`,
+  `sip.group.wake.<status>`). The wake goes off the queue pass, at most 64 at
+  a time; one past them is counted (`group.wake_skipped`) and tried again a
+  second later. The owner answers 200 and reads the queue (`sip.group.woken`); for
+  a registration, it first forgets the invitation it last asked for the
+  participant in the group and its pager-only mark, as a registration on a
+  new flow there would, so that it invites at once.
+- **Cost.** Where a group is served is remembered for a heartbeat: a task
+  reads the group and owner items for it at most once per
+  `RCSAS_TASK_HEARTBEAT`, and an INVITE to the factory costs one more read of
+  the group item first, unless its creator is over `RCSAS_GROUP_CREATE_RATE`,
+  which refuses it unread. That there is no such group is remembered for a
+  second, up to 10 000 of them; whatever then serves the request reads the
+  group itself, so a group made meanwhile is not taken for none, and checks
+  that this task owns it: a request that changes nothing, a rejoin of a
+  participant joined already or a roster read for a SUBSCRIBE, has no fence
+  to refuse it, and gets 500 with `Retry-After` on a task that does not own
+  the group, so that it comes back through the owner.
+- **Limits.** The per-user bounds on sessions and subscriptions are per task
+  (the lead's decision on #121): with a user's groups owned by several tasks,
+  a user may hold up to that many on each.
 
 ### How the SIP layer drives it
 
@@ -1030,7 +1121,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
 | `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
 | `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as`, and must not be `RCS_IMS_DOMAIN`, whose users' requests would all be taken for a group's |
-| `RCSAS_GROUP_CHAT_ENABLED` | `false` | Group chat at the conference factory and the conference URIs; off, they are answered 404, and queued group messages wait (up to `RCSAS_STORE_TTL`) instead of being given up. Turn it on with a single rcs-as task until [#121](https://github.com/jeonghun-app/rcs-platform/issues/121) |
+| `RCSAS_GROUP_CHAT_ENABLED` | `false` | Group chat at the conference factory and the conference URIs; off, they are answered 404, and queued group messages wait (up to `RCSAS_STORE_TTL`) instead of being given up. On, each group is served by the task that owns it ([Which task serves a group](#which-task-serves-a-group)) |
 | `RCSAS_CONFERENCE_FACTORY_URI` | `sip:conf-factory@<RCS_IMS_DOMAIN>` | Where clients create group chats: the `ConfFctyURI` ACS provisions. A SIP URI with a user; its user is compared with escapes undone and without case, its host without case |
 | `RCSAS_GROUPCHATS_TABLE` | `groupchats` | Groups table, with `RCSAS_STORE=dynamodb` |
 | `RCSAS_GROUP_MAX_PARTICIPANTS` | `100` | Current participants of one group, at most 200. Former participants are kept up to the same number, fewer above 104, so that the roster stays within 256 KiB (see [Roster events](#roster-events)) |
@@ -1187,17 +1278,16 @@ chat on has a heartbeat item:
   at its present time on shutdown, after its sessions have ended, so that
   another task takes its groups at once. A task remembers the groups it
   owns, so that a change of one costs no more reads than before. It forgets
-  them all when a beat is stored later than its last one's hold
-  (`RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW`), whether it saw itself lapse
-  or was paused unaware, and forgets one when the store refuses a write or a
-  message's copy for it. Whether to invite a participant for a group's
+  them all when its last stored beat's hold (`RCSAS_TASK_LEASE` less
+  `RCSAS_TASK_SKEW`) runs out with no beat stored since, at the first beat
+  that fails then, or when a beat is stored that late, as when it was paused
+  unaware, and forgets one when the store refuses a write or a message's copy
+  for it, or when the group has ended. Whether to invite a participant for a group's
   queued copies, which the store does not fence, it asks the owner item
   again once what it remembers is `RCSAS_TASK_HEARTBEAT` old: a task that
   lost a group stops inviting for it within a heartbeat, even one that
-  writes nothing to it. Until D3 of
-  #121 forwards requests to a group's owner, a request for a group another
-  task owns is answered 500 with `Retry-After` (never 404, which rcsjta
-  takes for the group's end and restarts it at the factory).
+  writes nothing to it. A request for a group another task owns goes to
+  that task ([Which task serves a group](#which-task-serves-a-group)).
 - **A replacement task waits for the old one's lease.** Even with one task,
   a task that replaces another, on a new address, may not change the old
   task's groups until the old one's last heartbeat has run out: after a
@@ -1248,8 +1338,8 @@ a copy refused with its fence held (the store checks the fence first), so
 only the owner queues one.
 Only the owner invites a participant for its queued copies
 (`delivery.group_not_owned` counts those another task's queue pass left
-alone); the owner reads the queue again on `Engine.Wake`, which #121 D3's
-wake message from the task that saw a registration calls. The fan-out
+alone); the owner reads the queue again on `Engine.Wake`, which another
+task's wake message calls ([Which task serves a group](#which-task-serves-a-group)). The fan-out
 budget bounds that per group. A notification costs a read of its sent-message
 record first, and of the group item only when the record exists; an
 is-composing indication reads the group item only when another participant
@@ -1308,6 +1398,8 @@ identifier ever appears in a metric name.
 | `group.name_dropped`, `group.invitee_skipped` | Names stored as none (too long, not text, or someone else's), and invitees left out for an identity the group cannot hold |
 | `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
 | `group.fanout.not_owner`, `delivery.group_not_owned`, `group.wake` | #121: fan-outs stopped because another task took the group over; group copies a task that does not own the group did not invite for; queue reads the owner was asked for |
+| `group.forwarded`, `group.forward_refused`, `group.forward_refused.address`, `group.owner_lost`, `group.owned_dropped`, `sip.group.disowned.sessions` | #121: requests forwarded to a group's owner; requests answered 500 with `Retry-After` for want of an owner to forward to, and of those, the ones whose owner's address rcs-as does not forward to; groups this task gave up, those of them it dropped at the bound on the groups it remembers owning, and the sessions it ended with them |
+| `group.wake_sent`, `group.wake_failed`, `group.wake_skipped`, `sip.group.wake.<status>`, `sip.group.wake.timeout`, `sip.group.woken` | #121: wake messages sent to a group's owner, those that could not be sent, those put off a second for want of room, their answers, and the wakes an owner acted on |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but neither queued nor summarized, the summaries' total or the queue being full; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through
@@ -1426,20 +1518,6 @@ Signals to alarm on (Phase 7):
 - **One user per registration.** `UserRegistered` gets the identity in the
   third-party REGISTER's `To`; queues kept under another identity of the
   same implicit registration set wait for their own retry.
-- **Group mode runs on one task until
-  [#121](https://github.com/jeonghun-app/rcs-platform/issues/121).** Every
-  participant's session with a group, its deliveries and its roster
-  notifications must be on the same task. With two or more tasks, a
-  participant's session would land on whichever task its SIP dialog names: a
-  message written on one task would invite participants whose session is on
-  another instead of delivering to it, and a roster change would reach only
-  the subscriptions of the task that made it. #121 anchors each group's focus
-  on one task (an owner lease, ADR 0005 amendment). Its store part is in:
-  each group has an owner task, and every write is fenced by it (see the
-  `groupchats` table). Until the SIP layer forwards a group's requests to its
-  owner and the engine leaves other tasks' groups alone (#121 D2, D3), turn
-  `RCSAS_GROUP_CHAT_ENABLED` on only with rcs-as on a single task. It is off
-  by default.
 - **Not checked against a licensed copy of RCC.07.** These follow the public
   reference client (rcsjta) and publicly documented behaviour:
   - the anonymous CPIM `From` and `To` in 1-to-1 chat;

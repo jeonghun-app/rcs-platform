@@ -139,9 +139,27 @@ func (ss *session) inviteContact() string { return ss.contactWith(ss.inviteTags(
 
 func (ss *session) contactWith(tags string) string {
 	if ss.group != "" {
-		return "<" + ss.group + ">;isfocus;" + tags
+		return "<" + focusContact(ss.group) + ">;isfocus;" + tags
 	}
 	return sip.Address{URI: ss.s.cfg.Contact}.String() + ";" + tags
+}
+
+// focusContact is a group's conference URI as rcs-as writes it in a
+// Contact: with transport=tcp, rcs-as's only SIP transport. scscf takes the
+// Contact as the next hop of the requests in the dialog, and without a
+// transport would read UDP on 5060, where no application server listens,
+// and refuse them 403 (code review on #542). It is the same URI to compare:
+// a transport on one side only does not count (RFC 3261 §19.1.4), and
+// rcs-as reads the group from the user part (conferenceURI). A URI that
+// does not parse, which the focus never writes, is left as it is.
+func focusContact(conference string) string {
+	u, err := sip.ParseURI(conference)
+	if err != nil {
+		return conference
+	}
+	u.Params = slices.Clone(u.Params)
+	u.Params.Set("transport", "tcp")
+	return u.String()
 }
 
 // Why addSession did not add a session.

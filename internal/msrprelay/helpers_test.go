@@ -20,6 +20,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/store"
 	"github.com/jeonghun-app/rcs-platform/internal/proxyproto"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // testToken is pcscf's token in tests: 43 characters, the shortest
@@ -315,7 +316,7 @@ func newRigWithStore(t *testing.T, tasks int, st store.Store, opts ...any) *rig 
 	}
 	r.control = newControl(controlOptions{
 		Store: r.store, StoreTimeout: stTimeout, Public: public, CoreHost: coreHostAddr,
-		CoreNetworks: loopback, CorePorts: ports, MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []string{testToken},
+		CoreNetworks: loopback, CorePorts: ports, MaxExpiresIn: DefaultMaxExpiresIn, Tokens: []secret.Key{secret.NewString(testToken)},
 		Clock: r.clock, Rand: rnd, Log: log, Metrics: r.metrics,
 	})
 	for range tasks {

@@ -56,7 +56,7 @@ func TestAHandlerMaySendOnASessionThatIsNotBoundYet(t *testing.T) {
 		switch {
 		case !m.IsRequest() && m.TransactionID == "b1ndtw0":
 			gotBind = true
-		case m.Method == MethodSend && string(m.Body) == "to two" && m.FromPath[0].SessionID == "as9two":
+		case m.Method == MethodSend && string(m.Body.Bytes()) == "to two" && m.FromPath[0].SessionID == "as9two":
 			gotSend = true
 			p.respond(t, m, StatusOK)
 		}
@@ -95,7 +95,7 @@ func TestAHandlerFansOutToEverySessionOnTheConnection(t *testing.T) {
 	seen := map[string]bool{}
 	for range 2 {
 		m := p.next(t)
-		if m.Method != MethodSend || string(m.Body) != "hello all" {
+		if m.Method != MethodSend || string(m.Body.Bytes()) != "hello all" {
 			t.Fatalf("got %+v", m)
 		}
 		seen[m.FromPath[0].SessionID] = true
@@ -280,24 +280,51 @@ func TestRelayStopsAChunkMidwayOnceTheNextHopRefusesIt(t *testing.T) {
 	r.asSentinel(t)
 }
 
+// Open's context ends an Open whose request cannot be written, the peer not
+// reading. The context is cancelled once the write has begun, so the order
+// is an event, not a race against a deadline (#510: a 1 s bound on a 50 ms
+// deadline failed at load 630). The 30 s is only a hang guard: an Open
+// that ignored its context would block for good.
 func TestContextEndsAnOpenThatCannotBeWritten(t *testing.T) {
 	ours, theirs := net.Pipe()
-	c, err := NewActiveConn(ours, Config{Clock: newFakeClock()})
+	writing := make(chan struct{})
+	c, err := NewActiveConn(&writeSignal{Conn: ours, writing: writing}, Config{Clock: newFakeClock()})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer theirs.Close()
 	t.Cleanup(func() { _ = c.Close() })
 	s := newTestSession(t, clientURI, asURI, nil)
-	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	start := time.Now()
-	if err := c.Open(ctx, s); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("Open = %v", err)
+	opened := make(chan error, 1)
+	go func() { opened <- c.Open(ctx, s) }()
+	select {
+	case <-writing:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Open never began to write its request")
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("Open ignored its context for %v", elapsed)
+	cancel()
+	select {
+	case err := <-opened:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Open = %v, want its context's error", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Open ignored its context while its request could not be written")
 	}
+}
+
+// writeSignal closes writing as the first write begins.
+type writeSignal struct {
+	net.Conn
+	once    sync.Once
+	writing chan struct{}
+}
+
+func (w *writeSignal) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.writing) })
+	return w.Conn.Write(p)
 }
 
 func TestConnectionLayerValuesPrintWithoutSessionIDs(t *testing.T) {
@@ -470,7 +497,7 @@ func TestEveryRefusalOfASentMessageReachesHandleReport(t *testing.T) {
 	}
 	const n = 200
 	for i := range n {
-		if _, err := alice.Send(context.Background(), Outgoing{ContentType: "image/png", Body: []byte("x")}); err != nil {
+		if _, err := alice.Send(context.Background(), Outgoing{ContentType: "image/png", Body: BodyOf([]byte("x"))}); err != nil {
 			t.Fatalf("Send %d: %v", i, err)
 		}
 		if waiting := alice.undeliveredReports(); waiting > cfg.SendWindow {

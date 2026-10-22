@@ -192,8 +192,8 @@ func TestFailedBindOnAConnectionWithBridgesRefusesOnlyTheNewSession(t *testing.T
 	default:
 	}
 	send(t, a, "first survives")
-	if m := asH.message(t); string(m.Body) != "first survives" {
-		t.Fatalf("rcs-as got %q", m.Body)
+	if m := asH.message(t); string(m.Body.Bytes()) != "first survives" {
+		t.Fatalf("rcs-as got %q", m.Body.Bytes())
 	}
 }
 
@@ -339,11 +339,14 @@ func trafficKeepsTheClientConnected(t *testing.T, name string, mode msrp.ReportM
 		t.Fatalf("the client was cut although the longest gap between deliveries was %v, under a third of the %v idle timeout", worst, idle)
 		return false, delivered
 	}
-	// Traffic goes out every idle/10.
+	// Traffic goes out every idle/10, for three idle timeouts, and in a
+	// stalling attempt at least until the stall: a loaded host that took
+	// three idle timeouts over the first messages ended the loop before
+	// message stallAt, and the attempt passed with no stall (#510).
 	deadline := time.Now().Add(3 * idle)
-	for i := 0; time.Now().Before(deadline); i++ {
+	for i := 0; time.Now().Before(deadline) || i <= stallAt; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_, err := as.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: []byte("to a quiet client"), FailureReport: mode})
+		_, err := as.Send(ctx, msrp.Outgoing{ContentType: "text/plain", Body: msrp.BodyOf([]byte("to a quiet client")), FailureReport: mode})
 		cancel()
 		if err != nil {
 			select {
@@ -371,8 +374,8 @@ func trafficKeepsTheClientConnected(t *testing.T, name string, mode msrp.ReportM
 		}
 		select {
 		case m := <-clientH.msgs:
-			if string(m.Body) != "to a quiet client" {
-				t.Fatalf("client got %q", m.Body)
+			if string(m.Body.Bytes()) != "to a quiet client" {
+				t.Fatalf("client got %q", m.Body.Bytes())
 			}
 		case <-c.conn.Done():
 			return cut()

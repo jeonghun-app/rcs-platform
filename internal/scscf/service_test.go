@@ -265,7 +265,11 @@ func TestTheHSSsPushRequestsAreRefusedUntilTheRegistrarIsWired(t *testing.T) {
 
 // TestAnRTREndsTheRegistrationOnceWired: once the service runs, the HSS's
 // RTR is the registrar's, which ends the set and tells the subscribed
-// P-CSCF.
+// P-CSCF. A full-state NOTIFY of the active registration may still come
+// before that one, the registration's own change catching up with the
+// subscription on a loaded host (#544: CSeq 2 active, then CSeq 3
+// terminated, on the same dialog); the test reads past those, a few at
+// most, to the terminated one.
 func TestAnRTREndsTheRegistrationOnceWired(t *testing.T) {
 	hss := startHSS(t)
 	core := startPCSCFCore(t)
@@ -278,9 +282,15 @@ func TestAnRTREndsTheRegistrationOnceWired(t *testing.T) {
 	if rc, _ := hss.push(t, false); rc != diameter.ResultSuccess {
 		t.Fatalf("RTR answered %d, want 2001", rc)
 	}
-	n := core.next(t)
-	if !strings.Contains(string(n.Body), `state="terminated"`) {
-		t.Errorf("the NOTIFY after the RTR: %s with %q", n.Method, n.Body)
+	for i := 0; ; i++ {
+		n := core.next(t)
+		body := string(n.Body)
+		if strings.Contains(body, `state="terminated"`) {
+			return
+		}
+		if i == 2 || n.Method != "NOTIFY" || !strings.Contains(body, `state="active"`) {
+			t.Fatalf("NOTIFY %d after the RTR: %s with %q, want the registration terminated", i+1, n.Method, body)
+		}
 	}
 }
 
@@ -721,7 +731,11 @@ func TestASubscribesFirstNOTIFYIsCountedBeforeIts200(t *testing.T) {
 	var r *running
 	var once sync.Once
 	stopped := make(chan error, 1)
-	r = startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+	r = startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
+		// The NOTIFY's transaction outlasts a loaded host's delay in
+		// reading it: at testConfig's 1 s it could end unanswered, and
+		// the stop with it, before the P-CSCF had the NOTIFY.
+		c.NotifyTimeout = stopWait
 		d.subscribeAnswered = func() {
 			once.Do(func() {
 				go func() { stopped <- r.stop() }()

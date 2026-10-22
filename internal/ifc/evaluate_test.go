@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -514,17 +515,28 @@ func TestCompileRefusesAPatternLongerThanMaxPatternBytes(t *testing.T) {
 		}
 	}
 	// Refused before any parse, Content's included: parsing the 256 KiB a
-	// provisioning request may carry takes seconds. Correct code takes
-	// microseconds, so the bound only shows a parse that came first.
+	// provisioning request may carry takes seconds of CPU, and allocates
+	// next to nothing, so only time shows it. The time is the process's CPU
+	// time, as in internal/cpim, which a loaded host does not stretch the
+	// way it stretched wall clock (#526: 1.07 s at load 450). Correct code
+	// takes microseconds, so 250 ms of CPU only shows a parse that came
+	// first, whatever else the process does meanwhile.
 	huge := unclosedClasses(256 << 10)
-	start := time.Now()
+	cpu := func() time.Duration {
+		var ru syscall.Rusage
+		if err := syscall.Getrusage(syscall.RUSAGE_SELF, &ru); err != nil {
+			t.Fatal(err)
+		}
+		return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+	}
+	start := cpu()
 	_, err := Compile([]FilterCriteria{criteria(0, &TriggerPoint{ConditionTypeCNF: true, SPTs: []SPT{{Groups: []int{0},
 		Condition: SIPHeader{Header: "Subject", Content: huge}}}})})
 	if err == nil || !strings.Contains(err.Error(), "MaxPatternBytes") {
 		t.Fatalf("256 KiB Content: %v", err)
 	}
-	if d := time.Since(start); d > 500*time.Millisecond {
-		t.Fatalf("refusing 256 KiB took %v: it was parsed first", d)
+	if d := cpu() - start; d > 250*time.Millisecond {
+		t.Fatalf("refusing 256 KiB took %v of CPU: it was parsed first", d)
 	}
 }
 

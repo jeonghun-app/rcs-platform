@@ -31,6 +31,11 @@ type Groups interface {
 	FullRoster(ctx context.Context, uri string) (groupstore.Group, []byte, error)
 	Get(ctx context.Context, uri string) (groupstore.Group, error)
 	Established(ctx context.Context, uri string) error
+	// Place and URIFor find the task that owns a group (#121); CanCreate
+	// says whether creator may make a group now, without taking a token.
+	Place(ctx context.Context, uri string) (mine bool, at groupstore.Owner, err error)
+	URIFor(contribution string) string
+	CanCreate(creator string) bool
 }
 
 // groupAllowed are the methods of a group chat's requests (RFC 3261
@@ -146,21 +151,36 @@ func (s *Server) invitees(entries []resourcelists.Entry) []group.Invitee {
 
 // routeGroup serves a group chat's request outside a dialog: an INVITE
 // that creates the group or joins it, or a SUBSCRIBE to its conference
-// event package. A REFER is taken in the referrer's session (refer).
-func (s *Server) routeGroup(r *proxy.Request) proxy.Decision {
+// event package, here if this task owns the group, else at its owner
+// (toOwner); and another task's wake MESSAGE. A REFER is taken in the
+// referrer's session (refer).
+func (s *Server) routeGroup(ctx context.Context, r *proxy.Request) proxy.Decision {
 	if !s.cfg.GroupChat {
 		// Off (RCSAS_GROUP_CHAT_ENABLED): nothing is created, and the
 		// request is not taken for a 1-to-1 one either.
 		s.cfg.Metrics.Count("sip.group.disabled", 1)
 		return proxy.Decision{Status: 404}
 	}
+	var serve func(context.Context, *proxy.UAS)
 	switch r.Message.Method {
 	case "INVITE":
-		return proxy.Decision{Serve: s.groupInvite}
+		serve = s.groupInvite
 	case "SUBSCRIBE":
-		return proxy.Decision{Serve: s.groupSubscribe}
+		serve = s.groupSubscribe
+	case "MESSAGE":
+		if s.groups != nil && isWake(r) {
+			return proxy.Decision{Serve: s.groupWake}
+		}
+		return s.refuseMethod(r, groupAllowed)
+	default:
+		return s.refuseMethod(r, groupAllowed)
 	}
-	return s.refuseMethod(r, groupAllowed)
+	if uri, ok := s.groupOf(r.Message); ok {
+		if d, ok := s.toOwner(ctx, r, uri); ok {
+			return d
+		}
+	}
+	return proxy.Decision{Serve: serve}
 }
 
 // groupInvite answers a client's INVITE to a group chat (RCC.07 Group
@@ -301,7 +321,9 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 	ss.group = g.URI
 	conv.ID = g.Conversation
 	ss.conversation = conv
-	if d.LocalTarget, err = sip.ParseURI(g.URI); err != nil {
+	// The Contact of what rcs-as sends in the session later, a REFER's
+	// NOTIFYs among them (focusContact).
+	if d.LocalTarget, err = sip.ParseURI(focusContact(g.URI)); err != nil {
 		s.respond(u, req, 500)
 		return
 	}
@@ -319,7 +341,7 @@ func (s *Server) groupInvite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, 488)
 		return
 	}
-	res, err := sip.NewResponse(req, 200, "", tag)
+	res, err := dialogResponse(req, 200, tag)
 	if err == nil {
 		err = s.sessionHeaders(res, ss.contact(), ss.sdp, interval)
 	}
@@ -390,9 +412,10 @@ func (s *Server) refuseGroup(u *proxy.UAS, req *sip.Request, err error) {
 	case errors.Is(err, group.ErrInvalid):
 		code = 400
 	case errors.Is(err, group.ErrBusy), errors.Is(err, store.ErrBusy), errors.Is(err, group.ErrNotOwner):
-		// Another task owns the group, or this one's heartbeat lapsed
-		// (#121): never a 404, which rcsjta takes for the group's end and
-		// restarts it; the request is forwarded to the owner from D3.
+		// Another task took the group over since the request was routed
+		// here, or this one's heartbeat lapsed (#121): never a 404, which
+		// rcsjta takes for the group's end and restarts it; tried again,
+		// the request goes to the owner (toOwner).
 		retry = true
 	}
 	s.cfg.Metrics.Count("sip.group.refused", 1)

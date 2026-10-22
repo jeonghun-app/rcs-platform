@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -187,10 +188,10 @@ type Config struct {
 	MaxPendingRegistersPerIP int
 	// RelayURL is msrp-relay's control API, a private host (ADR 0007 §5),
 	// and RelayToken pcscf's bearer token for it, which prints as
-	// "[redacted]". Without a token no MSRP session is anchored, and every
-	// offer of one is refused (#136 decision 5).
+	// "[redacted]" under every verb (#538). Without a token no MSRP session
+	// is anchored, and every offer of one is refused (#136 decision 5).
 	RelayURL     *url.URL
-	RelayToken   relayToken
+	RelayToken   secret.Key
 	RelayTimeout time.Duration
 	// MaxBindingsPerFlow and MaxBindings bound the relay bindings of one
 	// flow and of the task, and BindingsPerMinute those one flow creates
@@ -403,17 +404,11 @@ func Configure(s *runtime.Settings) Config {
 	return c
 }
 
-// relayToken is a bearer token that never prints.
-type relayToken struct{ v string }
-
-func (relayToken) String() string   { return "[redacted]" }
-func (relayToken) GoString() string { return "[redacted]" }
-
 // relaySettings reads PCSCF_RELAY_URL, an http or https URL of a private
 // host, msrp-relay's Cloud Map name on its control port by default, and
 // PCSCF_RELAY_TOKEN, which staging and prod require, of at least
 // minRelayTokenLength characters; in AWS it comes from Secrets Manager.
-func relaySettings(s *runtime.Settings) (*url.URL, relayToken) {
+func relaySettings(s *runtime.Settings) (*url.URL, secret.Key) {
 	e := s.Env
 	def := ""
 	if ns := s.ServiceNamespace(); ns != "" {
@@ -443,7 +438,10 @@ func relaySettings(s *runtime.Settings) (*url.URL, relayToken) {
 				"PCSCF_RELAY_TOKEN is shorter than %d characters (ADR 0007 §4: at least 256 random bits)", minRelayTokenLength))
 		}
 	}
-	return u, relayToken{token}
+	if token == "" {
+		return u, secret.Key{}
+	}
+	return u, secret.NewString(token)
 }
 
 // isLoopbackURL reports whether u names a loopback host, as a dev stack's

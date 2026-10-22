@@ -187,11 +187,21 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// Notifier is what the package needs from the SIP layer to tell the
+// Notifier is what the package needs from the SIP layer: to tell the
 // subscribers of a group's conference event package (RFC 4575) what
-// changed: it sends Document in a NOTIFY to each subscription of Group.
+// changed, for which it sends Document in a NOTIFY to each subscription of
+// Group; and to act on who owns a group (#121).
 type Notifier interface {
 	RosterChanged(ctx context.Context, u RosterUpdate)
+	// Disowned says that this task no longer owns the group uri (#121):
+	// another task took it over, or this one's heartbeat lapsed. The
+	// participants' sessions and subscriptions with it here end, so that
+	// they come back through its owner.
+	Disowned(uri string)
+	// WakeOwner asks the task at the SIP instance address at, which owns
+	// the group uri, to read user's queue again, telling it whether user
+	// registered on a new flow (Service.WakeOwner).
+	WakeOwner(ctx context.Context, at, uri, user string, registered bool) error
 }
 
 // RosterUpdate is one change to a group's roster.
@@ -264,7 +274,10 @@ type Service struct {
 	owned map[string]ownership
 	// others holds the groups another task was found to own, until when
 	// Owns takes that for granted.
-	others   map[string]time.Time
+	others map[string]otherOwner
+	// absent holds the groups Place found none of, until when it takes
+	// that for granted (absentFor), within maxAbsent.
+	absent   map[string]time.Time
 	beating  bool
 	lastBeat time.Time
 }
@@ -306,7 +319,8 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
 		touched:     map[string]time.Time{},
 		owned:       map[string]ownership{},
-		others:      map[string]time.Time{},
+		others:      map[string]otherOwner{},
+		absent:      map[string]time.Time{},
 		maxFormer:   former,
 	}
 	if s.cfg.Task == "" {
@@ -411,6 +425,9 @@ func (s *Service) Create(ctx context.Context, r CreateRequest) (groupstore.Group
 	// The owner record's epoch goes on from the URI's last group's (Create):
 	// the first write reads it, and remembers it.
 	g.Rev = 1
+	s.mu.Lock()
+	delete(s.absent, g.URI)
+	s.mu.Unlock()
 	s.metrics.Count("group.created", 1)
 	s.metrics.Count("group.name_dropped", int64(dropped))
 	s.notifier.RosterChanged(ctx, RosterUpdate{Group: g.URI, Version: g.Version, Full: true, Document: doc})
@@ -426,8 +443,26 @@ func (s *Service) conferenceID(contribution string) (string, error) {
 	if contribution == "" {
 		return s.randomHex(16)
 	}
+	return contributionID(contribution), nil
+}
+
+func contributionID(contribution string) string {
 	sum := sha256.Sum256([]byte("rcs-as group chat\x00" + contribution))
-	return hex.EncodeToString(sum[:16]), nil
+	return hex.EncodeToString(sum[:16])
+}
+
+// CanCreate reports whether creator may make a group now (CreateRate),
+// taking nothing from its rate: so that the SIP layer reads nothing for a
+// creator Create would refuse unread (security review on #464).
+func (s *Service) CanCreate(creator string) bool {
+	return s.creates.Would(creator, s.cfg.Clock.Now(), 1)
+}
+
+// URIFor is the conference URI of the group a creator's INVITE under the
+// Contribution-ID contribution makes or takes up (Create), which the SIP
+// layer finds the group's owner by (#121).
+func (s *Service) URIFor(contribution string) string {
+	return "sip:chat-" + contributionID(contribution) + "@" + s.cfg.ConferenceHost
 }
 
 // retried is the group uri for its creator trying its INVITE again
@@ -443,6 +478,11 @@ func (s *Service) retried(ctx context.Context, uri, creator string) (groupstore.
 	case g.Creator != creator || !s.pending(g):
 		s.metrics.Count("group.rejected.taken", 1)
 		return groupstore.Group{}, ErrTaken
+	}
+	// Taken up with no write, so no fence to refuse it: the creator's
+	// session is the owner's to hold, as for a no-op change (QA on #464).
+	if _, err := s.owner(ctx, g); err != nil {
+		return groupstore.Group{}, err
 	}
 	s.metrics.Count("group.create_retried", 1)
 	return g, nil
@@ -759,6 +799,11 @@ func (s *Service) Roster(ctx context.Context, uri, who string) ([]byte, uint32, 
 	if i := index(&g, who); i < 0 || !g.Participants[i].State.Active() {
 		return nil, 0, ErrNotParticipant
 	}
+	// The subscription it starts or refreshes is the owner's to hold (QA
+	// on #464).
+	if _, err := s.owner(ctx, g); err != nil {
+		return nil, 0, err
+	}
 	doc, err := fullDocument(g)
 	return doc, g.Version, err
 }
@@ -784,6 +829,7 @@ func (s *Service) Get(ctx context.Context, uri string) (groupstore.Group, error)
 func (s *Service) get(ctx context.Context, uri string) (groupstore.Group, error) {
 	g, err := s.store.Get(ctx, uri, s.cfg.Clock.Now())
 	if errors.Is(err, groupstore.ErrNotFound) {
+		s.ended(uri)
 		return groupstore.Group{}, ErrNoGroup
 	}
 	return g, err
@@ -807,6 +853,13 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 			return groupstore.Group{}, err
 		}
 		if len(changed) == 0 {
+			// Nothing to write, so no fence to refuse it: whoever serves
+			// the request must own the group all the same, or another task
+			// would hold its session (QA on #464). ErrNotOwner has the
+			// client try again, through the owner.
+			if _, err := s.owner(ctx, g); err != nil {
+				return groupstore.Group{}, err
+			}
 			return g, nil
 		}
 		deleted := s.forget(&g)

@@ -71,13 +71,16 @@ DynamoDB Local or S3Mock.
 
 | Service | Image | Role here | Health |
 |---|---|---|---|
-| `dynamodb` | `DDBLOCAL_IMAGE` (Makefile) | DynamoDB for `hss`, `ft-server` and `msrp-relay`, in memory, one shared database | a bare `GET` answers 400 |
+| `dynamodb` | `DDBLOCAL_IMAGE` (Makefile) | DynamoDB for `hss`, `scscf`, `rcs-as`, `ft-server` and `msrp-relay`, in memory, one shared database | a bare `GET` answers 400 |
 | `s3` | `S3MOCK_IMAGE` (Makefile) | S3 for `ft-server`'s content | `GET /` |
 | `stack-tables` | `deploy/stack-init.Dockerfile` | one-shot: creates the tables and the bucket ([Bootstrap](#bootstrap)) | exits 0 |
 | `hss` | platform image | subscribers, Cx on 3868, provisioning API | `hss -healthcheck` |
 | `ft-server` | platform image | FT via HTTP; credentials from `hss` | `ft-server -healthcheck` |
 | `msrp-relay` | platform image | MSRP anchor; plain MSRP, no PROXY header | `msrp-relay -healthcheck` |
 | `icscf` | platform image | I-CSCF; finds `hss` as `hss.rcs.local` by DNS ([icscf](icscf.md#settings)), SIP on 5060 | `icscf -healthcheck` |
+| `scscf` | platform image | S-CSCF; its state in DynamoDB Local, `hss` by DNS as `icscf` finds it ([scscf](scscf.md)), SIP on 5060 | `scscf -healthcheck` |
+| `pcscf` | platform image | P-CSCF; clients' SIP on plain TCP 5060, the core listener on 5070 (`RCS_PCSCF_CORE_PORT`, [pcscf](pcscf.md)) | `pcscf -healthcheck` |
+| `rcs-as-a` | platform image | rcs-as, the default profile's application server: chat, pager messages, group chat (off); its queue and groups in DynamoDB Local ([rcs-as](rcs-as.md)), SIP on 5060, MSRP on 2855 | `rcs-as -healthcheck` |
 | `acs` | `ACS_IMAGE` (Makefile) | auto-configuration, memory store, mock SMS | the image's own `/healthz` check |
 | `stack-seed` | `deploy/stack-init.Dockerfile` | one-shot, after the services are healthy: the test subscriber ([Bootstrap](#bootstrap)) | exits 0 |
 
@@ -87,9 +90,35 @@ shell or curl. `make up` waits until every service is healthy (up to 300 s). The
 test of `make e2e-compose` also waits for each `/readyz`, which checks the
 stores.
 
-`pcscf`, `scscf` and `rcs-as` are commented placeholders in the compose file.
-Until `scscf` is there, `icscf` connects to `hss` but has no S-CSCF to forward
-to. The pull request that adds a service enables it ([Adding a service](#adding-a-service)).
+### rcs-as
+
+`rcs-as` runs as one task, `rcs-as-a`, addressed as the D4 design on #121 sets
+out, so that a second task can join it with the same settings:
+
+- **Names.** Every task has two network aliases:
+  - `rcs-as.rcs.local`, the host of the AS URI `hss` gives `scscf` in the
+    default profile (`HSS_RCS_AS_URI`'s default);
+  - `conf.rcs.local`, the conference host (`RCSAS_CONFERENCE_HOST`). It is a
+    name in the namespace, which `scscf` and the resolvers look up. It is not
+    `RCS_IMS_DOMAIN`, which rcs-as refuses. A deployment sets its own.
+
+  Docker's DNS answers each name with every task that has it, as Cloud Map
+  does.
+- **Its own addresses.**
+  - SIP: every task listens on 5060, the port the AS URI names.
+    `RCSAS_SIP_HOST` is unset, so each task finds the one private IPv4 address
+    of its container, as staging and prod with group chat require.
+  - MSRP: each task names itself by an alias only it has, `rcs-as-a.rcs.local`
+    (`RCSAS_MSRP_HOST`). `msrp-relay` has the namespace
+    (`RCS_SERVICE_NAMESPACE`), so it accepts that name in a `core_path`, and it
+    connects on `RELAY_CORE_PORTS` (2855).
+- **What it sends** goes to `scscf.rcs.local` (`RCSAS_CORE_URI`'s default in
+  the namespace).
+- **Group chat** is off (`RCSAS_GROUP_CHAT_ENABLED`): the factory and
+  conference URIs are answered 404.
+
+The default profile's criteria send each REGISTER's third-party REGISTER, a
+capability query's OPTIONS, a chat INVITE and a MESSAGE to `rcs-as` ([hss](hss.md#default-service-profile)).
 
 ### Ports
 
@@ -103,12 +132,15 @@ Published on `127.0.0.1` only. The defaults are in `deploy/compose.env`.
 | 18083 (`RELAY_CONTROL_HOST_PORT`) | `msrp-relay` | control API (pcscf's) |
 | 12855 (`RELAY_MSRP_HOST_PORT`) | `msrp-relay` | MSRP, plain TCP |
 | 18000 (`DYNAMODB_HOST_PORT`) | `dynamodb` | DynamoDB API (any credentials) |
+| 15060 (`PCSCF_SIP_HOST_PORT`) | `pcscf` | SIP for a client on the host, plain TCP |
 | 19090 (`S3_HOST_PORT`) | `s3` | S3 API |
 
 The admin ports (8080) and Diameter (3868) are reachable on the compose network
 only. On the network every service has its compose name: `hss:8081`,
-`ft-server:8081`, `msrp-relay:2855` and `:8082`, `icscf:5060`, `acs:8080`,
-`dynamodb:8000`, `s3:9090`; `hss` is also `hss.rcs.local`.
+`ft-server:8081`, `msrp-relay:2855` and `:8082`, `icscf:5060`, `scscf:5060`,
+`pcscf:5060` and `:5070`, `acs:8080`, `dynamodb:8000`, `s3:9090`. `hss`,
+`icscf`, `scscf` and `msrp-relay` also have their Cloud Map names in
+`rcs.local`, such as `hss.rcs.local`, which the CSCFs' defaults name.
 
 For example, to read the test subscription with the operator token:
 
@@ -142,6 +174,12 @@ Locally, `tools/stack-init` does it, in two one-shot containers built from
   creates what their documents describe for the infrastructure:
   - `subscribers` and `service-profiles` ([hss](hss.md#tables)), through
     `internal/hss/awsstore.CreateTables`;
+  - `registrations`, `auth-challenges` and `reg-subscriptions`
+    ([scscf state](scscf-state.md)), through
+    `internal/scscf/state/dynamostore.CreateTables`;
+  - `messages`, with its `expiry` index, and `groupchats`
+    ([rcs-as](rcs-as.md#dynamodb-messages-table)), through
+    `internal/rcsas/awsstore.CreateMessagesTable` and `CreateGroupsTable`;
   - `files` with TTL on `ttl` and the bucket `ft-content`
     ([ft-server](ft-server.md#storage));
   - `msrp-bindings` with TTL on `ttl` ([msrp-relay](msrp-relay.md#the-bindings-table)).
@@ -201,7 +239,7 @@ deployment-wide, so the stack works around it:
 | home domain, IMPI and IMPU | from the IMSI's MCC and MNC, no setting | `RCS_IMS_DOMAIN` is fixed in the compose file to the same `ims.mnc001.mcc001.3gppnetwork.org`, so `hss` holds what `acs` hands out |
 | P-CSCF address (`LBO_P-CSCF_Address`, OMA-CP and OMA-DM) | `pcscf.{ims_domain}`, no setting | per-subscriber override `PCSCF_PUBLIC_HOST` |
 | `ftHTTPCSURI`, `ftHTTPDLURI` | `https://ft.{ims_domain}/…`, no setting | per-subscriber override from `FT_PUBLIC_BASE` |
-| `ConfFctyURI` | `sip:conf-factory@{ims_domain}`, no setting | per-subscriber override, the same value until `rcs-as` exists |
+| `ConfFctyURI` | `sip:conf-factory@{ims_domain}`, no setting | per-subscriber override, the same value: `rcs-as`'s own default factory (`RCSAS_CONFERENCE_FACTORY_URI`) |
 | `ftHTTPCSUser`, `ftHTTPCSPwd` | not provisioned | not provisioned; `make e2e-compose` issues the FT password from `hss` itself |
 | IMS credentials from `hss` | not called | `HSS_ACS_TOKEN` is set, unused |
 
@@ -227,7 +265,7 @@ The `acs` admin API stores an override key it does not know without complaint
 (#70), so a mistyped key shows only in this check. That holds for the FT URIs
 and the OMA-CP P-CSCF address, whose overrides differ from the defaults. It
 does not hold for two keys:
-- `ConfFctyURI`: its override equals the default until `rcs-as` exists;
+- `ConfFctyURI`: its override equals the default, which is also `rcs-as`'s;
 - the OMA-DM P-CSCF node: the test makes no DM session.
 
 Both keys were checked by hand against the v1.4.0 catalogue.
@@ -238,7 +276,8 @@ The test (`tools/rcs-sim/e2e`, build tag `e2ecompose`) runs in the toolchain
 container on the stack's network (`<COMPOSE_PROJECT>_default`), with
 `deploy/compose.env` as its environment. It:
 
-1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf` and `acs`;
+1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf`,
+   `scscf`, `pcscf`, `rcs-as-a` and `acs`;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
 4. runs `rcs-sim all`:
@@ -246,10 +285,35 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
      looks the credentials up in `hss` and keeps the content in S3Mock and
      DynamoDB Local.
    - the chat scenarios go through `msrp-relay` on DynamoDB Local. `rcs-sim`
-     stands in for `pcscf` (control API, `RELAY_PCSCF_TOKEN`) and `rcs-as` (on
-     the test container's address, port 2855) until those exist.
-5. checks the results by the same rules as `make e2e`: every step, the resume
-   bounds, no busy retries, nothing secret or identifying in the output.
+     stands in for `pcscf` toward the relay (control API,
+     `RELAY_PCSCF_TOKEN`) and for `rcs-as` (on the test container's address,
+     port 2855) until chat runs over SIP.
+5. runs `rcs-sim reg-event options pager-message` over SIP, at the P-CSCF `acs`
+   provisions. Both test subscribers register with IMS AKA, with the keys
+   `stack-seed` gave `hss`, through `pcscf`, `icscf` and `scscf`:
+   - `reg-event` subscribes to the client's own registration and follows it
+     through a refresh and the de-registration. Its network-deregister step
+     is skipped: rcs-sim has no way to ask for one yet.
+   - `options` sends the peer an OPTIONS to its tel URI and a capability
+     query to its SIP URI, through `scscf`'s originating and terminating
+     iFC chains; `rcs-as` passes the capability query on.
+   - `pager-message` sends the peer a MESSAGE with CPIM and an IMDN request
+     through `rcs-as`, which stores it and delivers it, and the peer's
+     delivery notification comes back the same way. A second MESSAGE, to the
+     peer unregistered, waits in `rcs-as`'s queue until the peer registers
+     again. The test checks that `rcs-as` answered both 202, which the
+     peer's client never answers, so neither went past it.
+6. runs `rcs-sim options` once more, with the client's OPTIONS in the
+   originating session case sent through two more application servers:
+   stubs on the test container, which act as proxies and send them back to
+   `scscf` with the iFC position it signed, ahead of `rcs-as`. The test
+   gives the client a service profile of its own for this, `hss`'s default
+   with those criteria first, `SESSION_TERMINATED`, and puts the default
+   back at the end (as `stack-seed` does at every `make up`). Each stub must
+   have taken both OPTIONS, the second after the first.
+7. checks the results of every run by the same rules as `make e2e`: every
+   step, the resume bounds, no busy retries, nothing secret or identifying
+   in the output.
 
 The CI job "end to end (compose stack)" runs `make up`, `make e2e-compose`,
 `make logs` on failure, and `make down`.
@@ -264,10 +328,12 @@ describe them. #56 provides the AWS values. Locally:
 | `RCS_ENV` | `dev` | `staging` or `prod` |
 | stop grace | `stop_grace_period: 25s`, above `RCS_SHUTDOWN_TIMEOUT` 20 s | the task definition's `stopTimeout` (at most 120 s), above `RCS_SHUTDOWN_TIMEOUT` ([msrp-relay](msrp-relay.md#settings)) |
 | `RCS_IMS_DOMAIN` | fixed, `ims.mnc001.mcc001.3gppnetwork.org` (see [acs](#acs)) | the operator's IMS domain |
-| `HSS_DYNAMODB_ENDPOINT`, `FT_DYNAMODB_ENDPOINT`, `FT_S3_ENDPOINT`, `RELAY_DYNAMODB_ENDPOINT` | `http://dynamodb:8000`, `http://s3:9090` | unset |
+| `HSS_DYNAMODB_ENDPOINT`, `SCSCF_DYNAMODB_ENDPOINT`, `FT_DYNAMODB_ENDPOINT`, `FT_S3_ENDPOINT`, `RELAY_DYNAMODB_ENDPOINT` | `http://dynamodb:8000`, `http://s3:9090` | unset |
 | `AWS_*` credentials | `local` | the task role |
 | hss data key | `HSS_DATA_KEY` (dev keyring path) | `HSS_KMS_KEY_ID` |
-| tokens, `FT_NONCE_KEY`, `RCS_PII_HMAC_KEY` | `deploy/compose.env` | Secrets Manager |
+| tokens, `FT_NONCE_KEY`, `RCS_PII_HMAC_KEY`, `scscf`'s keys | `deploy/compose.env` (`scscf`'s as `SCSCF_NONCE_KEY`, `SCSCF_DIALOG_KEY` and `SCSCF_CHALLENGE_KEY`) | Secrets Manager |
+| `ICSCF_HSS_DISCOVERY`, `SCSCF_HSS_DISCOVERY` | `dns`, `hss.rcs.local` | `cloudmap` |
+| `PCSCF_CLIENT_TRANSPORT` | `tcp`, no TLS | `nlb-tls` or `tls` |
 | `RELAY_PUBLIC_TLS`, `RCS_PROXY_PROTOCOL` | `false`, `false` (no NLB) | `true`, `true` |
 | `FT_UPLOAD_URI`, `FT_DOWNLOAD_URI` | `http://ft-server:8081/…` | `https://` names on the ALB |
 | `FT_HSS_URL` | `http://hss:8081` | the Cloud Map name, `RCS_SERVICE_NAMESPACE` set |
@@ -303,7 +369,8 @@ describe them. #56 provides the AWS values. Locally:
 | "not in deploy/compose.env; make up adds new settings to it" | The env file lacks a setting. `make up` adds it (`scripts/compose-env.sh`); running `docker compose` directly does not. |
 | "run make up, which …" for an image variable | The compose file was used without make. Use the make targets, which set the image variables. |
 | Another worktree's `make up` replaced this stack's containers, or `make e2e-compose` gets 401 from a stack it did not start | Both use the default `COMPOSE_PROJECT`. See [A second stack on the same host](#a-second-stack-on-the-same-host). |
-| `stack-tables` fails with "only one of the hss tables exists" | A half-made stack. Run `make down` and `make up`. |
+| `stack-tables` fails with "only some of the hss tables exist" (or the scscf tables) | A half-made stack. Run `make down` and `make up`. |
+| `make e2e-compose` fails with `REGISTER answered 500` right after several runs | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics): each run registers the client afresh four times. Wait a minute and run it again. |
 | `stack-seed` answers 401 | `deploy/compose.env` changed after the services started. Run `make up` again to recreate them, or `make down` and `make up`. |
 | `make e2e-compose`: "no local stack rcs-local is running: run make up first" | The stack's network does not exist, or `deploy/compose.env` is missing. Run `make up` first; the test does not start the stack. With another `COMPOSE_PROJECT`, pass the same name to both. |
 | `make e2e-compose`: "… is not ready: is the stack up" | The stack exists but a service is not ready within the test's wait. `make logs LOGS="<service>"`. |

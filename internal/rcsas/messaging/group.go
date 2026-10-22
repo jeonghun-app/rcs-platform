@@ -58,6 +58,11 @@ type GroupHandler interface {
 	// the Fence of group's Audience: another task owns the group now, and
 	// Owns must not take it for this task's any more.
 	Lost(group string)
+	// WakeOwner asks the task that owns group, another, to read user's
+	// queue again: this task's queue pass left a copy of the group's to
+	// it, which it may not know of, as when user registered here, which
+	// registered says of a registration on a new flow (Engine.Wake).
+	WakeOwner(ctx context.Context, group, user string, registered bool)
 }
 
 // Audience is who a participant's message in a group goes to, and the
@@ -73,11 +78,21 @@ type Audience struct {
 	Fence *store.Fence
 }
 
-// Wake has the engine read user's queue again, as a registration on a new
-// flow does: for the owner of a group whose copies wait in it, told by
-// the task that saw the registration (#121).
-func (e *Engine) Wake(user string) {
+// Wake has the engine read user's queue again: for the owner of group, a
+// group whose copies wait in it, told by another task whose queue pass
+// left them (#121). With registered, that task saw user register on a new
+// flow, which the owner takes as UserRegistered does for the group: the
+// invitation it last asked for user, which would hold its copies back
+// until InviteTimeout, and its pager-only mark, are forgotten (code review
+// on #464).
+func (e *Engine) Wake(user, group string, registered bool) {
 	e.metrics.Count("group.wake", 1)
+	if registered {
+		e.mu.Lock()
+		delete(e.pagerOnly, user)
+		delete(e.invites, inviteKey{user, group, store.Group, ""})
+		e.mu.Unlock()
+	}
 	e.kickEvent(user)
 }
 
@@ -113,6 +128,13 @@ func (e *Engine) ParticipantLeft(group, user string) {
 // mark records k in marks for as long as a copy could be queued for it,
 // within MaxTracked marks; it needs e.mu.
 func (e *Engine) mark(marks map[legKey]time.Time, k legKey) {
+	// Nothing queued outlives StoreTTL, so neither need the mark.
+	e.markFor(marks, k, e.cfg.StoreTTL)
+}
+
+// markFor records k in marks for d, within MaxTracked marks; it needs
+// e.mu.
+func (e *Engine) markFor(marks map[legKey]time.Time, k legKey, d time.Duration) {
 	now := e.clock.Now()
 	if len(marks) >= e.cfg.MaxTracked {
 		for k, until := range marks {
@@ -127,8 +149,7 @@ func (e *Engine) mark(marks map[legKey]time.Time, k legKey) {
 			delete(marks, k)
 		}
 	}
-	// Nothing queued outlives StoreTTL, so neither need the mark.
-	marks[k] = now.Add(e.cfg.StoreTTL)
+	marks[k] = now.Add(d)
 }
 
 // ParticipantAdded tells the engine that user is a participant of group
@@ -572,7 +593,7 @@ func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outco
 		dctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 		if i < len(send)-1 {
 			l.carried.Store(true)
-			_, err = l.session.Send(dctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: n.body, FailureReport: msrp.ReportNo})
+			_, err = l.session.Send(dctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf(n.body), FailureReport: msrp.ReportNo})
 			cancel()
 			if err != nil {
 				e.metrics.Count("delivery.msrp_failed", 1)
@@ -805,7 +826,7 @@ func (e *Engine) groupComposing(ctx context.Context, h GroupHandler, o GroupOrig
 		go func() {
 			ctx, cancel := e.withTimeout(e.ctx, e.cfg.DeliveryTimeout)
 			to.carried.Store(true)
-			_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: body, FailureReport: msrp.ReportNo})
+			_, err := to.session.Send(ctx, msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf(body), FailureReport: msrp.ReportNo})
 			cancel()
 			to.composing.Store(false)
 			if err != nil {
@@ -838,7 +859,7 @@ func (e *Engine) othersHere(group, sender string) bool {
 // indication, which a client may also send there, is wrapped in CPIM so
 // that the others learn who is typing.
 func (e *Engine) groupReceived(l *Leg, m *msrp.Message) error {
-	body := m.Body
+	body := m.Body.Bytes()
 	switch m.MediaType() {
 	case cpim.ContentType:
 	case IsComposingType:

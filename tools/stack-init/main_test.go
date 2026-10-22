@@ -78,6 +78,12 @@ func TestTablesDefaultToTheServicesOwnNames(t *testing.T) {
 	if c.hss.SubscribersTable != "subscribers" || c.hss.ProfilesTable != "service-profiles" || c.relayTable != "msrp-bindings" || c.ftTable != "ft-files" {
 		t.Fatalf("config %+v", c)
 	}
+	if c.scscf.RegistrationsTable != "registrations" || c.scscf.ChallengesTable != "auth-challenges" || c.scscf.SubscriptionsTable != "reg-subscriptions" {
+		t.Fatalf("scscf tables %+v", c.scscf)
+	}
+	if c.rcsasMessages != "messages" || c.rcsasGroups != "groupchats" {
+		t.Fatalf("rcs-as tables %q, %q", c.rcsasMessages, c.rcsasGroups)
+	}
 }
 
 // fakes is an hss and an acs that record what they were sent: the

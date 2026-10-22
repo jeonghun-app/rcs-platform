@@ -209,7 +209,7 @@ func (r *Reassembler) Add(m *Message, now time.Time) (*Message, error) {
 	}
 	id := m.MessageID
 	br := m.Range()
-	n := int64(len(m.Body))
+	n := int64(m.Body.Len())
 	maxSize := r.maxSize()
 
 	// Written so that a range-start near the int64 limit cannot overflow.
@@ -233,7 +233,7 @@ func (r *Reassembler) Add(m *Message, now time.Time) (*Message, error) {
 		if br.Total != Unknown && br.Total != n {
 			return nil, &StatusError{Code: StatusBadRequest, Comment: "message shorter than its total"}
 		}
-		return assembled(m, m.Body), nil
+		return assembled(m, m.Body.Bytes()), nil
 	}
 	if p == nil {
 		maxPending := r.MaxPending
@@ -274,7 +274,7 @@ func (r *Reassembler) Add(m *Message, now time.Time) (*Message, error) {
 		}
 	}
 	if n > 0 {
-		if code := r.store(p, br.Start, m.Body); code != 0 {
+		if code := r.store(p, br.Start, m.Body.Bytes()); code != 0 {
 			return fail(code, "message cannot be held")
 		}
 	}
@@ -464,7 +464,7 @@ func (r *Reassembler) Close() {
 func assembled(last *Message, body []byte) *Message {
 	whole := *last
 	n := int64(len(body))
-	whole.Body = body
+	whole.Body = BodyOf(body)
 	whole.ByteRange = &ByteRange{Start: 1, End: n, Total: n}
 	whole.Continuation = FlagEnd
 	return &whole

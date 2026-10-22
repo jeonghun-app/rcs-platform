@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	mathrand "math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
@@ -269,6 +270,7 @@ func clone(s *store.Subscription) *store.Subscription {
 	c := *s
 	c.PublicIdentities = append([]store.PublicIdentity(nil), s.PublicIdentities...)
 	c.Digest = append([]store.DigestCredential(nil), s.Digest...)
+	c.StaleSets = slices.Clone(s.StaleSets)
 	if s.AKA != nil {
 		a := *s.AKA
 		c.AKA = &a

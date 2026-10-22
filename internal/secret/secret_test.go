@@ -65,3 +65,45 @@ func TestAKeyKeepsItsBytes(t *testing.T) {
 		t.Error("the zero Key is not empty")
 	}
 }
+
+// TestATextKeyKeepsItsText: NewString and RevealString round-trip text,
+// IsZero tells an empty key, and Equal tells keys apart by their bytes
+// only, whatever their lengths.
+func TestATextKeyKeepsItsText(t *testing.T) {
+	k := NewString(string(key))
+	if k.RevealString() != string(key) || !k.Equal(NewKey(key)) || k.IsZero() {
+		t.Error("a text key does not hold its text")
+	}
+	if !NewString("").IsZero() || !(Key{}).IsZero() || !NewString("").Equal(Key{}) {
+		t.Error("an empty key is not zero, or not equal to the zero Key")
+	}
+	if k.Equal(NewKey(key[:len(key)-1])) || NewKey(key[:len(key)-1]).Equal(k) || k.Equal(Key{}) {
+		t.Error("keys of different lengths compare equal")
+	}
+}
+
+// sealedState stands for the state milenage and digest seal.
+type sealedState struct{ K []byte }
+
+// TestSealedStateIsPrintedNowhere: Sealed state, on its own or nested in
+// a struct or a pointer, shows under no verb, valid or not (#506).
+func TestSealedStateIsPrintedNowhere(t *testing.T) {
+	s := Seal(&sealedState{K: bytes.Clone(key)})
+	h := struct {
+		ID string
+		S  Sealed[sealedState]
+	}{"s1", s}
+	if !bytes.Equal(s().K, key) {
+		t.Fatal("the sealed state is not reachable through the seal")
+	}
+	for _, v := range []any{s, h, &h} {
+		for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%x", "%X", "%o", "%b", "%t", "%p", "%w", "%c", "%U", "%e"} {
+			out := fmt.Sprintf(verb, v)
+			for _, f := range forms() {
+				if strings.Contains(out, f) {
+					t.Errorf("%s: %q shows the sealed state (%q)", verb, out, f)
+				}
+			}
+		}
+	}
+}

@@ -599,8 +599,10 @@ func TestRedactMasksDigitRunsInEveryScript(t *testing.T) {
 // space, is read inside a number as its plain form is (#413), with the same
 // keyed hint: a format character (Cf), a variation selector or another
 // default-ignorable one as nothing; a combining mark (Mn, Me) right after a
-// digit as part of the digit, as the viewer draws it over the digit (a
-// keycap "1\ufe0f\u20e3"); and every space (Zs, Zl, Zp, U+2800 BRAILLE
+// number character as part of it, as the viewer draws it over that
+// character: a digit (a keycap "1\ufe0f\u20e3"), a "+", a separator, a tel
+// number's "*", "#" or hex digit, an IMEI's dash, or the ":" a tel number
+// starts after; and every space (Zs, Zl, Zp, U+2800 BRAILLE
 // PATTERN BLANK) as a space. Every character of each class is tried.
 func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 	k := NewRedactor(testKey)
@@ -616,8 +618,10 @@ func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 	userTemplates := []string{"sip:Xalice.smith@" + testDomain, "sip:alice.smiXth@" + testDomain, "sip:alice.smithX@" + testDomain}
 	// A mark on another character of a number joins it too (#453): on a
 	// tel number's "*", "#" or hex digit, an IMEI's dash, a separator or
-	// the "+".
+	// the "+", and on the ":" a tel number starts after (#490).
 	markTemplates := []string{
+		"tel:X*31#",
+		"tel:X123456*78#9",
 		"tel:*X31#",
 		"tel:123456*X78#9",
 		"tel:1234abX5678",
@@ -1012,8 +1016,8 @@ func untimedJSONLogger(w io.Writer) *slog.Logger {
 	}}))
 }
 
-// Redact never masks less than main did before #154 (review of #398): on a
-// random corpus of number characters of every form, invisible characters,
+// Redact never masks less than main did at the frozen copy's commit, after
+// #154, #413, #444 and #453 (review of #398, #490): on a random corpus of number characters of every form, invisible characters,
 // URI schemes, also inside words and without a user, and words, what the
 // keyed Redactor leaves of a text is part of what main's left, read in the
 // same form. The keyed hint has no digits, so nothing a mask writes can be

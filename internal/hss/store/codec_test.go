@@ -208,3 +208,26 @@ func TestAProfileWithAZeroCompiledSetIsCompiled(t *testing.T) {
 		t.Errorf("criteria that do not compile: %v, want ErrInvalid", err)
 	}
 }
+
+// #491: the stale sets of a subscription are stored, and one without any
+// is stored as before, without the field, so that a task of the previous
+// version still reads it.
+func TestStaleSetsAreStored(t *testing.T) {
+	s := storetest.Subscription(storetest.IMPI1, "p", storetest.IMPU1)
+	plain, err := store.EncodeSubscription(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(plain), "stale_sets") {
+		t.Errorf("a subscription with no stale sets stores the field: %s", plain)
+	}
+	s.StaleSets = []int{0, 3}
+	data, err := store.EncodeSubscription(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.DecodeSubscription(data, 1)
+	if err != nil || len(got.StaleSets) != 2 || got.StaleSets[0] != 0 || got.StaleSets[1] != 3 {
+		t.Fatalf("decoded %v, %v", got, err)
+	}
+}

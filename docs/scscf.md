@@ -160,14 +160,18 @@ On `SIGTERM`, `scscf` keeps its listener open and runs these steps in order:
 5. It closes the transport, disconnects from the HSS tasks (DPR), and closes
    the proxy.
 
-The stop ends by its deadline, `SCSCF_DRAIN_TIMEOUT` plus 4.5 s from the
-`SIGTERM`: half a second inside `RCS_SHUTDOWN_TIMEOUT` at the default drain,
-for the proxy's Close and the return. Steps 3 and 4 end 3 s before that
-deadline, and step 5 has those 3 s. That is longer than a connection to a
-peer takes to open or fail (2 s), so a REGISTER or NOTIFY that began to open
-one as the waits ended is done within it. In step 5, the third-party
-REGISTERs given up on in step 3 are waited for once the transport has
-closed, and then the Cx client says goodbye.
+The stop ends by its deadline, `SCSCF_DRAIN_TIMEOUT` plus 3.5 s from the
+`SIGTERM`. At the default drain, its own work therefore finishes 1.5 s before
+`RCS_SHUTDOWN_TIMEOUT`. That time is for the proxy's Close and the return,
+and for the last wait to end late on a loaded host, where the process may not
+run for a while: a goodbye was seen to end 1.35 s past its deadline (#502).
+Steps 3 and 4 end 2 s before that deadline, and step 5 has those 2 s. Closing
+the transport cuts a connection still opening to a peer, so the third-party
+REGISTERs given up on in step 3 return at once. They get 1 s, until 1 s
+before the deadline. Then the Cx client says goodbye in that last second,
+however slow the REGISTERs are to return. A stop that reaches the goodbye
+late, on a host that did not run it for a while, still gives it 100 ms to
+send its DPR, out of the 1.5 s.
 
 An application server that missed a third-party REGISTER at a stop hears of
 the registration at its next refresh. What the stop leaves undone is the other
@@ -182,7 +186,6 @@ after it ([docs/scscf-state.md](scscf-state.md)).
 
 ## Not in place yet
 
-- The compose stack and its end-to-end checks (#14 PR F2).
 - Deregistering a user whose SESSION_TERMINATED application server does not
   answer its third-party REGISTER (§5.4.1.7), and sending a re- or
   de-registration to the application server address the initial one reached

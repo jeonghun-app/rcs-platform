@@ -15,6 +15,23 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
+// dialogResponse is a 2xx that sets up a dialog with req's sender: req's
+// Record-Route copied in order (RFC 3261 §12.1.1, RFC 6665 §4.1.2.1). It
+// is the client's route set, without which pcscf refuses every request the
+// client sends in the dialog, its BYE among them (#541).
+func dialogResponse(req *sip.Request, code int, tag string) (*sip.Response, error) {
+	res, err := sip.NewResponse(req, code, "", tag)
+	if err != nil {
+		return nil, err
+	}
+	for _, rr := range req.Header.Values("Record-Route") {
+		if err := res.Header.Add("Record-Route", rr); err != nil {
+			return nil, err
+		}
+	}
+	return res, nil
+}
+
 // invite answers a client's INVITE for a chat session or a large-mode
 // message (RCC.07 §3.2, §3.3). msrp-relay, which pcscf put in the media
 // path, offers a=setup:active with its core path (ADR 0004): rcs-as opens
@@ -100,7 +117,7 @@ func (s *Server) invite(ctx context.Context, u *proxy.UAS) {
 		s.respond(u, req, 488)
 		return
 	}
-	res, err := sip.NewResponse(req, 200, "", tag)
+	res, err := dialogResponse(req, 200, tag)
 	if err == nil {
 		err = s.sessionHeaders(res, ss.contact(), ss.sdp, interval)
 	}

@@ -24,7 +24,8 @@ const groupURI = "sip:chat-1@conf.ims.example.net"
 // Member leaves out those in left: a copy written to them before they
 // left. The group is this task's unless another, alive, owns it
 // (notMine), and its copies are queued under fence; lost counts the
-// groups the engine said it lost.
+// groups the engine said it lost, and woken the owners it asked to read a
+// queue.
 type members struct {
 	all     []string
 	left    []string
@@ -33,6 +34,11 @@ type members struct {
 	notMine bool
 	fence   *store.Fence
 	lost    *atomic.Int64
+	woken   *atomic.Int64
+	// registered counts the wakes that told of a registration on a new
+	// flow, and hold, when set, holds every wake until it is closed.
+	registered *atomic.Int64
+	hold       chan struct{}
 }
 
 func (h members) Owns(_ context.Context, group string) (bool, error) {
@@ -42,6 +48,18 @@ func (h members) Owns(_ context.Context, group string) (bool, error) {
 func (h members) Lost(group string) {
 	if h.lost != nil && group == groupURI {
 		h.lost.Add(1)
+	}
+}
+
+func (h members) WakeOwner(_ context.Context, group, user string, registered bool) {
+	if h.hold != nil {
+		<-h.hold
+	}
+	if h.woken != nil && group == groupURI {
+		h.woken.Add(1)
+	}
+	if h.registered != nil && registered {
+		h.registered.Add(1)
 	}
 }
 
@@ -231,7 +249,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := a.outcome(t, cpim.ContentType, chat(t, "m1", "hi", imdn.Display)); code != 200 {
 		t.Fatalf("answered %d", code)
 	}
-	got, err := cpim.Parse(b.next(t).Body)
+	got, err := cpim.Parse(b.next(t).Body.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +259,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := b.outcome(t, cpim.ContentType, receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)); code != 200 {
 		t.Fatalf("bob's notification answered %d", code)
 	}
-	n, err := cpim.Parse(a.next(t).Body)
+	n, err := cpim.Parse(a.next(t).Body.Bytes())
 	if err != nil || !imdn.IsNotification(n) {
 		t.Fatalf("alice got %v, %v", n, err)
 	}
@@ -253,7 +271,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := a.outcome(t, IsComposingType, ind); code != 200 {
 		t.Fatalf("answered %d", code)
 	}
-	if c, err := cpim.Parse(b.next(t).Body); err != nil || !isComposing(c) {
+	if c, err := cpim.Parse(b.next(t).Body.Bytes()); err != nil || !isComposing(c) {
 		t.Fatalf("bob got %v, %v", c, err)
 	}
 	wrapped := "From: <" + bob + ">\r\nTo: <" + AnonymousURI + ">\r\n\r\nContent-Type: " + IsComposingType + "\r\n\r\n" + string(ind)
@@ -261,7 +279,7 @@ func TestAGroupRunsOverItsParticipantsSessions(t *testing.T) {
 	if code := b.outcome(t, cpim.ContentType, []byte(wrapped)); code != 200 {
 		t.Fatalf("answered %d", code)
 	}
-	if c, err := cpim.Parse(a.next(t).Body); err != nil || !isComposing(c) {
+	if c, err := cpim.Parse(a.next(t).Body.Bytes()); err != nil || !isComposing(c) {
 		t.Fatalf("alice got %v, %v", c, err)
 	}
 	// A delivered copy is removed once its success report is in, after
@@ -455,16 +473,16 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 		t.Fatalf("invitation %+v", inv)
 	}
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
-	if got := b.next(t); !strings.HasSuffix(string(got.Body), "one") {
-		t.Fatalf("bob got %q", got.Body)
+	if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), "one") {
+		t.Fatalf("bob got %q", got.Body.Bytes())
 	}
 	// With the mark gone, a copy goes on the open session unasked.
 	before := reads.Load()
 	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1b", "again", 0))); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.next(t); !strings.HasSuffix(string(got.Body), "again") || reads.Load() != before+1 {
-		t.Fatalf("bob got %q after %d reads, want the Recipients one alone", got.Body, reads.Load()-before)
+	if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), "again") || reads.Load() != before+1 {
+		t.Fatalf("bob got %q after %d reads, want the Recipients one alone", got.Body.Bytes(), reads.Load()-before)
 	}
 	// Gone now, with the session still open: the next copy is not sent on
 	// it.
@@ -476,7 +494,7 @@ func TestADepartureIsCheckedWithTheGroup(t *testing.T) {
 	waitFor(t, "the copy given up", func() bool { return r.m.get("delivery.not_participant") == 1 })
 	select {
 	case m := <-b.got:
-		t.Fatalf("a former participant got %q", m.Body)
+		t.Fatalf("a former participant got %q", m.Body.Bytes())
 	case <-time.After(50 * time.Millisecond):
 	}
 	// The marks are bounded.
@@ -612,8 +630,8 @@ func TestANewGroupMessageDoesNotOvertakeOnesWaitingForTheSession(t *testing.T) {
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
 	proceed <- struct{}{}
 	for _, want := range []string{"g1", "g2"} {
-		if got := b.next(t); !strings.HasSuffix(string(got.Body), want) {
-			t.Fatalf("got %q, want %s", got.Body, want)
+		if got := b.next(t); !strings.HasSuffix(string(got.Body.Bytes()), want) {
+			t.Fatalf("got %q, want %s", got.Body.Bytes(), want)
 		}
 	}
 }
@@ -763,9 +781,102 @@ func TestOnlyTheGroupsOwnerInvitesForItsCopies(t *testing.T) {
 		t.Fatalf("%d invitations from a task that does not own the group; %d skipped", n, r.m.get("delivery.group_not_owned"))
 	}
 	r.e.SetGroupHandler(members{all: []string{alice, bob}})
-	r.e.Wake(bob)
+	r.e.Wake(bob, groupURI, false)
 	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI || r.m.get("group.wake") != 1 {
 		t.Fatalf("invitation %+v after the wake", inv)
+	}
+}
+
+// #121 T8: a task's queue pass that leaves a group's copy to the group's
+// owner asks the owner to read the queue, which it may not know needs it
+// (a registration here, say): once per InviteTimeout, as often as the
+// owner would invite.
+func TestANonOwnersQueuePassWakesTheOwner(t *testing.T) {
+	r := newRig(t, Config{})
+	h := members{all: []string{alice, bob}, notMine: true, woken: new(atomic.Int64), registered: new(atomic.Int64)}
+	r.e.SetGroupHandler(h)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the owner woken", func() bool { return h.woken.Load() == 1 })
+	pass := func(newFlow bool) {
+		t.Helper()
+		before := r.m.get("delivery.group_not_owned")
+		if newFlow {
+			r.e.UserRegistered(bob, true)
+		} else {
+			r.e.Wake(bob, groupURI, false)
+		}
+		waitFor(t, "the next pass", func() bool { return r.m.get("delivery.group_not_owned") > before })
+		waitFor(t, "idle", r.idle)
+	}
+	pass(false)
+	if n := h.woken.Load(); n != 1 || h.registered.Load() != 0 {
+		t.Fatalf("woken %d times within InviteTimeout, %d telling of a registration", n, h.registered.Load())
+	}
+	// A registration on a new flow here wakes the owner at once, and says
+	// so (code review on #464), once.
+	pass(true)
+	waitFor(t, "the owner woken for the registration", func() bool { return h.woken.Load() == 2 })
+	if n := h.registered.Load(); n != 1 {
+		t.Fatalf("%d wakes told of the registration", n)
+	}
+	pass(false)
+	r.clock.Advance(DefaultInviteTimeout)
+	pass(false)
+	waitFor(t, "the owner woken again", func() bool { return h.woken.Load() == 3 })
+	if n := h.registered.Load(); n != 1 {
+		t.Fatalf("%d wakes told of the one registration", n)
+	}
+}
+
+// Code review on #464: a wake goes off the queue pass, which a connection
+// to the owner still to be made would hold up: with one worker, a pager
+// message for someone else goes while the wake waits.
+func TestAWakeDoesNotHoldTheQueuePass(t *testing.T) {
+	r := newRig(t, Config{Workers: 1})
+	h := members{all: []string{alice, bob}, notMine: true, woken: new(atomic.Int64), hold: make(chan struct{})}
+	r.e.SetGroupHandler(h)
+	defer close(h.hold)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the pass", func() bool { return r.m.get("delivery.group_not_owned") > 0 })
+	if err := r.e.Submit(t.Context(), standalone(alice, carol, chat(t, "p1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if d := r.d.nextPager(t); d.Recipient != carol {
+		t.Fatalf("delivered %+v", d)
+	}
+	if n := h.woken.Load(); n != 0 {
+		t.Fatalf("the held wake finished %d times", n)
+	}
+}
+
+// Code review and QA on #464: a wake that tells of a registration on a new
+// flow has the owner forget the invitation it last asked for the
+// participant in the group, which held its copies back, and invite at once;
+// one that does not leaves the invitation's wait.
+func TestAWakeForARegistrationInvitesAtOnce(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if inv := r.d.nextInvite(t); inv.Recipient != bob {
+		t.Fatalf("invitation %+v", inv)
+	}
+	waitFor(t, "idle", r.idle)
+	r.e.Wake(bob, groupURI, false)
+	waitFor(t, "idle", r.idle)
+	select {
+	case inv := <-r.d.invites:
+		t.Fatalf("invited again within InviteTimeout: %+v", inv)
+	default:
+	}
+	r.e.Wake(bob, groupURI, true)
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v after the registration's wake", inv)
 	}
 }
 
@@ -798,4 +909,57 @@ func TestACopyIsQueuedOnlyUnderTheGroupsOwner(t *testing.T) {
 	if h.lost.Load() != 1 {
 		t.Fatalf("the handler was told %d times", h.lost.Load())
 	}
+}
+
+// QA on #464: a wake telling of a registration on a new flow forgets the
+// participant's pager-only mark too, as the registration would here: a
+// client that once answered passive is offered the group's session again.
+func TestAWakeForARegistrationForgetsPagerOnly(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	r.e.InviteFailed(inv, ErrNoSessions) // bob answered passive
+	waitFor(t, "idle", r.idle)
+	r.e.Wake(bob, groupURI, false)
+	waitFor(t, "idle", r.idle)
+	select {
+	case inv := <-r.d.invites:
+		t.Fatalf("invited a pager-only client: %+v", inv)
+	default:
+	}
+	r.e.Wake(bob, groupURI, true)
+	if inv := r.d.nextInvite(t); inv.Recipient != bob {
+		t.Fatalf("invitation %+v after the registration's wake", inv)
+	}
+}
+
+// QA on #464: past maxWakesOut wakes on their way, a wake is counted and
+// tried again after wakeRetry, not left to the queue's own retry, up to an
+// hour away: every participant's owner is woken within a few seconds.
+func TestWakesPastTheBoundAreTriedAgainSoon(t *testing.T) {
+	const n = maxWakesOut + 36
+	var all []string
+	for i := range n {
+		all = append(all, fmt.Sprintf("sip:p%03d@%s", i, "ims.example.net"))
+	}
+	r := newRig(t, Config{})
+	release := make(chan struct{})
+	h := members{all: append([]string{alice}, all...), notMine: true, woken: new(atomic.Int64), hold: release}
+	r.e.SetGroupHandler(h)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "a wake skipped", func() bool { return r.m.get("group.wake_skipped") > 0 })
+	close(release) // the wakes on their way are answered
+	for range 5 {
+		r.clock.Advance(wakeRetry)
+		if h.woken.Load() == n {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	waitFor(t, "every owner woken", func() bool { return h.woken.Load() == n })
 }

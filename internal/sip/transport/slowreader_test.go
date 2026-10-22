@@ -175,7 +175,9 @@ func TestFlushWaitsForQueuedOutputUnlessTheWriterStalls(t *testing.T) {
 		{name: "a peer that stops reading", stuck: true},
 		{name: "a peer that reads, with output queued meanwhile", busy: true},
 		// Stuck for longer than the stall time before Flush, reading again
-		// once it starts: the stall time counts from the start of Flush.
+		// once it starts: the stall time counts from the start of Flush. The
+		// writer's last progress is set back past the stall time rather than
+		// waited out, so the stall time can be long (#551).
 		{name: "a peer that reads again as Flush starts", paused: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -200,7 +202,15 @@ func TestFlushWaitsForQueuedOutputUnlessTheWriterStalls(t *testing.T) {
 					time.Sleep(20 * time.Millisecond)
 				}
 			}()
-			tr, _ := newTransport(t, Config{Dialer: pipeDialer{noWriteDeadline{server}}})
+			// A send queue of 256 KiB, not the default 4 MiB: what Flush
+			// waits for is what was queued when it started, which the busy
+			// sender fills to the limit, and at the peer's 32 KiB every
+			// 20 ms a full 4 MiB took past the 30 s guard below on a loaded
+			// host (#551). 256 KiB and the body drain in about 0.4 s, so the
+			// guard is still far from a slow host and only a Flush that waits
+			// for output queued after it, which the busy sender never stops
+			// adding, reaches it.
+			tr, _ := newTransport(t, Config{Dialer: pipeDialer{noWriteDeadline{server}}, SendQueueBytes: 256 << 10})
 			listen(t, tr, ListenerConfig{Network: TCP})
 			req := newRequest(t, "MESSAGE", "SIP/2.0/TCP placeholder.invalid;branch=z9hG4bKflush")
 			req.Body = []byte(strings.Repeat("x", 8*writeChunk))
@@ -231,9 +241,14 @@ func TestFlushWaitsForQueuedOutputUnlessTheWriterStalls(t *testing.T) {
 			case tc.stuck:
 				stall = 300 * time.Millisecond
 			case tc.paused:
-				stall = time.Second
 				eventually(t, "the first chunk to be read", func() bool { return read.Load() >= writeChunk })
-				time.Sleep(stall + stall/2)
+				f := tr.flows.peer(reuseKey{network: TCP, remote: pipeDst.Addr})
+				if f == nil {
+					t.Fatal("no flow")
+				}
+				// As if the writer had made no progress for twice the stall
+				// time, the peer stuck all along.
+				f.q.progress.Store(time.Now().Add(-2 * stall).UnixNano())
 			}
 			done := make(chan struct{})
 			go func() {

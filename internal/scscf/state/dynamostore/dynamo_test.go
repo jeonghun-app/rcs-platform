@@ -307,7 +307,7 @@ func TestChallengesAreSealedAndBoundToTheirKey(t *testing.T) {
 	f := newFake(t)
 	d := newTestStore(t, f)
 	c := statetest.Challenge(statetest.IMPI1, "n1", time.Minute)
-	c.AKA.XRES = []byte("XRES-IN-CLEAR")
+	c.AKA.XRES = secret.NewString("XRES-IN-CLEAR")
 	if err := d.AddChallenge(bg(), c); err != nil {
 		t.Fatal(err)
 	}
