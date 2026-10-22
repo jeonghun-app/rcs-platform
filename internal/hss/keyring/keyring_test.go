@@ -268,7 +268,14 @@ func TestSealFailsWhenRandomnessFails(t *testing.T) {
 func TestKeyringNeverPrintsItsKeys(t *testing.T) {
 	k := localKeyring(t)
 	var buf bytes.Buffer
-	untimedJSONLogger(&buf).Info("x", slog.Any("keyring", k))
+	// The record carries #100's timestamp, whose nanoseconds hold 0707, the
+	// hex of the key bytes: every run meets the case that once failed, and
+	// passes only because the line leaves the time out.
+	rec := slog.NewRecord(time.Date(2026, 10, 19, 5, 24, 34, 908070758, time.UTC), slog.LevelInfo, "x", 0)
+	rec.AddAttrs(slog.Any("keyring", k))
+	if err := untimedJSONLogger(&buf).Handler().Handle(context.Background(), rec); err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(buf.String(), `"time"`) {
 		t.Fatalf("the line has a timestamp whose digits could match a secret:\n%s", buf.String())
 	}
