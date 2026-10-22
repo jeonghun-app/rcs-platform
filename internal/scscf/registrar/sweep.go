@@ -213,6 +213,8 @@ func (g *Registrar) RunSweeps(ctx context.Context, interval time.Duration, limit
 			return
 		case <-t.C:
 		}
-		g.sweepAll(ctx, limit)
+		// A panic ends this round only: the next comes at the next tick
+		// (#488).
+		g.cfg.Panics.Run("registrar: sweep", func() { g.sweepAll(ctx, limit) })
 	}
 }

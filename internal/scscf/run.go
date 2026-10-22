@@ -24,6 +24,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
@@ -39,6 +40,11 @@ import (
 
 // coreListener names the one SIP listener.
 const coreListener = "core"
+
+// metricBackgroundPanics counts the panics recovered from scscf's
+// background work: the sweeps, the metrics report, the first NOTIFYs, the
+// reg event's tasks, the third-party REGISTERs and the identity repairs.
+const metricBackgroundPanics = "background.panics"
 
 // Service is scscf for runtime.Main.
 func Service() runtime.Service[ServiceConfig] {
@@ -76,6 +82,8 @@ type deps struct {
 	// subscribeAnswered, if set, runs once a SUBSCRIBE's 200 is written,
 	// before its first NOTIFY goes.
 	subscribeAnswered func()
+	// reported, if set, runs at each metrics report.
+	reported func()
 	// stopping, if set, hears when the stop began and its deadline;
 	// goodbye, just before the Cx client's goodbye is given its deadline,
 	// which a test may hold it past.
@@ -171,9 +179,15 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		resolver: resolver, listener: coreListener, branch: ids.Branch,
 	}
 
+	// One guard for the work scscf runs on goroutines of its own: a panic
+	// in it ends that work only, counted as background.panics, as pcscf's
+	// and rcs-as's are (#488).
+	bgPanics := panics.New(panics.Config{
+		Metric: metricBackgroundPanics, Message: "scscf: background work panicked", Log: rt.Logger, Metrics: rt.Metrics,
+	})
 	notifier, err := regevent.New(regevent.Config{
 		Store: store, Sender: send, Contact: service, NotifyTimeout: cfg.NotifyTimeout,
-		Now: d.now, Rand: d.rand, Logger: rt.Logger, Metrics: rt.Metrics,
+		Now: d.now, Rand: d.rand, Logger: rt.Logger, Metrics: rt.Metrics, Panics: bgPanics,
 	})
 	if err != nil {
 		return err
@@ -186,6 +200,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	g, err := registrar.New(registrar.Config{
 		Store: store, HSS: hss, Realm: cfg.HomeDomain, ServiceRoute: serviceRoute, NonceKey: cfg.NonceKey,
 		Now: d.now, Rand: d.rand, Metrics: rt.Metrics, Events: notifier, ThirdParty: third, Logger: rt.Logger,
+		Panics: bgPanics,
 	})
 	if err != nil {
 		return err
@@ -201,7 +216,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		EdgeProxyPublicHosts: cfg.EdgeProxyPublicHosts, Sender: send,
 		ASTimeout: cfg.ASTimeout, ThirdPartyTimeout: cfg.ThirdPartyTimeout, MaxThirdParty: cfg.MaxThirdParty,
 		Resolver: resolver,
-		Now:      d.now, Rand: d.rand, Logger: rt.Logger, Metrics: rt.Metrics,
+		Now:      d.now, Rand: d.rand, Logger: rt.Logger, Metrics: rt.Metrics, Panics: bgPanics,
 	})
 	if err != nil {
 		return err
@@ -209,6 +224,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	third.router.Store(router)
 
 	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger, answered: d.subscribeAnswered}
+	disp.firsts.panics = bgPanics
 	var pr proxy.Router = disp
 	if d.router != nil {
 		pr = d.router
@@ -239,6 +255,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// it rises, and once more after the drain.
 	var om proxy.OverloadMeter
 	report := func() {
+		if d.reported != nil {
+			d.reported()
+		}
 		if rt.Metrics != nil {
 			om.Record(rt.Metrics, px)
 		}
@@ -247,8 +266,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	sweepCtx, stopSweeps := context.WithCancel(context.WithoutCancel(ctx))
 	var sweeps sync.WaitGroup
 	sweeps.Go(func() { g.RunSweeps(sweepCtx, cfg.SweepInterval, cfg.SweepLimit) })
-	sweeps.Go(func() { runSubscriptionSweeps(sweepCtx, notifier, cfg.SweepInterval, cfg.SweepLimit, rt.Logger) })
-	sweeps.Go(func() { every(sweepCtx, cmp.Or(d.metricsEvery, metricsInterval), report) })
+	sweeps.Go(func() {
+		runSubscriptionSweeps(sweepCtx, notifier, cfg.SweepInterval, cfg.SweepLimit, rt.Logger, bgPanics)
+	})
+	sweeps.Go(func() { reportEvery(sweepCtx, cmp.Or(d.metricsEvery, metricsInterval), report, bgPanics) })
 
 	rt.Logger.Info("serving SIP", slog.String("core_addr", coreAddr.String()), slog.String("origin_host", host))
 	rt.Ready()
@@ -273,7 +294,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// requests are answered, and the sweeps stop.
 	stopSweeps()
 	sweeps.Wait()
-	report()
+	// Guarded as at every interval: a report that panics must not skip
+	// the waits and the goodbye after it (#527 code review).
+	bgPanics.Run("scscf: metrics report", report)
 	// The router, the first NOTIFYs and the notifier's queue share what is
 	// left of the budget but closeMargin: an application server or a P-CSCF
 	// that does not answer holds none of them past it (#439 QA and code
@@ -358,9 +381,16 @@ func every(ctx context.Context, interval time.Duration, f func()) {
 	}
 }
 
+// reportEvery runs report every interval until ctx ends, guard recovering
+// a panic in one report, which ends that one only.
+func reportEvery(ctx context.Context, interval time.Duration, report func(), guard *panics.Guard) {
+	every(ctx, interval, func() { guard.Run("scscf: metrics report", report) })
+}
+
 // runSubscriptionSweeps runs the notifier's sweep every interval until ctx
-// ends, as the registrar's RunSweeps does.
-func runSubscriptionSweeps(ctx context.Context, n *regevent.Notifier, interval time.Duration, limit int, log *slog.Logger) {
+// ends, as the registrar's RunSweeps does, guard recovering a panic in a
+// round.
+func runSubscriptionSweeps(ctx context.Context, n *regevent.Notifier, interval time.Duration, limit int, log *slog.Logger, guard *panics.Guard) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
@@ -369,15 +399,19 @@ func runSubscriptionSweeps(ctx context.Context, n *regevent.Notifier, interval t
 			return
 		case <-t.C:
 		}
-		for {
-			k, err := n.Sweep(ctx, limit)
-			if err != nil {
-				log.Warn("scscf: subscription sweep", slog.Int("handled", k), slog.String("error", err.Error()))
+		// A panic ends this round only: the next comes at the next tick
+		// (#488).
+		guard.Run("scscf: subscription sweep", func() {
+			for {
+				k, err := n.Sweep(ctx, limit)
+				if err != nil {
+					log.Warn("scscf: subscription sweep", slog.Int("handled", k), slog.String("error", err.Error()))
+				}
+				if k < limit || ctx.Err() != nil {
+					return
+				}
 			}
-			if k < limit || ctx.Err() != nil {
-				break
-			}
-		}
+		})
 	}
 }
 
