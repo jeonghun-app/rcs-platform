@@ -57,6 +57,7 @@ func stackFT(t *testing.T) (scenario.Config, *simtest.FT) {
 		FileSize:     100 << 10,
 		ResumeSize:   5*part + 123,
 		Control:      &anchor.Control{HTTP: http.DefaultClient, URL: r.Control, Token: anchor.NewToken(simtest.RelayToken)},
+		RelayPublic:  r.Public,
 		CoreListener: core.Lend,
 		MSRP:         msrp.Config{KeepAliveInterval: 100 * time.Millisecond},
 		IdleWait:     600 * time.Millisecond,
