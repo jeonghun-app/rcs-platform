@@ -485,10 +485,14 @@ func (t *Transport) streamTo(network Network, addr netip.AddrPort, serverName st
 }
 
 func (t *Transport) dial(k reuseKey) (*flow, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), t.cfg.DialTimeout)
+	ctx, cancel := context.WithTimeout(t.dials, t.cfg.DialTimeout)
 	defer cancel()
 	c, err := t.cfg.Dialer.DialContext(ctx, "tcp", k.remote.String())
 	if err != nil {
+		if t.dials.Err() != nil {
+			// Close cut it: no dial error.
+			return nil, ErrClosed
+		}
 		t.stats.dialErrors.Add(1)
 		return nil, fmt.Errorf("transport: connecting over %s: %w", k.network, err)
 	}
@@ -504,6 +508,9 @@ func (t *Transport) dial(k reuseKey) (*flow, error) {
 		tc := tls.Client(c, cfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			c.Close()
+			if t.dials.Err() != nil {
+				return nil, ErrClosed
+			}
 			t.stats.dialErrors.Add(1)
 			return nil, fmt.Errorf("transport: TLS handshake: %w", err)
 		}
