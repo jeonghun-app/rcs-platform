@@ -139,11 +139,20 @@ func (l *Layer) Request(req *sip.Request, dst transport.Destination, h ResponseH
 
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
+	// A send that fails, or panics on its way out to a caller that contains
+	// it (#471), leaves the layer as it found it: the transaction, which
+	// was recorded above, is terminated (#582).
+	sent := false
+	defer func() {
+		if !sent {
+			tx.terminate()
+		}
+	}()
 	network, err := l.sender.SendRequest(req, dst)
 	if err != nil {
-		tx.terminate()
 		return nil, err
 	}
+	sent = true
 	tx.network = network
 	tx.reliable = network.Reliable()
 	if tx.invite {
