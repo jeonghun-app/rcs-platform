@@ -12,11 +12,15 @@ import (
 	"testing"
 )
 
-// maxInfoWait bounds how long ft-resume's get_upload_info step waits for
-// ft-server to notice the break and keep the parts, its 300 ms quiet time
-// included: a server that is slow to keep a broken upload fails here instead
-// of passing on retries. A bound on elapsed time rather than on the number
-// of answers keeps its margin when a loaded host answers slowly.
+// maxInfoWait bounds how long ft-server takes to notice the break and show
+// the parts it keeps in get_upload_info: a server that is slow to keep a
+// broken upload fails here instead of passing on retries. It bounds the
+// step's showed_ms, the time until the last request was sent that did not
+// get the bytes held the step settled on (ft.Settled.Showed), rather than the
+// step's whole time: on a loaded host the answers themselves, and so the
+// 300 ms quiet time's confirmation, take seconds (#286). A bound on time
+// rather than on the number of answers keeps its margin when the answers
+// come slowly.
 const maxInfoWait = 2000 // ms
 
 // result is one line of rcs-sim's output.
@@ -70,9 +74,14 @@ func checkResults(t *testing.T, stdout, stderr string, want []string, leaks ...s
 	if _, ok := seen["ft-resume/upload-again"]; ok {
 		t.Error("ft-resume uploaded again: ft-server kept nothing of the broken upload")
 	}
-	if info := seen["ft-resume/get_upload_info"]; info.Millis > maxInfoWait {
-		t.Errorf("get_upload_info took %d ms (%d answers asked again, %d of them 404), more than %d ms: ft-server is slow to keep a broken upload",
-			info.Millis, info.Detail["retries"], info.Detail["not_held"], maxInfoWait)
+	if info, ok := seen["ft-resume/get_upload_info"]; ok {
+		// A missing key would read as 0 and pass any server.
+		if showed, ok := info.Detail["showed_ms"]; !ok {
+			t.Errorf("get_upload_info reported no showed_ms: %v", info.Detail)
+		} else if showed > maxInfoWait {
+			t.Errorf("get_upload_info showed the parts held %d ms after it began (%d answers asked again, %d of them 404; %d ms in all), more than %d ms: ft-server is slow to keep a broken upload",
+				showed, info.Detail["retries"], info.Detail["not_held"], info.Millis, maxInfoWait)
+		}
 	}
 	// Nothing on an idle stack is busy: a retry rcsjta would make here
 	// would hide an overloaded or misconfigured ft-server.

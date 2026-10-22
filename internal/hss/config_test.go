@@ -57,7 +57,7 @@ func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if c.DiameterAddr != DefaultDiameterAddr || c.APIAddr != DefaultAPIAddr || c.IMSRealm != domain || c.OriginRealm != domain ||
-		c.PeerRealm != domain || c.SCSCFPattern != "scscf-*.rcs.local" || c.RCSASURI != "sip:rcs-as.rcs.local" ||
+		c.PeerRealm != domain || c.SCSCFPattern != "scscf-*.rcs.local" || c.RCSASURI != "sip:rcs-as.rcs.local;transport=tcp" ||
 		c.DefaultProfile != DefaultProfileID || c.MaxAuthItems != DefaultMaxAuthItems || c.CxTimeout != DefaultCxTimeout ||
 		c.SubscribersTable != "subscribers" || c.ProfilesTable != "service-profiles" || c.OriginHost != "" {
 		t.Fatalf("config = %+v", c)
@@ -72,7 +72,7 @@ func TestNamespaceDefaultsToTheSharedServiceNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Namespace != "prod.internal" || c.SCSCFPattern != "scscf-*.prod.internal" || c.RCSASURI != "sip:rcs-as.prod.internal" {
+	if c.Namespace != "prod.internal" || c.SCSCFPattern != "scscf-*.prod.internal" || c.RCSASURI != "sip:rcs-as.prod.internal;transport=tcp" {
 		t.Errorf("config = %+v", c)
 	}
 	// The shared value is used as the runtime normalises it, as the other
@@ -117,6 +117,8 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 		"bad default profile":       {with(devEnv, "HSS_DEFAULT_PROFILE", "Bad"), "HSS_DEFAULT_PROFILE"},
 		"bad rcs-as URI":            {with(devEnv, "HSS_RCS_AS_URI", "http://rcs-as"), "HSS_RCS_AS_URI"},
 		"bad rcs-as port":           {with(devEnv, "HSS_RCS_AS_URI", "sip:rcs-as:99999"), "HSS_RCS_AS_URI"},
+		"rcs-as over UDP":           {with(devEnv, "HSS_RCS_AS_URI", "sip:rcs-as;transport=udp"), "HSS_RCS_AS_URI"},
+		"rcs-as with other params":  {with(devEnv, "HSS_RCS_AS_URI", "sip:rcs-as;lr"), "HSS_RCS_AS_URI"},
 		"no auth items":             {with(devEnv, "HSS_MAX_AUTH_ITEMS", "0"), "HSS_MAX_AUTH_ITEMS"},
 		"no rate":                   {with(devEnv, "HSS_ACS_RATE", "0"), "HSS_ACS_RATE"},
 		"no Cx timeout":             {with(devEnv, "HSS_CX_TIMEOUT", "0s"), "HSS_CX_TIMEOUT"},

@@ -62,7 +62,8 @@ func (r *Request) Initial() bool {
 //
 // A panic in Route or in a Decision's hooks is recovered on its goroutine and
 // ends only what it was for: Route's and Serve's request is answered 500,
-// Prepare's branch fails with 500, OnBranchFailure adds no target, and a
+// Prepare's branch fails with 500, OnBranchFailure adds no target, a
+// Target's OnTimeout lets the timeout end its branch, and a
 // final response whose OnFinal or OnResponse panicked is replaced by a 500,
 // a provisional one or a 2xx retransmission dropped. It is counted
 // (Config.Metrics, #428), and logged without its value, at most once a
@@ -151,7 +152,13 @@ type Decision struct {
 	// being forwarded. The authoritative proxy of RFC 5626 §7 uses it to forget a
 	// binding whose flow failed (430) and try the same instance over another
 	// flow. Targets returned after a 2xx or 6xx, a CANCEL, or past
-	// Config.MaxBranches are ignored. It runs on a goroutine that may block.
+	// Config.MaxBranches are ignored. A returned target that finds no
+	// Max-Breadth left fails at once as 440, ErrMaxBreadth, and is reported
+	// here in turn (RFC 5393 §5.3.3). A replacement for that failure fails
+	// the same way while the other branches hold their shares, each taking
+	// one of Config.MaxBranches, so a later replacement that would find a
+	// share is dropped: return none for ErrMaxBreadth, as icscf, pcscf and
+	// scscf do. It runs on a goroutine that may block.
 	OnBranchFailure func(ctx context.Context, f BranchFailure) []Target
 }
 
@@ -178,7 +185,24 @@ type Target struct {
 	// answer (TS 24.229 §5.4.3.2). A non-INVITE request that ends on such a
 	// timeout is answered 504, which OnFinal may change: unlike a 408 after
 	// Timer F (RFC 4320 §4.2) it reaches the client in time.
+	// A branch it ends this way gives its share of the request's Max-Breadth
+	// back at once, so that a replacement can go out while the abandoned
+	// request is still alive downstream: a cancelled INVITE may still get a
+	// 2xx, and a non-INVITE, which cannot be cancelled, runs on at the next
+	// hop to its Timer F. This is an intended deviation from RFC 5393
+	// §5.4.1, which counts a branch until its transaction ends: a lone
+	// branch holds all of the breadth, so keeping it would leave every
+	// replacement 440, scscf's default handling of a silent application
+	// server included.
 	Timeout time.Duration
+	// OnTimeout, if set, runs when Timeout passes, on a goroutine of its own
+	// with the hooks' context, and reports whether the timeout ends the
+	// branch: false keeps it, and it ends on its transaction's own timers
+	// then, as a branch without Timeout does. scscf keeps the branch to an
+	// application server that has sent the request back meanwhile, as the
+	// far end is now the one answering (#386). A panic in it ends the branch
+	// as the timeout does (see Router).
+	OnTimeout func(ctx context.Context) bool
 }
 
 // Forward is the decision to send a request on to its Request-URI unchanged,
@@ -205,7 +229,9 @@ type BranchFailure struct {
 	// made up, nil for a received one: ErrTargetTimeout when Target.Timeout
 	// ended the branch, transaction.ErrTimeout or ErrTerminated for Timer B,
 	// F or C, transaction.ErrFlowClosed when the flow the request was sent
-	// over closed before its final response (RFC 5626 §5.3.1).
+	// over closed before its final response (RFC 5626 §5.3.1), ErrMaxBreadth
+	// for a target never sent for want of Max-Breadth, with a 440 (RFC 5393
+	// §5.3.3): no answer from it, but not a timeout either.
 	Err error
 	// Provisional reports that the branch received a provisional response,
 	// 100 Trying included, before it ended: the target had the request, which

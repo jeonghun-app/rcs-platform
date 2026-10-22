@@ -440,8 +440,30 @@ func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool)
 			return o
 		}
 	}
+	if !e.ownsGroup(ctx, m) {
+		// Another task owns the group and invites for its copies; an
+		// invitation from here would open the session on this task
+		// instead, and the next message would invite back (#121).
+		e.metrics.Count("delivery.group_not_owned", 1)
+		return skip
+	}
 	e.invite(ctx, m)
 	return skip
+}
+
+// ownsGroup asks the GroupHandler whether this task owns m's group; when
+// it cannot tell, it does not.
+func (e *Engine) ownsGroup(ctx context.Context, m store.Message) bool {
+	h := e.groupHandler()
+	if h == nil {
+		return false
+	}
+	owns, err := h.Owns(ctx, m.Sender)
+	if err != nil {
+		e.storeFailed("group owner", m.Recipient, err)
+		return false
+	}
+	return owns
 }
 
 // stillMember asks the GroupHandler whether m's recipient is still a

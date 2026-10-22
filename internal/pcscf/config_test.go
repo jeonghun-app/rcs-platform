@@ -345,3 +345,22 @@ func ipNet(s string) net.Addr {
 	}
 	return &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)}
 }
+
+// TestTheCoreListenerIsOnTheSharedCorePort (#14 PR F): pcscf's core port
+// comes from RCS_PCSCF_CORE_PORT, which scscf reads too, and a
+// PCSCF_CORE_ADDR on another port is refused while it is set.
+func TestTheCoreListenerIsOnTheSharedCorePort(t *testing.T) {
+	c, err := configure(with(devEnv, "RCS_PCSCF_CORE_PORT", "5080"))
+	if err != nil || c.CoreAddr != "0.0.0.0:5080" {
+		t.Errorf("CoreAddr %q, %v; want the shared port", c.CoreAddr, err)
+	}
+	if c, err := configure(devEnv); err != nil || c.CoreAddr != DefaultCoreAddr {
+		t.Errorf("CoreAddr %q, %v; want the default", c.CoreAddr, err)
+	}
+	if _, err := configure(with(devEnv, "RCS_PCSCF_CORE_PORT", "5080", "PCSCF_CORE_ADDR", "0.0.0.0:5070")); err == nil || !strings.Contains(err.Error(), "PCSCF_CORE_ADDR") {
+		t.Errorf("a core address off the shared port: %v", err)
+	}
+	if _, err := configure(with(devEnv, "PCSCF_CORE_ADDR", "0.0.0.0:5099")); err != nil {
+		t.Errorf("a core address without the shared port set: %v", err)
+	}
+}

@@ -16,6 +16,19 @@ type Memory struct {
 	mu     sync.Mutex
 	queues map[string]map[string]Message
 	sent   map[sentKey]*sentRecord
+	// fenced reports whether a Fence holds, from the groups store this
+	// one stands beside (SetFence); nil refuses every fenced enqueue.
+	fenced func(Fence) bool
+}
+
+// SetFence gives s what tells whether a Fence holds (Message.Fence): in
+// DynamoDB the groups table, read in the enqueue's own transaction; here
+// the groups store, as groupstore.Memory.Fenced. It is called under s's
+// lock, and must not call s.
+func (s *Memory) SetFence(fenced func(Fence) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.fenced = fenced
 }
 
 type sentKey struct{ sender, messageID string }
@@ -46,6 +59,12 @@ func (s *Memory) Len(recipient string) int {
 func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if f := m.Fence; f != nil {
+		if s.fenced == nil || !s.fenced(*f) {
+			return fmt.Errorf("store: enqueue: %w", ErrNotOwner)
+		}
+		m.Fence = nil
+	}
 	q := s.queues[m.Recipient]
 	if _, ok := q[m.ID]; ok {
 		return fmt.Errorf("store: enqueue: %w", ErrExists)

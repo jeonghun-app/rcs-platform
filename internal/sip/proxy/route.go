@@ -113,6 +113,15 @@ func (p *Proxy) validate(req *sip.Request, loop string) *rejection {
 			return &rejection{code: 483}
 		}
 	}
+	// Before the Router, so that its decision's hooks, which may release
+	// what Route took, see every answer (code review of #454). A 2xx's ACK
+	// is not refused, since nothing can answer it: it goes on with
+	// MaxBreadth in place of the malformed value (incomingBreadth).
+	if req.Method != "ACK" && req.Header.Has("Max-Breadth") {
+		if _, err := req.Header.MaxBreadth(); err != nil {
+			return &rejection{code: 400}
+		}
+	}
 	if loop != "" && p.looped(req, loop) {
 		p.stats.loops.Add(1)
 		return &rejection{code: 482}
@@ -293,9 +302,14 @@ var errPrepare = errors.New("proxy: preparing the request failed")
 // buildBranch makes the copy of r forwarded to t (RFC 3261 §16.6 steps 1 to 7)
 // and finds its next hop; the caller adds the Via (step 8). recordRoute is false
 // for an ACK, which cannot change a dialog's route set.
-func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Target, recordRoute bool) (*sip.Request, transport.Destination, error) {
+func (p *Proxy) buildBranch(ctx context.Context, r *Request, d *Decision, t Target, recordRoute bool, breadth int) (*sip.Request, transport.Destination, error) {
 	fwd := copyRequest(r.Message)
 	fwd.URI = cloneURI(t.URI)
+	// RFC 5393 §5.3.3: every request the proxy forwards carries one
+	// Max-Breadth, its share of the request's.
+	if err := fwd.Header.Set("Max-Breadth", strconv.Itoa(breadth)); err != nil {
+		return nil, transport.Destination{}, err
+	}
 	mf := "70"
 	if fwd.Header.Has("Max-Forwards") {
 		n, err := fwd.Header.MaxForwards()
@@ -399,4 +413,18 @@ func checkRecordRoute(values []sip.Address) error {
 		}
 	}
 	return nil
+}
+
+// MaxBreadth is the most Max-Breadth a request brings to the proxy, and what
+// one that has none is given (RFC 5393 §5.3.3, which recommends 60 for
+// both): the parallel branches its forwarded copies may have in all.
+const MaxBreadth = 60
+
+// incomingBreadth is req's Incoming Max-Breadth: its own, at most
+// MaxBreadth, or MaxBreadth. validate has refused a malformed one.
+func incomingBreadth(req *sip.Request) int {
+	if n, err := req.Header.MaxBreadth(); err == nil && req.Header.Has("Max-Breadth") {
+		return min(n, MaxBreadth)
+	}
+	return MaxBreadth
 }
