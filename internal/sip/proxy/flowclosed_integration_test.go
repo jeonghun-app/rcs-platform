@@ -631,11 +631,13 @@ func finalsBehindAStalledPeer(t *testing.T, kind string) {
 // A final whose connection closed and is being dialled again, to the Via's
 // sent-by (RFC 3261 §18.2.2), is in no queue yet, but on its way: Drain's
 // flush waits for it, and the peer still gets it (code review of #438,
-// whose repro this is). The dial is held until the test sees that Drain
-// has not returned.
+// whose repro this is). The dial is held for 1.5 s, past drainFlushStall,
+// as a lost SYN holds it: the stall bounds a writer that does not move, not
+// a dial, which has DialTimeout (QA of #438). drainSendWait is long, so that
+// only the stall could end the wait.
 func TestDrainWaitsForAFinalWhoseConnectionIsBeingDialled(t *testing.T) {
-	drainFlushStall = 10 * time.Second
-	t.Cleanup(func() { drainFlushStall = time.Second })
+	drainSendWait = time.Hour
+	t.Cleanup(func() { drainSendWait = DrainSendWait })
 	// The peer's own address, where the 200 goes once its connection closed.
 	back, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -704,7 +706,7 @@ func TestDrainWaitsForAFinalWhoseConnectionIsBeingDialled(t *testing.T) {
 	select {
 	case <-done:
 		t.Fatal("Drain returned while the 200 was still being dialled")
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(drainFlushStall + 500*time.Millisecond):
 	}
 	once.Do(func() { close(release) })
 	select {
