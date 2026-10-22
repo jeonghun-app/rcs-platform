@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -101,9 +102,7 @@ func TestTheStopKeepsReturnMarginForItsReturn(t *testing.T) {
 		d.stopping = func(b, s time.Time) { begun, stopBy = b, s }
 		d.goodbyeAt = func(dl time.Time) { deadline = dl }
 	})
-	if err := r.stop(); err != nil {
-		t.Fatal(err)
-	}
+	stopAfterCxOpen(t, r, hss)
 	want := testConfig().DrainTimeout + stopMargin - returnMargin
 	if got := stopBy.Sub(begun); got != want {
 		t.Errorf("the stop's deadline is %v after it began, want %v", got, want)
@@ -113,7 +112,7 @@ func TestTheStopKeepsReturnMarginForItsReturn(t *testing.T) {
 		t.Errorf("the goodbye's deadline is %v from the stop's, want the stop's", deadline.Sub(stopBy))
 	}
 	if dprs.Load() == 0 {
-		t.Error("no DPR was written")
+		t.Errorf("no DPR was written; %s", cxLog(r))
 	}
 }
 
@@ -153,16 +152,14 @@ func TestAGoodbyeReachedLateStillSendsItsDPR(t *testing.T) {
 		}
 		d.goodbyeAt = func(dl time.Time) { deadline = dl }
 	})
-	if err := r.stop(); err != nil {
-		t.Fatal(err)
-	}
+	stopAfterCxOpen(t, r, hss)
 	// The floor from when the stop was let go: a host may run it later
 	// still, which only moves the deadline on, so the bound above is loose.
 	if left := deadline.Sub(released); left < goodbyeFloor || left > goodbyeFloor+time.Second {
 		t.Errorf("reached %v past the stop's deadline, the goodbye had %v, want its floor of %v", released.Sub(stopBy), left, goodbyeFloor)
 	}
 	if dprs.Load() == 0 {
-		t.Error("no DPR was written: the goodbye had no time once reached late")
+		t.Errorf("no DPR was written: the goodbye had no time once reached late; %s", cxLog(r))
 	}
 }
 
@@ -176,13 +173,9 @@ func TestAStopDoesNotWaitForTheGoodbyeOfAnHSSThatDoesNotAnswer(t *testing.T) {
 		c.CxTimeout = 25 * time.Second
 		d.dial = dprDial(hss, true, &dprs)
 	})
-	start := time.Now()
-	if err := r.stop(); err != nil {
-		t.Fatal(err)
-	}
-	checkStopTook(t, time.Since(start))
+	checkStopTook(t, stopAfterCxOpen(t, r, hss))
 	if dprs.Load() == 0 {
-		t.Fatal("no DPR was written: the test tested nothing")
+		t.Fatalf("no DPR was written: the test tested nothing; %s", cxLog(r))
 	}
 }
 
@@ -504,4 +497,46 @@ func TestTheStopMarginsLeaveEveryStepItsTime(t *testing.T) {
 		t.Errorf("closeMargin %v, goodbyeMargin %v, returnMargin %v, stopMargin %v, lateWake %v, goodbyeFloor %v",
 			closeMargin, goodbyeMargin, returnMargin, stopMargin, lateWake, goodbyeFloor)
 	}
+}
+
+// stopAfterCxOpen stops r once its Cx connection to hss is open on both
+// sides: the HSS stub has it available, and scscf's /readyz says so, looked
+// at past its cache. A test that counts the stop's DPR needs that
+// connection at the goodbye (#587). The wait is bounded by realWait, and
+// ends as soon as the connection is seen open.
+func stopAfterCxOpen(t *testing.T, r *running, hss *diameterHSS) time.Duration {
+	t.Helper()
+	deadline := time.Now().Add(realWait)
+	for {
+		peers := hss.node.Peers()
+		open := len(peers) > 0 && peers[0].Available()
+		if open {
+			r.h.Advance(2 * time.Second)
+			if code, _ := r.h.Get("/readyz"); code == 200 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the Cx connection did not open: %s", cxLog(r))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	start := time.Now()
+	if err := r.stop(); err != nil {
+		t.Fatal(err)
+	}
+	return time.Since(start)
+}
+
+// cxLog is what scscf logged of its Diameter connections, for a test that
+// found no DPR to say whether the connection was open at the stop.
+func cxLog(r *running) string {
+	var out []string
+	for _, msg := range []string{"diameter peer open", "diameter peer closed", "diameter peer connection failed",
+		"diameter connection closed before capabilities exchange completed", "cxclient: HSS task added", "cxclient: HSS task removed"} {
+		if n := len(r.h.Logs(msg)); n > 0 {
+			out = append(out, fmt.Sprintf("%q x%d", msg, n))
+		}
+	}
+	return strings.Join(out, ", ")
 }

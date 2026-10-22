@@ -188,8 +188,10 @@ type Config struct {
 	MaxPendingRegistersPerIP int
 	// RelayURL is msrp-relay's control API, a private host (ADR 0007 §5),
 	// and RelayToken pcscf's bearer token for it, which prints as
-	// "[redacted]" under every verb (#538). Without a token no MSRP session
-	// is anchored, and every offer of one is refused (#136 decision 5).
+	// "[redacted]" under the valid verbs and as its closure's address under
+	// the invalid ones, never as its bytes (#538, #570). Without a token no
+	// MSRP session is anchored, and every offer of one is refused (#136
+	// decision 5).
 	RelayURL     *url.URL
 	RelayToken   secret.Key
 	RelayTimeout time.Duration
