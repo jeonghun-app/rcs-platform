@@ -206,7 +206,7 @@ func fileTransferResumed(r *run) error {
 			settle = uploadSettle
 		}
 		info, st, err = c.SettledUploadInfo(ctx, up.TID, settle, settlePoll, settleQuiet)
-		detail := map[string]int64{"retries": st.Retries, "not_held": st.NotHeld}
+		detail := map[string]int64{"retries": st.Retries, "not_held": st.NotHeld, "showed_ms": st.Showed.Milliseconds()}
 		switch {
 		case errors.Is(err, ft.ErrNothingHeld):
 			// rcsjta uploads the file again from the start; so does the

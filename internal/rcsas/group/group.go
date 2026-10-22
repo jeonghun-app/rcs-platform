@@ -259,8 +259,12 @@ type Service struct {
 	mu      sync.Mutex
 	touched map[string]time.Time
 	// owned holds the groups this task owns, with the epoch it owns them
-	// at; beating and lastBeat its heartbeat (StartHeartbeat).
-	owned    map[string]groupstore.Owner
+	// at and when the store said so; beating and lastBeat its heartbeat
+	// (StartHeartbeat).
+	owned map[string]ownership
+	// others holds the groups another task was found to own, until when
+	// Owns takes that for granted.
+	others   map[string]time.Time
 	beating  bool
 	lastBeat time.Time
 }
@@ -301,7 +305,8 @@ func New(cfg Config, st groupstore.Store, engine *messaging.Engine, n Notifier, 
 		adds:        messaging.NewLimiter(cfg.AddRate, cfg.MaxTracked),
 		creates:     messaging.NewLimiter(cfg.CreateRate, cfg.MaxTracked),
 		touched:     map[string]time.Time{},
-		owned:       map[string]groupstore.Owner{},
+		owned:       map[string]ownership{},
+		others:      map[string]time.Time{},
 		maxFormer:   former,
 	}
 	if s.cfg.Task == "" {
@@ -963,6 +968,10 @@ func (s *Service) Recipients(ctx context.Context, uri, sender string, kind messa
 		if !s.fanout.Allow(uri, now, len(aud.Recipients)) {
 			s.metrics.Count("group.fanout_budget_exceeded", 1)
 			return messaging.Audience{}, messaging.Reject(messaging.ReasonRateLimited)
+		}
+		// Every copy is queued under the group's owner, this task (#121).
+		if aud.Fence, err = s.fence(ctx, g); err != nil {
+			return messaging.Audience{}, err
 		}
 		s.touch(ctx, g, now)
 	}

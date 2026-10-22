@@ -103,8 +103,11 @@ type Config struct {
 	// Clock runs the session timers; nil is the system clock.
 	Clock msrp.Clock
 
-	// closeWait is closeWait unless a test sets it.
-	closeWait time.Duration
+	// closeWait is closeWait unless a test sets it; closeClock, if a test
+	// sets it, runs Close's bound for each subscription instead of real
+	// time (#432).
+	closeWait  time.Duration
+	closeClock msrp.Clock
 	// groupChatOff keeps GroupChat off in the tests, whose rigs turn it
 	// on wherever they run a group service.
 	groupChatOff bool
