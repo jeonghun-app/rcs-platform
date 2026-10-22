@@ -26,6 +26,16 @@ The proxy hands each request to the part that serves it:
   was set up through, a P-CSCF on `RCS_PCSCF_CORE_PORT`, or an application
   server in `SCSCF_APPLICATION_SERVERS`.
 
+An application server reached by name, such as `rcs-as.<namespace>`, has
+every address of its DNS answer tried (RFC 3263 §4.3). A branch that fails
+for want of a connection, or with no response at all, goes on to the next
+address before the criterion's default handling, and is counted in
+`routing.as_failover`. The address is then tried last for the DNS TTL
+(10 s), during which a stopped task may still be in the answer. The default
+handling applies once every address has failed; SESSION_TERMINATED then
+answers 500 with `Retry-After` (#574). A server that answered, even with a
+provisional response, or whose `SCSCF_AS_TIMEOUT` passed, is not failed over.
+
 What `scscf` sends itself, NOTIFYs and third-party REGISTERs, goes in client
 transactions over the core listener, to the first `Route` or else the
 Request-URI.
@@ -131,6 +141,11 @@ Alarm on a rise of these:
   `transaction.handler_panics`, in a response handler of a request scscf
   sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
   the request or the call it was in; alarm on any.
+
+`routing.as_failover` counts requests sent on to another address of an
+application server whose first could not be reached: a stopped task still in
+the DNS answer. A burst at a deploy is expected; a steady rate says an
+address in the answer is gone.
 
 `routing.third_party.evicted` counts refreshes an end took the place of in a
 full queue: a server that does not keep up. Each is made good by the user's

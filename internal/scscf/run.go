@@ -57,9 +57,10 @@ type deps struct {
 	dial func(ctx context.Context, network, address string) (net.Conn, error)
 	// hssResolver, if set, resolves hss.<namespace> for DNS discovery.
 	hssResolver cxclient.Resolver
-	// lookup and allow are the SIP resolver's (proxy.DNSResolver).
-	lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)
-	allow  func(netip.Addr) bool
+	// lookup, allow and shuffle are the SIP resolver's (proxy.DNSResolver).
+	lookup  func(ctx context.Context, network, host string) ([]netip.Addr, error)
+	allow   func(netip.Addr) bool
+	shuffle func(n int, swap func(i, j int))
 	// sipDialer, if set, opens the transport's connections.
 	sipDialer transport.Dialer
 	// writeTimeout replaces the transport's WriteTimeout when set, and
@@ -125,7 +126,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	defer closeCx(context.Background())
 	rt.Admin.AddReadinessCheck("hss", func(context.Context) error { return hss.Ready() })
 
-	resolver := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Logger: rt.Logger}
+	resolver := &proxy.DNSResolver{Lookup: d.lookup, Namespace: cfg.Namespace, Allow: d.allow, Shuffle: d.shuffle, Logger: rt.Logger}
 	var p atomic.Pointer[proxy.Proxy]
 	tr, err := transport.New(transport.Config{
 		DialTimeout: d.dialTimeout, WriteTimeout: d.writeTimeout, SendQueueBytes: d.sendQueueBytes, Dialer: d.sipDialer, Logger: rt.Logger,
@@ -192,7 +193,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		EdgeProxyPort: cfg.PCSCFCorePort, ApplicationServers: cfg.ApplicationServers,
 		EdgeProxyPublicHosts: cfg.EdgeProxyPublicHosts, Sender: send,
 		ASTimeout: cfg.ASTimeout, ThirdPartyTimeout: cfg.ThirdPartyTimeout, MaxThirdParty: cfg.MaxThirdParty,
-		Now: d.now, Rand: d.rand, Logger: rt.Logger, Metrics: rt.Metrics,
+		Resolver: resolver,
+		Now:      d.now, Rand: d.rand, Logger: rt.Logger, Metrics: rt.Metrics,
 	})
 	if err != nil {
 		return err

@@ -13,6 +13,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
 
 // Metrics receives the router's counters; *runtime.Metrics implements it.
@@ -99,6 +100,16 @@ type Config struct {
 	Rand    io.Reader
 	Logger  *slog.Logger
 	Metrics Metrics
+	// Resolver, if set, gives every address of an application server, so
+	// that a request goes on to the next when one cannot be reached, before
+	// the criterion's default handling applies (RFC 3263 §4.3, #574).
+	// Without one the proxy resolves the server, and only its first
+	// address is tried.
+	Resolver ASResolver
+	// ASDownFor is how long an application server address whose branch
+	// failed for want of a connection is tried last: as long as the DNS
+	// answer that named it may be reused, proxy.DefaultDNSTTL when 0.
+	ASDownFor time.Duration
 }
 
 // maxDialogKeys are the current key and the previous one: a rotation keeps
@@ -186,6 +197,8 @@ type Router struct {
 	// idleOnce makes idleCh, which idle closes.
 	idleOnce sync.Once
 	idleCh   chan struct{}
+	// down holds the application server addresses tried last (asDown).
+	down asDown
 }
 
 // New validates cfg and returns a Router.
@@ -216,6 +229,9 @@ func New(cfg Config) (*Router, error) {
 	}
 	if cfg.ODILifetime <= 0 {
 		cfg.ODILifetime = DefaultODILifetime
+	}
+	if cfg.ASDownFor <= 0 {
+		cfg.ASDownFor = proxy.DefaultDNSTTL
 	}
 	if cfg.ASTimeout <= 0 {
 		cfg.ASTimeout = DefaultASTimeout
