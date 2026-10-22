@@ -16,6 +16,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -360,7 +361,7 @@ func (c *CxServer) mar(ctx context.Context, _ *diameter.Peer, req *diameter.Mess
 	if err != nil {
 		return nil, err
 	}
-	resync := r.AuthDataItem.Authorization
+	resync := r.AuthDataItem.Authorization.Reveal()
 	if len(resync) > 0 && (r.AuthDataItem.Scheme != cx.SchemeDigestAKAv1MD5 || len(resync) != milenage.RANDSize+milenage.AUTSSize) {
 		// TS 29.228 Table 6.3.2: SIP-Authorization only for an AKA
 		// resynchronisation, carrying RAND ‖ AUTS.
@@ -408,7 +409,7 @@ func (c *CxServer) authenticate(ctx context.Context, r *cx.MAR) ([]cx.AuthDataIt
 	if scheme == cx.SchemeDigestAKAv1MD5 {
 		n = int(min(r.NumberAuthItems, uint32(c.h.maxItems)))
 	}
-	resync := r.AuthDataItem.Authorization
+	resync := r.AuthDataItem.Authorization.Reveal()
 	var first milenage.SQN
 	var m milenage.Milenage
 	var amf [milenage.AMFSize]byte
@@ -500,9 +501,9 @@ func (h *HSS) vectors(m milenage.Milenage, first milenage.SQN, n int, amf [milen
 			ItemNumber:         uint32(i + 1),
 			Scheme:             cx.SchemeDigestAKAv1MD5,
 			Authenticate:       append(r[:], autn[:]...),
-			Authorization:      xres[:],
-			ConfidentialityKey: ck[:],
-			IntegrityKey:       ik[:],
+			Authorization:      secret.NewKey(xres[:]),
+			ConfidentialityKey: secret.NewKey(ck[:]),
+			IntegrityKey:       secret.NewKey(ik[:]),
 		})
 	}
 	return items, nil

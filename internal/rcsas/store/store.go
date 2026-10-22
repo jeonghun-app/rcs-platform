@@ -23,6 +23,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 )
 
@@ -142,8 +143,9 @@ type Message struct {
 	// the group's sent record holds as marks. Delivering it sends them.
 	Summary bool
 	// CPIM is the message/cpim body exactly as received: rcs-as forwards
-	// content byte for byte (docs/architecture.md §8).
-	CPIM []byte
+	// content byte for byte (docs/architecture.md §8). It is chat content,
+	// held where no verb or encoder shows it (#547).
+	CPIM content.Body
 	// Enqueued is when the message was accepted; Expires is when it is
 	// given up on and, if the sender asked, a negative delivery
 	// notification goes back.
@@ -222,11 +224,11 @@ func (m Message) ShareKey() (string, bool) {
 }
 
 // Size is what m counts for against its queue's Limit.
-func (m Message) Size() int64 { return int64(len(m.CPIM)) }
+func (m Message) Size() int64 { return int64(m.CPIM.Len()) }
 
 // Clone returns a copy of m that shares no memory with it.
 func (m Message) Clone() Message {
-	m.CPIM = slices.Clone(m.CPIM)
+	m.CPIM = content.BodyOf(slices.Clone(m.CPIM.Bytes()))
 	return m
 }
 

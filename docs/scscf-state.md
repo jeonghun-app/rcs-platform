@@ -140,6 +140,11 @@ additionally sealed (below).
   so the NOTIFY with the highest reginfo version carries the newest state.
   A subscription's last NOTIFY is numbered with `FinalNotify`, after which
   nothing is, so it goes once whichever instances end the subscription.
+  A change's NOTIFYs are queued on a worker after the request that made it
+  is answered, so a SUBSCRIBE that follows may have its subscription made
+  first: one that has numbered no NOTIFY since its first, of a record at
+  least as new as the change's, is not sent the change again, as that
+  first NOTIFY reads the set when it is sent (#516).
 - **The end of a set is never lost.** Before a deregistration, a sweep or an
   RTR deletes a set's record, each of the set's subscriptions is saved
   Terminated, with the reason and an expiry five seconds past a NOTIFY's
@@ -287,8 +292,9 @@ its first item.
 ### Reg event NOTIFYs
 
 The registrar tells the notifier of every change of a set, refreshes
-included, and each change sends a NOTIFY to every subscription of the set:
-about two per user, the P-CSCF's and the UE's. Each NOTIFY is prepared on
+included, and each change sends a NOTIFY to every subscription of the set
+but one made after it (#516): about two per user, the P-CSCF's and the
+UE's. Each NOTIFY is prepared on
 one of `Workers` (8) workers: a read of the set, the `NextNotify` update,
 and a delete when it ends, some 10–20 ms, so an instance prepares about
 `Workers` / 15 ms, some 500 a second. The wait for the answer is not a

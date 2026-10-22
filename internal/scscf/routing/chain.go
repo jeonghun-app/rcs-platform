@@ -11,6 +11,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
 // step is where a request goes next: an answer, or hops.
@@ -206,7 +207,7 @@ func (rt *Router) next(ctx context.Context, req *sip.Request, pos position, set 
 		return rt.next(ctx, req, after, set, end)
 	}
 	rt.count("routing.ifc.application_server")
-	return rt.toAS(req, after, set, as, fc.ApplicationServer.DefaultHandling, end)
+	return rt.toAS(ctx, req, after, set, as, fc.ApplicationServer.DefaultHandling, end)
 }
 
 // toAS is the hop to an application server: the request's Request-URI
@@ -219,7 +220,15 @@ func (rt *Router) next(ctx context.Context, req *sip.Request, pos position, set 
 // server had not matched, SESSION_TERMINATED ends the request with the
 // server's answer, a 500 with Retry-After included, or the proxy's. Any
 // other answer the server sends is passed on as it is.
-func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, as sip.URI, handling ifc.DefaultHandling, end func(context.Context) step) step {
+//
+// A server reached by name has every address of its answer tried first:
+// a branch that fails for want of a connection or of any response
+// (failsOver) goes on to the next address, counted in
+// routing.as_failover, and the address is tried last for ASDownFor. The
+// default handling applies once every address has failed, and
+// SESSION_TERMINATED then answers 500 with Retry-After, as the client may
+// reach a working server soon (#574).
+func (rt *Router) toAS(ctx context.Context, req *sip.Request, pos position, set *state.Registration, as sip.URI, handling ifc.DefaultHandling, end func(context.Context) step) step {
 	server := as
 	server.Params = append(sip.Params(nil), as.Params...)
 	server.Params.SetFlag("lr")
@@ -228,7 +237,23 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 	expires := rt.cfg.Now().Add(rt.cfg.ODILifetime).Truncate(time.Second)
 	odi := rt.signODI(pos, requestOf(req), expires)
 	back.Params.Set(odiParam, odi)
+	addrs := rt.asAddresses(ctx, server)
+	var hopAt func(i int) hop
+	hopAt = func(i int) hop {
+		return rt.asHop(req, pos, set, server, back, odi, expires, handling, end, addrs, i, hopAt)
+	}
+	return step{hops: []hop{hopAt(0)}}
+}
+
+// asHop is toAS's hop to the i-th of addrs, or with no addrs to the
+// server as the proxy resolves it; next makes the hop to another.
+func (rt *Router) asHop(req *sip.Request, pos position, set *state.Registration, server, back sip.URI, odi string, expires time.Time,
+	handling ifc.DefaultHandling, end func(context.Context) step, addrs []transport.Destination, i int, next func(int) hop) hop {
 	t := proxy.Target{URI: req.URI, Routes: []sip.Address{{URI: server}, {URI: back}}}
+	if i < len(addrs) {
+		dst := addrs[i]
+		t.Destination = &dst
+	}
 	// fired is set as OnTimeout starts, timedOut once the timeout has taken
 	// the position. The branch lives on while OnTimeout waits on the store,
 	// so it may end meanwhile, with the 403 the server relays for a copy it
@@ -261,12 +286,26 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 			return true
 		}
 	}
-	return step{hops: []hop{{
+	return hop{
 		target: t,
 		prepare: func(_ context.Context, b *sip.Request) error {
 			return b.Header.Set("P-Served-User", servedUser(pos))
 		},
 		failed: func(ctx context.Context, f proxy.BranchFailure) step {
+			if failsOver(req, f) {
+				if t.Destination != nil {
+					rt.down.mark(t.Destination.Addr, rt.cfg.Now().Add(rt.cfg.ASDownFor))
+				}
+				if i+1 < len(addrs) {
+					rt.count("routing.as_failover")
+					return step{hops: []hop{next(i + 1)}}
+				}
+				if handling != ifc.SessionContinued {
+					// No address took the request: the client may reach a
+					// server soon, at the next answer of its name.
+					return rt.unavailable(req)
+				}
+			}
 			if fired.Load() && !timedOut.Load() {
 				// The claim is the same side's again, so it is safe to
 				// repeat: true if OnTimeout's took the position. If the
@@ -311,7 +350,7 @@ func (rt *Router) toAS(req *sip.Request, pos position, set *state.Registration, 
 			rt.count("routing.ifc.default_handling_continued")
 			return rt.next(ctx, req, pos, set, end)
 		},
-	}}}
+	}
 }
 
 // unanswered reports whether a branch ended without an answer that does

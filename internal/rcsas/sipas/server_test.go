@@ -38,7 +38,7 @@ func TestAPagerMessageIsSubmittedFromTheAssertedSender(t *testing.T) {
 	}
 	o := got[0]
 	if o.Sender != alice || o.Recipient != bob || o.Mode != store.Standalone || !o.Pager ||
-		o.Conversation != (messaging.Conversation{ID: "c0nv1", Contribution: "c0ntr1"}) || string(o.CPIM) != cpimBody("m1", "hi") {
+		o.Conversation != (messaging.Conversation{ID: "c0nv1", Contribution: "c0ntr1"}) || string(o.CPIM.Bytes()) != cpimBody("m1", "hi") {
 		t.Fatalf("origin %+v", o)
 	}
 	// Every asserted identity, as asserted, may name the sender in its

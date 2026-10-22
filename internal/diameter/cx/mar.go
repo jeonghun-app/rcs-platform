@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // MAR is a Multimedia-Auth-Request (TS 29.229 §6.1.7): the S-CSCF asks for
@@ -126,16 +127,19 @@ func ParseMAA(m *diameter.Message) (*MAA, error) {
 // Authorization and the keys in ConfidentialityKey and IntegrityKey; for SIP
 // Digest it returns Digest. Those are credentials: String and LogValue leave
 // them out, so that an item printed or logged by mistake does not leak them
-// (docs/architecture.md §8).
+// (docs/architecture.md §8), and XRES, CK and IK are secret.Keys, which print
+// as "[redacted]" under the valid verbs and as their closure's address under
+// the invalid ones, never as their bytes (#570). A zero Key leaves its AVP
+// out, an empty one sends it empty.
 type AuthDataItem struct {
 	// ItemNumber orders the items of one answer; 0 leaves the AVP out.
 	ItemNumber            uint32
 	Scheme                string
 	Authenticate          []byte
-	Authorization         []byte
+	Authorization         secret.Key
 	AuthenticationContext []byte
-	ConfidentialityKey    []byte
-	IntegrityKey          []byte
+	ConfidentialityKey    secret.Key
+	IntegrityKey          secret.Key
 	Digest                *DigestAuthenticate
 }
 
@@ -159,10 +163,10 @@ func (a *AuthDataItem) avp() (*diameter.AVP, error) {
 	}
 	children = append(children, optionalUTF8(specSIPAuthenticationScheme, a.Scheme)...)
 	children = append(children, optionalOctets(specSIPAuthenticate, a.Authenticate)...)
-	children = append(children, optionalOctets(specSIPAuthorization, a.Authorization)...)
+	children = append(children, optionalOctets(specSIPAuthorization, a.Authorization.Reveal())...)
 	children = append(children, optionalOctets(specSIPAuthenticationContext, a.AuthenticationContext)...)
-	children = append(children, optionalOctets(specConfidentialityKey, a.ConfidentialityKey)...)
-	children = append(children, optionalOctets(specIntegrityKey, a.IntegrityKey)...)
+	children = append(children, optionalOctets(specConfidentialityKey, a.ConfidentialityKey.Reveal())...)
+	children = append(children, optionalOctets(specIntegrityKey, a.IntegrityKey.Reveal())...)
 	if d := a.Digest; d != nil {
 		switch {
 		case d.Realm == "":
@@ -182,15 +186,24 @@ func (a *AuthDataItem) avp() (*diameter.AVP, error) {
 	return specSIPAuthDataItem.Grouped(children...), nil
 }
 
+// optionalKey keeps an AVP's absence: a missing AVP is the zero Key, which
+// optionalOctets leaves out again.
+func optionalKey(b []byte) secret.Key {
+	if b == nil {
+		return secret.Key{}
+	}
+	return secret.NewKey(b)
+}
+
 func readAuthDataItem(g *Fields) AuthDataItem {
 	item := AuthDataItem{
 		ItemNumber:            g.Unsigned32(specSIPItemNumber, Optional),
 		Scheme:                g.UTF8String(specSIPAuthenticationScheme, Optional),
 		Authenticate:          g.OctetString(specSIPAuthenticate, Optional),
-		Authorization:         g.OctetString(specSIPAuthorization, Optional),
+		Authorization:         optionalKey(g.OctetString(specSIPAuthorization, Optional)),
 		AuthenticationContext: g.OctetString(specSIPAuthenticationContext, Optional),
-		ConfidentialityKey:    g.OctetString(specConfidentialityKey, Optional),
-		IntegrityKey:          g.OctetString(specIntegrityKey, Optional),
+		ConfidentialityKey:    optionalKey(g.OctetString(specConfidentialityKey, Optional)),
+		IntegrityKey:          optionalKey(g.OctetString(specIntegrityKey, Optional)),
 	}
 	if d := g.Grouped(specSIPDigestAuthenticate, Optional); d != nil {
 		item.Digest = &DigestAuthenticate{

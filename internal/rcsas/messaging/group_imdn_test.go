@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -60,7 +61,7 @@ func TestAGroupReceiptSentOutsideTheGroupReachesTheAuthorInIt(t *testing.T) {
 		t.Fatalf("alice's own record %+v, %v", own, err)
 	}
 	pager := Origin{Sender: bob, Recipient: alice, Mode: store.Standalone, Pager: true,
-		CPIM: receiptAs(t, "m1", imdn.DisplayNotification, imdn.Displayed, bob)}
+		CPIM: content.BodyOf(receiptAs(t, "m1", imdn.DisplayNotification, imdn.Displayed, bob))}
 	if err := r.e.Submit(t.Context(), pager); err != nil {
 		t.Fatalf("bob's pager-mode receipt: %v", err)
 	}
@@ -72,7 +73,7 @@ func TestAGroupReceiptSentOutsideTheGroupReachesTheAuthorInIt(t *testing.T) {
 	if !q.Notification || q.Mode != store.Group || q.Sender != groupURI || q.Author != bob {
 		t.Fatalf("queued %+v", q)
 	}
-	readAddresses(t, q.CPIM, cpim.Address{URI: bob}, "<"+alice+">")
+	readAddresses(t, q.CPIM.Bytes(), cpim.Address{URI: bob}, "<"+alice+">")
 	// The same receipt again, by pager or in the group, is a repeat.
 	if err := r.e.Submit(t.Context(), pager); err != nil {
 		t.Fatal(err)
@@ -89,11 +90,11 @@ func TestAGroupReceiptSentOutsideTheGroupReachesTheAuthorInIt(t *testing.T) {
 		want Reason
 	}{
 		"not a recipient": {Origin{Sender: elsewhere, Recipient: alice, Mode: store.Standalone, Pager: true,
-			CPIM: receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)}, ReasonIMDNForged},
+			CPIM: content.BodyOf(receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered))}, ReasonIMDNForged},
 		"for someone else": {Origin{Sender: carol, Recipient: alice, Mode: store.Standalone, Pager: true,
-			CPIM: receiptAs(t, "m1", imdn.DeliveryNotification, imdn.Delivered, bob)}, ReasonIMDNForged},
+			CPIM: content.BodyOf(receiptAs(t, "m1", imdn.DeliveryNotification, imdn.Delivered, bob))}, ReasonIMDNForged},
 		"not asked for": {Origin{Sender: carol, Recipient: alice, Mode: store.Standalone, Pager: true,
-			CPIM: receipt(t, "m1", imdn.ProcessingNotification, imdn.Processed)}, ReasonIMDNNotRequested},
+			CPIM: content.BodyOf(receipt(t, "m1", imdn.ProcessingNotification, imdn.Processed))}, ReasonIMDNNotRequested},
 	} {
 		if got := rejected(r.e.Submit(t.Context(), c.o)); got != c.want {
 			t.Errorf("%s: %q, want %q", name, got, c.want)
@@ -119,7 +120,7 @@ func TestAGroupReceiptForAnotherParticipantIsRefused(t *testing.T) {
 	}
 	// One of carol's own identities is hers too.
 	o = GroupOrigin{Group: groupURI, Sender: bob, Identities: []string{"sip:bob@example.net"}, Conversation: conv,
-		CPIM: receiptAs(t, "m1", imdn.DisplayNotification, imdn.Displayed, "sip:bob@example.net")}
+		CPIM: content.BodyOf(receiptAs(t, "m1", imdn.DisplayNotification, imdn.Displayed, "sip:bob@example.net"))}
 	if err := r.e.SubmitGroup(t.Context(), o); err != nil {
 		t.Fatalf("bob reporting under his other identity: %v", err)
 	}
@@ -224,7 +225,7 @@ func TestReceiptsFromManyGroupsDoNotFillTheAuthorsQueue(t *testing.T) {
 	r.d.onInvite(func(Invitation) error { return ErrOffline })
 	for g := range 9 {
 		o := GroupOrigin{Group: fmt.Sprintf("sip:chat-%d@conf.example.net", g), Sender: alice, Conversation: conv,
-			CPIM: chat(t, fmt.Sprint("g", g), "hi all", imdn.PositiveDelivery|imdn.Display)}
+			CPIM: content.BodyOf(chat(t, fmt.Sprint("g", g), "hi all", imdn.PositiveDelivery|imdn.Display))}
 		if err := r.e.SubmitGroup(t.Context(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -233,7 +234,7 @@ func TestReceiptsFromManyGroupsDoNotFillTheAuthorsQueue(t *testing.T) {
 				kind   imdn.Kind
 				status imdn.Status
 			}{{imdn.DeliveryNotification, imdn.Delivered}, {imdn.DisplayNotification, imdn.Displayed}} {
-				n := GroupOrigin{Group: o.Group, Sender: p, Conversation: conv, CPIM: receipt(t, fmt.Sprint("g", g), k.kind, k.status)}
+				n := GroupOrigin{Group: o.Group, Sender: p, Conversation: conv, CPIM: content.BodyOf(receipt(t, fmt.Sprint("g", g), k.kind, k.status))}
 				if err := r.e.SubmitGroup(t.Context(), n); err != nil {
 					t.Fatalf("%s's receipt: %v", p, err)
 				}

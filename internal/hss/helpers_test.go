@@ -22,6 +22,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -414,8 +415,12 @@ func (c *cscf) uar(impi, impu string, typ cx.UserAuthorizationType) *cx.UAA {
 
 func (c *cscf) mar(impi, impu, scheme string, n uint32, server string, authorization []byte) *cx.MAA {
 	c.t.Helper()
+	var auth secret.Key
+	if authorization != nil {
+		auth = secret.NewKey(authorization)
+	}
 	r := &cx.MAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi, PublicIdentity: impu,
-		AuthDataItem: cx.AuthDataItem{Scheme: scheme, Authorization: authorization}, NumberAuthItems: n, ServerName: server}
+		AuthDataItem: cx.AuthDataItem{Scheme: scheme, Authorization: auth}, NumberAuthItems: n, ServerName: server}
 	a, err := cx.ParseMAA(c.send(r.Message(c.node)))
 	if err != nil {
 		c.t.Fatal(err)

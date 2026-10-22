@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -147,8 +148,10 @@ type Proxy struct {
 	cancelsSending atomic.Int64
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
-	// proxy makes up, so none of them can be predicted or forged.
-	key []byte
+	// proxy makes up, so none of them can be predicted or forged. It prints as
+	// "[redacted]" under the valid verbs and as its closure's address under
+	// the invalid ones, never as its bytes (#570).
+	key secret.Key
 	log *slog.Logger
 	// panics recovers, counts and logs the hooks' panics (hook); now is
 	// the clock of its log limit, read against started.
@@ -270,7 +273,7 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		maxBranch: cfg.MaxBranches,
 		maxBytes:  cfg.MaxContextBytes,
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
-		key:       key,
+		key:       secret.NewKey(key),
 		log:       cfg.Logger,
 		now:       time.Now,
 		started:   time.Now(),

@@ -69,20 +69,48 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 	mmtel.headers = append(slices.Clone(msrpOnly.headers),
 		ifc.HeaderField{Name: "Contact", Value: "<" + refUser + `>;+g.3gpp.icsi-ref="urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel"`},
 		ifc.HeaderField{Name: ifc.FeatureTagField, Value: "+g.3gpp.icsi-ref=urn:urn-7:3gpp-service.ims.icsi.mmtel"})
+	// The roster SUBSCRIBE in the forms rcs-as takes (#557): with an
+	// event parameter, in another case. And what it is not: the reg event
+	// a client subscribes to at its own IMPU, another package, one whose
+	// name only starts so, and the package with another method.
+	withEvent := func(method, uri, event string) *refRequest {
+		r := *reqs["SUBSCRIBE"]
+		r.method, r.uri = method, uri
+		r.headers = slices.DeleteFunc(slices.Clone(r.headers), func(h ifc.HeaderField) bool { return h.Name == "Event" || h.Name == "CSeq" })
+		r.headers = append(r.headers, ifc.HeaderField{Name: "CSeq", Value: "1 " + method})
+		if event != "" {
+			r.headers = append(r.headers, ifc.HeaderField{Name: "Event", Value: event})
+		}
+		return &r
+	}
 	for name, c := range map[string]struct {
 		req  ifc.Request
 		want []int
 	}{
-		"chat INVITE":        {reqs["INVITE"], []int{10}},
-		"MESSAGE":            {reqs["MESSAGE"], []int{20}},
-		"REGISTER":           {reqs["REGISTER"], []int{40}},
-		"RCS OPTIONS":        {&options, []int{30}},
-		"rcsjta chat INVITE": {&imInvite, []int{10}},
-		"rcsjta OPTIONS":     {&imOptions, []int{30}},
-		"INVITE for voice":   {&plainInvite, nil},
-		"INVITE with MSRP":   {&msrpOnly, []int{10}},
-		"image share INVITE": {&imageShare, nil},
-		"MMTEL with MSRP":    {&mmtel, nil},
+		"roster SUBSCRIBE":                 {reqs["SUBSCRIBE"], []int{25}},
+		"roster SUBSCRIBE with an id":      {withEvent("SUBSCRIBE", refConference, "conference;id=r1"), []int{25}},
+		"roster SUBSCRIBE spaced":          {withEvent("SUBSCRIBE", refConference, "conference ; id=r1"), []int{25}},
+		"roster SUBSCRIBE in caps":         {withEvent("SUBSCRIBE", refConference, "CONFERENCE"), []int{25}},
+		"roster SUBSCRIBE, two parameters": {withEvent("SUBSCRIBE", refConference, "conference;id=r1;x=y"), []int{25}},
+		// The package's name ends the value of another (code review on
+		// #577): the whole event type is matched, from its start.
+		"reg event naming conference": {withEvent("SUBSCRIBE", refUser, "reg;id=conference"), nil},
+		"a package ending so":         {withEvent("SUBSCRIBE", refConference, "x-conference"), nil},
+		"reg event SUBSCRIBE":         {withEvent("SUBSCRIBE", refUser, "reg"), nil},
+		"presence SUBSCRIBE":          {withEvent("SUBSCRIBE", refPeer, "presence"), nil},
+		"another package":             {withEvent("SUBSCRIBE", refConference, "conference-x"), nil},
+		"SUBSCRIBE without an Event":  {withEvent("SUBSCRIBE", refConference, ""), nil},
+		"PUBLISH of the package":      {withEvent("PUBLISH", refConference, "conference"), nil},
+		"chat INVITE":                 {reqs["INVITE"], []int{10}},
+		"MESSAGE":                     {reqs["MESSAGE"], []int{20}},
+		"REGISTER":                    {reqs["REGISTER"], []int{40}},
+		"RCS OPTIONS":                 {&options, []int{30}},
+		"rcsjta chat INVITE":          {&imInvite, []int{10}},
+		"rcsjta OPTIONS":              {&imOptions, []int{30}},
+		"INVITE for voice":            {&plainInvite, nil},
+		"INVITE with MSRP":            {&msrpOnly, []int{10}},
+		"image share INVITE":          {&imageShare, nil},
+		"MMTEL with MSRP":             {&mmtel, nil},
 	} {
 		for _, ctx := range referenceContexts {
 			matched, err := set.Match(c.req, ctx)
@@ -103,6 +131,26 @@ func TestDefaultProfileSendsRCSTrafficToRCSAS(t *testing.T) {
 	}
 }
 
+// The default handling of each criterion is the one docs/hss.md gives
+// (code review on #577): chat, messaging and the roster fail rather than
+// bypass rcs-as, with an error a client tries again, where a continued
+// roster SUBSCRIBE would reach the S-CSCF's 404 for a conference host and
+// look like a group that does not exist; capability discovery and
+// registration go on without it.
+func TestDefaultProfileHandlingsAreTheDocumentedOnes(t *testing.T) {
+	want := map[int]ifc.DefaultHandling{10: ifc.SessionTerminated, 20: ifc.SessionTerminated, 25: ifc.SessionTerminated,
+		30: ifc.SessionContinued, 40: ifc.SessionContinued}
+	criteria := DefaultRCSProfile(DefaultProfileID, asURI).Criteria
+	if len(criteria) != len(want) {
+		t.Fatalf("%d criteria, want %d", len(criteria), len(want))
+	}
+	for _, fc := range criteria {
+		if h, ok := want[fc.Priority]; !ok || fc.ApplicationServer.DefaultHandling != h {
+			t.Errorf("criterion %d: default handling %v, want %v", fc.Priority, fc.ApplicationServer.DefaultHandling, h)
+		}
+	}
+}
+
 // A request rcs-as sends itself carries a P-Served-User (servedUserHeader),
 // and no trigger sends it back to rcs-as, in any session case; without the
 // header the same request still goes there. A delivery that came back to
@@ -114,7 +162,7 @@ func TestDefaultProfileSkipsRCSASForARequestItServed(t *testing.T) {
 	}
 	options := *referenceByMethod(t, "INVITE")
 	options.method = "OPTIONS"
-	for _, r := range []*refRequest{referenceByMethod(t, "INVITE"), referenceByMethod(t, "MESSAGE"), referenceByMethod(t, "REGISTER"), &options} {
+	for _, r := range []*refRequest{referenceByMethod(t, "INVITE"), referenceByMethod(t, "MESSAGE"), referenceByMethod(t, "REGISTER"), referenceByMethod(t, "SUBSCRIBE"), &options} {
 		for _, name := range []string{"P-Served-User", "p-served-user"} {
 			served := *r
 			served.headers = append(slices.Clone(r.headers),

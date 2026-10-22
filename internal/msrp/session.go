@@ -497,7 +497,7 @@ func (s *Session) Send(ctx context.Context, out Outgoing) (string, error) {
 				once.Do(func() { <-s.window })
 			}
 		}
-		err := c.sendRequest(ctx, s.chunk(id, out, sr, r, ch.Data, ch.Flag), sendMode{windowed: windowed}, func(code int, comment string) {
+		err := c.sendRequest(ctx, s.chunk(id, out, sr, r, ch.Data.Bytes(), ch.Flag), sendMode{windowed: windowed}, func(code int, comment string) {
 			if code == StatusOK {
 				free()
 				return

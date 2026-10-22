@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/xmlsafe"
 )
@@ -390,7 +391,7 @@ func (n Notification) Message(e Envelope) (*cpim.Message, error) {
 		{Name: "Content-Type", Value: ContentType},
 		{Name: "Content-Disposition", Value: ContentDisposition},
 	}
-	m.Body = body
+	m.Body = content.BodyOf(body)
 	return m, nil
 }
 
@@ -408,5 +409,5 @@ func ParseNotificationMessage(m *cpim.Message) (Notification, error) {
 	case mt != ContentType:
 		return Notification{}, fmt.Errorf("%w: notification content is not %s", ErrMalformed, ContentType)
 	}
-	return ParseNotification(m.Body)
+	return ParseNotification(m.Body.Bytes())
 }

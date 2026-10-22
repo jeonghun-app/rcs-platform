@@ -15,6 +15,7 @@ import (
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store/storetest"
 )
@@ -116,7 +117,7 @@ func TestDamagedItemsAreReportedNotGuessed(t *testing.T) {
 func TestOptionalAttributesAreLeftOutRatherThanStoredEmpty(t *testing.T) {
 	f := newFakeDynamo(t)
 	s := NewWithClient("messages", f)
-	m := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Standalone, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	m := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Standalone, CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
 	if err := s.Enqueue(context.Background(), m, store.Limit{}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +149,7 @@ func TestAMessageLargerThanAnItemIsRefusedBeforeAnyRequest(t *testing.T) {
 	f := newFakeDynamo(t)
 	f.fail = errors.New("no request expected")
 	s := NewWithClient("messages", f)
-	err := s.Enqueue(context.Background(), store.Message{Recipient: "r", ID: "1", CPIM: make([]byte, MaxCPIMSize+1)}, store.Limit{})
+	err := s.Enqueue(context.Background(), store.Message{Recipient: "r", ID: "1", CPIM: content.BodyOf(make([]byte, MaxCPIMSize+1))}, store.Limit{})
 	if !errors.Is(err, ErrTooLarge) {
 		t.Fatalf("Enqueue = %v", err)
 	}
@@ -181,7 +182,7 @@ func TestARepeatedWriteThatTookEffectIsNotAConflict(t *testing.T) {
 	f := newFakeDynamo(t)
 	s := NewWithClient("messages", lostAnswers{f})
 	ctx := context.Background()
-	m := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	m := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Chat, CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
 	if err := s.Enqueue(ctx, m, store.Limit{}); err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +222,7 @@ func TestExpiredReadsTheIndexAndResumes(t *testing.T) {
 	var want []string
 	for i := range 40 {
 		r := fmt.Sprintf("sip:user%d@example.net", i)
-		m := store.Message{Recipient: r, ID: fmt.Sprint(i), Sender: "s", Mode: store.Chat, CPIM: []byte("x"),
+		m := store.Message{Recipient: r, ID: fmt.Sprint(i), Sender: "s", Mode: store.Chat, CPIM: content.BodyOf([]byte("x")),
 			Enqueued: t0, Expires: t0.Add(time.Duration(i) * time.Second)}
 		if err := s.Enqueue(ctx, m, store.Limit{}); err != nil {
 			t.Fatal(err)
@@ -274,7 +275,7 @@ func TestASizeThatDriftedIsCorrectedWhenItRefuses(t *testing.T) {
 	ctx := context.Background()
 	l := store.Limit{Count: 2, SenderCount: 2}
 	msg := func(id string) store.Message {
-		return store.Message{Recipient: "r", ID: id, Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+		return store.Message{Recipient: "r", ID: id, Sender: "s", Mode: store.Chat, CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
 	}
 	for _, id := range []string{"1", "2"} {
 		if err := s.Enqueue(ctx, msg(id), l); err != nil {
@@ -306,7 +307,7 @@ func TestADriftedGroupNotificationTotalIsCorrected(t *testing.T) {
 	l := store.Limit{Count: 10, SenderCount: 10, GroupCount: 2}
 	notice := func(id, group string) store.Message {
 		return store.Message{Recipient: "r", ID: id, Sender: group, Author: "sip:p@example.net", Mode: store.Group, Notification: true,
-			CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+			CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
 	}
 	for _, id := range []string{"1", "2"} {
 		if err := s.Enqueue(ctx, notice(id, "sip:g"+id), l); err != nil {
@@ -336,7 +337,7 @@ func TestARecountCountsSummariesApartFromNotifications(t *testing.T) {
 	l := store.Limit{Count: 10, SenderCount: 10, GroupCount: 2, SummaryCount: 2}
 	notice := func(id string) store.Message {
 		return store.Message{Recipient: "r", ID: id, Sender: "sip:g" + id, Author: "sip:p@example.net", Mode: store.Group, Notification: true,
-			CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+			CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
 	}
 	summary := func(id string) store.Message {
 		return store.Message{Recipient: "r", ID: "r-" + id, Sender: "sip:g" + id, Mode: store.Group, Notification: true, Summary: true,
@@ -376,7 +377,7 @@ func TestAFullQueueIsRecountedAtMostOncePerInterval(t *testing.T) {
 	ctx := context.Background()
 	l := store.Limit{Count: 1}
 	at := func(id string, when time.Time) store.Message {
-		return store.Message{Recipient: "r", ID: id, Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: when, Expires: when.Add(time.Hour)}
+		return store.Message{Recipient: "r", ID: id, Sender: "s", Mode: store.Chat, CPIM: content.BodyOf([]byte("x")), Enqueued: when, Expires: when.Add(time.Hour)}
 	}
 	if err := s.Enqueue(ctx, at("0", t0), l); err != nil {
 		t.Fatal(err)
@@ -405,7 +406,7 @@ func TestARemovalLeavesTheQueueSizeTTLAlone(t *testing.T) {
 	f := newFakeDynamo(t)
 	s := NewWithClient("messages", f)
 	ctx := context.Background()
-	old := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Chat, CPIM: []byte("x"), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	old := store.Message{Recipient: "r", ID: "1", Sender: "s", Mode: store.Chat, CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
 	young := old
 	young.ID, young.Expires = "2", t0.Add(7*24*time.Hour)
 	for _, m := range []store.Message{old, young} {

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -208,7 +209,7 @@ func TestNoSecondSessionIsAskedForOnceOneHasOpened(t *testing.T) {
 				if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, body)); err != nil {
 					t.Fatal(err)
 				}
-			} else if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: mode, CPIM: body}); err != nil {
+			} else if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: mode, CPIM: content.BodyOf(body)}); err != nil {
 				t.Fatal(err)
 			}
 			inv := r.d.nextInvite(t)
@@ -251,7 +252,7 @@ func TestNoSecondSessionIsAskedForOnceOneHasOpened(t *testing.T) {
 // message's next invitation back for InviteTimeout.
 func TestAGuardedInviteLeavesNoKeyBehind(t *testing.T) {
 	r := newRig(t, Config{})
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "for bob", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "for bob", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	inv := r.d.nextInvite(t)
@@ -492,7 +493,7 @@ func TestASessionOpeningMidwayKeepsTheQueueInOrder(t *testing.T) {
 	r := newRig(t, Config{SenderRate: Rate{PerMinute: -1}})
 	l := r.listen(t)
 	for _, id := range []string{"m1", "m2", "m3"} {
-		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, id, id, 0)}); err != nil {
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, id, id, 0))}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -524,7 +525,7 @@ func TestANewMessageDoesNotOvertakeOnesWaitingForTheSameSession(t *testing.T) {
 	l := r.listen(t)
 	drainInvites(t, r.d)
 	// alice's m1 waits for a session to bob.
-	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m1", "m1", 0)}); err != nil {
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "m1", 0))}); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "idle", r.idle)
@@ -539,7 +540,7 @@ func TestANewMessageDoesNotOvertakeOnesWaitingForTheSameSession(t *testing.T) {
 	// tries them on their own, c2 first.
 	for _, o := range []Origin{
 		standalone(carol, bob, chat(t, "c2", "c2", 0)),
-		{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: chat(t, "m2", "m2", 0)},
+		{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m2", "m2", 0))},
 	} {
 		if err := r.e.Submit(t.Context(), o); err != nil {
 			t.Fatal(err)
