@@ -75,10 +75,16 @@ func (c *countingGroups) Get(ctx context.Context, uri string, now time.Time) (gr
 type recordingEngine struct {
 	*messaging.Engine
 	failed chan error
+	// panics, while positive, makes that many InviteFailed calls panic
+	// after recording them.
+	panics atomic.Int32
 }
 
 func (e *recordingEngine) InviteFailed(inv messaging.Invitation, err error) {
 	e.failed <- err
+	if e.panics.Add(-1) >= 0 {
+		panic("engine")
+	}
 	e.Engine.InviteFailed(inv, err)
 }
 

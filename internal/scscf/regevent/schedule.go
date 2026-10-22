@@ -78,6 +78,8 @@ func (n *Notifier) enqueue(t *task) bool {
 				}
 				maps.Copy(merged, t.job.ends)
 				old.job.ends = merged
+				// A refresh only if both are.
+				old.job.refresh = old.job.refresh && t.job.refresh
 				n.count("regevent.notify_merged")
 				finish(t)
 				return true

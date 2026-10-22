@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
@@ -252,7 +253,7 @@ func TestAStandaloneRequestIsNotRecorded(t *testing.T) {
 // TestADialogKeyPrintsWithoutItsKey (security on #322): fmt, slog and JSON
 // show its ID alone, in a Config as on its own.
 func TestADialogKeyPrintsWithoutItsKey(t *testing.T) {
-	k := DialogKey{ID: "k2", Key: []byte("0123456789abcdef0123456789abcdef")}
+	k := DialogKey{ID: "k2", Key: secret.NewKey([]byte("0123456789abcdef0123456789abcdef"))}
 	cfg := Config{DialogKeys: []DialogKey{k}}
 	var logged bytes.Buffer
 	slog.New(slog.NewTextHandler(&logged, nil)).Info("key", "key", k, "keys", cfg.DialogKeys)
@@ -260,8 +261,14 @@ func TestADialogKeyPrintsWithoutItsKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, out := range []string{fmt.Sprint(k), fmt.Sprintf("%v %+v %#v %s %x", k, k, k, k, k), fmt.Sprintf("%+v", cfg), logged.String(), string(js)} {
-		for _, leak := range []string{"0123456789abcdef", hex.EncodeToString(k.Key[:8]), base64.StdEncoding.EncodeToString(k.Key[:9])} {
+	outs := []string{fmt.Sprint(k), fmt.Sprintf("%v %+v %#v %s %x", k, k, k, k, k), fmt.Sprintf("%+v", cfg), logged.String(), string(js)}
+	// fmt calls no method for %p, %w or a verb that does not fit, and
+	// prints the fields (#455): of the key, and of a Config holding it.
+	for _, verb := range []string{"%p", "%w", "%q", "%d", "%e"} {
+		outs = append(outs, fmt.Sprintf(verb, k), fmt.Sprintf(verb, cfg))
+	}
+	for _, out := range outs {
+		for _, leak := range []string{"0123456789abcdef", hex.EncodeToString(k.Key.Reveal()[:8]), base64.StdEncoding.EncodeToString(k.Key.Reveal()[:9])} {
 			if strings.Contains(out, leak) {
 				t.Errorf("%q gives the key away", out)
 			}
@@ -277,7 +284,7 @@ func TestADialogKeyPrintsWithoutItsKey(t *testing.T) {
 func TestNewKeepsTheCurrentAndThePreviousKeyAlone(t *testing.T) {
 	e := newEnv(t)
 	k := func(id string, b byte) DialogKey {
-		return DialogKey{ID: id, Key: bytes.Repeat([]byte{b}, MinDialogKeyBytes)}
+		return DialogKey{ID: id, Key: secret.NewKey(bytes.Repeat([]byte{b}, MinDialogKeyBytes))}
 	}
 	if _, err := New(validConfig(e, func(c *Config) { c.DialogKeys = []DialogKey{k("k3", 3), k("k2", 2)} })); err != nil {
 		t.Errorf("two keys: %v", err)

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // KeySize is the length of a challenge key (AES-256).
@@ -21,8 +22,9 @@ const maxKeyID = 64
 // ChallengeKey is one key that challenges are sealed or opened with, named by
 // an identifier the instances agree on (the Secrets Manager version, say).
 type ChallengeKey struct {
-	ID  string
-	Key []byte
+	ID string
+	// Key is the AES-256 key, which no output reaches (internal/secret).
+	Key secret.Key
 }
 
 // redacted is what a ChallengeKey prints as: its ID, never its key.
@@ -31,8 +33,8 @@ func (k ChallengeKey) redacted() string { return "ChallengeKey{ID:" + k.ID + " K
 // String, GoString, Format, LogValue and MarshalJSON print the key's ID
 // alone, under every valid verb of fmt, as routing.DialogKey's do, so that
 // a Config logged or printed does not give the key away (#439 security
-// review). fmt does not call Format for an invalid verb, %p on a struct
-// say (#455).
+// review). An invalid verb, %p on a struct say, calls none of them and
+// prints the fields, where Key, a secret.Key, shows no byte (#455).
 func (k ChallengeKey) String() string               { return k.redacted() }
 func (k ChallengeKey) GoString() string             { return k.redacted() }
 func (k ChallengeKey) Format(f fmt.State, _ rune)   { _, _ = io.WriteString(f, k.redacted()) }
@@ -65,10 +67,10 @@ func newSealer(keys []ChallengeKey, sealID string) (*sealer, error) {
 		if _, dup := s.keys[k.ID]; dup {
 			return nil, errors.New("dynamostore: two challenge keys share an ID")
 		}
-		if len(k.Key) != KeySize {
+		if k.Key.Len() != KeySize {
 			return nil, fmt.Errorf("dynamostore: a challenge key must be %d bytes", KeySize)
 		}
-		block, err := aes.NewCipher(k.Key)
+		block, err := aes.NewCipher(k.Key.Reveal())
 		if err != nil {
 			return nil, err
 		}

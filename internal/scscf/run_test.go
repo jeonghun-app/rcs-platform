@@ -22,6 +22,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -202,8 +203,8 @@ func testConfig() ServiceConfig {
 		OriginRealm: realm, HSSRealm: realm, HSSDiscovery: DiscoveryDNS,
 		HSSHostPattern: "hss-*.rcs.local", CxTimeout: 2 * time.Second,
 		Store:         StoreMemory,
-		NonceKey:      []byte("0123456789abcdef0123456789abcdef"),
-		DialogKeys:    []routing.DialogKey{{ID: "k1", Key: []byte("fedcba9876543210fedcba9876543210")}},
+		NonceKey:      secret.NewKey([]byte("0123456789abcdef0123456789abcdef")),
+		DialogKeys:    []routing.DialogKey{{ID: "k1", Key: secret.NewKey([]byte("fedcba9876543210fedcba9876543210"))}},
 		ICSCF:         mustURI("sip:icscf.rcs.local:5060;transport=tcp;lr"),
 		PCSCFCorePort: DefaultPCSCFCorePort,
 		ASTimeout:     routing.DefaultASTimeout, ThirdPartyTimeout: routing.DefaultThirdPartyTimeout,
