@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -390,7 +391,7 @@ func TestAPanicInAHookEndsOnlyItsOwnRequest(t *testing.T) {
 				t.Errorf("%s counted %d, Stats %d", MetricHookPanics, m, n)
 			}
 			out := logs.String()
-			if !strings.Contains(out, "hook="+tt.hook) {
+			if !strings.Contains(out, "name="+tt.hook) {
 				t.Errorf("the log does not name the hook %s:\n%s", tt.hook, out)
 			}
 			for _, secret := range []string{hookSecret, "alice@example.com", "bob@"} {
@@ -432,7 +433,7 @@ func TestAHookPanicIsLoggedOnceAMinute(t *testing.T) {
 		h.receive(request(t, "MESSAGE", "sip:bob@example.com",
 			"Via: SIP/2.0/TCP 192.0.2.10:5060;branch=z9hG4bKup-"+itoa(n), "Call-ID: call-"+itoa(n)+"@192.0.2.10"))
 	}
-	lines := func() int { return strings.Count(logs.String(), "hook=Route") }
+	lines := func() int { return strings.Count(logs.String(), "name=Route") }
 	for _, step := range []struct {
 		advance time.Duration
 		want    int
@@ -473,5 +474,30 @@ func TestAServePanicAfterACancelIsAnswered487(t *testing.T) {
 	check(t, "upstream", h.upstream(), codes(200, 487))
 	if n := h.p.Stats().HookPanics; n != 1 {
 		t.Errorf("HookPanics = %d, want 1", n)
+	}
+}
+
+// The proxy's transaction layer counts a service's response handler's
+// panics where the proxy counts its hooks' (#445): pcscf's SUBSCRIBE goes
+// through Layer().Request.
+func TestTheProxysLayerCountsAResponseHandlersPanics(t *testing.T) {
+	metrics := &countingMetrics{}
+	var logs lockedBuffer
+	h := newHarness(t, Config{Metrics: metrics, Logger: slog.New(slog.NewTextHandler(&logs, nil))})
+	req := request(t, "SUBSCRIBE", "sip:bob@192.0.2.30", "Via: SIP/2.0/TCP proxy.example.net;branch=z9hG4bKsub1")
+	if _, err := h.p.Layer().Request(req, transport.Destination{Network: transport.TCP, ServerName: "s"}, func(res *sip.Response, err error) {
+		if res != nil {
+			panic("handler")
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.reply(h.one(), 200)
+	if n := metrics.count(transaction.MetricHandlerPanics); n != 1 {
+		t.Errorf("%s = %d, want 1", transaction.MetricHandlerPanics, n)
+	}
+	// And logs it through the proxy's Logger (#471 QA).
+	if !strings.Contains(logs.String(), "name=ResponseHandler") {
+		t.Errorf("the proxy's log lacks the handler's panic:\n%s", logs.String())
 	}
 }
