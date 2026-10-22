@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/safeerr"
 )
 
@@ -32,18 +33,11 @@ type Control struct {
 	// HTTP sends requests; it must not follow redirects (ADR 0007 §5).
 	HTTP *http.Client
 	// URL is the control API's base, e.g. http://msrp-relay.rcs.local:8082.
-	URL   *url.URL
-	Token Token
+	URL *url.URL
+	// Token is pcscf's bearer token, which prints as "[redacted]" under
+	// every verb (#538).
+	Token secret.Key
 }
-
-// Token is pcscf's bearer token; it prints as a placeholder.
-type Token struct{ v string }
-
-// NewToken wraps a token.
-func NewToken(v string) Token { return Token{v: v} }
-
-func (Token) String() string   { return "[redacted]" }
-func (Token) GoString() string { return "[redacted]" }
 
 // Binding is what POST returned.
 type Binding struct {
@@ -130,7 +124,7 @@ func (c *Control) call(ctx context.Context, op, method, path string, body map[st
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token.v)
+	req.Header.Set("Authorization", "Bearer "+c.Token.RevealString())
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return fmt.Errorf("anchor: %s: %w", op, safeerr.Reason(err))
