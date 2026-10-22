@@ -161,7 +161,7 @@ func TestReassemblingAMessageInOrderCostsTheSameForEveryChunk(t *testing.T) {
 			}
 		}
 	})
-	if got == nil || !bytes.Equal(got.Body, bodyOf(size)) {
+	if got == nil || !bytes.Equal(got.Body.Bytes(), bodyOf(size)) {
 		t.Fatal("message not reassembled")
 	}
 	// The one run doubles up to the declared total and is handed over
@@ -578,18 +578,18 @@ func TestASenderWaitsForRoomInItsSessionsWindow(t *testing.T) {
 	s := newTestSession(t, clientURI, asURI, newRecorder())
 	openWithPeer(t, c, p, s)
 	for range 2 {
-		if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("x")}); err != nil {
+		if _, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("x"))}); err != nil {
 			t.Fatal(err)
 		}
 		p.next(t)
 	}
 	sent := make(chan error, 1)
 	go func() {
-		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("third")})
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("third"))})
 		sent <- err
 	}()
 	clock.Advance(DefaultTransactionTimeout)
-	if m := p.next(t); string(m.Body) != "third" {
+	if m := p.next(t); string(m.Body.Bytes()) != "third" {
 		t.Fatalf("got %+v", m)
 	}
 	if err := <-sent; err != nil {
@@ -790,7 +790,7 @@ func TestClientAddressesInURIsAreLoggedAsTheirNetwork(t *testing.T) {
 func TestMessagesPrintWithoutBodiesOrSessionIDs(t *testing.T) {
 	m := &Message{TransactionID: "l0gged", Method: MethodSend, ToPath: []URI{mustURI(t, asURI)}, FromPath: []URI{mustURI(t, clientURI)},
 		MessageID: "msg1", ByteRange: &ByteRange{1, 15, 15}, ContentType: "text/plain",
-		Header: []Field{{"Content-Disposition", "s3cr3tvalue"}}, Body: []byte("private content")}
+		Header: []Field{{"Content-Disposition", "s3cr3tvalue"}}, Body: BodyOf([]byte("private content"))}
 	resp := &Message{TransactionID: "l0gged", StatusCode: 200, ToPath: m.FromPath, FromPath: m.ToPath}
 	rep := NewReport(m, m.ToPath[0], *m.ByteRange, 200)
 	rep.TransactionID = "l0gged"
@@ -865,7 +865,7 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 	body := bodyOf((DefaultSendWindow + 1) * DefaultChunkSize)
 	for i := range stalled {
 		s := open(i)
-		go func() { _, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: body}) }()
+		go func() { _, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf(body)}) }()
 	}
 	want := int64(stalled * DefaultSendWindow)
 	deadline := time.Now().Add(hangGuard)
@@ -878,7 +878,7 @@ func TestSessionsStalledAtAFullWindowDoNotStallAnotherSession(t *testing.T) {
 	other := open(stalled)
 	done := make(chan error, 1)
 	go func() {
-		_, err := other.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("not stuck")})
+		_, err := other.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("not stuck"))})
 		done <- err
 	}()
 	select {

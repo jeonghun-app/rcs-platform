@@ -61,7 +61,7 @@ func TestSplitRefusesChunksThatWouldHaveToBeInterruptible(t *testing.T) {
 
 func chunkMsg(id string, r ByteRange, body string, flag byte) *Message {
 	return &Message{Method: MethodSend, MessageID: id, ByteRange: &r, ContentType: "text/plain",
-		Body: []byte(body), Continuation: flag}
+		Body: BodyOf([]byte(body)), Continuation: flag}
 }
 
 func TestReassemblerPassesAWholeMessageStraightThrough(t *testing.T) {
@@ -69,10 +69,10 @@ func TestReassemblerPassesAWholeMessageStraightThrough(t *testing.T) {
 	for _, m := range []*Message{
 		chunkMsg("msg1", ByteRange{1, 5, 5}, "hello", FlagEnd),
 		chunkMsg("msg2", ByteRange{1, Unknown, Unknown}, "hello", FlagEnd),
-		{Method: MethodSend, MessageID: "msg3", ContentType: "text/plain", Body: []byte("hello")}, // no Byte-Range
+		{Method: MethodSend, MessageID: "msg3", ContentType: "text/plain", Body: BodyOf([]byte("hello"))}, // no Byte-Range
 	} {
 		got, err := r.Add(m, t0)
-		if err != nil || got == nil || string(got.Body) != "hello" || *got.ByteRange != (ByteRange{1, 5, 5}) {
+		if err != nil || got == nil || string(got.Body.Bytes()) != "hello" || *got.ByteRange != (ByteRange{1, 5, 5}) {
 			t.Fatalf("%s: got %+v, %v", m.MessageID, got, err)
 		}
 	}
@@ -101,7 +101,7 @@ func TestReassemblerJoinsChunksInAnyOrder(t *testing.T) {
 			}
 			got = m
 		}
-		if got == nil || string(got.Body) != "abcdEFGHijkl" || r.Pending() != 0 {
+		if got == nil || string(got.Body.Bytes()) != "abcdEFGHijkl" || r.Pending() != 0 {
 			t.Fatalf("order %v: got %+v", order, got)
 		}
 	}
@@ -112,7 +112,7 @@ func TestReassemblerTakesTheLaterOfOverlappingChunks(t *testing.T) {
 	mustAdd(t, &r, chunkMsg("msg1", ByteRange{1, 6, 8}, "abcdef", FlagMore))
 	mustAdd(t, &r, chunkMsg("msg1", ByteRange{4, 6, 8}, "DEF", FlagMore))
 	got := mustAdd(t, &r, chunkMsg("msg1", ByteRange{7, 8, 8}, "gh", FlagEnd))
-	if got == nil || string(got.Body) != "abcDEFgh" {
+	if got == nil || string(got.Body.Bytes()) != "abcDEFgh" {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -124,7 +124,7 @@ func TestReassemblerHandlesUnknownTotalsAndInterruptedChunks(t *testing.T) {
 	mustAdd(t, &r, chunkMsg("msg1", ByteRange{1, 10, Unknown}, "abc", FlagMore))
 	mustAdd(t, &r, chunkMsg("msg1", ByteRange{4, Unknown, Unknown}, "de", FlagMore))
 	got := mustAdd(t, &r, chunkMsg("msg1", ByteRange{6, 7, Unknown}, "fg", FlagEnd))
-	if got == nil || string(got.Body) != "abcdefg" {
+	if got == nil || string(got.Body.Bytes()) != "abcdefg" {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -136,7 +136,7 @@ func TestReassemblerWaitsForEveryGap(t *testing.T) {
 	if got := mustAdd(t, &r, chunkMsg("msg1", ByteRange{5, 6, 8}, "ef", FlagMore)); got != nil {
 		t.Fatal("completed with a gap at 3-4")
 	}
-	if got := mustAdd(t, &r, chunkMsg("msg1", ByteRange{3, 4, 8}, "cd", FlagMore)); got == nil || string(got.Body) != "abcdefgh" {
+	if got := mustAdd(t, &r, chunkMsg("msg1", ByteRange{3, 4, 8}, "cd", FlagMore)); got == nil || string(got.Body.Bytes()) != "abcdefgh" {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -145,7 +145,7 @@ func TestReassemblerCompletesAnEmptyMessageSentInChunks(t *testing.T) {
 	var r Reassembler
 	mustAdd(t, &r, chunkMsg("msg1", ByteRange{1, Unknown, Unknown}, "", FlagMore))
 	got := mustAdd(t, &r, chunkMsg("msg1", ByteRange{1, 0, 0}, "", FlagEnd))
-	if got == nil || len(got.Body) != 0 {
+	if got == nil || got.Body.Len() != 0 {
 		t.Fatalf("got %+v", got)
 	}
 }
@@ -244,7 +244,7 @@ func TestReassemblerKeepsMessagesApartByMessageID(t *testing.T) {
 	mustAdd(t, &r, chunkMsg("msg2", ByteRange{1, 2, 4}, "AB", FlagMore))
 	one := mustAdd(t, &r, chunkMsg("msg1", ByteRange{3, 4, 4}, "cd", FlagEnd))
 	two := mustAdd(t, &r, chunkMsg("msg2", ByteRange{3, 4, 4}, "CD", FlagEnd))
-	if string(one.Body) != "abcd" || string(two.Body) != "ABCD" {
+	if string(one.Body.Bytes()) != "abcd" || string(two.Body.Bytes()) != "ABCD" {
 		t.Fatalf("got %q and %q", one.Body, two.Body)
 	}
 }

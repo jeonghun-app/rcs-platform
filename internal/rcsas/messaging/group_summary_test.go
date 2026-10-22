@@ -139,7 +139,7 @@ func (a *author) listen(t *testing.T, c *client) {
 		for {
 			select {
 			case m := <-c.got:
-				a.take(t, m.Body)
+				a.take(t, m.Body.Bytes())
 			case <-t.Context().Done():
 				return
 			}

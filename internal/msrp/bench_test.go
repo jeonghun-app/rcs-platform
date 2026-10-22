@@ -36,7 +36,7 @@ func (r *benchBinder) Bind(_ *Conn, to URI) (*Session, error) {
 type counted struct{ got chan struct{} }
 
 func (h counted) HandleMessage(*Session, *Message) error { h.got <- struct{}{}; return nil }
-func (counted) HandleReport(*Session, Report)             {}
+func (counted) HandleReport(*Session, Report)            {}
 
 // BenchmarkRelayMessage relays one message per iteration from a client,
 // through a relay, to rcs-as, over pipes: the path a chat message takes
@@ -86,7 +86,7 @@ func BenchmarkRelayMessage(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for b.Loop() {
-				if _, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: body, FailureReport: ReportNo}); err != nil {
+				if _, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf(body), FailureReport: ReportNo}); err != nil {
 					b.Fatal(err)
 				}
 				<-got

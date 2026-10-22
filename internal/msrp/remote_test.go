@@ -47,21 +47,21 @@ func TestASessionWhosePathComesLaterBindsAndSendsOnceItIsSet(t *testing.T) {
 	}
 
 	// The peer can already send; this side's Send waits for the path.
-	if _, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("early")}); err != nil {
+	if _, err := alice.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("early"))}); err != nil {
 		t.Fatal(err)
 	}
-	if m := bobH.message(t); string(m.Body) != "early" {
+	if m := bobH.message(t); string(m.Body.Bytes()) != "early" {
 		t.Fatalf("got %q", m.Body)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	_, err = bob.Send(ctx, Outgoing{ContentType: "text/plain", Body: []byte("too soon")})
+	_, err = bob.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("too soon"))})
 	cancel()
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Send before SetRemote = %v", err)
 	}
 	sent := make(chan error, 1)
 	go func() {
-		_, err := bob.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("reply")})
+		_, err := bob.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("reply"))})
 		sent <- err
 	}()
 	if err := bob.SetRemote([]URI{mustURI(t, clientURI)}); err != nil {
@@ -70,7 +70,7 @@ func TestASessionWhosePathComesLaterBindsAndSendsOnceItIsSet(t *testing.T) {
 	if err := <-sent; err != nil {
 		t.Fatal(err)
 	}
-	if m := aliceH.message(t); string(m.Body) != "reply" {
+	if m := aliceH.message(t); string(m.Body.Bytes()) != "reply" {
 		t.Fatalf("got %q", m.Body)
 	}
 	if !bob.Remote()[0].Equal(mustURI(t, clientURI)) {
@@ -91,7 +91,7 @@ func TestAPathSetLaterMustBeValidAndAClosedSessionStopsWaiting(t *testing.T) {
 	}
 	waited := make(chan error, 1)
 	go func() {
-		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("x")})
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("x"))})
 		waited <- err
 	}()
 	_ = s.Close()

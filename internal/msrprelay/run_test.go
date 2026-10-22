@@ -107,7 +107,7 @@ func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 		t.Fatalf("Open = %v", err)
 	}
 	send(t, s, "through Run")
-	if m := asH.message(t); string(m.Body) != "through Run" {
+	if m := asH.message(t); string(m.Body.Bytes()) != "through Run" {
 		t.Fatalf("rcs-as got %q", m.Body)
 	}
 
@@ -130,7 +130,7 @@ func TestRunServesTheControlAPIAndTheDataPathThenDrains(t *testing.T) {
 		t.Fatal("a stopping relay accepted a connection")
 	}
 	send(t, s, "while draining")
-	if m := asH.message(t); string(m.Body) != "while draining" {
+	if m := asH.message(t); string(m.Body.Bytes()) != "while draining" {
 		t.Fatalf("rcs-as got %q", m.Body)
 	}
 	r.clock.Advance(5 * time.Second)

@@ -158,7 +158,8 @@ type Message struct {
 
 	// Header holds every other header in wire order.
 	Header []Field
-	Body   []byte
+	// Body is the content, which prints as "[redacted body]" (Body).
+	Body Body
 
 	// Continuation is the end-line flag. The zero value is written as
 	// FlagEnd.

@@ -35,7 +35,7 @@ func (h *countingHandler) HandleMessage(_ *Session, m *Message) error {
 		time.Sleep(h.delay)
 	}
 	h.msgs.Add(1)
-	h.octets.Add(int64(len(m.Body)))
+	h.octets.Add(int64(m.Body.Len()))
 	if h.got != nil {
 		select {
 		case h.got <- m:
@@ -119,7 +119,7 @@ func sendMany(ctx context.Context, s *Session, workers, per, size int, sr bool) 
 	for range workers {
 		go func() {
 			for range per {
-				if _, err := s.Send(ctx, Outgoing{ContentType: "application/octet-stream", Body: body, SuccessReport: sr}); err != nil {
+				if _, err := s.Send(ctx, Outgoing{ContentType: "application/octet-stream", Body: BodyOf(body), SuccessReport: sr}); err != nil {
 					errs <- err
 					return
 				}
@@ -820,7 +820,7 @@ func TestSlowAndSilentClientsDoNotHoldUpOthersOnTheSharedRelayConnection(t *test
 		bound := time.After(fastBound)
 		sent := make(chan error, 1)
 		go func() {
-			_, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))})
+			_, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte(fmt.Sprintf("hi %d", i)))})
 			sent <- err
 		}()
 		for got, answered := false, false; !got || !answered; {
@@ -902,7 +902,7 @@ func TestARelayKeepsItsRcsAsConnectionUnderPacedChatAndFilePush(t *testing.T) {
 				case tc.gap > 0:
 					go func() {
 						for ctx.Err() == nil {
-							if _, err := cs.Send(ctx, Outgoing{ContentType: "text/plain", Body: bodyOf(200)}); err != nil {
+							if _, err := cs.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf(bodyOf(200))}); err != nil {
 								return
 							}
 							time.Sleep(tc.gap)
@@ -941,7 +941,7 @@ func TestSendHonoursItsContextWhenThePeerStopsReading(t *testing.T) {
 	defer cancel()
 	sent := make(chan error, 1)
 	go func() {
-		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: bodyOf(10000)})
+		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf(bodyOf(10000))})
 		sent <- err
 	}()
 	// The peer takes one byte, so the write has begun, and then stops
@@ -997,14 +997,14 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 	sendsStart := time.Now()
 	stored := make(chan error, 1)
 	go func() {
-		_, err := asLate.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("kept for you")})
+		_, err := asLate.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("kept for you"))})
 		stored <- err
 	}()
 	// More than the relay holds for an unbound session, from a sender that
 	// does not wait for answers, is refused for that session alone.
 	over := make(chan error, 1)
 	go func() {
-		_, err := asOver.Send(context.Background(), Outgoing{ContentType: "application/octet-stream", Body: bodyOf(1 << 20), FailureReport: ReportPartial})
+		_, err := asOver.Send(context.Background(), Outgoing{ContentType: "application/octet-stream", Body: BodyOf(bodyOf(1 << 20)), FailureReport: ReportPartial})
 		over <- err
 	}()
 	// The connected client gets its messages while the unconnected one's
@@ -1030,7 +1030,7 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 		bound := time.After(stallBound)
 		sent := make(chan error, 1)
 		go func() {
-			_, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte(fmt.Sprintf("hi %d", i))})
+			_, err := asFast.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte(fmt.Sprintf("hi %d", i)))})
 			sent <- err
 		}()
 		for got, answered := false, false; !got || !answered; {
@@ -1077,13 +1077,13 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 	}
 	overClient := &countingHandler{got: make(chan *Message, 4)}
 	rig.dialClient(t, clOver, rpOver, overClient)
-	if _, err := asOver.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("after")}); err != nil {
+	if _, err := asOver.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("after"))}); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case m := <-overClient.got:
-		if string(m.Body) != "after" {
-			t.Fatalf("the client got %d octets of %q first", len(m.Body), m.MessageID)
+		if string(m.Body.Bytes()) != "after" {
+			t.Fatalf("the client got %d octets of %q first", m.Body.Len(), m.MessageID)
 		}
 	case <-time.After(hangGuard):
 		t.Fatal("the later message never arrived")
@@ -1093,7 +1093,7 @@ func TestRcsAsSendingBeforeTheClientConnectsHoldsUpNoOtherSession(t *testing.T) 
 	rig.dialClient(t, clLate, rpLate, lateH)
 	select {
 	case m := <-lateH.got:
-		if string(m.Body) != "kept for you" {
+		if string(m.Body.Bytes()) != "kept for you" {
 			t.Fatalf("got %q", m.Body)
 		}
 	case <-time.After(hangGuard):

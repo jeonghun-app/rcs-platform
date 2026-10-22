@@ -35,7 +35,7 @@ func TestASendCancelledWhileQueuedEndsWithItsContextsError(t *testing.T) {
 	// rest.
 	first := make(chan error, 1)
 	go func() {
-		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: bytes.Repeat([]byte("a"), 1000)})
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf(bytes.Repeat([]byte("a"), 1000))})
 		first <- err
 	}()
 	_ = theirs.SetReadDeadline(time.Now().Add(hangGuard))
@@ -48,7 +48,7 @@ func TestASendCancelledWhileQueuedEndsWithItsContextsError(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	second := make(chan error, 1)
 	go func() {
-		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: []byte("cancelled")})
+		_, err := s.Send(ctx, Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("cancelled"))})
 		second <- err
 	}()
 	waitQueued(t, c, 1, "the second message")
@@ -67,11 +67,11 @@ func TestASendCancelledWhileQueuedEndsWithItsContextsError(t *testing.T) {
 	}
 	third := make(chan error, 1)
 	go func() {
-		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("third")})
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("third"))})
 		third <- err
 	}()
 	m := p.next(t)
-	if string(m.Body) != "third" {
+	if string(m.Body.Bytes()) != "third" {
 		t.Fatalf("after the first message the peer read %q, want the third", m.Body)
 	}
 	p.respond(t, m, StatusOK)
@@ -126,7 +126,7 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	defer cancelB()
 	b := make(chan error, 1)
 	go func() {
-		_, err := s.Send(ctxB, Outgoing{ContentType: "text/plain", Body: []byte("bbbbbbbbBBBBBBBB")})
+		_, err := s.Send(ctxB, Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("bbbbbbbbBBBBBBBB"))})
 		b <- err
 	}()
 	if _, err := io.ReadFull(theirs, octet); err != nil {
@@ -135,7 +135,7 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	// A, one chunk, queues behind B's first chunk.
 	a := make(chan error, 1)
 	go func() {
-		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("aaaa")})
+		_, err := s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("aaaa"))})
 		a <- err
 	}()
 	waitQueued(t, c, 1, "A")
@@ -143,7 +143,7 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	// queues behind A. Then B is cancelled.
 	p.r = NewReader(io.MultiReader(bytes.NewReader(octet), theirs), 0)
 	b1 := p.next(t)
-	if string(b1.Body) != "bbbbbbbb" {
+	if string(b1.Body.Bytes()) != "bbbbbbbb" {
 		t.Fatalf("first chunk %q", b1.Body)
 	}
 	if _, err := io.ReadFull(theirs, octet); err != nil { // A is being written
@@ -156,7 +156,7 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	}
 	p.r = NewReader(io.MultiReader(bytes.NewReader(octet), theirs), 0)
 	am := p.next(t)
-	if string(am.Body) != "aaaa" {
+	if string(am.Body.Bytes()) != "aaaa" {
 		t.Fatalf("after B's first chunk the peer read %q, want A", am.Body)
 	}
 	p.respond(t, am, StatusOK)
@@ -166,9 +166,11 @@ func TestALaterChunkCancelledWhileQueuedIsAborted(t *testing.T) {
 	}
 	// A third message, so a missing abort shows at once as the wrong next
 	// message.
-	go func() { _, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("cccc")}) }()
+	go func() {
+		_, _ = s.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("cccc"))})
+	}()
 	m := p.next(t)
-	if m.Continuation != FlagAbort || m.MessageID != b1.MessageID || m.Range() != (ByteRange{Start: 9, End: 8, Total: 16}) || len(m.Body) != 0 {
+	if m.Continuation != FlagAbort || m.MessageID != b1.MessageID || m.Range() != (ByteRange{Start: 9, End: 8, Total: 16}) || m.Body.Len() != 0 {
 		t.Fatalf("after A the peer read %q flag %q range %+v (id %s, B's %s); want B's abort chunk 9-8/16",
 			m.Body, m.Continuation, m.ByteRange, m.MessageID, b1.MessageID)
 	}

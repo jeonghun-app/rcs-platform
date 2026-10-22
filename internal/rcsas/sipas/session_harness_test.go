@@ -274,7 +274,7 @@ func (r *chatRig) connect(t *testing.T, local, remote msrp.URI) *relayEnd {
 // send sends a chat message and returns the code of its report.
 func (e *relayEnd) send(t *testing.T, body string) int {
 	t.Helper()
-	id, err := e.session.Send(context.Background(), msrp.Outgoing{ContentType: cpim.ContentType, Body: []byte(body), SuccessReport: true})
+	id, err := e.session.Send(context.Background(), msrp.Outgoing{ContentType: cpim.ContentType, Body: msrp.BodyOf([]byte(body)), SuccessReport: true})
 	if err != nil {
 		t.Fatal(err)
 	}

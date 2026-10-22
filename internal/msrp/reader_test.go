@@ -60,7 +60,7 @@ func TestReadMessageParsesASendWithABody(t *testing.T) {
 	if v, _ := m.Get("Content-Disposition"); v != "render" {
 		t.Fatalf("Content-Disposition = %q", v)
 	}
-	if string(m.Body) != "hello there" || m.Continuation != FlagEnd {
+	if string(m.Body.Bytes()) != "hello there" || m.Continuation != FlagEnd {
 		t.Fatalf("body %q flag %q", m.Body, m.Continuation)
 	}
 }
@@ -74,7 +74,7 @@ func TestReadMessageParsesABodilessSend(t *testing.T) {
 		"Byte-Range: 1-0/0",
 		"-------b0dy1ess$",
 	))
-	if m.HasBody() || len(m.Body) != 0 || m.Continuation != FlagEnd {
+	if m.HasBody() || m.Body.Len() != 0 || m.Continuation != FlagEnd {
 		t.Fatalf("bodiless SEND read as %+v", m)
 	}
 }
@@ -90,7 +90,7 @@ func TestReadMessageKeepsAnEmptyBodyApartFromNoBody(t *testing.T) {
 		"",
 		"-------e1mpty$",
 	))
-	if !m.HasBody() || len(m.Body) != 0 {
+	if !m.HasBody() || m.Body.Len() != 0 {
 		t.Fatalf("empty body read as %+v", m)
 	}
 }
@@ -167,7 +167,7 @@ func TestBodyKeepsBytesThatOnlyLookLikeAnEndLine(t *testing.T) {
 			"-------tidtid+",
 		)
 		m := readOne(t, in)
-		if string(m.Body) != body || m.Continuation != FlagMore {
+		if string(m.Body.Bytes()) != body || m.Continuation != FlagMore {
 			t.Errorf("body %q read as %q, flag %q", body, m.Body, m.Continuation)
 		}
 	}
@@ -196,8 +196,8 @@ func TestEndLineIsFoundWhereverTheBufferBoundaryFalls(t *testing.T) {
 			if err != nil {
 				t.Fatalf("n=%d %s: %v", n, name, err)
 			}
-			if string(m.Body) != body+"\r" {
-				t.Fatalf("n=%d %s: body of %d octets, want %d", n, name, len(m.Body), n+1)
+			if string(m.Body.Bytes()) != body+"\r" {
+				t.Fatalf("n=%d %s: body of %d octets, want %d", n, name, m.Body.Len(), n+1)
 			}
 		}
 	}
@@ -422,7 +422,7 @@ func TestMarshalAndReadMessageRoundTrip(t *testing.T) {
 			MessageID: "msg1", ByteRange: &ByteRange{Start: 1, End: Unknown, Total: Unknown},
 			SuccessReport: ReportYes, FailureReport: ReportPartial,
 			Header:      []Field{{"Content-ID", "<p1@client.example.com>"}, {"X-Ext", "v"}},
-			ContentType: "message/cpim", Body: []byte("To: <sip:x@example.com>\r\n\r\n-------r0und2$\r\n"), Continuation: FlagMore},
+			ContentType: "message/cpim", Body: BodyOf([]byte("To: <sip:x@example.com>\r\n\r\n-------r0und2$\r\n")), Continuation: FlagMore},
 		{TransactionID: "r0und1", Method: MethodSend, ToPath: []URI{to}, FromPath: []URI{from},
 			MessageID: "msg1", ByteRange: &ByteRange{Start: 1, End: 0, Total: 0}},
 		{TransactionID: "r0und1", Method: MethodReport, ToPath: []URI{to}, FromPath: []URI{from},
@@ -443,7 +443,7 @@ func TestMarshalAndReadMessageRoundTrip(t *testing.T) {
 		if !bytes.Equal(b, again) {
 			t.Fatalf("round trip changed the message:\n%s\n%s", b, again)
 		}
-		if got.flag() != want.flag() || !bytes.Equal(got.Body, want.Body) {
+		if got.flag() != want.flag() || !bytes.Equal(got.Body.Bytes(), want.Body.Bytes()) {
 			t.Fatalf("flag or body changed")
 		}
 		var sb strings.Builder
@@ -457,7 +457,7 @@ func TestMarshalPutsMIMEHeadersAfterTheOthersAndContentTypeLast(t *testing.T) {
 	m := &Message{TransactionID: "0rder1", Method: MethodSend, ToPath: []URI{mustURI(t, toURI)},
 		FromPath: []URI{mustURI(t, fromURI)}, MessageID: "msg1",
 		Header:      []Field{{"Content-Disposition", "inline"}, {"X-Ext", "v"}},
-		ContentType: "text/plain", Body: []byte("x")}
+		ContentType: "text/plain", Body: BodyOf([]byte("x"))}
 	b, err := m.Marshal()
 	if err != nil {
 		t.Fatal(err)
@@ -489,16 +489,16 @@ func TestMarshalRefusesMessagesThatBreakTheRules(t *testing.T) {
 		"bad header name":            func(m *Message) { m.Header = []Field{{"X A", "v"}} },
 		"typed header in Header":     func(m *Message) { m.Header = []Field{{"byte-range", "1-1/1"}} },
 		"MIME header without body":   func(m *Message) { m.Header = []Field{{"Content-ID", "<a@b>"}} },
-		"body without Content-Type":  func(m *Message) { m.Body = []byte("x") },
-		"bad Content-Type":           func(m *Message) { m.ContentType = "text"; m.Body = []byte("x") },
-		"end-line in the body":       func(m *Message) { m.ContentType = "text/plain"; m.Body = []byte("a\r\n-------v4lid1$\r\n") },
+		"body without Content-Type":  func(m *Message) { m.Body = BodyOf([]byte("x")) },
+		"bad Content-Type":           func(m *Message) { m.ContentType = "text"; m.Body = BodyOf([]byte("x")) },
+		"end-line in the body":       func(m *Message) { m.ContentType = "text/plain"; m.Body = BodyOf([]byte("a\r\n-------v4lid1$\r\n")) },
 		"chunked REPORT":             func(m *Message) { m.Method = MethodReport; m.Status = &Status{Code: 200}; m.Continuation = FlagMore },
 		"REPORT without Status":      func(m *Message) { m.Method = MethodReport },
 		"REPORT with Failure-Report": func(m *Message) { m.Method = MethodReport; m.Status = &Status{Code: 200}; m.FailureReport = ReportNo },
 		"large non-SEND body": func(m *Message) {
 			m.Method = MethodNickname
 			m.ContentType = "text/plain"
-			m.Body = bytes.Repeat([]byte("a"), maxNonSendBody+1)
+			m.Body = BodyOf(bytes.Repeat([]byte("a"), maxNonSendBody+1))
 		},
 		"response with a body":    func(m *Message) { m.Method = ""; m.StatusCode = 200; m.ContentType = "text/plain" },
 		"response continued":      func(m *Message) { m.Method = ""; m.StatusCode = 200; m.Continuation = FlagMore },

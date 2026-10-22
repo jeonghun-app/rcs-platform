@@ -66,16 +66,16 @@ func TestFlowBasicSession(t *testing.T) {
 		"Hello from us!",
 		"-------a7k2p9q1$")
 	expectWire(t, alice, ok200("a7k2p9q1"))
-	if m := h.message(t); string(m.Body) != "Hello from us!" {
+	if m := h.message(t); string(m.Body.Bytes()) != "Hello from us!" {
 		t.Fatalf("bob got %q", m.Body)
 	}
 
-	if _, err := bob.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: []byte("And hello back.")}); err != nil {
+	if _, err := bob.Send(context.Background(), Outgoing{ContentType: "text/plain", Body: BodyOf([]byte("And hello back."))}); err != nil {
 		t.Fatal(err)
 	}
 	m := alice.next(t)
 	if m.Method != MethodSend || m.ToPath[0].String() != aliceURI || m.FromPath[0].String() != bobURI ||
-		*m.ByteRange != (ByteRange{1, 15, 15}) || m.ContentType != "text/plain" || string(m.Body) != "And hello back." {
+		*m.ByteRange != (ByteRange{1, 15, 15}) || m.ContentType != "text/plain" || string(m.Body.Bytes()) != "And hello back." {
 		t.Fatalf("bob sent %+v", m)
 	}
 	resp, _ := NewResponse(m, StatusOK, "OK")
@@ -106,7 +106,7 @@ func TestFlowChunkedMessage(t *testing.T) {
 		"WXYZ",
 		"-------ch0nk002$")
 	expectWire(t, alice, ok200("ch0nk002"))
-	if m := h.message(t); string(m.Body) != "wxyzWXYZ" || m.MessageID != "ch0nkmsg" {
+	if m := h.message(t); string(m.Body.Bytes()) != "wxyzWXYZ" || m.MessageID != "ch0nkmsg" {
 		t.Fatalf("bob got %q", m.Body)
 	}
 }
@@ -141,7 +141,7 @@ func TestFlowChunkedCPIMPayload(t *testing.T) {
 		second,
 		"-------cp1m0002$")
 	expectWire(t, alice, ok200("cp1m0002"))
-	if m := h.message(t); string(m.Body) != cpim+text || m.MediaType() != "message/cpim" {
+	if m := h.message(t); string(m.Body.Bytes()) != cpim+text || m.MediaType() != "message/cpim" {
 		t.Fatalf("bob got %q", m.Body)
 	}
 }

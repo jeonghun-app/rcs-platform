@@ -68,7 +68,7 @@ func TestAChatInviteCarriesItsFirstMessage(t *testing.T) {
 	p.ack(s)
 	inv := r.core.nextOf(t, "INVITE")
 	toLeg, _ := offered(t, inv)
-	if m := r.connect(t, toBob, toLeg).next(t); !strings.Contains(string(m.Body), "hello in the INVITE") {
+	if m := r.connect(t, toBob, toLeg).next(t); !strings.Contains(string(m.Body.Bytes()), "hello in the INVITE") {
 		t.Fatalf("bob got %q", m.Body)
 	}
 }
@@ -332,7 +332,7 @@ func TestAMessageWaitsUntilTheRecipientRegisters(t *testing.T) {
 	inv := r.core.nextOf(t, "INVITE")
 	toLeg, _ := offered(t, inv)
 	r.core.nextOf(t, "ACK")
-	if m := r.connect(t, toBob, toLeg).next(t); !strings.Contains(string(m.Body), "stored for bob") {
+	if m := r.connect(t, toBob, toLeg).next(t); !strings.Contains(string(m.Body.Bytes()), "stored for bob") {
 		t.Fatalf("bob got %q", m.Body)
 	}
 }

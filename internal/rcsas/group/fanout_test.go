@@ -18,7 +18,7 @@ import (
 // asSeen parses what a participant received.
 func asSeen(t *testing.T, m *msrp.Message) *cpim.Message {
 	t.Helper()
-	c, err := cpim.Parse(m.Body)
+	c, err := cpim.Parse(m.Body.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}

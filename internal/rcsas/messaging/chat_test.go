@@ -24,7 +24,7 @@ func TestChatFlowsBetweenTwoClientsOverLoopbackMSRP(t *testing.T) {
 		t.Fatalf("alice's message was answered with %d", rep.Code)
 	}
 	got := b.next(t)
-	if !bytes.Equal(got.Body, msg) || got.MediaType() != cpim.ContentType {
+	if !bytes.Equal(got.Body.Bytes(), msg) || got.MediaType() != cpim.ContentType {
 		t.Fatalf("bob got %q", got.Body)
 	}
 
@@ -40,10 +40,10 @@ func TestChatFlowsBetweenTwoClientsOverLoopbackMSRP(t *testing.T) {
 			t.Fatalf("bob's %s notification was answered with %d", s, rep.Code)
 		}
 		got := a.next(t)
-		if !bytes.Equal(got.Body, rcpt) {
+		if !bytes.Equal(got.Body.Bytes(), rcpt) {
 			t.Fatalf("alice got %q", got.Body)
 		}
-		if n := readNotification(t, got.Body); n.Status != s || n.MessageID != "Xs8kLz1" {
+		if n := readNotification(t, got.Body.Bytes()); n.Status != s || n.MessageID != "Xs8kLz1" {
 			t.Fatalf("alice got %+v", n)
 		}
 	}
@@ -75,10 +75,10 @@ func TestChatQueuedForAnAbsentRecipientWaitsForItsSession(t *testing.T) {
 	// The SIP layer gets bob's answer and opens his leg; the stored
 	// messages arrive in order.
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
-	if got := b.next(t); !bytes.Equal(got.Body, first) {
+	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), first) {
 		t.Fatalf("first delivery %q", got.Body)
 	}
-	if got := b.next(t); !bytes.Equal(got.Body, second) {
+	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), second) {
 		t.Fatalf("second delivery %q", got.Body)
 	}
 	waitFor(t, "both deliveries to be confirmed", func() bool { return r.m.get("delivery.msrp") == 2 })
@@ -94,7 +94,7 @@ func TestARecipientThatRefusesAMessageCausesANegativeNotification(t *testing.T) 
 	a.send(t, chat(t, "m1", "hi", imdn.NegativeDelivery))
 	b.next(t)
 	got := a.next(t)
-	if n := readNotification(t, got.Body); n.Status != imdn.Failed || n.MessageID != "m1" || n.Kind != imdn.DeliveryNotification {
+	if n := readNotification(t, got.Body.Bytes()); n.Status != imdn.Failed || n.MessageID != "m1" || n.Kind != imdn.DeliveryNotification {
 		t.Fatalf("alice got %+v", n)
 	}
 	waitFor(t, "the refusal to be counted", func() bool { return r.m.get("delivery.refused") == 1 })
@@ -172,7 +172,7 @@ func TestARelayConnectingBeforeTheAnswerIsServed(t *testing.T) {
 	bobURI := clientURI()
 	b := r.dial(t, l, bobURI, leg.Local())
 	b.send(t, chat(t, "m2", "early from bob", 0))
-	if got := a.next(t); !bytes.Equal(got.Body, chat(t, "m2", "early from bob", 0)) {
+	if got := a.next(t); !bytes.Equal(got.Body.Bytes(), chat(t, "m2", "early from bob", 0)) {
 		t.Fatalf("alice got %q", got.Body)
 	}
 	select {
@@ -183,7 +183,7 @@ func TestARelayConnectingBeforeTheAnswerIsServed(t *testing.T) {
 	if err := leg.Answer([]msrp.URI{bobURI}); err != nil {
 		t.Fatal(err)
 	}
-	if got := b.next(t); !bytes.Equal(got.Body, chat(t, "m1", "for bob", 0)) {
+	if got := b.next(t); !bytes.Equal(got.Body.Bytes(), chat(t, "m1", "for bob", 0)) {
 		t.Fatalf("bob got %q", got.Body)
 	}
 	if err := leg.Answer([]msrp.URI{bobURI}); err == nil {
@@ -239,7 +239,7 @@ func TestNoSecondSessionIsAskedForOnceOneHasOpened(t *testing.T) {
 			default:
 			}
 			b := r.dial(t, l, bobURI, leg.Local())
-			if got := b.next(t); !bytes.Contains(got.Body, []byte("for bob")) {
+			if got := b.next(t); !bytes.Contains(got.Body.Bytes(), []byte("for bob")) {
 				t.Fatalf("bob got %q", got.Body)
 			}
 		})
@@ -378,7 +378,7 @@ func TestIsComposingIsForwardedToThePeerWithoutBeingStored(t *testing.T) {
 		t.Fatalf("is-composing answered %d", code)
 	}
 	got := b.next(t)
-	if got.MediaType() != IsComposingType || !bytes.Equal(got.Body, body) {
+	if got.MediaType() != IsComposingType || !bytes.Equal(got.Body.Bytes(), body) {
 		t.Fatalf("bob got %s %q", got.MediaType(), got.Body)
 	}
 	waitFor(t, "the count", func() bool { return r.m.get("iscomposing.forwarded") == 1 })
@@ -511,7 +511,7 @@ func TestASessionOpeningMidwayKeepsTheQueueInOrder(t *testing.T) {
 	r.e.UserRegistered(bob, true)
 	b := <-opened
 	for _, want := range []string{"m1", "m2", "m3"} {
-		if got := b.next(t); !bytes.HasSuffix(got.Body, []byte(want)) {
+		if got := b.next(t); !bytes.HasSuffix(got.Body.Bytes(), []byte(want)) {
 			t.Fatalf("got %q, want %s", got.Body, want)
 		}
 	}
@@ -551,7 +551,7 @@ func TestANewMessageDoesNotOvertakeOnesWaitingForTheSameSession(t *testing.T) {
 	_, b := r.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
 	proceed <- struct{}{}
 	for _, want := range []string{"m1", "m2"} {
-		if got := b.next(t); !bytes.HasSuffix(got.Body, []byte(want)) {
+		if got := b.next(t); !bytes.HasSuffix(got.Body.Bytes(), []byte(want)) {
 			t.Fatalf("got %q, want %s", got.Body, want)
 		}
 	}

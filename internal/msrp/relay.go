@@ -398,7 +398,7 @@ func (p *Session) forwardPiece(out, in *Conn, from *Session, m *Message, pos int
 			FailureReport: m.FailureReport,
 			ContentType:   m.ContentType,
 			Header:        m.Header,
-			Body:          data,
+			Body:          BodyOf(data),
 			Continuation:  flag,
 		}
 		p.touch(out)
@@ -458,7 +458,7 @@ func (s *Session) relayBuffered(c *Conn, peer *Session, m *Message) error {
 	var err error
 	if peer.edge {
 		// The body was read into a buffer of its own, so m can be held.
-		err = peer.dispatch(c, m.MessageID, int64(len(m.Body)), send, func(code int) { _ = c.respond(m, code) })
+		err = peer.dispatch(c, m.MessageID, int64(m.Body.Len()), send, func(code int) { _ = c.respond(m, code) })
 	} else {
 		out, code := peer.forwardConn(c)
 		if code != 0 {
