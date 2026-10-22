@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
@@ -191,7 +192,7 @@ func keyOf(impu string) string {
 func StartIMSCore(t testing.TB, domain string, users map[string]string, t1 ...time.Duration) *IMSCore {
 	t.Helper()
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: domain, NonceKey: bytes.Repeat([]byte("i"), digest.MinNonceKeySize),
+		Realm: domain, NonceKey: secret.NewKey(bytes.Repeat([]byte("i"), digest.MinNonceKeySize)),
 		NonceCounts: digest.NewMemoryNonceCounts(nil),
 	})
 	if err != nil {

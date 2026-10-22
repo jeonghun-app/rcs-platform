@@ -28,6 +28,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -88,7 +89,7 @@ func StartFT(t testing.TB, partSize int64) *FT {
 	download, _ := url.Parse(base + "/dl")
 	h := runtimetest.New(t, "ft-server")
 	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: FTRealm, NonceKey: bytes.Repeat([]byte("k"), digest.MinNonceKeySize),
+		Realm: FTRealm, NonceKey: secret.NewKey(bytes.Repeat([]byte("k"), digest.MinNonceKeySize)),
 		NonceCounts: digest.NewMemoryNonceCounts(nil), HTTPPathOnlyURI: true,
 	})
 	if err != nil {

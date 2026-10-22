@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // TestAPositionLastsTheConfiguredLifetime (QA on #359): Config.ODILifetime
@@ -31,8 +32,8 @@ func TestAKeyRotationKeepsTheChainGoingAcrossInstances(t *testing.T) {
 	e := newEnv(t)
 	e.registered(binding(1, 0, time.Hour))
 	e.profile(t0, criterion(10, rcsAS, method("MESSAGE"), ifc.SessionTerminated), criterion(20, thirdAS, method("MESSAGE"), ifc.SessionTerminated), criterion(30, operatorAS, method("MESSAGE"), ifc.SessionTerminated))
-	oldK := DialogKey{ID: "k1", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}
-	newK := DialogKey{ID: "k3", Key: bytes.Repeat([]byte{3}, MinDialogKeyBytes)}
+	oldK := DialogKey{ID: "k1", Key: secret.NewKey(bytes.Repeat([]byte{1}, MinDialogKeyBytes))}
+	newK := DialogKey{ID: "k3", Key: secret.NewKey(bytes.Repeat([]byte{3}, MinDialogKeyBytes))}
 	notYet := e.router(nil, func(c *Config) { c.DialogKeys = []DialogKey{oldK} })
 	rotated := e.router(nil, func(c *Config) { c.DialogKeys = []DialogKey{newK, oldK} })
 	r := fromUser(t, "MESSAGE", impu2)

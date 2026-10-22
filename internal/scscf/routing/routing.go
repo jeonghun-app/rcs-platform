@@ -226,12 +226,11 @@ func New(cfg Config) (*Router, error) {
 	}
 	ids := map[string]bool{}
 	cfg.DialogKeys = slices.Clone(cfg.DialogKeys)
-	for i, k := range cfg.DialogKeys {
-		if !isKeyID(k.ID) || ids[k.ID] || len(k.Key) < MinDialogKeyBytes {
+	for _, k := range cfg.DialogKeys {
+		if !isKeyID(k.ID) || ids[k.ID] || k.Key.Len() < MinDialogKeyBytes {
 			return nil, errors.New("routing: each DialogKey needs its own ID of letters and digits and a key of at least 32 bytes")
 		}
 		ids[k.ID] = true
-		cfg.DialogKeys[i].Key = slices.Clone(k.Key)
 	}
 	if cfg.ThirdPartyTimeout <= 0 {
 		cfg.ThirdPartyTimeout = DefaultThirdPartyTimeout
