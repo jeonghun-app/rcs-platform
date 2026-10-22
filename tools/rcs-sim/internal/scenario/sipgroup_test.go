@@ -59,7 +59,10 @@ type groupFocus struct {
 	cfg  scenario.Config
 
 	// Faults: reinvite invites the peer again before every message from
-	// the client, twiceAfterLoss twice when the owner is lost; strayFirst
+	// the client, reinviteLater before every one after the first, as a
+	// task that does not hold the session invites for what comes through
+	// it once the client rejoined there (QA on #602), twiceAfterLoss twice
+	// when the owner is lost; strayFirst
 	// sends the peer a 1-to-1 chat INVITE first, no focus's, which must not
 	// be taken for the group's; fromOther invites the peer from another
 	// group's conference URI;
@@ -69,6 +72,7 @@ type groupFocus struct {
 	// the rejoins once the owner is lost, in turn (default: 500 with
 	// Retry-After, then 200); crash ends nothing at the stop.
 	reinvite        bool
+	reinviteLater   bool
 	twiceAfterLoss  bool
 	strayFirst      bool
 	fromOther       bool
@@ -88,6 +92,7 @@ type groupFocus struct {
 	answers          map[string]response // by Call-ID, for the core's rewrite
 	sub              *rosterSub
 	version          uint32
+	messagesSeen     int
 	invitedAfterLoss bool
 	peerInvites      int
 }
@@ -370,7 +375,8 @@ func (l *focusLeg) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 			// that does so for every one (reinvite), and once by the new
 			// owner, which holds no session with it.
 			f.mu.Lock()
-			again := f.reinvite || f.lost && !f.invitedAfterLoss
+			f.messagesSeen++
+			again := f.reinvite || f.reinviteLater && f.messagesSeen > 1 && !f.lost || f.lost && !f.invitedAfterLoss
 			if again {
 				f.invitedAfterLoss = f.invitedAfterLoss || f.lost
 				f.peerLeg, f.peerReady = nil, make(chan struct{})
@@ -604,6 +610,11 @@ func TestAGroupChatTheFocusGetsWrongFailsTheStepThatSeesIt(t *testing.T) {
 		// invites it again for each message.
 		"a re-invite for every message": {func(f *groupFocus) { f.reinvite = true },
 			"message", "the focus invited the peer again, though its session with the group was open", 0},
+		// The rejoins go through the task that does not own the group:
+		// #121's fault shows in the rejoin step's message (QA and code
+		// review on #602).
+		"a re-invite after the rejoins": {func(f *groupFocus) { f.reinviteLater = true },
+			"rejoin", "the focus invited the peer again, though its session with the group was open", 0},
 		"the new owner invites the peer twice": {func(f *groupFocus) { f.twiceAfterLoss = true },
 			"message-after-loss", "the new owner did not invite the peer back exactly once", 0},
 		// Another group's INVITE is no session of this one's.
