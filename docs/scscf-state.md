@@ -172,6 +172,23 @@ additionally sealed (below).
   meanwhile, a new record, says terminated without a body, so that it ends
   nothing of the new registration. The subscription sweep must therefore run
   every few seconds to a minute, as the registration sweep does.
+- **Every re-registration notifies every subscription.** A REGISTER that
+  only refreshes the set's bindings, their expiry and CSeq and nothing else,
+  still sends each of the set's subscriptions a full NOTIFY, its contacts
+  `refreshed` (or `shortened`): TS 24.229 §5.4.2.1.2 has the S-CSCF send a
+  NOTIFY on every dialog when an event pertaining to the user occurs, gives
+  the content for a re-registration (4) e) III), and asks the full state in
+  every NOTIFY. RFC 3680 §4.7.2 alone would let the notifier skip it (#277).
+  Each such NOTIFY costs, per subscription, a read of the set's record, the
+  conditional `NextNotify` write on `reg-subscriptions` and a SIP round trip
+  to the P-CSCF or the UE; the change also lists the subscriptions of each of
+  the set's identities not barred. The rate is about U × S ÷ T for U
+  registered users, S subscriptions a set (one from the P-CSCF per default
+  identity, one more for a UE that subscribes) and T between re-registrations
+  (clients without outbound re-register within 600 s, the expiry `pcscf`
+  caps them to): 1 million users, two subscriptions and 480 s make about
+  4,200 NOTIFYs, and as many writes, a second. `regevent.notify_refresh`
+  counts these NOTIFYs, so the rate can be read from a running stack.
 - **Known limit: the first NOTIFY of a very large set.** A full reginfo
   document is at most 256 KiB (`reginfo.MaxDocumentSize`). A set at the
   store's limits, 32 identities (`MaxIdentities`) each listing up to 32
@@ -197,8 +214,10 @@ The reg event notifier counts, without dimensions:
 `regevent.subscribed`, `refused`, `refused_full`, `replaced`,
 `no_subscription`, `refresh_conflict`, `notified`, `notify_refused`,
 `notify_failed`, `notify_merged`, `notify_dropped`, `notify_deferred`,
-`notify_superseded`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`,
-`final_resent`, `final_retry`, `final_abandoned` and `internal_errors`. Alarm on `regevent.notify_dropped` and
+`notify_superseded`, `notify_refresh`, `subscriber_gone`, `lapsed`, `too_large`, `end_failed`,
+`final_resent`, `final_retry`, `final_abandoned` and `internal_errors`;
+`notify_refresh` counts the NOTIFYs numbered and sent for re-registrations
+that only refreshed bindings, answered or not. Alarm on `regevent.notify_dropped` and
 `regevent.notify_deferred` (any sustained rate): NOTIFYs are queuing faster
 than subscribers answer (below), and ends are waiting for the sweep. Alarm
 on any `regevent.end_failed`: a set's end could not be saved, and its
