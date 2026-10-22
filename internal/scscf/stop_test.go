@@ -94,22 +94,26 @@ func dprDial(hss *diameterHSS, swallow bool, seen *atomic.Int64) func(ctx contex
 func TestTheStopKeepsReturnMarginForItsReturn(t *testing.T) {
 	hss := startHSS(t)
 	var dprs atomic.Int64
-	var begun, stopBy time.Time
-	var reached atomic.Bool
+	var begun, stopBy, deadline time.Time
 	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
 		c.CxTimeout = 25 * time.Second
 		d.dial = dprDial(hss, true, &dprs)
 		d.stopping = func(b, s time.Time) { begun, stopBy = b, s }
-		d.goodbye = func() { reached.Store(true) }
+		d.goodbyeAt = func(dl time.Time) { deadline = dl }
 	})
 	if err := r.stop(); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := stopBy.Sub(begun), testConfig().DrainTimeout+stopMargin-returnMargin; got != want {
+	want := testConfig().DrainTimeout + stopMargin - returnMargin
+	if got := stopBy.Sub(begun); got != want {
 		t.Errorf("the stop's deadline is %v after it began, want %v", got, want)
 	}
-	if !reached.Load() || dprs.Load() == 0 {
-		t.Errorf("the goodbye was reached %v, %d DPRs written", reached.Load(), dprs.Load())
+	// Nothing held the stop, so the goodbye is reached long before.
+	if !deadline.Equal(stopBy) {
+		t.Errorf("the goodbye's deadline is %v from the stop's, want the stop's", deadline.Sub(stopBy))
+	}
+	if dprs.Load() == 0 {
+		t.Error("no DPR was written")
 	}
 }
 
@@ -138,15 +142,24 @@ func TestTheGoodbyeHasStopByOrItsFloor(t *testing.T) {
 func TestAGoodbyeReachedLateStillSendsItsDPR(t *testing.T) {
 	hss := startHSS(t)
 	var dprs atomic.Int64
-	var stopBy time.Time
+	var stopBy, released, deadline time.Time
 	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
 		c.CxTimeout = 25 * time.Second
 		d.dial = dprDial(hss, true, &dprs)
 		d.stopping = func(_, s time.Time) { stopBy = s }
-		d.goodbye = func() { time.Sleep(time.Until(stopBy.Add(goodbyeFloor))) }
+		d.goodbye = func() {
+			time.Sleep(time.Until(stopBy.Add(goodbyeFloor)))
+			released = time.Now()
+		}
+		d.goodbyeAt = func(dl time.Time) { deadline = dl }
 	})
 	if err := r.stop(); err != nil {
 		t.Fatal(err)
+	}
+	// The floor from when the stop was let go: a host may run it later
+	// still, which only moves the deadline on, so the bound above is loose.
+	if left := deadline.Sub(released); left < goodbyeFloor || left > goodbyeFloor+time.Second {
+		t.Errorf("reached %v past the stop's deadline, the goodbye had %v, want its floor of %v", released.Sub(stopBy), left, goodbyeFloor)
 	}
 	if dprs.Load() == 0 {
 		t.Error("no DPR was written: the goodbye had no time once reached late")
@@ -482,11 +495,12 @@ func TestTheCxGoodbyeHasItsTimeWhateverTheRouterWaitsFor(t *testing.T) {
 // TestTheStopMarginsLeaveEveryStepItsTime: steps 3 and 4 have part of
 // stopMargin, step 5 has time for the sends before the goodbye's, and the
 // return holds the late end of a wait on a loaded host, lateWake as
-// measured, and the goodbye's floor (docs/scscf.md, Stop; #502). A dial need not fit in the sends' time: the
-// transport's Close cuts it (#474,
+// measured, and the goodbye's floor (docs/scscf.md, Stop; #502). A dial need
+// not fit in the sends' time: the transport's Close cuts it (#474,
 // TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling).
 func TestTheStopMarginsLeaveEveryStepItsTime(t *testing.T) {
-	if closeMargin <= goodbyeMargin || returnMargin+closeMargin >= stopMargin || returnMargin < lateWake+goodbyeFloor || goodbyeFloor >= goodbyeMargin {
+	if closeMargin <= goodbyeMargin || returnMargin+closeMargin >= stopMargin ||
+		returnMargin < lateWake+goodbyeFloor || goodbyeFloor >= goodbyeMargin {
 		t.Errorf("closeMargin %v, goodbyeMargin %v, returnMargin %v, stopMargin %v, lateWake %v, goodbyeFloor %v",
 			closeMargin, goodbyeMargin, returnMargin, stopMargin, lateWake, goodbyeFloor)
 	}
