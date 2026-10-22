@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 )
@@ -120,14 +121,29 @@ func TestProxyHeaderDeadlineDoesNotCutTheFirstMessage(t *testing.T) {
 }
 
 // Behind a PROXY header the TLS handshake gets ReadTimeout of its own, not
-// what is left of the PROXY deadline.
+// what is left of the PROXY deadline. The client handshakes only once the
+// server has read the header and waits in its handshake, and the header's
+// deadline has passed since then: it was set before the header was read
+// (#495). It used to sleep a second after writing the header, with a
+// 300 ms deadline, and a server preempted for 300 ms before reading the
+// header, already sent, timed it out under load; the header's deadline is
+// the production default now, and that wait no longer decides the test.
 func TestProxyHeaderDeadlineDoesNotCutTheTLSHandshake(t *testing.T) {
 	serverTLS, clientTLS := testTLS(t)
 	server, rec := newTransport(t, Config{TLS: serverTLS})
-	addr := listen(t, server, ListenerConfig{Network: TLS, ProxyProtocol: true, ProxyHeaderTimeout: 300 * time.Millisecond})
+	addr := listen(t, server, ListenerConfig{Network: TLS, ProxyProtocol: true})
 	raw := dialRaw(t, addr)
 	raw.Write(proxyHeaderFor(netip.MustParseAddrPort("192.0.2.10:40000"), netip.MustParseAddrPort("198.51.100.1:5061"), awsTLV))
-	time.Sleep(time.Second)
+	eventually(t, "the server to read the header and wait in its handshake", func() bool {
+		return stackHolds("(*listener).serveAccepted", "HandshakeContext")
+	})
+	// Past the header's deadline, and past the timer that ends a read
+	// blocked on it: were the deadline left in place, the handshake's first
+	// read would fail.
+	time.Sleep(DefaultProxyHeaderTimeout + 500*time.Millisecond)
+	if s := server.Stats(); s.ProxyHeaderTimeouts != 0 {
+		t.Fatalf("the header timed out: %+v", s)
+	}
 	c := tls.Client(raw, clientTLS)
 	if err := c.Handshake(); err != nil {
 		t.Fatalf("handshake after the PROXY deadline: %v", err)
@@ -314,4 +330,21 @@ func TestUDPListenersAreNotInTheConnectionGauge(t *testing.T) {
 	if got := server.Stats().ListenerConnections; len(got) != 1 || got["stream"] != 0 {
 		t.Fatalf("per-listener connections = %v, want stream alone", got)
 	}
+}
+
+// stackHolds reports whether a goroutine's stack holds every one of fns.
+func stackHolds(fns ...string) bool {
+	for _, g := range strings.Split(string(allStacks()), "\n\n") {
+		all := true
+		for _, fn := range fns {
+			if !strings.Contains(g, fn) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
 }
