@@ -281,15 +281,11 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
    `scscf`, `pcscf`, `rcs-as-a` and `acs`;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
-4. runs `rcs-sim all`:
-   - the FT scenarios go to the `ftHTTPCSURI` `acs` provisioned. `ft-server`
-     looks the credentials up in `hss` and keeps the content in S3Mock and
-     DynamoDB Local.
-   - the chat scenarios go through `msrp-relay` on DynamoDB Local. `rcs-sim`
-     stands in for `pcscf` toward the relay (control API,
-     `RELAY_PCSCF_TOKEN`) and for `rcs-as` (on the test container's address,
-     port 2855) until chat runs over SIP.
-5. runs `rcs-sim reg-event options pager-message` over SIP, at the P-CSCF `acs`
+4. runs `rcs-sim ft ft-resume`: the FT scenarios go to the `ftHTTPCSURI`
+   `acs` provisioned. `ft-server` looks the credentials up in `hss` and keeps
+   the content in S3Mock and DynamoDB Local. The chat scenarios that stand in
+   for `pcscf` and `rcs-as` are `make e2e`'s; here chat goes over SIP (5).
+5. runs `rcs-sim reg-event options pager-message chat-invite` over SIP, at the P-CSCF `acs`
    provisions. Both test subscribers register with IMS AKA, with the keys
    `stack-seed` gave `hss`, through `pcscf`, `icscf` and `scscf`:
    - `reg-event` subscribes to the client's own registration and follows it
@@ -302,8 +298,17 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
      through `rcs-as`, which stores it and delivers it, and the peer's
      delivery notification comes back the same way. A second MESSAGE, to the
      peer unregistered, waits in `rcs-as`'s queue until the peer registers
-     again. The test checks that `rcs-as` answered both 202, which the
-     peer's client never answers, so neither went past it.
+     again. The test checks that `rcs-as` answered both, and the
+     notification's MESSAGE, 202, which the peer's client never answers, so
+     none went past it.
+   - `chat-invite` sends the peer an INVITE with an MSRP offer. `pcscf`
+     anchors it at `msrp-relay` and `scscf` takes it to `rcs-as`, which
+     answers with the relay's `client_path`. The client connects there, and
+     `rcs-as` opens a chat to the peer for the client's message, which the
+     peer answers and connects to the relay for. A message goes each way,
+     with its success report and its delivery and display notifications.
+     The client's BYE ends the chat, and the relay then refuses its session
+     with 481.
 6. runs `rcs-sim options` once more, with the client's OPTIONS in the
    originating session case sent through two more application servers:
    stubs on the test container, which act as proxies and send them back to
@@ -371,7 +376,7 @@ describe them. #56 provides the AWS values. Locally:
 | "run make up, which …" for an image variable | The compose file was used without make. Use the make targets, which set the image variables. |
 | Another worktree's `make up` replaced this stack's containers, or `make e2e-compose` gets 401 from a stack it did not start | Both use the default `COMPOSE_PROJECT`. See [A second stack on the same host](#a-second-stack-on-the-same-host). |
 | `stack-tables` fails with "only some of the hss tables exist" (or the scscf tables) | A half-made stack. Run `make down` and `make up`. |
-| `make e2e-compose` fails with `REGISTER answered 500` right after several runs | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics): each run registers the client afresh four times. Wait a minute and run it again. |
+| `make e2e-compose` fails with `REGISTER answered 500` right after several runs | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics): each run registers the client afresh five times. Wait a minute and run it again. |
 | `stack-seed` answers 401 | `deploy/compose.env` changed after the services started. Run `make up` again to recreate them, or `make down` and `make up`. |
 | `make e2e-compose`: "no local stack rcs-local is running: run make up first" | The stack's network does not exist, or `deploy/compose.env` is missing. Run `make up` first; the test does not start the stack. With another `COMPOSE_PROJECT`, pass the same name to both. |
 | `make e2e-compose`: "… is not ready: is the stack up" | The stack exists but a service is not ready within the test's wait. `make logs LOGS="<service>"`. |

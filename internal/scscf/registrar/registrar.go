@@ -13,6 +13,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/secret"
@@ -115,6 +116,10 @@ type Config struct {
 	Now     func() time.Time
 	Rand    io.Reader
 	Metrics Metrics
+	// Panics recovers a panic in the work this package runs on goroutines
+	// of its own, which ends that work only and releases what it held
+	// (#488). Nil only recovers.
+	Panics *panics.Guard
 	// Events is told of every change of a set's bindings, for the reg event
 	// (regevent.Notifier); nil tells no one.
 	Events Events

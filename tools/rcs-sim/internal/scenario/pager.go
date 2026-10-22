@@ -276,10 +276,11 @@ func pagerMessage(r *run) error {
 		// The notification is told by its own Message-ID, which no
 		// earlier run's can have.
 		got, c, skipped, err := a.await(ctx, nid, "")
+		status := int64(res.StatusCode)
 		if err != nil {
-			return map[string]int64{"skipped": int64(skipped)}, sipError(err)
+			return map[string]int64{"skipped": int64(skipped), "status": status}, sipError(err)
 		}
-		detail := map[string]int64{"bytes": int64(len(got.Body)), "skipped": int64(skipped)}
+		detail := map[string]int64{"bytes": int64(len(got.Body)), "skipped": int64(skipped), "status": status}
 		if !imdn.IsNotification(c) {
 			return detail, errors.New("the sender received something other than a notification")
 		}

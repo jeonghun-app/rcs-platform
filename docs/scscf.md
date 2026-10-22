@@ -40,7 +40,10 @@ INVITE that met Timer F), or one whose `SCSCF_AS_TIMEOUT` passed.
 
 What `scscf` sends itself, NOTIFYs and third-party REGISTERs, goes in client
 transactions over the core listener, to the first `Route` or else the
-Request-URI.
+Request-URI. A third-party REGISTER to a server reached by name tries its
+addresses as a request to it does, the ones that just failed last, but goes
+on to the next only when it could not be sent at all: once written, the
+server may have it (#580).
 
 Every task names itself by its service name, `sip:scscf.<namespace>`, never a
 task's own:
@@ -139,10 +142,17 @@ Alarm on a rise of these:
 - `routing.third_party.terminated_unanswered`;
 - `regevent.notify_dropped`;
 - `regevent.final_abandoned`;
+- `registrar.saa_profile_moved`: an SAA's profile named another default
+  identity, so the HSS moved the set's default and this S-CSCF missed its
+  RTR, and the set was ended here (#536);
 - `proxy.hook_panics`, panics recovered in scscf's routing (#428), and
   `transaction.handler_panics`, in a response handler of a request scscf
   sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
-  the request or the call it was in; alarm on any.
+  the request or the call it was in; alarm on any;
+- `background.panics`, panics recovered in scscf's own background work:
+  the sweeps, the metrics report, a reg event task, a first NOTIFY, a
+  third-party REGISTER or an identity repair (#488). Each ends only that
+  piece of work, which gives back what it held; alarm on any.
 
 `routing.as_failover` counts requests sent on to another address of an
 application server whose first could not be reached: a stopped task still in

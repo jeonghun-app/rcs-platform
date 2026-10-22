@@ -61,9 +61,10 @@ type Tokens struct {
 // HSS_<CALLER>_TOKEN_NEXT); either may be empty. The audit log names the
 // slot a request used by the variable it came from, so it shows when the old
 // token is no longer used whichever order the rotation empties them in.
-// The tokens are secret.Keys, which print as "[redacted]" under every verb,
-// so a Tokens or an APIOptions printed by mistake shows none; NewAPI keeps
-// only their SHA-256 (#533).
+// The tokens are secret.Keys, which print as "[redacted]" under the valid
+// verbs and as their closure's address under the invalid ones, so a Tokens
+// or an APIOptions printed by mistake shows none; NewAPI keeps only their
+// SHA-256 (#533, #570).
 type TokenPair struct {
 	Current, Next secret.Key
 }

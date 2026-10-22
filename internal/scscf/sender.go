@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
@@ -48,6 +49,18 @@ func (s *sender) Send(ctx context.Context, req *sip.Request) (*sip.Response, err
 	if err != nil {
 		return nil, fmt.Errorf("scscf: next hop: %w", err)
 	}
+	return s.SendTo(ctx, req, dst)
+}
+
+// SendTo is Send to dst, an address of the next hop (routing.Sender's
+// SendTo): a send that fails before req is written, a connection not made
+// above all, wraps routing.ErrNotSent, so that a third-party REGISTER goes
+// on to the server's next address (#580).
+func (s *sender) SendTo(ctx context.Context, req *sip.Request, dst transport.Destination) (*sip.Response, error) {
+	layer := s.layer()
+	if layer == nil {
+		return nil, errNoLayer
+	}
 	dst.Listener = s.listener
 	branch, err := s.branch()
 	if err != nil {
@@ -72,7 +85,7 @@ func (s *sender) Send(ctx context.Context, req *sip.Request) (*sip.Response, err
 		}
 	})
 	if err != nil {
-		return nil, fmt.Errorf("scscf: send: %w", err)
+		return nil, fmt.Errorf("scscf: send: %w: %w", routing.ErrNotSent, err)
 	}
 	select {
 	case r := <-answered:

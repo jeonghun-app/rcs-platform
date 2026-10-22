@@ -20,6 +20,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -78,6 +79,11 @@ type Config struct {
 	// 24.229 §5.4.1.5), for reg-event's network-deregister step. Nil skips
 	// that step, which RequireAll (-require-all) makes a failure.
 	Deregister func(ctx context.Context, impu sip.URI) error
+	// RelayPublic is msrp-relay's public host:port, the authority of every
+	// client_path (RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT). chat-invite
+	// requires each a=path the network gives a client to name it, so a
+	// chat that went past the relay fails (ADR 0004, code review on #553).
+	RelayPublic string
 
 	// StepTimeout bounds each step.
 	StepTimeout time.Duration
@@ -120,6 +126,7 @@ var scenarios = map[string]func(*run) error{
 	"ft-resume":              fileTransferResumed,
 	"chat-client-originated": chatClientOriginated,
 	"chat-core-originated":   chatCoreOriginated,
+	"chat-invite":            chatInvite,
 	"pager-message":          pagerMessage,
 	"reg-event":              regEvent,
 	"options":                options,
@@ -129,7 +136,7 @@ var scenarios = map[string]func(*run) error{
 // SIP configuration at all, as a stack without pcscf cannot run them
 // (#135). With SIP configured they run, and one that lacks a setting it
 // needs, such as the peer, fails at its first step rather than vanish.
-var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true, "options": true}
+var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true, "options": true, "chat-invite": true}
 
 // Names lists the built-in scenarios, sorted.
 func Names() []string {
@@ -182,6 +189,11 @@ type run struct {
 	report   Report
 	failed   bool
 	cleanups []func()
+
+	// refusal is why the peer last refused an offer the network sent it
+	// (answerCalls), which a step that then waits in vain reports.
+	refusalMu sync.Mutex
+	refusal   string
 }
 
 // errStepFailed stops a scenario after a failed or skipped step has been

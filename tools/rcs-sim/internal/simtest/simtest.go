@@ -144,6 +144,9 @@ func StartFT(t testing.TB, partSize int64) *FT {
 // Relay is an msrp-relay in the test process.
 type Relay struct {
 	Control *url.URL
+	// Public is the authority of every client_path the relay hands out,
+	// host:port (RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT).
+	Public  string
 	Harness *runtimetest.Harness
 	// TLSRoots trusts the certificate of the TLS terminator in front of a
 	// relay from StartRelayBehindTLS; nil otherwise.
@@ -302,7 +305,7 @@ func startRelay(t testing.TB, public, control int, corePorts []int, front *tlsFr
 		time.Sleep(10 * time.Millisecond)
 	}
 	u, _ := url.Parse("http://127.0.0.1:" + strconv.Itoa(control))
-	return &Relay{Control: u, Harness: h}, nil
+	return &Relay{Control: u, Harness: h, Public: net.JoinHostPort("127.0.0.1", strconv.Itoa(advertised))}, nil
 }
 
 // FreePort returns a loopback port nothing listens on at the moment, for a

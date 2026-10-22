@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sync"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
@@ -48,12 +49,16 @@ func (d *dispatcher) Route(ctx context.Context, r *proxy.Request) proxy.Decision
 			// way (RFC 6665 §4.2.1.2), under a context of its own. It is
 			// counted for the stop first: the drain takes the SUBSCRIBE
 			// for done once the 200 is written (#439 code review).
-			run := d.firsts.hold()
+			// A panic before the NOTIFY is started, in the answer or the
+			// hook, releases the count, which the stop would otherwise
+			// wait out (#527 code review).
+			first := d.firsts.hold()
+			defer first.drop()
 			d.respond(u, res)
 			if d.answered != nil {
 				d.answered()
 			}
-			run(func() { after(context.WithoutCancel(ctx)) })
+			first.run(func() { after(context.WithoutCancel(ctx)) })
 		}}
 	case r.Initial():
 		return d.router.Initial(ctx, r)
@@ -69,25 +74,49 @@ type firstNotifies struct {
 	mu      sync.Mutex
 	waiting bool
 	wg      sync.WaitGroup
+	// panics recovers a panic in a NOTIFY, which ends that one only (#488).
+	panics *panics.Guard
 }
 
 // hold counts a first NOTIFY for wait, unless wait has begun: a WaitGroup
 // takes no Add once its Wait may be waiting. It returns what runs the
 // NOTIFY on a goroutine of its own. One held after wait has begun, from a
 // request the drain gave up on, is not waited for.
-func (f *firstNotifies) hold() func(run func()) {
+func (f *firstNotifies) hold() *firstHold {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.waiting {
-		return func(run func()) { go run() }
+	h := &firstHold{f: f, counted: !f.waiting}
+	if h.counted {
+		f.wg.Add(1)
 	}
-	f.wg.Add(1)
-	return func(run func()) {
+	return h
+}
+
+// firstHold is one first NOTIFY hold counted: run starts it, and drop
+// releases a hold whose NOTIFY never started; whichever comes first does.
+type firstHold struct {
+	f       *firstNotifies
+	counted bool
+	once    sync.Once
+}
+
+func (h *firstHold) run(notify func()) {
+	h.once.Do(func() {
 		go func() {
-			defer f.wg.Done()
-			run()
+			if h.counted {
+				defer h.f.wg.Done()
+			}
+			h.f.panics.Run("scscf: first NOTIFY", notify)
 		}()
-	}
+	})
+}
+
+func (h *firstHold) drop() {
+	h.once.Do(func() {
+		if h.counted {
+			h.f.wg.Done()
+		}
+	})
 }
 
 // wait waits for the NOTIFYs hold counted, until ctx ends, and reports whether

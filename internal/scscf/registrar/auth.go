@@ -172,7 +172,7 @@ func (g *Registrar) resynchronise(ctx context.Context, r *register, sync *digest
 	auth = append(append(auth, sync.RAND[:]...), sync.AUTS[:]...)
 	maa, err := g.cfg.HSS.MAR(ctx, &cx.MAR{
 		UserName: r.impi, PublicIdentity: r.impu, NumberAuthItems: 1,
-		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5, Authorization: auth},
+		AuthDataItem: cx.AuthDataItem{Scheme: cx.SchemeDigestAKAv1MD5, Authorization: secretkey.NewKey(auth)},
 	})
 	f = g.challengeFrom(ctx, r, maa, err, false, true)
 	if neverSent(err) {
@@ -212,7 +212,7 @@ func (g *Registrar) challengeFrom(ctx context.Context, r *register, maa *cx.MAA,
 }
 
 func (g *Registrar) akaChallenge(ctx context.Context, r *register, item cx.AuthDataItem, stale, resynced bool) (*failure, error) {
-	if len(item.Authenticate) != akaVectorSize || len(item.Authorization) == 0 {
+	if len(item.Authenticate) != akaVectorSize || item.Authorization.IsZero() {
 		return nil, errors.New("AKA item without a vector")
 	}
 	rand, autn := item.Authenticate[:16], item.Authenticate[16:]
@@ -224,8 +224,8 @@ func (g *Registrar) akaChallenge(ctx context.Context, r *register, item cx.AuthD
 	// this platform does not set up (it uses TLS), so they are not sent in
 	// the 401 (TS 24.229 §5.4.1.2.1 adds them for IPsec only).
 	err = g.store(ctx, r, ch.Nonce, &state.Challenge{Resynchronised: resynced, AKA: &state.AKAVector{
-		RAND: secretkey.NewKey(rand), AUTN: secretkey.NewKey(autn), XRES: secretkey.NewKey(item.Authorization),
-		CK: secretkey.NewKey(item.ConfidentialityKey), IK: secretkey.NewKey(item.IntegrityKey),
+		RAND: secretkey.NewKey(rand), AUTN: secretkey.NewKey(autn), XRES: item.Authorization,
+		CK: item.ConfidentialityKey, IK: item.IntegrityKey,
 	}})
 	if err != nil {
 		return nil, err

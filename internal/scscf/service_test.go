@@ -807,3 +807,74 @@ func TestARequestReachesALiveTaskOfAServerWhoseOtherTaskStopped(t *testing.T) {
 		return n == 1
 	})
 }
+
+// TestAThirdPartyREGISTERReachesALiveTaskOfAServerWhoseOtherTaskStopped
+// (#580): the server's name still resolves to a stopped task, first, and
+// a live one; the third-party REGISTER, which could not be sent to the
+// stopped one, reaches the live one, and the failover is counted.
+func TestAThirdPartyREGISTERReachesALiveTaskOfAServerWhoseOtherTaskStopped(t *testing.T) {
+	hss := startHSS(t)
+	live := startSilentPeer(t)
+	port := live.addr[strings.LastIndex(live.addr, ":")+1:]
+	uri := "sip:rcs-as.rcs.local:" + port + ";transport=tcp"
+	hss.asURI.Store(&uri)
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) {
+		d.lookup = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			if host != "rcs-as.rcs.local" {
+				return nil, errors.New("no such host")
+			}
+			// Nothing listens on 127.0.0.2 or 127.0.0.3: two stopped tasks.
+			return []netip.Addr{netip.MustParseAddr("127.0.0.2"), netip.MustParseAddr("127.0.0.3"), netip.MustParseAddr("127.0.0.1")}, nil
+		}
+		d.shuffle = func(int, func(i, j int)) {}
+	})
+	p := dialSCSCF(t, r)
+	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
+	waitFor(t, "the REGISTER at the live task", func() bool { return live.got.Load() > 0 })
+	req := live.first.Load()
+	if req == nil || req.Method != "REGISTER" {
+		t.Fatalf("the live task got %v", req)
+	}
+	// Each attempt is a copy: the failed ones' Vias are not on it (#592
+	// code review).
+	if vias := req.Header.Values("Via"); len(vias) != 1 {
+		t.Errorf("the REGISTER came with Vias %q, want scscf's one", vias)
+	}
+	waitFor(t, "the failovers counted", func() bool {
+		n, _ := r.h.Metric("routing.as_failover")
+		return n == 2
+	})
+}
+
+// TestAThirdPartyREGISTERWhoseDialOutlastsItsTimeGoesNowhereElse (#592
+// code review): the first address drops the SYN, so its dial takes the
+// dial timeout, past the REGISTER's 1 s. The REGISTER is not then written
+// to the live task with no time left to wait for its answer.
+func TestAThirdPartyREGISTERWhoseDialOutlastsItsTimeGoesNowhereElse(t *testing.T) {
+	hss := startHSS(t)
+	live := startSilentPeer(t)
+	port := live.addr[strings.LastIndex(live.addr, ":")+1:]
+	uri := "sip:rcs-as.rcs.local:" + port + ";transport=tcp"
+	hss.asURI.Store(&uri)
+	dialer := &blackholeDialer{addr: "127.0.0.2:" + port}
+	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
+		c.ThirdPartyTimeout = time.Second
+		d.sipDialer = dialer
+		d.lookup = func(_ context.Context, _, host string) ([]netip.Addr, error) {
+			if host != "rcs-as.rcs.local" {
+				return nil, errors.New("no such host")
+			}
+			return []netip.Addr{netip.MustParseAddr("127.0.0.2"), netip.MustParseAddr("127.0.0.1")}, nil
+		}
+		d.shuffle = func(int, func(i, j int)) {}
+	})
+	p := dialSCSCF(t, r)
+	p.registerFully(t, deviceAt("127.0.0.1:5070", 1), 600)
+	waitFor(t, "the REGISTER unanswered", func() bool {
+		n, _ := r.h.Metric("routing.third_party.unanswered")
+		return n == 1
+	})
+	if n, _ := r.h.Metric("routing.as_failover"); dialer.dialled.Load() != 1 || live.got.Load() != 0 || n != 0 {
+		t.Errorf("dials to the blackhole %d, REGISTERs at the live task %d, failovers %v; want 1, 0, 0", dialer.dialled.Load(), live.got.Load(), n)
+	}
+}

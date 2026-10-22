@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // marWith builds a MAR with the common AVPs and then avps, as an arbitrary
@@ -258,8 +259,8 @@ func TestAuthenticationVectorsAreNotPrintedOrLogged(t *testing.T) {
 	ha1 := "0123456789abcdef0123456789abcdef"
 	item := AuthDataItem{
 		ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5,
-		Authenticate: seq(32, 0x61), Authorization: seq(8, 0x61),
-		ConfidentialityKey: seq(16, 0x61), IntegrityKey: seq(16, 0x61),
+		Authenticate: seq(32, 0x61), Authorization: secret.NewKey(seq(8, 0x61)),
+		ConfidentialityKey: secret.NewKey(seq(16, 0x61)), IntegrityKey: secret.NewKey(seq(16, 0x61)),
 		Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: ha1},
 	}
 	maa := MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), AuthDataItems: []AuthDataItem{item}}
@@ -293,8 +294,8 @@ func TestCredentialsInsideMessagesDoNotReachJSONLogs(t *testing.T) {
 	ha1 := "0123456789abcdef0123456789abcdef"
 	key := seq(16, 0x61)
 	item := AuthDataItem{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5,
-		Authenticate: seq(32, 0x41), Authorization: seq(8, 0x30),
-		ConfidentialityKey: key, IntegrityKey: key,
+		Authenticate: seq(32, 0x41), Authorization: secret.NewKey(seq(8, 0x30)),
+		ConfidentialityKey: secret.NewKey(key), IntegrityKey: secret.NewKey(key),
 		Digest: &DigestAuthenticate{Realm: realm, QoP: "auth", HA1: ha1, AlternateHA1: ha1 + ha1}}
 	credentials := []string{ha1, "abcdefgh",
 		base64.StdEncoding.EncodeToString(key)[:12],
@@ -341,6 +342,31 @@ func TestCredentialsInsideMessagesDoNotReachJSONLogs(t *testing.T) {
 			for _, c := range credentials {
 				if strings.Contains(out, c) {
 					t.Errorf("%s leaks %q: %s", name, c, out)
+				}
+			}
+		}
+	}
+}
+
+// An item's XRES, CK and IK print as their placeholder under these verbs,
+// valid ones and the invalid %p and %w, which call no method and print the
+// fields, in an item, its pointer, a slice, a map and the answer that holds
+// it: neither in hex of either case nor as %d writes bytes (#570).
+func TestTheKeysOfAnItemNeverPrint(t *testing.T) {
+	xres, ck, ik := seq(8, 0xa0), seq(16, 0xb0), seq(16, 0xc0)
+	item := AuthDataItem{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5, Authenticate: seq(32, 0x10),
+		Authorization: secret.NewKey(xres), ConfidentialityKey: secret.NewKey(ck), IntegrityKey: secret.NewKey(ik)}
+	maa := MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), AuthDataItems: []AuthDataItem{item}}
+	var forms []string
+	for _, k := range [][]byte{xres, ck, ik} {
+		forms = append(forms, fmt.Sprintf("%x", k[:6]), fmt.Sprintf("%X", k[:6]), strings.Trim(fmt.Sprint(k[:6]), "[]"), string(k[:6]))
+	}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{item, &item, []AuthDataItem{item}, map[string]AuthDataItem{"k": item}, maa, &maa} {
+			out := fmt.Sprintf(verb, v)
+			for _, form := range forms {
+				if strings.Contains(out, form) {
+					t.Errorf("%s printed a key as %q: %s", verb, form, out)
 				}
 			}
 		}
