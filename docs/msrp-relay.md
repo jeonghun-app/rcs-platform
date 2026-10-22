@@ -254,7 +254,8 @@ not multiply them. Names come from fixed sets and never carry an identifier.
 | `LookupBudgetUntracked` | count | lookups let through uncounted because the budget's table of sources was full |
 | `Refused.<reason>` | count | `ConnectionLimit`, `SourceLimit`, `ProxyHeader`, `SourceLookupBudget`, `BindOverload`, `UnknownSession`, `EndedSession`, `IncompleteBinding`, `AlreadyClaimed`, `CoreUnreachable`, `StoreUnavailable`, `Draining`, `ControlUnauthorized`, `ControlForbidden`, `ControlInvalid` |
 | `Client.Refused.<code>`, `Core.Refused.<code>` | count | MSRP requests refused on client connections or toward `rcs-as` (`internal/msrp` events) |
-| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PeerNotReading`, `TooManyUnknownSessions`, …). `Dropped.KeepAliveNotSent` is a keep-alive the relay could not build (its random source failed); it is also logged at error level, and the next interval tries again |
+| `msrp.callback_panics` | count | panics recovered on a connection's goroutines (#445). One while reading the peer's input or binding a session closes that connection, which counts as `Client.Closed.Panicked` or `Core.Closed.Panicked`; one while reading a client's PROXY header closes the connection before it is a session connection, so it counts in no `Closed.*`; one in an event's count drops that event only, and the connection goes on. Alarm on any |
+| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PeerNotReading`, `TooManyUnknownSessions`, `Panicked`, …). `Dropped.KeepAliveNotSent` is a keep-alive the relay could not build (its random source failed); it is also logged at error level, and the next interval tries again |
 
 Alarm candidates for Phase 7, each to get a runbook section:
 

@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 )
 
 // event is one call to a session's Handler. ready, when set, holds the call
@@ -125,6 +127,9 @@ type Session struct {
 	remoteSet chan struct{}
 	handler   Handler
 	accept    []string
+	// panics is the bound connection's Config.Panics, which recovers the
+	// handler's panics.
+	panics *panics.Guard
 
 	// reasm and budget are set when the session is bound; budget has the
 	// connection's as its Parent.
@@ -341,6 +346,7 @@ func (s *Session) attach(c *Conn) error {
 		return ErrSessionInUse
 	}
 	s.conn = c
+	s.panics = c.cfg.Panics
 	s.lastActive = c.cfg.Clock.Now()
 	s.budget = &Budget{Reserve: c.cfg.SessionReserve, Parent: c.budget}
 	s.reasm = &Reassembler{
@@ -833,7 +839,8 @@ func (s *Session) deliverReports() {
 
 func (s *Session) hand(q queuedReport) {
 	s.rmu.Lock()
-	s.handler.HandleReport(s, q.r)
+	// A panic drops the report; rmu is not held across it.
+	s.panics.Run("HandleReport", func() { s.handler.HandleReport(s, q.r) })
 	s.rmu.Unlock()
 	if q.after != nil {
 		q.after()
@@ -910,7 +917,9 @@ func (s *Session) serve(c *Conn, m *Message) error {
 		return c.respond(m, StatusNotImplemented)
 	}
 	if !s.post(event{run: func() {
-		code := rh.HandleRequest(s, m)
+		code := StatusForbidden
+		// A panic answers as a refusal does.
+		s.panics.Run("HandleRequest", func() { code = rh.HandleRequest(s, m) })
 		if code != StatusOK {
 			c.emit(Event{Kind: EventRefused, Method: m.Method, Code: code})
 		}
@@ -970,10 +979,15 @@ func (s *Session) receiveSend(c *Conn, m *Message) error {
 // this side is sending, and the session's messages would be refused for
 // it. The answer queue bounds REPORTs a peer asks for and never reads.
 func (s *Session) deliver(c *Conn, whole *Message) {
-	code := StatusOK
-	if err := s.handler.HandleMessage(s, whole); err != nil {
-		code = codeOf(err, StatusForbidden)
-	}
+	code := StatusForbidden
+	// A panic is answered as an error is.
+	s.panics.Run("HandleMessage", func() {
+		if err := s.handler.HandleMessage(s, whole); err != nil {
+			code = codeOf(err, StatusForbidden)
+		} else {
+			code = StatusOK
+		}
+	})
 	if ShouldReport(whole, code) {
 		_ = c.sendRequest(context.Background(), NewReport(whole, s.local, *whole.ByteRange, code), sendQueue, nil)
 	}

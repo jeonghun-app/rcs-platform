@@ -623,6 +623,7 @@ the sweep, every 30 s.
 | `msrp.bindings`, `msrp.refused.*`, `msrp.ended.*`, `msrp.relay_errors`, `msrp.released_after_cancel`, `msrp.create_cut_at_stop`, `msrp.bye_failed` | gauge, count | as in [MSRP anchoring](#msrp-anchoring) |
 | `transport.listener_connections.*`, `transport.*` | gauge, count | as in [Edge rules](#edge-rules) |
 | `proxy.hook_panics` | count | panics recovered in pcscf's routing, SDP and response hooks: the request was answered 500, or the branch or response the hook was for was ended (#428). Alarm on any |
+| `transaction.handler_panics`, `transport.callback_panics`, `background.panics` | count | panics recovered in a response handler (the SUBSCRIBE's), in the transport's callbacks (`Admit`, which then refuses the flow, `OnFlowClosed`, `OnPong`), and in background work (reg-event subscriptions, calls to msrp-relay); each ends only the call or work it was in (#445). Alarm on any |
 | `QueuedBytes` | gauge | bytes waiting in every send queue, against the transport's budget |
 | `BudgetSheds` | count | stalled connections closed to keep the queues in their budget |
 | `BudgetRefusals` | count | sends refused, the connection kept, with the budget full |

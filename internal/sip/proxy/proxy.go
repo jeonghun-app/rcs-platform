@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -140,14 +141,13 @@ type Proxy struct {
 	// key keys the hashes that make the loop-detection part of branch IDs, the
 	// branch IDs of ACKs forwarded statelessly and the To tags of responses the
 	// proxy makes up, so none of them can be predicted or forged.
-	key     []byte
-	log     *slog.Logger
-	metrics Metrics
-	// panicLogs limits the log lines of each hook's panics, by its name
-	// (panicLog); now is their clock, read against started.
-	panicLogs sync.Map
-	now       func() time.Time
-	started   time.Time
+	key []byte
+	log *slog.Logger
+	// panics recovers, counts and logs the hooks' panics (hook); now is
+	// the clock of its log limit, read against started.
+	panics  *panics.Guard
+	now     func() time.Time
+	started time.Time
 	// ctx is the parent of every request's context; Close cancels it.
 	ctx  context.Context
 	stop context.CancelFunc
@@ -213,6 +213,13 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 	}
 	tcfg := cfg.Transaction
 	tcfg.DelayTrying = true
+	// The layer's panics go where the proxy's do, unless set apart.
+	if tcfg.Logger == nil {
+		tcfg.Logger = cfg.Logger
+	}
+	if tcfg.Metrics == nil {
+		tcfg.Metrics = cfg.Metrics
+	}
 	if tcfg.Clock == nil {
 		tcfg.Clock = transaction.SystemClock
 	}
@@ -258,13 +265,16 @@ func New(s transaction.Sender, cfg Config) (*Proxy, error) {
 		ids:       sip.IDGenerator{Rand: cfg.Rand},
 		key:       key,
 		log:       cfg.Logger,
-		metrics:   cfg.Metrics,
 		now:       time.Now,
 		started:   time.Now(),
 		drainAns:  cfg.DrainAnswer,
 		contexts:  make(map[*transaction.ServerTransaction]*respContext),
 		awaiting:  make(map[ackKey]*UAS),
 	}
+	p.panics = panics.New(panics.Config{
+		Metric: MetricHookPanics, Message: "proxy: a service hook panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
+		Now: func() time.Time { return p.now() }, Start: p.started,
+	})
 	for _, tag := range cfg.Supported {
 		p.supported[strings.ToLower(tag)] = true
 	}
@@ -791,7 +801,7 @@ type Stats struct {
 type counters struct {
 	branches, targetsDropped, breadthExceeded, cancels, timerC, targetTimeouts, targetTimeoutsKept, overloaded, loops, silenced,
 	provisionalsDropped, retransmissionsDropped, strayResponses, acksForwarded, acksConsumed, acksMissing, acksDropped,
-	upstreamErrors, hookPanics, drained atomic.Uint64
+	upstreamErrors, drained atomic.Uint64
 }
 
 // Stats returns the current gauges and counters.
@@ -821,7 +831,7 @@ func (p *Proxy) Stats() Stats {
 		ACKsMissing:            s.acksMissing.Load(),
 		ACKsDropped:            s.acksDropped.Load(),
 		UpstreamErrors:         s.upstreamErrors.Load(),
-		HookPanics:             s.hookPanics.Load(),
+		HookPanics:             p.panics.Panics(),
 
 		Drained: s.drained.Load(),
 	}

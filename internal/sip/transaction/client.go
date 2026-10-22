@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"sync"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
@@ -31,6 +32,10 @@ type ResponseHandler func(res *sip.Response, err error)
 // the handler call Terminate itself.
 type delivery struct {
 	h ResponseHandler
+	// guard recovers a panic in h, which ends only that call: the ones
+	// after it are still delivered, so the TU still hears how the
+	// transaction ended (#445).
+	guard *panics.Guard
 
 	mu      sync.Mutex
 	queue   []event
@@ -60,7 +65,7 @@ func (d *delivery) deliver(res *sip.Response, err error) {
 		e := d.queue[0]
 		d.queue = d.queue[1:]
 		d.mu.Unlock()
-		d.h(e.res, e.err)
+		d.guard.Run("ResponseHandler", func() { d.h(e.res, e.err) })
 		d.mu.Lock()
 	}
 	d.running = false
@@ -109,7 +114,7 @@ func (l *Layer) Request(req *sip.Request, dst transport.Destination, h ResponseH
 		return nil, errors.New("transaction: the top Via branch lacks the RFC 3261 magic cookie")
 	}
 	key, _ := clientKey(&req.Header)
-	tx := &ClientTransaction{invite: req.Method == "INVITE", req: req, dst: dst, out: delivery{h: h}}
+	tx := &ClientTransaction{invite: req.Method == "INVITE", req: req, dst: dst, out: delivery{h: h, guard: l.panics}}
 	tx.machine = machine{l: l, key: key, onTimer: tx.onTimer}
 
 	l.mu.Lock()
