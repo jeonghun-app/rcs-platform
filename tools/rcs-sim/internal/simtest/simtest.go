@@ -98,7 +98,7 @@ func StartFT(t testing.TB, partSize int64) *FT {
 	}
 	srv, err := ftserver.New(ftserver.Options{
 		UploadURI: upload, DownloadURI: download, Digest: ds,
-		Credentials: ftserver.NewStaticCredentials(map[string]string{FTUser: FTPassword}),
+		Credentials: ftserver.NewStaticCredentials(map[string]secret.Key{FTUser: secret.NewString(FTPassword)}),
 		Metadata:    store.NewMemory(), Blobs: store.NewMemoryBlobs(partSize),
 		Logger: h.Runtime.Logger, Metrics: h.Runtime.Metrics,
 		MaxSize: 64 * partSize, MaxThumbnailSize: partSize, PartSize: partSize,

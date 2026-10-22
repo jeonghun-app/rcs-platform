@@ -12,6 +12,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state/statetest"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 func TestMemoryStoreMeetsTheContract(t *testing.T) {
@@ -37,8 +38,8 @@ func TestPruneRemovesOnlyExpiredContacts(t *testing.T) {
 
 func TestCredentialsAreNotPrintedOrLogged(t *testing.T) {
 	c := statetest.Challenge(statetest.IMPI1, "n", time.Minute)
-	c.AKA.XRES = []byte("SECRET-XRES")
-	d := &state.DigestChallenge{Realm: "r", Algorithm: "MD5", HA1: "SECRET-HA1"}
+	c.AKA.XRES = secret.NewString("SECRET-XRES")
+	d := &state.DigestChallenge{Realm: "r", Algorithm: "MD5", HA1: secret.NewString("SECRET-HA1")}
 	digest := statetest.Challenge(statetest.IMPI1, "m", time.Minute)
 	digest.AKA, digest.Digest = nil, d
 	var out bytes.Buffer
@@ -48,9 +49,36 @@ func TestCredentialsAreNotPrintedOrLogged(t *testing.T) {
 	printed := []string{out.String(), string(b), fmt.Sprint(c.AKA), fmt.Sprintf("%v %+v %#v", *c.AKA, *c.AKA, *c.AKA),
 		fmt.Sprintf("%v %+v %#v", *d, *d, *d), fmt.Sprintf("%v %+v %#v", *c, *c, *c)}
 	for _, s := range printed {
-		for _, secret := range []string{"SECRET", "U0VDUkVU", statetest.IMPI1} {
-			if strings.Contains(s, secret) {
+		for _, leak := range []string{"SECRET", "U0VDUkVU", statetest.IMPI1} {
+			if strings.Contains(s, leak) {
 				t.Errorf("printed or logged a credential or identity: %s", s)
+			}
+		}
+	}
+}
+
+func TestCredentialsAreNotPrintedUnderAnyVerb(t *testing.T) {
+	c := statetest.Challenge(statetest.IMPI1, "n", time.Minute)
+	c.AKA.RAND, c.AKA.AUTN = secret.NewString("SECRET-RAND"), secret.NewString("SECRET-AUTN")
+	c.AKA.XRES, c.AKA.CK, c.AKA.IK = secret.NewString("SECRET-XRES"), secret.NewString("SECRET-CK"), secret.NewString("SECRET-IK")
+	d := &state.DigestChallenge{Realm: "r", Algorithm: "MD5", HA1: secret.NewString("SECRET-HA1")}
+	digest := statetest.Challenge(statetest.IMPI1, "m", time.Minute)
+	digest.AKA, digest.Digest = nil, d
+	// fmt calls no redaction method for an invalid verb, %p or %w (#506):
+	// what it prints of the fields then, here or nested in a value without
+	// methods, must not hold a credential either.
+	nested := struct {
+		AKA    state.AKAVector
+		Digest state.DigestChallenge
+	}{*c.AKA, *d}
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%x", "%X", "%d", "%p", "%w", "%t", "%c", "%U", "%e", "%b", "%o"} {
+		for _, v := range []any{c, *c, c.AKA, *c.AKA, d, *d, digest, nested, &nested} {
+			s := strings.ToUpper(fmt.Sprintf(verb, v))
+			// SECRET as it is, in hex, in base64 and as decimal bytes.
+			for _, leak := range []string{"SECRET", "534543524554", "U0VDUKVU", "83 69 67 82 69 84"} {
+				if strings.Contains(s, leak) {
+					t.Errorf("%s printed a credential of %T: %s", verb, v, s)
+				}
 			}
 		}
 	}

@@ -340,10 +340,9 @@ func (c *respContext) answer(res *sip.Response) {
 // Transport.Flush, which Drain ends with, waits for it anyway: from the
 // start of SendResponse, its connection dialled again to the Via address
 // included, as a send under way, then as a sender waiting for room, giving
-// up only once it stops getting anywhere (#375). The gap is the transaction
-// layer's few lines between taking the response and calling SendResponse:
-// a final caught there when Flush looks is not waited for, and Close may
-// drop it.
+// up only once it stops getting anywhere (#375). Between the proxy handing
+// it over and the transaction layer calling SendResponse, respondFinal's
+// hold counts it for Flush in the same way (#469).
 func (c *respContext) inProgress() bool {
 	c.mu.Lock()
 	uas := c.uas
@@ -355,6 +354,27 @@ func (c *respContext) inProgress() bool {
 	return uas == nil || !uas.handedFinal() && !(flushed && uas.hasAnswered())
 }
 
+// respondFinal hands a final response to the server transaction. From here
+// it is on its way, and not in progress for Drain (responding), so it is
+// first held for the transport's Flush as a send under way until
+// SendResponse counts it itself: otherwise a Flush between the two, while
+// the transaction layer had it, would see no send and leave it to Close to
+// drop (#469).
+func (c *respContext) respondFinal(res *sip.Response) error {
+	defer c.p.holdFinal(res)()
+	c.responding.Store(true)
+	if f := handingFinal.Load(); f != nil {
+		(*f)()
+	}
+	return c.tx.Respond(res)
+}
+
+// handingFinal, empty but in tests, runs in respondFinal and UAS.Respond
+// once a final is on its way and before the transaction has it, so that a
+// test can hold it in that gap (#469). It is atomic since a proxy may outlive the test that set
+// it.
+var handingFinal atomic.Pointer[func()]
+
 // answerForStop answers a request still without a final response 500 with
 // Retry-After, and closes its branches: INVITE branches are cancelled
 // (§16.10 does the same for a CANCEL from upstream), and the others end on
@@ -362,7 +382,9 @@ func (c *respContext) inProgress() bool {
 // deciding is answered as well; the Router's decision then starts nothing.
 //
 // It returns a channel closed once the 500 has been handed to the
-// transport, or nil when the request needed no answer.
+// transport, or, for a request a Serve handler has, once the handler's
+// final, or serve's in its place, has been handed to the transaction; nil
+// when the request needed no answer.
 func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	if !c.inProgress() {
 		return nil
@@ -378,9 +400,11 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 	if uas != nil {
 		// The service answers for itself. It learns of the stop through its
 		// context, and serve answers for it if it returns without a final
-		// response.
+		// response. Drain waits for that final as for its own answers, so
+		// that the flush after it, and the Close, do not leave it behind
+		// (#499).
 		c.cancelReq()
-		return nil
+		return uas.handedCh
 	}
 	// The response, and the service's DrainAnswer, are made without the
 	// lock, as every hook runs.
@@ -404,9 +428,10 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 		return nil
 	case c.uas != nil:
 		// The Router handed the request to a Serve handler meanwhile.
+		uas := c.uas
 		c.mu.Unlock()
 		c.cancelReq()
-		return nil
+		return uas.handedCh
 	case c.cancelled && !cancelled:
 		// Cancelled upstream meanwhile: 487 after all.
 		if res, err = c.p.response(c.tx.Request(), 487); err != nil {
@@ -433,8 +458,7 @@ func (c *respContext) answerForStop(answered *atomic.Int64) <-chan struct{} {
 					return
 				}
 			}
-			c.responding.Store(true)
-			err := c.tx.Respond(res)
+			err := c.respondFinal(res)
 			c.handed.Store(true)
 			if err != nil {
 				c.p.stats.upstreamErrors.Add(1)
@@ -573,7 +597,7 @@ func (c *respContext) startBranches(targets []Target) []func() {
 		// Each branch holds a copy of the header (the body is shared) and its
 		// CANCEL.
 		cost := 2 * c.header
-		if !c.p.reserve(cost) {
+		if !c.p.reserve(cost, c.tx.Source().ClientFacing) {
 			c.p.stats.overloaded.Add(1)
 			acts = append(acts, c.branchEnded(b, c.failureResponse(errOverload), errOverload)...)
 			continue
@@ -1249,10 +1273,11 @@ func (c *respContext) forwardAs(res *sip.Response, again bool) func() {
 
 		// §16.9: a response that cannot be sent is dropped, and the
 		// branches are left alone.
+		respond := c.tx.Respond
 		if code >= 200 {
-			c.responding.Store(true)
+			respond = c.respondFinal
 		}
-		if err := c.tx.Respond(res); err != nil {
+		if err := respond(res); err != nil {
 			c.p.stats.upstreamErrors.Add(1)
 		}
 		if code >= 200 {
@@ -1322,8 +1347,7 @@ func (c *respContext) sendBest() []func() {
 			}
 			// On its way, as the other finals (inProgress; code review of
 			// #438).
-			c.responding.Store(true)
-			if err := c.tx.Respond(res); err != nil {
+			if err := c.respondFinal(res); err != nil {
 				c.p.stats.upstreamErrors.Add(1)
 			}
 		})

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -349,7 +350,7 @@ func inDialogFrom(t *testing.T, routed []string, uri string, extra ...string) *p
 
 // testPcscfMAC is dialogMAC under newTestPcscf's key.
 func testPcscfMAC(flow transport.FlowID, callID, icid string) string {
-	return (&pcscf{dialogKey: []byte("test dialog key")}).dialogMAC(flow, callID, icid)
+	return (&pcscf{dialogKey: secret.NewString("test dialog key")}).dialogMAC(flow, callID, icid)
 }
 
 // A request inside a dialog is forwarded only along a route set this pcscf

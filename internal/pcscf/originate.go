@@ -322,7 +322,7 @@ const (
 // requests are charged to (review of #221). Each field is written after its
 // length, so no two sets of fields hash alike.
 func (p *pcscf) dialogMAC(flow transport.FlowID, callID, icid string) string {
-	m := hmac.New(sha256.New, p.dialogKey)
+	m := hmac.New(sha256.New, p.dialogKey.Reveal())
 	for _, f := range []string{string(flow), callID, icid} {
 		var n [8]byte
 		binary.BigEndian.PutUint64(n[:], uint64(len(f)))

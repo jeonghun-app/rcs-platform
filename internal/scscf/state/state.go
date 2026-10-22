@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Errors of the stores. Backends wrap them, so callers test with errors.Is.
@@ -654,9 +655,10 @@ func (c Challenge) MarshalJSON() ([]byte, error) { return json.Marshal(c.redacte
 // AKAVector is what the S-CSCF keeps of an IMS AKA authentication vector to
 // check the response and protect the client's traffic (TS 33.203 §6.1).
 // Every field is a credential: String, LogValue and MarshalJSON leave them
-// out.
+// out, and each is a secret.Key, which an invalid verb, %p or %w, does not
+// print either (#506).
 type AKAVector struct {
-	RAND, AUTN, XRES, CK, IK []byte
+	RAND, AUTN, XRES, CK, IK secret.Key
 }
 
 // String describes the vector without its contents.
@@ -673,13 +675,14 @@ func (AKAVector) MarshalJSON() ([]byte, error) { return []byte(`"AKAVector{...}"
 
 // DigestChallenge is the SIP Digest state of a challenge (RFC 2617, RFC 7616):
 // the parameters the S-CSCF sent and the HA1 from the HSS, a credential that
-// String, LogValue and MarshalJSON leave out.
+// String, LogValue and MarshalJSON leave out, held in a secret.Key, which an
+// invalid verb does not print either (#506).
 type DigestChallenge struct {
 	Realm     string
 	Algorithm string
 	QoP       string
 	Opaque    string
-	HA1       string
+	HA1       secret.Key
 }
 
 // String describes the challenge without HA1.
@@ -727,10 +730,8 @@ func (c *Challenge) Validate() error {
 func (c *Challenge) Clone() *Challenge {
 	cp := *c
 	if c.AKA != nil {
-		v := AKAVector{
-			RAND: slices.Clone(c.AKA.RAND), AUTN: slices.Clone(c.AKA.AUTN), XRES: slices.Clone(c.AKA.XRES),
-			CK: slices.Clone(c.AKA.CK), IK: slices.Clone(c.AKA.IK),
-		}
+		// A secret.Key never changes, so the copy shares it.
+		v := *c.AKA
 		cp.AKA = &v
 	}
 	if c.Digest != nil {

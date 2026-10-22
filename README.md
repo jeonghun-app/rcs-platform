@@ -18,13 +18,21 @@ Built and merged on `main` (details in [CHANGELOG.md](CHANGELOG.md)):
 - **Libraries**: service runtime, identifier masking, SIP messages, SIP/HTTP
   Digest and AKA, Milenage, SDP, Diameter base, Cx and Sh, iFC, MSRP, CPIM,
   IMDN, conference-info, PROXY protocol v2.
-- **Services**: `ft-server` ([docs](docs/ft-server.md)) and `msrp-relay`
-  ([docs](docs/msrp-relay.md)). Both run on their own; nothing calls them yet.
+- **Services**: the IMS core, `hss` ([docs](docs/hss.md)), `pcscf`
+  ([docs](docs/pcscf.md)), `icscf` ([docs](docs/icscf.md)) and `scscf`
+  ([docs](docs/scscf.md)), and `ft-server` ([docs](docs/ft-server.md)) and
+  `msrp-relay` ([docs](docs/msrp-relay.md)).
+- **In progress**: `rcs-as` ([docs](docs/rcs-as.md)) runs in the local stack
+  as the IMS core's application server. Pager messages run end to end there;
+  chat does not yet, since `rcs-sim` has no chat over SIP.
+- **Tools**: the client simulator `rcs-sim` ([docs](docs/rcs-sim.md)) and the
+  local stack ([docs](docs/local-stack.md)). In the local stack a client
+  registers through the IMS core with IMS AKA, follows its registration (reg
+  event), reaches another client with OPTIONS, and sends it pager messages
+  through `rcs-as`, which stores one for a client that is not registered.
 - **Decisions**: ADRs 0001–0007 and the [threat model](docs/threat-model.md).
 
-Not built yet: SIP transport and transactions, `hss`, `pcscf`, `icscf`,
-`scscf`, `rcs-as`, the client simulator, the local stack and the AWS
-infrastructure. There is no release yet.
+There is no release yet.
 
 ## Services
 

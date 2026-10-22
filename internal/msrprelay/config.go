@@ -10,6 +10,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // Defaults of the RELAY_ settings; docs/msrp-relay.md has the full table.
@@ -121,7 +122,7 @@ type Config struct {
 	StoreTimeout     time.Duration
 
 	// Tokens are pcscf's current and next control API tokens.
-	Tokens []secret
+	Tokens []secretkey.Key
 
 	MaxExpiresIn            time.Duration
 	MaxConnections          int
@@ -137,12 +138,6 @@ type Config struct {
 	MetricsInterval         time.Duration
 	UserTimeout             time.Duration
 }
-
-// secret holds a token so that printing a Config cannot reveal it.
-type secret struct{ v string }
-
-func (secret) String() string   { return "[redacted]" }
-func (secret) GoString() string { return "[redacted]" }
 
 // interfaceAddrs finds this task's addresses; tests replace it.
 var interfaceAddrs = net.InterfaceAddrs
@@ -313,7 +308,7 @@ func coreHost(e *runtime.Env) netip.Addr {
 
 // tokens reads pcscf's two tokens (ADR 0007 §4: current and next, so a token
 // rotates without downtime).
-func tokens(s *runtime.Settings) []secret {
+func tokens(s *runtime.Settings) []secretkey.Key {
 	e := s.Env
 	current, next := e.String("PCSCF_TOKEN", ""), e.String("PCSCF_TOKEN_NEXT", "")
 	switch {
@@ -325,7 +320,7 @@ func tokens(s *runtime.Settings) []secret {
 		return nil
 	}
 	s.ForbidInProduction(current == "", "RELAY_PCSCF_TOKEN is unset: the control API would refuse every call")
-	var out []secret
+	var out []secretkey.Key
 	for _, t := range []struct{ name, v string }{{"PCSCF_TOKEN", current}, {"PCSCF_TOKEN_NEXT", next}} {
 		if t.v == "" {
 			continue
@@ -337,7 +332,7 @@ func tokens(s *runtime.Settings) []secret {
 		}
 		s.ForbidInProduction(len(t.v) < minTokenLength, fmt.Sprintf(
 			"RELAY_%s is shorter than %d characters (ADR 0007 §4: at least 256 random bits, e.g. 32 bytes in base64)", t.name, minTokenLength))
-		out = append(out, secret{t.v})
+		out = append(out, secretkey.NewString(t.v))
 	}
 	return out
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -41,7 +42,7 @@ func stallingHSS(t *testing.T, headers bool) *hss {
 // by the default (QA on #138).
 func wiredSource(t *testing.T, h *hss, timeout time.Duration) *HSSCredentials {
 	t.Helper()
-	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL(h.URL), HSSToken: secret{"t"}, Realm: realm, HSSTimeout: timeout, MaxLookups: 4}
+	cfg := Config{Credentials: CredentialsHSS, HSSURL: mustURL(h.URL), HSSToken: secretkey.NewString("t"), Realm: realm, HSSTimeout: timeout, MaxLookups: 4}
 	src, ok := credentialSource(cfg, false).(*HSSCredentials)
 	if !ok {
 		t.Fatalf("credentialSource gave %T, want *HSSCredentials", credentialSource(cfg, false))
