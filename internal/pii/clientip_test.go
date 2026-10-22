@@ -134,7 +134,13 @@ func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
 		"：203.0.113.9":                           "：203.0.113.0/24",
 		"“203.0.113.9”":                          "“203.0.113.0/24”",
 		"udp/2001:db8:5:6::8 and ip/203.0.113.9": "udp/2001:db8:5::/48 and ip/203.0.113.0/24",
-		" :2001:db8:5:6::8 =:2001:db8:5:6::9":    " :2001:db8:5::/48 =:2001:db8:5::/48",
+		// A "/" after a digit starts a length only if a length follows it
+		// (#512).
+		"5/2001:db8:5:6::8": "5/2001:db8:5::/48",
+		// After a word's colon, "/" and a length after an address keep the
+		// length.
+		"host:2001:db8::/48::1":               "host:2001:db8::/48::1",
+		" :2001:db8:5:6::8 =:2001:db8:5:6::9": " :2001:db8:5::/48 =:2001:db8:5::/48",
 		// After a word's colon, whatever letter ends the word.
 		"remote:2001:db8:5:6::8 node:2001:db8:5:6::8":    "remote:2001:db8:5::/48 node:2001:db8:5::/48",
 		"ipv6:2001:db8:5:6::8 cafe:2001:db8:5:6:7:8:9:a": "ipv6:2001:db8:5::/48 cafe:2001:db8::/48",
@@ -154,6 +160,41 @@ func TestTheAddressesInFreeTextAreTruncated(t *testing.T) {
 	} {
 		if got := TruncateIPsIn(in); got != want {
 			t.Errorf("TruncateIPsIn(%q)\n = %q\nwant %q", in, got, want)
+		}
+	}
+}
+
+// TruncateIPsIn's output reads the same when truncated again (#512): a
+// network whose length is followed by more of a token ("::/48::") keeps that
+// length, rather than reading the length as an address of its own.
+func TestTruncatedTextReadsTheSameAgain(t *testing.T) {
+	for _, in := range []string{
+		"0.0.0.0:1::0.0.0.0::",
+		"1::0.0.0.0::",
+		"::/48::",
+		"0.0.0.0/24::/48::",
+		"2001:db8:5::/48::1",
+		"[2001:db8::1]:443::",
+		".0.0.0.0::",
+		// A token longer than an address, whose start is one that ends at
+		// its dotted quad.
+		"1::1.0.0.0:" + strings.Repeat("0", 54),
+	} {
+		once := TruncateIPsIn(in)
+		if again := TruncateIPsIn(once); again != once {
+			t.Errorf("TruncateIPsIn(%q) = %q, and again %q", in, once, again)
+		}
+	}
+}
+
+// An address after a colon and a run of dots is truncated, however many
+// dots there are, the window of a long token's starts included (#520).
+func TestAnAddressAfterAColonAndDotsIsTruncated(t *testing.T) {
+	for n := range 101 {
+		in := ":" + strings.Repeat(".", n) + "2001:db8:5:6::8"
+		got := TruncateIPsIn(in)
+		if want := ":" + strings.Repeat(".", n) + "2001:db8:5::/48"; got != want {
+			t.Fatalf("%d dots: TruncateIPsIn(%q) = %q, want %q", n, in, got, want)
 		}
 	}
 }
