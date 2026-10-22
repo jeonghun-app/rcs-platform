@@ -765,8 +765,9 @@ group's sessions and subscriptions is its conference URI.
   and saying whether it registered on a new flow there since the last wake;
   at most once per participant and group every `RCSAS_INVITE_TIMEOUT`, and
   at once after such a registration (`group.wake_sent`,
-  `sip.group.wake.<status>`). The wake goes off the queue pass, at most 16 at
-  a time. The owner answers 200 and reads the queue (`sip.group.woken`); for
+  `sip.group.wake.<status>`). The wake goes off the queue pass, at most 64 at
+  a time; one past them is counted (`group.wake_skipped`) and tried again a
+  second later. The owner answers 200 and reads the queue (`sip.group.woken`); for
   a registration, it first forgets the invitation it last asked for the
   participant in the group and its pager-only mark, as a registration on a
   new flow there would, so that it invites at once.
@@ -776,7 +777,11 @@ group's sessions and subscriptions is its conference URI.
   the group item first, unless its creator is over `RCSAS_GROUP_CREATE_RATE`,
   which refuses it unread. That there is no such group is remembered for a
   second, up to 10 000 of them; whatever then serves the request reads the
-  group itself, so a group made meanwhile is not taken for none.
+  group itself, so a group made meanwhile is not taken for none, and checks
+  that this task owns it: a request that changes nothing, a rejoin of a
+  participant joined already or a roster read for a SUBSCRIBE, has no fence
+  to refuse it, and gets 500 with `Retry-After` on a task that does not own
+  the group, so that it comes back through the owner.
 - **Limits.** The per-user bounds on sessions and subscriptions are per task
   (the lead's decision on #121): with a user's groups owned by several tasks,
   a user may hold up to that many on each.
@@ -1376,7 +1381,7 @@ identifier ever appears in a metric name.
 | `group.notification.summarized`, `group.summary.expanded`, `group.summary.sent`, `group.summary.abandoned` | Notifications that went to a summary for want of room, summaries delivered, the notifications they sent, and summaries given up after three failed removals with nothing new to send |
 | `group.fanout.not_owner`, `delivery.group_not_owned`, `group.wake` | #121: fan-outs stopped because another task took the group over; group copies a task that does not own the group did not invite for; queue reads the owner was asked for |
 | `group.forwarded`, `group.forward_refused`, `group.forward_refused.address`, `group.owner_lost`, `group.owned_dropped`, `sip.group.disowned.sessions` | #121: requests forwarded to a group's owner; requests answered 500 with `Retry-After` for want of an owner to forward to, and of those, the ones whose owner's address rcs-as does not forward to; groups this task gave up, those of them it dropped at the bound on the groups it remembers owning, and the sessions it ended with them |
-| `group.wake_sent`, `group.wake_failed`, `sip.group.wake.<status>`, `sip.group.wake.timeout`, `sip.group.woken` | #121: wake messages sent to a group's owner, those that could not be sent, their answers, and the wakes an owner acted on |
+| `group.wake_sent`, `group.wake_failed`, `group.wake_skipped`, `sip.group.wake.<status>`, `sip.group.wake.timeout`, `sip.group.woken` | #121: wake messages sent to a group's owner, those that could not be sent, those put off a second for want of room, their answers, and the wakes an owner acted on |
 | `group.message.accepted`, `group.notification.accepted`, `group.notification.dropped`, `group.fanout.deliveries`, `group.fanout.queue_full`, `group.fanout.timed_out`, `group.fanout_budget_exceeded`, `group.fanout_share_exceeded` | Group messages; `dropped` counts notifications taken but neither queued nor summarized, the summaries' total or the queue being full; `share_exceeded` messages refused for their sender's quarter of the budget; `timed_out` recipients a message was not queued for within `FanoutTimeout` |
 
 Logs never carry message content. Identities appear only through

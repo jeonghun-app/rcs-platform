@@ -804,7 +804,9 @@ func TestNoGroupIsRememberedAMoment(t *testing.T) {
 	}
 	other := a.s.URIFor("gch4t8")
 	_, _, _ = a.s.Place(t.Context(), other)
-	a.clock.Advance(absentFor)
+	// A second, not absentFor: a window much longer would leave a group
+	// made elsewhere served here for that long (QA on #464).
+	a.clock.Advance(time.Second + time.Millisecond)
 	gets = sa.gets.Load()
 	if _, _, _ = a.s.Place(t.Context(), other); sa.gets.Load() == gets {
 		t.Error("no read once the moment had passed")

@@ -35,6 +35,8 @@ func twoTasks(t *testing.T, invitees ...string) (ga, gb *groupRig) {
 type twoTaskOptions struct {
 	transport transport.Config
 	group     func(*group.Config)
+	// transportB, when set, is b's transport instead.
+	transportB *transport.Config
 }
 
 // twoTasksWith is twoTasks with o.
@@ -43,7 +45,11 @@ func twoTasksWith(t *testing.T, o twoTaskOptions, invitees ...string) (ga, gb *g
 	st, groups := store.NewMemory(), groupstore.NewMemory()
 	cfg := Config{peers: loopbackPeers}
 	a := newChatRigShared(t, messaging.Config{}, cfg, o.transport, rigShare{store: st, groups: groups, task: "task-a", beat: true, group: o.group})
-	b := newChatRigShared(t, messaging.Config{}, cfg, o.transport, rigShare{store: st, groups: groups, task: "task-b", beat: true, group: o.group})
+	tb := o.transport
+	if o.transportB != nil {
+		tb = *o.transportB
+	}
+	b := newChatRigShared(t, messaging.Config{}, cfg, tb, rigShare{store: st, groups: groups, task: "task-b", beat: true, group: o.group})
 	for _, r := range []*chatRig{a, b} {
 		r.core.setAnswer(func(req *sip.Request) int {
 			if req.Method == "INVITE" {

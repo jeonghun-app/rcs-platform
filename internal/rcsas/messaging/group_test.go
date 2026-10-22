@@ -910,3 +910,56 @@ func TestACopyIsQueuedOnlyUnderTheGroupsOwner(t *testing.T) {
 		t.Fatalf("the handler was told %d times", h.lost.Load())
 	}
 }
+
+// QA on #464: a wake telling of a registration on a new flow forgets the
+// participant's pager-only mark too, as the registration would here: a
+// client that once answered passive is offered the group's session again.
+func TestAWakeForARegistrationForgetsPagerOnly(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	r.e.InviteFailed(inv, ErrNoSessions) // bob answered passive
+	waitFor(t, "idle", r.idle)
+	r.e.Wake(bob, groupURI, false)
+	waitFor(t, "idle", r.idle)
+	select {
+	case inv := <-r.d.invites:
+		t.Fatalf("invited a pager-only client: %+v", inv)
+	default:
+	}
+	r.e.Wake(bob, groupURI, true)
+	if inv := r.d.nextInvite(t); inv.Recipient != bob {
+		t.Fatalf("invitation %+v after the registration's wake", inv)
+	}
+}
+
+// QA on #464: past maxWakesOut wakes on their way, a wake is counted and
+// tried again after wakeRetry, not left to the queue's own retry, up to an
+// hour away: every participant's owner is woken within a few seconds.
+func TestWakesPastTheBoundAreTriedAgainSoon(t *testing.T) {
+	const n = maxWakesOut + 36
+	var all []string
+	for i := range n {
+		all = append(all, fmt.Sprintf("sip:p%03d@%s", i, "ims.example.net"))
+	}
+	r := newRig(t, Config{})
+	release := make(chan struct{})
+	h := members{all: append([]string{alice}, all...), notMine: true, woken: new(atomic.Int64), hold: release}
+	r.e.SetGroupHandler(h)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "a wake skipped", func() bool { return r.m.get("group.wake_skipped") > 0 })
+	close(release) // the wakes on their way are answered
+	for range 5 {
+		r.clock.Advance(wakeRetry)
+		if h.woken.Load() == n {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	waitFor(t, "every owner woken", func() bool { return h.woken.Load() == n })
+}

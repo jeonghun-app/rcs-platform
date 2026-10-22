@@ -452,8 +452,12 @@ func (e *Engine) deliverGroup(ctx context.Context, m store.Message, behind bool)
 	return skip
 }
 
-// maxWakesOut bounds the wakes on their way at once.
-const maxWakesOut = 16
+// maxWakesOut bounds the wakes on their way at once, and wakeRetry is when
+// a queue whose wake found no room is read again for it.
+const (
+	maxWakesOut = 64
+	wakeRetry   = time.Second
+)
 
 // wakeOwner asks the owner of m's group to read m's recipient's queue
 // (GroupHandler.WakeOwner), once per InviteTimeout, as often as the owner
@@ -461,7 +465,9 @@ const maxWakesOut = 16
 // registered on a new flow here, which the wake tells (Engine.Wake). It
 // goes off the queue pass, which a connection to the owner still to be
 // made would hold up (code review on #464); beyond maxWakesOut on their
-// way it is left for the next pass.
+// way it is counted (group.wake_skipped) and the queue read again after
+// wakeRetry, rather than at its own next retry, up to an hour away (QA on
+// #464).
 func (e *Engine) wakeOwner(m store.Message) {
 	h := e.groupHandler()
 	if h == nil {
@@ -470,8 +476,25 @@ func (e *Engine) wakeOwner(m store.Message) {
 	k := legKey{m.Recipient, m.Sender}
 	e.mu.Lock()
 	until, asked := e.woken[k]
-	if e.closed || asked && e.clock.Now().Before(until) || e.wakesOut >= maxWakesOut {
+	if e.closed || asked && e.clock.Now().Before(until) {
 		e.mu.Unlock()
+		return
+	}
+	if e.wakesOut >= maxWakesOut {
+		retry := !e.wakeRetries[k.user]
+		if retry {
+			e.wakeRetries[k.user] = true
+		}
+		e.mu.Unlock()
+		e.metrics.Count("group.wake_skipped", 1)
+		if retry {
+			e.clock.AfterFunc(wakeRetry, func() {
+				e.mu.Lock()
+				delete(e.wakeRetries, k.user)
+				e.mu.Unlock()
+				e.kickEvent(k.user)
+			})
+		}
 		return
 	}
 	e.markFor(e.woken, k, e.cfg.InviteTimeout)

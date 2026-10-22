@@ -794,6 +794,11 @@ func (s *Service) Roster(ctx context.Context, uri, who string) ([]byte, uint32, 
 	if i := index(&g, who); i < 0 || !g.Participants[i].State.Active() {
 		return nil, 0, ErrNotParticipant
 	}
+	// The subscription it starts or refreshes is the owner's to hold (QA
+	// on #464).
+	if _, err := s.owner(ctx, g); err != nil {
+		return nil, 0, err
+	}
 	doc, err := fullDocument(g)
 	return doc, g.Version, err
 }
@@ -843,6 +848,13 @@ func (s *Service) change(ctx context.Context, uri string, f func(g *groupstore.G
 			return groupstore.Group{}, err
 		}
 		if len(changed) == 0 {
+			// Nothing to write, so no fence to refuse it: whoever serves
+			// the request must own the group all the same, or another task
+			// would hold its session (QA on #464). ErrNotOwner has the
+			// client try again, through the owner.
+			if _, err := s.owner(ctx, g); err != nil {
+				return groupstore.Group{}, err
+			}
 			return g, nil
 		}
 		deleted := s.forget(&g)

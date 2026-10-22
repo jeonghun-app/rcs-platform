@@ -13,6 +13,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -61,7 +62,8 @@ func TestQA464WokenOwnerInvites(t *testing.T) {
 // QA on #464: an owner whose address does not answer the connection, past
 // the dial timeout, is no end of the group either: 500 with Retry-After.
 func TestAnOwnerThatCannotBeDialledIsNoEndOfTheGroup(t *testing.T) {
-	ga, gb := twoTasksWith(t, twoTaskOptions{transport: transport.Config{DialTimeout: 200 * time.Millisecond}}, bob)
+	// The short dial timeout is b's alone: a's own setup dials its core.
+	ga, gb := twoTasksWith(t, twoTaskOptions{transportB: &transport.Config{DialTimeout: 200 * time.Millisecond}}, bob)
 	gb.a.srv.cfg.peers = func(netip.AddrPort) bool { return true }
 	mine, err := ga.groupStore.Owner(t.Context(), ga.uri)
 	if err != nil {
@@ -196,5 +198,89 @@ func TestAnOwnerThatNeverAnswersIsNoEndOfTheGroup(t *testing.T) {
 	m.from, m.to, m.fields[0] = "<"+bob+">;tag=g3", "<"+ga.uri+">", "P-Asserted-Identity: <"+bob+">"
 	if res := gb.p.send(m); res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
 		t.Fatalf("answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}
+
+// QA's reproduction (#464): b, which found no group at a URI a moment ago,
+// gets the SUBSCRIBE of a group a has made there since, in the window b
+// takes the miss for granted. b may not hold the subscription: the roster
+// it would serve is a's, and it answers 500 with Retry-After, so that the
+// subscriber tries again, through a.
+func TestQAR2RestartRightAfterAMissOnANonOwner(t *testing.T) {
+	ga, gb := twoTasks(t, carol)
+	uri := gb.groups.URIFor("qarestart")
+	m := gb.groupInvite(uri, sdpType, offerSDP(relayPath(), "active"))
+	m.to = "<" + uri + ">"
+	if res := gb.p.send(m); res.StatusCode != 404 { // b remembers: no group
+		t.Fatalf("rejoin of no group answered %d", res.StatusCode)
+	}
+	f := ga.factoryInvite(relayPath(), bob) // the restart, made on a
+	for i, x := range f.fields {
+		if x == "Contribution-ID: gch4t1" {
+			f.fields[i] = "Contribution-ID: qarestart"
+		}
+	}
+	s := answeredBy(t, ga.p.send(f))
+	ga.p.ack(s)
+	g := &groupRig{chatRig: gb.chatRig, p: gb.p, uri: uri}
+	res, _ := g.subscribe(t, alice, "600")
+	gb.a.srv.mu.Lock()
+	onB := len(gb.a.srv.groupSubs[uri])
+	gb.a.srv.mu.Unlock()
+	if onB != 0 {
+		t.Fatal("b, not the owner, holds the subscription")
+	}
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("the SUBSCRIBE on b answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+	// alice's rejoin on b, a no-op Join, is not served there either.
+	if res := g.p.send(m); res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("a rejoin on b answered %d", res.StatusCode)
+	}
+}
+
+// QA on #464: a SUBSCRIBE forwarded to an owner that never answers ends
+// on the branch's timeout as a 504 (a non-INVITE's), which is no end of
+// the group either: 500 with Retry-After.
+func TestASubscribeToAnOwnerThatNeverAnswersIsToBeTriedAgain(t *testing.T) {
+	ga, gb := twoTasks(t, bob)
+	gb.a.srv.cfg.forwardWait = 300 * time.Millisecond
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	mine, err := ga.groupStore.Owner(t.Context(), ga.uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	silent := groupstore.Owner{Task: mine.Task, SIP: l.Addr().String()}
+	if _, err := ga.groupStore.TakeOver(t.Context(), ga.uri, mine, silent, ga.clock.Now().Add(time.Hour), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := gb.subscribe(t, alice, "600")
+	if res.StatusCode != 500 || res.Header.Get("Retry-After") == "" {
+		t.Fatalf("answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
+	}
+}
+
+// QA on #464: a forward waits for the owner less than the client's own
+// INVITE transaction does (Timer B, 64*T1), and a disowned session waits
+// for its ACK as long as the server transaction does (Timer H, 64*T1).
+func TestTheForwardAndACKWaitsAreTheTransactions(t *testing.T) {
+	if forwardWait >= 64*transaction.DefaultT1 {
+		t.Errorf("forwardWait %v, the client gives up at %v", forwardWait, 64*transaction.DefaultT1)
+	}
+	if ackWait != 64*transaction.DefaultT1 {
+		t.Errorf("ackWait %v, Timer H is %v", ackWait, 64*transaction.DefaultT1)
 	}
 }

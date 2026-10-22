@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"errors"
+	"math/rand/v2"
 	"slices"
 	"strings"
 	"testing"
@@ -258,5 +259,28 @@ func TestMessagesOfAPairWithoutAConversationIDShareOne(t *testing.T) {
 	slices.Sort(got)
 	if want := []string{"=", "c1=" + pair, "c2=" + pair, "c3=own"}; !slices.Equal(got, want) {
 		t.Fatalf("delivered %v, want %v", got, want)
+	}
+}
+
+// would says what allowN would do, taking nothing (QA on #464): checked
+// against allowN over random steps, on rates with and without bursts and a
+// bound on the keys that evicts.
+func TestWouldAgreesWithAllowN(t *testing.T) {
+	for _, r := range []Rate{{PerMinute: 5, Burst: 10}, {PerMinute: 60, Burst: 1}, {PerMinute: 1, Burst: 3}, {PerMinute: -1}} {
+		l := newLimiter(r, 4)
+		rnd := rand.New(rand.NewPCG(uint64(r.PerMinute), uint64(r.Burst)))
+		now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+		for step := range 5000 {
+			now = now.Add(time.Duration(rnd.IntN(3000)) * time.Millisecond)
+			key := string(rune('a' + rnd.IntN(6)))
+			n := 1 + rnd.IntN(3)
+			want := l.would(key, now, n)
+			if again := l.would(key, now, n); again != want {
+				t.Fatalf("%+v step %d: would changed its own answer", r, step)
+			}
+			if got := l.allowN(key, now, n); got != want {
+				t.Fatalf("%+v step %d: would %v, allowN %v", r, step, want, got)
+			}
+		}
 	}
 }

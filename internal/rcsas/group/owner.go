@@ -172,7 +172,8 @@ func (s *Service) Place(ctx context.Context, uri string) (mine bool, at groupsto
 		// Remembered a moment, so that requests for a group there is none
 		// of cost no read each (security review on #464). Whatever serves
 		// them reads the group itself, so a group made meanwhile is never
-		// answered as none.
+		// answered as none, and checks that this task owns it (change,
+		// Roster), so another task's is not served here (QA on #464).
 		s.mu.Lock()
 		if len(s.absent) >= maxAbsent {
 			clear(s.absent)
