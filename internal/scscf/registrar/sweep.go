@@ -115,16 +115,17 @@ func permanent(o cxclient.Outcome) bool {
 const maxReassertTries = 5
 
 // reassert tells the HSS again that this S-CSCF serves reg's set (SAR
-// REGISTRATION, TS 29.228 §6.1.2), which a deregistration's SAR that crossed
-// a REGISTER's may have undone, and clears Reassert. A failure that may pass
+// REGISTRATION, TS 29.228 §6.1.2), which a deregistration's SAR that crossed a
+// REGISTER's may have undone, and clears Reassert. A failure that may pass
 // moves Reassert on by a doubled reassertBackoff, until maxReassertTries; a
 // permanent one, or the last, gives up, counted, and the set's next
-// re-registration tells the HSS anyway. Saves are conditional on the version
+// re-registration tells the HSS anyway; a profile the answer carries is applied
+// once the save is done (applySAAProfile). Saves are conditional on the version
 // the sweep claimed: a REGISTER that saved the set meanwhile told the HSS
-// itself and left no Reassert. A save that loses after a SAR the HSS took
-// may have lost to a deregistration, which undoIfEnded tells the HSS of
-// again; one that wins shows that none has ended the set, and any that
-// follows sends its SAR after this one's answer.
+// itself and left no Reassert. A save that loses after a SAR the HSS took may
+// have lost to a deregistration, which undoIfEnded tells the HSS of again; one
+// that wins shows that none has ended the set, and any that follows sends its
+// SAR after this one's answer.
 func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error {
 	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{
 		UserName: reg.Key.IMPI, PublicIdentities: []string{reg.Key.IMPU},
@@ -151,14 +152,21 @@ func (g *Registrar) reassert(ctx context.Context, reg *state.Registration) error
 		g.count("registrar.reassert_abandoned")
 		next.Reassert, next.ReassertAttempts = time.Time{}, 0
 	}
-	_, err = g.cfg.Store.SaveRegistration(ctx, next)
+	saved, err := g.cfg.Store.SaveRegistration(ctx, next)
 	switch {
 	case (errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound)) && o == cxclient.Success:
 		return g.undoIfEnded(ctx, reg.Key)
 	case errors.Is(err, state.ErrConflict) || errors.Is(err, state.ErrNotFound):
 		return nil
+	case err != nil:
+		return err
 	}
-	return err
+	if o == cxclient.Success {
+		// After the save, which the sweep's claim makes conditional on the
+		// version it read (#536).
+		g.applySAAProfile(ctx, saved, saa.UserData)
+	}
+	return nil
 }
 
 // sweepAll sweeps as many times as it takes to find fewer than limit sets

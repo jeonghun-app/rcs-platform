@@ -120,7 +120,8 @@ func TestWhatTheHSSAnswersAnUnregisteredUsersSARIsTold(t *testing.T) {
 func ptr[T any](v T) *T { return &v }
 
 // TestARecordOfTheSetIsReturnedAsItIs: one saved before the SAR, as a
-// registration is, or while it was under way, which the save loses to.
+// registration is, or while it was under way, which the save loses to. The
+// SAA's profile is kept for it all the same (#536).
 func TestARecordOfTheSetIsReturnedAsItIs(t *testing.T) {
 	t.Run("before", func(t *testing.T) {
 		e := newEnv(t)
@@ -132,8 +133,8 @@ func TestARecordOfTheSetIsReturnedAsItIs(t *testing.T) {
 		if rec.Incarnation != live.Incarnation || len(rec.Contacts) != 1 {
 			t.Errorf("record %+v", rec)
 		}
-		if _, err := e.store.Profile(bg, live.Key, t0); !errors.Is(err, state.ErrNotFound) {
-			t.Errorf("the registration's profile was written: %v", err)
+		if p, err := e.store.Profile(bg, live.Key, t0); err != nil || len(p.UserData) == 0 {
+			t.Errorf("the SAA's profile was not kept for the registration: %v", err)
 		}
 	})
 	t.Run("meanwhile", func(t *testing.T) {

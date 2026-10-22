@@ -709,8 +709,9 @@ const reassertBackoff = time.Minute
 // set's identities at the record again, which the deregistration may have
 // deleted. If the HSS cannot be told, the record is marked (Reassert) for a
 // sweep to try again: the HSS may otherwise hold the set as deregistered
-// while its devices are registered here. If it is told, a deregistration
-// that ended the set meanwhile is told again (undoIfEnded).
+// while its devices are registered here. If it is told, a profile its
+// answer carries is applied (applySAAProfile), and a deregistration that
+// ended the set meanwhile is told again (undoIfEnded).
 func (g *Registrar) reassign(ctx context.Context, reg *state.Registration) error {
 	g.count("registrar.reassigned")
 	if err := g.point(ctx, reg, keepUntil(reg).Add(state.ProfileGrace)); err != nil {
@@ -721,6 +722,7 @@ func (g *Registrar) reassign(ctx context.Context, reg *state.Registration) error
 		AssignmentType: assignmentOf(reg), UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable,
 	})
 	if err == nil && saa != nil && cxclient.Classify(saa.Result) == cxclient.Success {
+		g.applySAAProfile(ctx, reg, saa.UserData)
 		return g.undoIfEnded(ctx, reg.Key)
 	}
 	g.count("registrar.hss_failed")
