@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -633,22 +634,27 @@ func TestAThirdPartyREGISTERIsBoundedByThirdPartyTimeout(t *testing.T) {
 	for _, c := range []struct{ cfg, want time.Duration }{{0, DefaultThirdPartyTimeout}, {150 * time.Millisecond, 150 * time.Millisecond}} {
 		e := newEnv(t)
 		e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
-		var left atomic.Int64
+		// The deadline is wall clock, the transaction's, not the S-CSCF's
+		// injected time: it is set after start, so it is at least the
+		// timeout past start, and before the send reads it, so at most the
+		// timeout past then, however slow the scheduler.
+		var sinceStart, untilEnd atomic.Int64
+		start := time.Now()
 		s := senderFunc(func(ctx context.Context, req *sip.Request) (*sip.Response, error) {
+			now := time.Now()
 			d, ok := ctx.Deadline()
 			if !ok {
 				return nil, errors.New("no deadline")
 			}
-			left.Store(int64(time.Until(d)))
+			sinceStart.Store(int64(d.Sub(start)))
+			untilEnd.Store(int64(d.Sub(now)))
 			return sip.NewResponse(req, 200, "", "as")
 		})
 		rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.ThirdPartyTimeout = c.cfg })
 		rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
 		rt.Stop()
-		// The deadline is wall clock: the transaction's, not the S-CSCF's
-		// injected time.
-		if got := time.Duration(left.Load()); got <= 0 || got > c.want {
-			t.Errorf("deadline in %v, want at most %v", got, c.want)
+		if from, until := time.Duration(sinceStart.Load()), time.Duration(untilEnd.Load()); from < c.want || until > c.want {
+			t.Errorf("deadline %v after the start and %v after the send, want at least and at most %v", from, until, c.want)
 		}
 	}
 }
@@ -805,4 +811,450 @@ func TestARegistrationWaitingForItsSetHoldsNoSlot(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Error("the other user's registration waited for set1's queue: a waiting registration held a slot")
 	}
+}
+
+// twoIdentities is a profile of set1 in which impu1 and impu2 both have
+// the REGISTER criterion, and a registration of each.
+func twoIdentities(t *testing.T, typ ifc.RegistrationType, expires time.Duration) (registrar.ThirdPartyRegistration, registrar.ThirdPartyRegistration) {
+	t.Helper()
+	sub := ifc.Subscription{PrivateID: set1.IMPI, ServiceProfiles: []ifc.ServiceProfile{{
+		PublicIdentities:      []ifc.PublicIdentity{{Identity: impu1}, {Identity: impu2}},
+		InitialFilterCriteria: []ifc.FilterCriteria{criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued)},
+	}}}
+	data, err := sub.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &state.Profile{Key: set1, UserData: data, Received: t0, KeepUntil: t0.Add(time.Hour)}
+	a := registration(t, typ, expires)
+	a.Profile = p
+	b := a
+	b.IMPU = impu2
+	return a, b
+}
+
+// TestASetsEndIsNotDroppedWhenItsServersQueueIsFull (#420, QA on #379 and
+// #446): with the server's queue full of other sets' registrations and
+// nothing of the ending set's waiting, the end goes past the bound and
+// reaches the server. A refresh past the bound is dropped; an end past the
+// headroom too evicts the oldest refresh waiting, and is sent.
+func TestASetsEndIsNotDroppedWhenItsServersQueueIsFull(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	// One slot, so four queued fill the server's queue: one at the server
+	// and three waiting, all other sets'.
+	for n := range queuedPerServer {
+		rt.Registered(bg, otherSet(t, e, n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	end := registration(t, ifc.DeRegistration, 0)
+	end.Profile = profileFor(t, e, set1, impu1)
+	rt.Registered(bg, end)
+	// A refresh of yet another set has no allowance past the bound, and
+	// another end none past the headroom, MaxThirdParty, which the first
+	// took: it evicts the oldest refresh waiting, user001's.
+	rt.Registered(bg, otherSet(t, e, queuedPerServer))
+	other := otherSet(t, e, queuedPerServer+1)
+	other.Type, other.Expires = ifc.DeRegistration, 0
+	rt.Registered(bg, other)
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf(impu1); len(got) != 1 || got[0] != "0" {
+		t.Errorf("the server heard %v for the ending set, want its end", got)
+	}
+	if got := s.expiresOf(other.IMPU); len(got) != 1 || got[0] != "0" {
+		t.Errorf("the server heard %v for the other ending set, want its end", got)
+	}
+	if got := s.expiresOf("sip:user001@" + realm); len(got) != 0 {
+		t.Errorf("the server heard %v for the evicted refresh", got)
+	}
+	for name, want := range map[string]int64{"end_past_bound": 1, "dropped": 1, "evicted": 1, "end_dropped": 0} {
+		if got := e.metrics.get("routing.third_party." + name); got != want {
+			t.Errorf("%s %d, want %d", name, got, want)
+		}
+	}
+	// The evicted refresh is no longer counted: the queue empties.
+	rt.tp.mu.Lock()
+	defer rt.tp.mu.Unlock()
+	if q := rt.tp.servers[rcsAS]; q.queued != 0 || len(q.keys) != 0 || len(q.sets) != 0 || len(q.waiting) != 0 {
+		t.Errorf("after Stop: %d queued, %d keys, %d sets, %d waiting", q.queued, len(q.keys), len(q.sets), len(q.waiting))
+	}
+}
+
+// TestAnEndEvictsARefreshBeforeAnInitialRegistration (#446 code review):
+// an initial registration lost leaves the server unaware of the user, a
+// refresh lost does not, so an end evicts the refreshes waiting first,
+// though the initial registration is older.
+func TestAnEndEvictsARefreshBeforeAnInitialRegistration(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	rt.Registered(bg, otherSet(t, e, 0))
+	recv(t, s.inside)
+	rt.Registered(bg, otherSet(t, e, 1))
+	for n := 2; n <= 3; n++ {
+		r := otherSet(t, e, n)
+		r.Type = ifc.ReRegistration
+		rt.Registered(bg, r)
+	}
+	for n := 100; n <= 101; n++ {
+		r := otherSet(t, e, n)
+		r.Type, r.Expires = ifc.DeRegistration, 0
+		rt.Registered(bg, r)
+	}
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:user001@" + realm); len(got) != 1 {
+		t.Errorf("the initial registration heard %v: an end evicted it with refreshes waiting", got)
+	}
+	if got := len(s.expiresOf("sip:user002@"+realm)) + len(s.expiresOf("sip:user003@"+realm)); got != 1 {
+		t.Errorf("%d of the two refreshes sent, want one evicted", got)
+	}
+}
+
+// TestAnEndIsDroppedOnlyWithNothingButEndsQueued (#446, the lead's decision
+// on #420): with the server's queue and its headroom full of ends, none of
+// them a refresh to evict, one more end is dropped and counted apart.
+func TestAnEndIsDroppedOnlyWithNothingButEndsQueued(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	end := func(n int) registrar.ThirdPartyRegistration {
+		r := otherSet(t, e, n)
+		r.Type, r.Expires = ifc.DeRegistration, 0
+		return r
+	}
+	for n := range queuedPerServer + 2 {
+		rt.Registered(bg, end(n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	close(s.hold)
+	rt.Stop()
+	if got := len(s.sent); got != queuedPerServer+1 {
+		t.Errorf("%d ends sent, want %d", got, queuedPerServer+1)
+	}
+	if got := e.metrics.get("routing.third_party.end_dropped"); got != 1 {
+		t.Errorf("end_dropped %d, want 1", got)
+	}
+	if got := e.metrics.get("routing.third_party.dropped"); got != 0 {
+		t.Errorf("dropped %d: an end counted as a dropped refresh", got)
+	}
+}
+
+// TestEndsEvictWaitingRefreshesBeforeTheyAreDropped (#446 QA): a queue of
+// refreshes, which could make room, and more ends of other sets than the
+// headroom takes: every end reaches the server.
+func TestEndsEvictWaitingRefreshesBeforeTheyAreDropped(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 64)}
+	const max = 2
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = max })
+	for n := range queuedPerServer * max {
+		rt.Registered(bg, otherSet(t, e, n))
+		if n < max {
+			recv(t, s.inside)
+		}
+	}
+	var ends []registrar.ThirdPartyRegistration
+	for n := 100; n < 100+max+1; n++ {
+		r := otherSet(t, e, n)
+		r.Type, r.Expires = ifc.DeRegistration, 0
+		ends = append(ends, r)
+		rt.Registered(bg, r)
+	}
+	close(s.hold)
+	rt.Stop()
+	for _, r := range ends {
+		if got := s.expiresOf(r.IMPU); len(got) != 1 || got[0] != "0" {
+			t.Errorf("%s heard %v, want its end", r.IMPU, got)
+		}
+	}
+	if got := e.metrics.get("routing.third_party.end_dropped"); got != 0 {
+		t.Errorf("end_dropped %d with refreshes to evict", got)
+	}
+}
+
+// TestBothIdentitiesHearTheirEndsAtAFullServerQueue (#446 QA): two
+// identities of a set end while the server's queue is full of other sets'
+// refreshes and has one slot: both hear Expires 0.
+func TestBothIdentitiesHearTheirEndsAtAFullServerQueue(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 64)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	for n := range queuedPerServer {
+		rt.Registered(bg, otherSet(t, e, n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	endA, endB := twoIdentities(t, ifc.DeRegistration, 0)
+	rt.Registered(bg, endA)
+	rt.Registered(bg, endB)
+	close(s.hold)
+	rt.Stop()
+	for _, impu := range []string{impu1, impu2} {
+		if got := s.expiresOf(impu); len(got) != 1 || got[0] != "0" {
+			t.Errorf("%s heard %v, want its end", impu, got)
+		}
+	}
+}
+
+// TestASetsIdentitiesShareItsCap (#446 code review): the per-set cap counts
+// a whole set, whatever its identities, so a set refreshing two identities
+// eight times each leaves room for another user's registration.
+func TestASetsIdentitiesShareItsCap(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 64)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 2 })
+	a, b := twoIdentities(t, ifc.ReRegistration, time.Hour)
+	for range 8 {
+		rt.Registered(bg, a)
+		rt.Registered(bg, b)
+	}
+	rt.Registered(bg, otherSet(t, e, 1))
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:user001@" + realm); len(got) != 1 {
+		t.Errorf("another user's registration heard %v: one set took the server's queue", got)
+	}
+}
+
+// TestASetWithManyIdentitiesTakesNoMoreThanItsCap (#446 QA): one set
+// refreshing eight identities holds at most queuedPerSet of the server's
+// queue and one more per identity, and another user's registration is
+// sent.
+func TestASetWithManyIdentitiesTakesNoMoreThanItsCap(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 256)}
+	const max = 8
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = max })
+	set := state.SetKey{IMPI: "big@" + realm, IMPU: "sip:big0@" + realm}
+	for i := range 8 {
+		impu := fmt.Sprintf("sip:big%d@%s", i, realm)
+		for range queuedPerSet {
+			r := registration(t, ifc.ReRegistration, time.Hour)
+			r.Set, r.IMPU, r.Profile = set, impu, profileFor(t, e, set, impu)
+			rt.Registered(bg, r)
+		}
+	}
+	rt.tp.mu.Lock()
+	q := rt.tp.servers[rcsAS].queued
+	rt.tp.mu.Unlock()
+	// Its cap, and the first of each identity past it.
+	if q > queuedPerSet+8 {
+		t.Errorf("one set holds %d of the server's queue, want at most %d", q, queuedPerSet+8)
+	}
+	rt.Registered(bg, otherSet(t, e, 1))
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:user001@" + realm); len(got) != 1 {
+		t.Errorf("another user's registration heard %v", got)
+	}
+}
+
+// TestEveryIdentityOfAnEndingSetHearsItsEnd (#420, code review on #379):
+// the server keeps a registration per To, so the queue is per identity: a
+// set registered under two identities that ends while its queue is full
+// tells each of them Expires 0, the one not taking the other's place.
+func TestEveryIdentityOfAnEndingSetHearsItsEnd(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s))
+	a, b := twoIdentities(t, ifc.ReRegistration, time.Hour)
+	// impu1's first is at the server; each identity then has its queue
+	// full of refreshes.
+	rt.Registered(bg, a)
+	recv(t, s.inside)
+	for range queuedPerSet - 1 {
+		rt.Registered(bg, a)
+	}
+	for range queuedPerSet {
+		rt.Registered(bg, b)
+	}
+	endA, endB := twoIdentities(t, ifc.DeRegistration, 0)
+	rt.Registered(bg, endA)
+	rt.Registered(bg, endB)
+	close(s.hold)
+	rt.Stop()
+	for _, impu := range []string{impu1, impu2} {
+		if got := s.expiresOf(impu); len(got) == 0 || got[len(got)-1] != "0" {
+			t.Errorf("%s heard %v, want its end last", impu, got)
+		}
+	}
+}
+
+// endOf is a deregistration of the n-th of other users' sets.
+func endOf(t *testing.T, e *env, n int) registrar.ThirdPartyRegistration {
+	t.Helper()
+	r := otherSet(t, e, n)
+	r.Type, r.Expires = ifc.DeRegistration, 0
+	return r
+}
+
+// queueEmpty fails the test if a server's queue still counts anything.
+func queueEmpty(t *testing.T, rt *Router) {
+	t.Helper()
+	rt.tp.mu.Lock()
+	defer rt.tp.mu.Unlock()
+	for name, q := range rt.tp.servers {
+		if q.queued != 0 || len(q.keys) != 0 || len(q.sets) != 0 || len(q.waiting) != 0 {
+			t.Errorf("%s after Stop: %d queued, %d keys, %d sets, %d waiting", name, q.queued, len(q.keys), len(q.sets), len(q.waiting))
+		}
+	}
+}
+
+// TestAThirdIdentitysFirstGoesPastTheSetsCap (#446 QA, the lead's
+// decision): a set's two identities hold its cap, and a third identity's
+// first registration, with nothing of its own queued, is still sent while
+// the server's queue has room.
+func TestAThirdIdentitysFirstGoesPastTheSetsCap(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 64)}
+	rt := e.router(nil, withSender(s))
+	set := state.SetKey{IMPI: "three@" + realm, IMPU: "sip:three1@" + realm}
+	reg := func(i int, typ ifc.RegistrationType) registrar.ThirdPartyRegistration {
+		impu := fmt.Sprintf("sip:three%d@%s", i, realm)
+		r := registration(t, typ, time.Hour)
+		r.Set, r.IMPU, r.Profile = set, impu, profileFor(t, e, set, impu)
+		return r
+	}
+	rt.Registered(bg, reg(1, ifc.InitialRegistration))
+	recv(t, s.inside)
+	rt.Registered(bg, reg(1, ifc.ReRegistration))
+	rt.Registered(bg, reg(2, ifc.ReRegistration))
+	recv(t, s.inside)
+	rt.Registered(bg, reg(2, ifc.ReRegistration))
+	rt.Registered(bg, reg(3, ifc.ReRegistration))
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:three3@" + realm); len(got) != 1 {
+		t.Errorf("the third identity heard %v, want its registration; dropped %d", got, e.metrics.get("routing.third_party.dropped"))
+	}
+}
+
+// TestAnEndThatARegistrationReplacedCanBeEvicted (#446 QA): a waiting end
+// whose identity registers again becomes that registration, a refresh a
+// later end may evict, rather than leaving the queue to look full of ends.
+func TestAnEndThatARegistrationReplacedCanBeEvicted(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 64)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	for n := range queuedPerServer {
+		rt.Registered(bg, endOf(t, e, n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	rt.Registered(bg, endOf(t, e, 50)) // into the headroom
+	again := otherSet(t, e, 50)        // takes that end's place
+	rt.Registered(bg, again)
+	y := endOf(t, e, 60)
+	rt.Registered(bg, y)
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf(y.IMPU); len(got) != 1 || got[0] != "0" {
+		t.Errorf("%s heard %v, want its end; end_dropped %d", y.IMPU, got, e.metrics.get("routing.third_party.end_dropped"))
+	}
+	queueEmpty(t, rt)
+}
+
+// TestAnEndInARefreshsPlaceIsNotEvicted (#446 QA): an end that took the
+// place of its identity's waiting refresh is an end, which a later end
+// does not evict.
+func TestAnEndInARefreshsPlaceIsNotEvicted(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	for n := range queuedPerServer {
+		rt.Registered(bg, otherSet(t, e, n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	rt.Registered(bg, endOf(t, e, 1))   // takes user001's waiting refresh's place
+	rt.Registered(bg, endOf(t, e, 100)) // into the headroom
+	rt.Registered(bg, endOf(t, e, 101)) // evicts user002's refresh, not user001's end
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:user001@" + realm); len(got) != 1 || got[0] != "0" {
+		t.Errorf("user001 heard %v, want its end", got)
+	}
+}
+
+// TestAnEndAfterItsWaitingRefreshWasEvictedIsSent (#446 QA): with its
+// identity's waiting refresh evicted, an end of that identity is queued
+// behind the one at the server, not put in the evicted one's place.
+func TestAnEndAfterItsWaitingRefreshWasEvictedIsSent(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	rt.Registered(bg, otherSet(t, e, 0))
+	recv(t, s.inside)
+	refresh := otherSet(t, e, 0)
+	refresh.Type = ifc.ReRegistration
+	rt.Registered(bg, refresh)
+	rt.Registered(bg, otherSet(t, e, 1))
+	rt.Registered(bg, otherSet(t, e, 2))
+	rt.Registered(bg, endOf(t, e, 100)) // into the headroom
+	rt.Registered(bg, endOf(t, e, 101)) // evicts user000's waiting refresh
+	rt.Registered(bg, endOf(t, e, 0))
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:user000@" + realm); len(got) != 2 || got[1] != "0" {
+		t.Errorf("user000 heard %v, want [3600 0]; evicted %d", got, e.metrics.get("routing.third_party.evicted"))
+	}
+}
+
+// blockedOnASlot waits until n of the queue's goroutines are blocked on
+// a server's slot, as their stacks show.
+func blockedOnASlot(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	buf := make([]byte, 1<<20)
+	for {
+		stacks := string(buf[:goruntime.Stack(buf, true)])
+		got := 0
+		for _, g := range strings.Split(stacks, "\n\n") {
+			if strings.Contains(g, "[chan send") && strings.Contains(g, "(*Router).turn") {
+				got++
+			}
+		}
+		if got >= n {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d goroutines blocked on a slot, want %d", got, n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestARefreshEvictedWhileWaitingForASlotIsNotSent (#446 QA and code
+// review): the refresh is already waiting for the server's slot when an
+// end evicts it, so only the check made once it has the slot keeps it
+// from being sent.
+func TestARefreshEvictedWhileWaitingForASlotIsNotSent(t *testing.T) {
+	e := newEnv(t)
+	s := &orderedExpires{hold: make(chan struct{}), inside: make(chan struct{}, 16)}
+	rt := e.router(nil, withSender(s), func(cfg *Config) { cfg.MaxThirdParty = 1 })
+	for n := range queuedPerServer {
+		rt.Registered(bg, otherSet(t, e, n))
+		if n == 0 {
+			recv(t, s.inside)
+		}
+	}
+	blockedOnASlot(t, queuedPerServer-1)
+	rt.Registered(bg, endOf(t, e, 100))
+	rt.Registered(bg, endOf(t, e, 101))
+	close(s.hold)
+	rt.Stop()
+	if got := s.expiresOf("sip:user001@" + realm); len(got) != 0 || e.metrics.get("routing.third_party.evicted") != 1 {
+		t.Errorf("the evicted refresh heard %v (evicted %d)", got, e.metrics.get("routing.third_party.evicted"))
+	}
+	queueEmpty(t, rt)
 }

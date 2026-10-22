@@ -88,7 +88,7 @@ func (rt *Router) signODI(pos position, callID string, expires time.Time) string
 
 // odiMAC is the MAC under k of payload for the request with callID.
 func odiMAC(k DialogKey, payload []byte, callID string) []byte {
-	m := hmac.New(sha256.New, k.Key)
+	m := hmac.New(sha256.New, k.Key.Reveal())
 	m.Write([]byte(odiLabel))
 	var n [4]byte
 	binary.BigEndian.PutUint32(n[:], uint32(len(payload)))

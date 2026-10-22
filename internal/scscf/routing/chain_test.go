@@ -14,6 +14,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
@@ -218,7 +219,7 @@ func TestAPositionTheSCSCFDidNotSignForTheRequestIsRefused(t *testing.T) {
 				t.Fatal(err)
 			}
 			other := e.router(nil, func(c *Config) {
-				c.DialogKeys = []DialogKey{{ID: "k2", Key: bytes.Repeat([]byte{1}, MinDialogKeyBytes)}}
+				c.DialogKeys = []DialogKey{{ID: "k2", Key: secret.NewKey(bytes.Repeat([]byte{1}, MinDialogKeyBytes))}}
 			})
 			b.Routed[0].URI.Params.Set(odiParam, other.signODI(pos, requestOf(b.Message), t0.Add(time.Minute)))
 		},
@@ -707,7 +708,7 @@ func TestNewRefusesAnIncompleteConfig(t *testing.T) {
 		self, _ := sip.ParseURI("sip:scscf.rcs.local")
 		rr, _ := sip.ParseAddress("<sip:scscf.rcs.local;transport=tcp;lr>")
 		icscf, _ := sip.ParseURI("sip:icscf.rcs.local;lr")
-		cfg := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}, Registrar: e.hss, DialogKeys: []DialogKey{{ID: "k2", Key: dialogKey}}, ICSCF: icscf, HomeDomain: realm}
+		cfg := Config{Store: e.store, RecordRoute: rr, Self: []sip.URI{self}, Registrar: e.hss, DialogKeys: []DialogKey{{ID: "k2", Key: secret.NewKey(dialogKey)}}, ICSCF: icscf, HomeDomain: realm}
 		if _, err := New(cfg); err != nil {
 			t.Fatalf("the complete config: %v", err)
 		}
@@ -887,7 +888,7 @@ func TestEachIdentityHasTheCriteriaOfItsServiceProfile(t *testing.T) {
 func TestAPositionTooShortIsRefusedEvenWithItsMAC(t *testing.T) {
 	rt := newEnv(t).router(nil)
 	payload := []byte{0, 0, 0, 0}
-	k := DialogKey{ID: "k2", Key: dialogKey}
+	k := DialogKey{ID: "k2", Key: secret.NewKey(dialogKey)}
 	v := "k2." + base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(odiMAC(k, payload, "c"))
 	if _, err := rt.openODI(v, "c", t0); err == nil {
 		t.Error("opened")

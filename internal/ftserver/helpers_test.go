@@ -17,6 +17,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
+	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
@@ -78,7 +79,7 @@ func newEnv(t *testing.T, change ...func(*Options)) *env {
 	c := &clock{now: time.Date(2026, 5, 1, 9, 0, 0, 0, time.UTC)}
 	ds, err := digest.NewServer(digest.ServerConfig{
 		Realm:       realm,
-		NonceKey:    bytes.Repeat([]byte("k"), 32),
+		NonceKey:    secretkey.NewKey(bytes.Repeat([]byte("k"), 32)),
 		NonceCounts: digest.NewMemoryNonceCounts(c.Now),
 		Now:         c.Now,
 		Random:      &seeded{r: rand.NewChaCha8([32]byte{1})},

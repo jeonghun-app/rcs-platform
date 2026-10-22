@@ -1,6 +1,7 @@
 package scscf
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -70,13 +71,24 @@ type deps struct {
 	dialTimeout time.Duration
 	// router, if set, routes in place of the dispatcher.
 	router proxy.Router
+	// subscribeAnswered, if set, runs once a SUBSCRIBE's 200 is written,
+	// before its first NOTIFY goes.
+	subscribeAnswered func()
 	// transportMade, if set, hears of the transport once it is made.
 	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
 	now func() time.Time
 	// listening, if set, hears the core listener's bound address.
 	listening func(netip.AddrPort)
+	// metricsEvery is how often the proxy's counts are recorded; zero is
+	// metricsInterval. proxy, if set, gets the proxy once it is made.
+	metricsEvery time.Duration
+	proxy        func(*proxy.Proxy)
 }
+
+// metricsInterval is how often scscf records the proxy's counts, as
+// icscf's does, well within the runtime's minute between flushes.
+const metricsInterval = 15 * time.Second
 
 // Run serves cfg until ctx ends.
 func Run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig) error {
@@ -186,7 +198,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	}
 	third.router.Store(router)
 
-	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger}
+	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger, answered: d.subscribeAnswered}
 	var pr proxy.Router = disp
 	if d.router != nil {
 		pr = d.router
@@ -210,11 +222,23 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	}
 	defer px.Close()
 	p.Store(px)
+	if d.proxy != nil {
+		d.proxy(px)
+	}
+	// sip.overloaded, the one overload counter of #56's alarms (#467), as
+	// it rises, and once more after the drain.
+	var om proxy.OverloadMeter
+	report := func() {
+		if rt.Metrics != nil {
+			om.Record(rt.Metrics, px)
+		}
+	}
 
 	sweepCtx, stopSweeps := context.WithCancel(context.WithoutCancel(ctx))
 	var sweeps sync.WaitGroup
 	sweeps.Go(func() { g.RunSweeps(sweepCtx, cfg.SweepInterval, cfg.SweepLimit) })
 	sweeps.Go(func() { runSubscriptionSweeps(sweepCtx, notifier, cfg.SweepInterval, cfg.SweepLimit, rt.Logger) })
+	sweeps.Go(func() { every(sweepCtx, cmp.Or(d.metricsEvery, metricsInterval), report) })
 
 	rt.Logger.Info("serving SIP", slog.String("core_addr", coreAddr.String()), slog.String("origin_host", host))
 	rt.Ready()
@@ -235,6 +259,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// requests are answered, and the sweeps stop.
 	stopSweeps()
 	sweeps.Wait()
+	report()
 	// The router, the first NOTIFYs and the notifier's queue share what is
 	// left of the budget but closeMargin: an application server or a P-CSCF
 	// that does not answer holds none of them past it (#439 QA and code
@@ -277,6 +302,20 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 func proxyLimits(cfg ServiceConfig) (tcfg transaction.Config, maxContexts int, maxContextBytes int64) {
 	tcfg = transaction.Config{MaxServerTransactions: cfg.MaxServerTransactions, MaxServerTransactionBytes: cfg.MaxServerTransactionBytes}
 	return tcfg, cfg.MaxServerTransactions, cfg.MaxServerTransactionBytes
+}
+
+// every runs f every interval until ctx ends.
+func every(ctx context.Context, interval time.Duration, f func()) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			f()
+		}
+	}
 }
 
 // runSubscriptionSweeps runs the notifier's sweep every interval until ctx

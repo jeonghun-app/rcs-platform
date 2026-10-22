@@ -3,6 +3,7 @@ package hss
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,9 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -802,6 +805,253 @@ func TestAKAOverTheAPIAuthenticatesOverCx(t *testing.T) {
 		t.Error("the vector does not come from the provisioned keys")
 	}
 }
+
+// setsBody is a subscription of impi with each identity in the implicit
+// registration set given after it.
+func setsBody(impi string, ids ...any) string {
+	var parts []string
+	for i := 0; i < len(ids); i += 2 {
+		parts = append(parts, fmt.Sprintf(`{"impu":%q,"barred":false,"implicit_set":%d}`, ids[i], ids[i+1]))
+	}
+	return `{"impi":"` + impi + `","imsi":"` + imsi1 + `","public_identities":[` + strings.Join(parts, ",") + `],"acs_managed":true}`
+}
+
+// #213: provisioning that moves tel1 from set 0 to set 1, set 1 coming
+// first in the subscription, sends the PPR for set 0, without tel1, and
+// once it is answered, the PPR for set 1, with it (TS 29.228 §6.5.2.1).
+func TestAMoveBetweenSetsPushesTheOldSetFirst(t *testing.T) {
+	a := newAPIEnv(t)
+	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, impu2, 1, impu1, 0, tel1, 0)); code != http.StatusCreated {
+		t.Fatalf("create = %d %v", code, body)
+	}
+	a.modify(impi1, func(s *store.Subscription) {
+		s.ServerName = scscfName
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].State = store.Registered
+		}
+	})
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, impu2, 1, tel1, 1, impu1, 0)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	_, pprs := a.notifier.got()
+	if len(pprs) != 2 {
+		t.Fatalf("%d PPRs", len(pprs))
+	}
+	for i, want := range [][]string{{impu1}, {impu2, tel1}} {
+		doc, err := ifc.ParseSubscription(pprs[i].UserData)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []string
+		for _, p := range doc.ServiceProfiles[0].PublicIdentities {
+			got = append(got, p.Identity)
+		}
+		if !slices.Equal(got, want) {
+			t.Errorf("PPR %d names %v, want %v", i, got, want)
+		}
+	}
+	if s := a.sub(impi1); s.Identity(tel1).State != store.Registered {
+		t.Errorf("tel1 is %v in its new set", s.Identity(tel1).State)
+	}
+}
+
+// impu4 is impi2's identity in the tests of one IMPI among two.
+const impu4 = "sip:+15550100004@" + domain
+
+// movedWithSecondUser provisions impi1 with set 0 {impu1} and set 1 {impu2,
+// impu3}, and impi2 with {impu4}, all registered at one S-CSCF, then moves
+// impu3 from set 1 to set 0, whose PPR goes second.
+func (a *apiEnv) movedWithSecondUser(t *testing.T) {
+	t.Helper()
+	second := strings.Replace(setsBody(impi2, impu4, 0), imsi1, "001010000000002", 1)
+	for _, b := range []string{setsBody(impi1, impu1, 0, impu2, 1, impu3, 1), second} {
+		if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, b); code != http.StatusCreated {
+			t.Fatalf("create = %d %v", code, body)
+		}
+	}
+	for _, impi := range []string{impi1, impi2} {
+		a.modify(impi, func(s *store.Subscription) {
+			s.ServerName = scscfName
+			for i := range s.PublicIdentities {
+				s.PublicIdentities[i].State = store.Registered
+			}
+		})
+	}
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, impu1, 0, impu3, 0, impu2, 1)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+}
+
+// #213: when the S-CSCF refuses the old set's PPR, as one that has lost the
+// user (DIAMETER_ERROR_USER_UNKNOWN, 5001) or that does not take the data,
+// impi1 is marked not registered as for any PPR (§6.2.2.1), and deregistered
+// for the latter. The change's next PPR, the new set's, is not sent: the
+// S-CSCF no longer holds the user. impi2, at the same S-CSCF, is untouched.
+func TestAMoveWhoseFirstPPRIsRefusedStops(t *testing.T) {
+	for name, c := range map[string]struct {
+		result cx.Result
+		rtr    bool
+		metric string
+	}{
+		"user unknown":          {exp(cx.ErrorUserUnknown), false, "push.ppr.user_unknown"},
+		"too much data":         {exp(cx.ErrorTooMuchData), true, "push.ppr.data_refused"},
+		"unsupported user data": {exp(cx.ErrorNotSupportedUserData), true, "push.ppr.data_refused"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := newAPIEnv(t)
+			a.notifier.pprErr = &RejectedError{Command: "PPR", Result: c.result}
+			a.movedWithSecondUser(t)
+			rtrs, pprs := a.notifier.got()
+			if len(pprs) != 1 {
+				t.Fatalf("%d PPRs", len(pprs))
+			}
+			if got := len(rtrs) == 1 && rtrs[0].UserName == impi1 && rtrs[0].DeregistrationReason.Code == cx.ServerChange; got != c.rtr || len(rtrs) > 1 {
+				t.Fatalf("RTRs %+v, want SERVER_CHANGE %t", rtrs, c.rtr)
+			}
+			doc, err := ifc.ParseSubscription(pprs[0].UserData)
+			if err != nil || len(doc.ServiceProfiles[0].PublicIdentities) != 1 || doc.ServiceProfiles[0].PublicIdentities[0].Identity != impu2 {
+				t.Fatalf("the PPR sent is not set 1's: %v %+v", err, doc)
+			}
+			s := a.sub(impi1)
+			for _, p := range s.PublicIdentities {
+				if p.State != store.NotRegistered {
+					t.Errorf("%s is %v", p.IMPU, p.State)
+				}
+			}
+			if s.ServerName != "" || a.metrics.get(c.metric) != 1 {
+				t.Errorf("server %q, %s %d", s.ServerName, c.metric, a.metrics.get(c.metric))
+			}
+			if other := a.sub(impi2); other.Identity(impu4).State != store.Registered || other.ServerName != scscfName {
+				t.Errorf("impi2 changed: %+v", other)
+			}
+		})
+	}
+}
+
+// refusingOnce refuses the first PPR with result, and then makes the store
+// fail, so that marking the user not registered cannot be written.
+type refusingOnce struct {
+	*recordingNotifier
+	result cx.Result
+	fs     *failingStore
+}
+
+func (n *refusingOnce) PushProfile(ctx context.Context, r *cx.PPR) error {
+	_, before := n.got()
+	_ = n.recordingNotifier.PushProfile(ctx, r)
+	if len(before) == 0 {
+		n.fs.fail.Store(true)
+		return &RejectedError{Command: "PPR", Result: n.result}
+	}
+	return nil
+}
+
+// Code review on #476: when the HSS cannot write that the user the S-CSCF
+// refused is not registered, it has not deregistered the user, and the
+// change's other pushes still go.
+func TestARefusedPPRWhoseStateCannotBeWrittenLetsTheNextGo(t *testing.T) {
+	for name, result := range map[string]cx.Result{
+		"user unknown":          exp(cx.ErrorUserUnknown),
+		"unsupported user data": exp(cx.ErrorNotSupportedUserData),
+	} {
+		t.Run(name, func(t *testing.T) {
+			fs := &failingStore{Store: store.NewMemory()}
+			e := newEnvWith(t, fs)
+			id := func(impu string, set int) store.PublicIdentity {
+				return store.PublicIdentity{IMPU: impu, ImplicitSet: set, State: store.Registered}
+			}
+			old := &store.Subscription{IMPI: impi1, IMSI: imsi1, Profile: DefaultProfileID, ServerName: scscfName,
+				PublicIdentities: []store.PublicIdentity{id(impu2, 1), id(impu1, 0), id(tel1, 0)}}
+			next := clone(old)
+			next.PublicIdentities = []store.PublicIdentity{id(impu2, 1), id(tel1, 1), id(impu1, 0)}
+			pushes := reconcile(old, next, false)
+			if _, err := fs.Store.CreateSubscription(t.Context(), next); err != nil {
+				t.Fatal(err)
+			}
+			p, err := fs.Store.Profile(t.Context(), DefaultProfileID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n := &refusingOnce{recordingNotifier: newRecorder(), result: result, fs: fs}
+			e.h.notify(t.Context(), n, next, p, pushes, time.Second)
+			if rtrs, pprs := n.got(); len(pprs) != 2 || len(rtrs) != 0 {
+				t.Fatalf("%d PPRs, %d RTRs; want both PPRs and no RTR", len(pprs), len(rtrs))
+			}
+		})
+	}
+}
+
+// QA on #476: an S-CSCF slow to answer the old set's PPR, past the push
+// timeout, leaves the new set's PPR its own time: it is still sent.
+func TestASlowAnswerLeavesTheNextPushItsOwnTime(t *testing.T) {
+	const timeout = time.Second
+	a := newAPIEnv(t, func(o *APIOptions) { o.PushTimeout = timeout })
+	n := serveHSS(t, a.h, "hss-a.rcs.local")
+	scscf := connectScriptedSCSCF(t, n, "scscf-1.rcs.local", func(i int) time.Duration {
+		if i == 0 {
+			return timeout + timeout/2
+		}
+		return 0
+	})
+	p := NewPusher(n.node, PusherOptions{SCSCFHostPattern: "scscf-*.rcs.local", Timeout: timeout, Metrics: a.metrics})
+	a.api = a.h.NewAPI(APIOptions{
+		Tokens:   Tokens{Admin: TokenPair{adminToken, adminTokenNext}, ACS: TokenPair{Current: acsToken}, FT: TokenPair{Current: ftToken}},
+		Notifier: p, DefaultProfile: DefaultProfileID, PushTimeout: timeout,
+	})
+	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, impu2, 1, impu1, 0, tel1, 0)); code != http.StatusCreated {
+		t.Fatalf("create = %d %v", code, body)
+	}
+	a.modify(impi1, func(s *store.Subscription) {
+		s.ServerName = scscfName
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].State = store.Registered
+		}
+	})
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, impu2, 1, tel1, 1, impu1, 0)); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	if got := scscf.pprs.Load(); got != 2 {
+		t.Fatalf("the S-CSCF got %d PPRs, want the old set's and the new set's", got)
+	}
+}
+
+// connectScriptedSCSCF connects an S-CSCF to the HSS node to, which answers
+// the i-th PPR with success after wait(i).
+func connectScriptedSCSCF(t *testing.T, to *hssNode, host string, wait func(i int) time.Duration) *scriptedSCSCF {
+	t.Helper()
+	c := &scriptedSCSCF{}
+	n, err := diameter.NewNode(nodeConfig(t, host, to.ln.dial))
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.HandleFunc(cx.ApplicationID, cx.CodePushProfile, func(_ context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
+		if _, err := cx.ParsePPR(req); err != nil {
+			return nil, err
+		}
+		time.Sleep(wait(int(c.pprs.Add(1) - 1)))
+		return (&cx.PPA{Answer: cx.Answer{Result: resSuccess}}).Message(n, req)
+	})
+	peer, err := n.Connect(diameter.PeerConfig{Address: "hss:3868"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), realWait)
+		defer cancel()
+		_ = n.Shutdown(ctx)
+	})
+	deadline := time.Now().Add(realWait)
+	for !peer.Available() || len(to.node.Peers()) == 0 || !to.node.Peers()[0].Available() {
+		if time.Now().After(deadline) {
+			t.Fatal("the S-CSCF did not connect")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return c
+}
+
+// scriptedSCSCF counts the PPRs it was sent.
+type scriptedSCSCF struct{ pprs atomic.Int64 }
 
 // TS 29.228 §6.2.2.1: a PPA that says the S-CSCF lost the user brings the
 // HSS's state in line; one that refuses the data deregisters the user with
