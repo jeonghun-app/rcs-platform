@@ -774,7 +774,7 @@ func (e *Engine) ask(ctx context.Context, inv Invitation, key inviteKey) {
 		return
 	}
 	e.invites[key] = inviteMark{until: now.Add(e.cfg.InviteTimeout)}
-	inv.flow = e.flows[inv.Recipient]
+	inv.flow, inv.asked = e.flows[inv.Recipient], e.flowSeq
 	e.mu.Unlock()
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 	err := e.deliverer.Invite(ctx, inv)
