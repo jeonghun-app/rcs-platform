@@ -101,9 +101,11 @@ func (n *Notifier) fanOut(ctx context.Context, before, after *state.Registration
 			if sub.Set == after.Key && sub.Incarnation == after.Incarnation {
 				if sub.ReginfoVersion == 0 && sub.NotifiedOf >= after.Version {
 					// Made since the change was saved, the subscription
-					// has had only its first NOTIFY, the full state of a
-					// record at least as new: it knew nothing the change
-					// ended either (#516).
+					// has numbered no NOTIFY since its first, which is the
+					// full state of a record at least as new: it knows
+					// nothing the change ended either (#516). That holds
+					// while the first NOTIFY is still queued, or is sent
+					// again: it reads the set when it is sent (prepare).
 					continue
 				}
 				j = job{before: before, cause: cause, ends: ends, refresh: refreshOnly(before, after, cause)}

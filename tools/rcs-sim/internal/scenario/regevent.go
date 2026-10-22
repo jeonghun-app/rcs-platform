@@ -191,8 +191,10 @@ func refreshedBy(reg *sipua.Registration) func(reginfo.Contact) bool {
 }
 
 // sameContact reports whether a and b tell the same of the client's
-// contact: its state, its event and the CSeq of the REGISTER that last
-// changed it.
+// contact: its state and the CSeq of the REGISTER that last changed it.
+// The event is left out: scscf writes a contact another binding's change
+// left as it was "registered" again, after a "refreshed" (#543 code
+// review).
 func sameContact(a, b reginfo.Contact) bool {
 	cseq := func(c reginfo.Contact) int64 {
 		if c.CSeq == nil {
@@ -200,7 +202,7 @@ func sameContact(a, b reginfo.Contact) bool {
 		}
 		return int64(*c.CSeq)
 	}
-	return a.State == b.State && a.Event == b.Event && cseq(a) == cseq(b)
+	return a.State == b.State && cseq(a) == cseq(b)
 }
 
 // regWatch follows the NOTIFYs of one subscription. instance is the
