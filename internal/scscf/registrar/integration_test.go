@@ -17,6 +17,7 @@ import (
 	"github.com/aws/smithy-go/logging"
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -40,7 +41,7 @@ func dynamoPair(t *testing.T, e *env) (*Registrar, *Registrar) {
 	sfx := strconv.FormatInt(time.Now().UnixNano(), 36)
 	c := dynamostore.Config{
 		RegistrationsTable: "registrations-" + sfx, ChallengesTable: "challenges-" + sfx, SubscriptionsTable: "subscriptions-" + sfx,
-		ChallengeKeys: []dynamostore.ChallengeKey{{ID: "k1", Key: bytes.Repeat([]byte{0x42}, dynamostore.KeySize)}},
+		ChallengeKeys: []dynamostore.ChallengeKey{{ID: "k1", Key: secret.NewKey(bytes.Repeat([]byte{0x42}, dynamostore.KeySize))}},
 	}
 	if err := dynamostore.CreateTables(context.Background(), api(), c); err != nil {
 		t.Fatal(err)
@@ -51,7 +52,7 @@ func dynamoPair(t *testing.T, e *env) (*Registrar, *Registrar) {
 			t.Fatal(err)
 		}
 		u, _ := sip.ParseURI("sip:scscf." + realm)
-		g, err := New(Config{Store: d, HSS: e.hss, Realm: realm, ServiceRoute: u, NonceKey: testKey, Now: e.clock.Now, Rand: newRand(seed), Logger: newTestLogger(e.logs)})
+		g, err := New(Config{Store: d, HSS: e.hss, Realm: realm, ServiceRoute: u, NonceKey: secret.NewKey(testKey), Now: e.clock.Now, Rand: newRand(seed), Logger: newTestLogger(e.logs)})
 		if err != nil {
 			t.Fatal(err)
 		}

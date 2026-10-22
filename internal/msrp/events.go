@@ -48,12 +48,15 @@ var (
 	// ErrKeepAliveNotSent: a keep-alive could not be built, for want of
 	// random bytes for its ids; the next interval tries again.
 	ErrKeepAliveNotSent = errors.New("msrp: keep-alive could not be sent")
+	// ErrPanicked: a panic while the connection read the peer's input
+	// ended it (Config.Panics).
+	ErrPanicked = errors.New("msrp: a panic ended the connection")
 )
 
 // eventErrs are the errors an Event may carry as they are, most specific
 // first.
 var eventErrs = []error{
-	ErrHandlerBusy, ErrReassemblyTimeout, ErrMalformedResponse, ErrTooManyUnknownSessions, ErrKeepAliveNotSent,
+	ErrHandlerBusy, ErrReassemblyTimeout, ErrMalformedResponse, ErrTooManyUnknownSessions, ErrKeepAliveNotSent, ErrPanicked,
 	ErrPeerNotReading, ErrKeepAliveTimeout, ErrUnbound, ErrFraming, ErrWriteTimeout, ErrConnClosed,
 }
 
@@ -87,5 +90,9 @@ func (c *Conn) emit(e Event) {
 	}
 	e.Method = eventMethod(e.Method)
 	e.Err = eventErr(e.Err)
-	c.cfg.OnEvent(e)
+	c.cfg.Panics.Run("OnEvent", func() { c.cfg.OnEvent(e) })
 }
+
+// MetricCallbackPanics is the metric a service counts msrp's panics under,
+// with the Guard it gives Config.Panics.
+const MetricCallbackPanics = "msrp.callback_panics"

@@ -3,7 +3,14 @@ package pcscf
 import (
 	"context"
 	"sync"
+
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 )
+
+// metricBackgroundPanics counts the panics recovered from pcscf's
+// background work: the reg-event subscriptions and the MSRP anchor's calls
+// to msrp-relay.
+const metricBackgroundPanics = "background.panics"
 
 // background runs work that must not hold up the request or response that
 // starts it, a SUBSCRIBE or a call to msrp-relay, on goroutines it can wait
@@ -14,7 +21,11 @@ import (
 // WaitGroup's Add must not race its Wait from zero (#248 code review).
 type background struct {
 	// ctx ends the work; once closed no other starts.
-	ctx     context.Context
+	ctx context.Context
+	// name names the work in a panic's log line, and panics recovers a
+	// panic in it, which ends that work only (#445). Nil only recovers.
+	name    string
+	panics  *panics.Guard
 	mu      sync.Mutex
 	idle    *sync.Cond
 	running int
@@ -34,7 +45,7 @@ func (b *background) goRun(f func(ctx context.Context)) bool {
 	b.mu.Unlock()
 	go func() {
 		defer b.done()
-		f(b.ctx)
+		b.panics.Run(b.name, func() { f(b.ctx) })
 	}()
 	return true
 }

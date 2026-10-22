@@ -12,6 +12,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 )
@@ -162,7 +163,7 @@ func (e *env) router(st state.Store, tweak ...func(*Config)) *Router {
 	cfg := Config{
 		Store: st, RecordRoute: rr, Self: []sip.URI{self}, Now: e.clock.Now, Metrics: e.metrics,
 		Registrar: e.hss, ICSCF: icscf, HomeDomain: realm,
-		DialogKeys:           []DialogKey{{ID: "k2", Key: dialogKey}},
+		DialogKeys:           []DialogKey{{ID: "k2", Key: secret.NewKey(dialogKey)}},
 		ApplicationServers:   []sip.URI{asURI},
 		EdgeProxyPublicHosts: []string{"pcscf.example.net", "203.0.113.5"},
 	}

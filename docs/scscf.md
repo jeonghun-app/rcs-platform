@@ -110,6 +110,13 @@ Counters, by the names the packages' documentation lists:
 `registrar.*`, `regevent.*`, `routing.*` and `ifc.*`. `cxclient.*` counts the
 Cx answers by result code and their latency.
 
+`sip.overloaded` counts the requests refused as overloaded (503 with
+Retry-After): at the transaction layer's caps
+(`SCSCF_MAX_SERVER_TRANSACTIONS`, `SCSCF_MAX_SERVER_TRANSACTION_BYTES`), or at
+the proxy's own bound, which charges headers twice. It is recorded every 15 s
+and at the stop, as icscf's and pcscf's are; #56's overload alarm reads it
+(#467).
+
 Alarm on a rise of these:
 
 - `registrar.hss_failed`;
@@ -119,7 +126,11 @@ Alarm on a rise of these:
   that a user ended, so it keeps them registered until the last Expires;
 - `routing.third_party.terminated_unanswered`;
 - `regevent.notify_dropped`;
-- `regevent.final_abandoned`.
+- `regevent.final_abandoned`;
+- `proxy.hook_panics`, panics recovered in scscf's routing (#428), and
+  `transaction.handler_panics`, in a response handler of a request scscf
+  sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
+  the request or the call it was in; alarm on any.
 
 `routing.third_party.evicted` counts refreshes an end took the place of in a
 full queue: a server that does not keep up. Each is made good by the user's

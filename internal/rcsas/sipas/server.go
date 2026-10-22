@@ -15,6 +15,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -134,6 +135,9 @@ type Server struct {
 	cfg    Config
 	ids    sip.IDGenerator
 	engine Engine
+	// panics recovers a panic in the work an answer to rcs-as's INVITE
+	// starts (goRun, #471 QA).
+	panics *panics.Guard
 	groups Groups
 	layer  *transaction.Layer
 	// sender sends the ACKs of 2xx responses, which belong to no
@@ -230,6 +234,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	return &Server{
 		cfg: cfg, ids: sip.IDGenerator{Rand: cfg.Rand},
+		panics: panics.New(panics.Config{
+			Metric: MetricBackgroundPanics, Message: "rcs-as: background work panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
+		}),
 		sessions: map[string]*session{}, perUser: map[string]int{}, large: map[string]bool{},
 		registered: map[string]time.Time{},
 		subs:       map[string]*subscription{}, groupSubs: map[string]map[*subscription]bool{}, subsOf: map[string]int{},
@@ -245,6 +252,14 @@ func New(cfg Config) (*Server, error) {
 func (s *Server) Bind(e Engine, g Groups, l *transaction.Layer, tr transaction.Sender) {
 	s.engine, s.groups, s.layer, s.sender = e, g, l, tr
 }
+
+// MetricBackgroundPanics counts the panics recovered from the work an
+// answer to one of rcs-as's INVITEs starts on a goroutine of its own.
+const MetricBackgroundPanics = "background.panics"
+
+// goRun runs f, named name, on a goroutine of its own, where a panic ends
+// it only, counted and logged (#471 QA).
+func (s *Server) goRun(name string, f func()) { go s.panics.Run(name, f) }
 
 type noMetrics struct{}
 

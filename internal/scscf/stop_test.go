@@ -277,10 +277,15 @@ func TestTheWorstStopEndsBeforeTheRuntimesDeadline(t *testing.T) {
 		listening: func(a netip.AddrPort) { listening <- a },
 		allow:     func(a netip.Addr) bool { return a.IsLoopback() },
 	}
+	var returned atomic.Int64
 	svc := runtime.Service[ServiceConfig]{
 		Name: "scscf", EnvPrefix: "SCSCF_",
 		Configure: func(*runtime.Settings) ServiceConfig { return cfg },
-		Run:       func(ctx context.Context, rt *runtime.Runtime, c ServiceConfig) error { return run(ctx, rt, c, d) },
+		Run: func(ctx context.Context, rt *runtime.Runtime, c ServiceConfig) error {
+			err := run(ctx, rt, c, d)
+			returned.Store(time.Now().UnixNano())
+			return err
+		},
 	}
 	env := map[string]string{"RCS_ENV": "dev", "RCS_SHUTDOWN_TIMEOUT": shutdown.String()}
 	var out syncBuffer
@@ -332,11 +337,20 @@ func TestTheWorstStopEndsBeforeTheRuntimesDeadline(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "the INVITE at the P-CSCF", func() bool { return silent.got.Load() > before })
+	cancelled := time.Now()
 	cancel()
 	select {
 	case s := <-status:
 		if s != runtime.ExitOK {
 			t.Errorf("exit %d: the stop overran RCS_SHUTDOWN_TIMEOUT (%v):\n%s", s, shutdown, out.String())
+		}
+		// run itself returns before the deadline, which the exit status
+		// shows only when the runtime's timer is on time (#479). It ends
+		// its own work returnMargin inside it, so that the closes after,
+		// 0.4 s at most under the race detector on a loaded host, fit;
+		// without the margin it returns past the deadline, every time.
+		if took := time.Duration(returned.Load() - cancelled.UnixNano()); took >= shutdown {
+			t.Errorf("run returned %v after the cancel, at or past the deadline of %v", took, shutdown)
 		}
 	case <-time.After(stopWait):
 		t.Fatal("the runtime did not return")

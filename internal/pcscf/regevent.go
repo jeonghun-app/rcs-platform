@@ -276,6 +276,16 @@ func (p *pcscf) subscriptionExpires(reg *registration) time.Duration {
 // registration as P-Asserted-Identity, which scscf checks against the Path
 // it keeps, and a new charging identifier.
 func (p *pcscf) startSubscription(ctx context.Context, sub *subscription, reg *registration) {
+	// A panic below fails sub as an error does, so that it does not stay
+	// busy and the sweep subscribes again after resubscribeAfter (#471 code
+	// review). mu is held only around assignments, never across a call
+	// that may panic.
+	settled := false
+	defer func() {
+		if !settled {
+			p.failSubscription(sub, p.now())
+		}
+	}()
 	contact := sip.URI{Scheme: "sip", User: sub.id, Host: hostOf(p.cfg.CoreHost), Port: p.corePort}
 	contact.Params.Set("transport", "tcp")
 	from := sip.Address{URI: sip.URI{Scheme: "sip", Host: p.cfg.PublicHost}}
@@ -289,20 +299,28 @@ func (p *pcscf) startSubscription(ctx context.Context, sub *subscription, reg *r
 		dst, err = p.resolve.Resolve(ctx, reg.serviceRoute[0].URI)
 	}
 	now := p.now()
-	p.subs.mu.Lock()
-	defer p.subs.mu.Unlock()
 	if err != nil {
-		p.failLocked(sub, now, 0)
+		settled = true
+		p.failSubscription(sub, now)
 		return
 	}
-	sub.subscribe, sub.sent, sub.requested, sub.path = req, now, expires, p.pathURI(reg)
-	// The send is synchronous; its handler takes mu, after this returns.
-	p.subs.mu.Unlock()
-	err = p.send(req, dst, func(res *sip.Response, err error) { p.subscribed(sub, res, err, true) })
+	path := p.pathURI(reg)
 	p.subs.mu.Lock()
+	sub.subscribe, sub.sent, sub.requested, sub.path = req, now, expires, path
+	p.subs.mu.Unlock()
+	// The send is synchronous; its handler takes mu, after this returns.
+	err = p.send(req, dst, func(res *sip.Response, err error) { p.subscribed(sub, res, err, true) })
+	settled = true
 	if err != nil {
-		p.failLocked(sub, now, 0)
+		p.failSubscription(sub, now)
 	}
+}
+
+// failSubscription fails sub as failLocked does, with mu taken.
+func (p *pcscf) failSubscription(sub *subscription, now time.Time) {
+	p.subs.mu.Lock()
+	defer p.subs.mu.Unlock()
+	p.failLocked(sub, now, 0)
 }
 
 // prepareSubscribe adds what every SUBSCRIBE of pcscf carries, a refresh
@@ -469,16 +487,15 @@ func (p *pcscf) reconcileSubscriptions() {
 // asserted. A refresh that cannot be sent leaves sub as it was, for the
 // sweep to try again.
 func (p *pcscf) resubscribe(ctx context.Context, sub *subscription, reg *registration) {
-	p.subs.mu.Lock()
-	expires := time.Duration(0)
-	if reg != nil {
-		expires = p.subscriptionExpires(reg)
-		sub.requested, sub.path = expires, p.pathURI(reg)
-	}
-	path := sub.path
-	req, err := sub.dialog.Subscribe(sip.Event{Type: regEvent}, uint32(expires/time.Second), p.ids)
-	next := sub.dialog.NextHop()
-	p.subs.mu.Unlock()
+	// A panic below leaves sub as a refresh that cannot be sent does, for
+	// the sweep to try again, with mu released (#471 code review).
+	settled := false
+	defer func() {
+		if !settled && reg != nil {
+			p.subscribed(sub, nil, errSubscribePanicked, false)
+		}
+	}()
+	req, next, path, expires, err := p.resubscribeRequest(sub, reg)
 	if err == nil {
 		err = p.prepareSubscribe(req, reg, path, expires)
 	}
@@ -493,9 +510,30 @@ func (p *pcscf) resubscribe(ctx context.Context, sub *subscription, reg *registr
 			}
 		})
 	}
+	settled = true
 	if err != nil && reg != nil {
 		p.subscribed(sub, nil, err, false)
 	}
+}
+
+// errSubscribePanicked is a refresh whose making or sending panicked.
+var errSubscribePanicked = errors.New("pcscf: a SUBSCRIBE panicked")
+
+// resubscribeRequest builds sub's next SUBSCRIBE under mu, released
+// whatever happens.
+func (p *pcscf) resubscribeRequest(sub *subscription, reg *registration) (req *sip.Request, next sip.URI, path sip.URI, expires time.Duration, err error) {
+	p.subs.mu.Lock()
+	defer p.subs.mu.Unlock()
+	if reg != nil {
+		expires = p.subscriptionExpires(reg)
+		sub.requested, sub.path = expires, p.pathURI(reg)
+	}
+	path = sub.path
+	req, err = sub.dialog.Subscribe(sip.Event{Type: regEvent}, uint32(expires/time.Second), p.ids)
+	if err == nil {
+		next = sub.dialog.NextHop()
+	}
+	return req, next, path, expires, err
 }
 
 // ownURI reports whether u names this task's core listener: the

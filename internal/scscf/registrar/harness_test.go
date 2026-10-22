@@ -17,6 +17,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
@@ -272,7 +273,7 @@ func (e *env) instance(seed byte, tweak ...func(*Config)) *Registrar {
 		e.t.Fatal(err)
 	}
 	cfg := Config{
-		Store: e.store, HSS: e.hss, Realm: realm, ServiceRoute: u, NonceKey: testKey,
+		Store: e.store, HSS: e.hss, Realm: realm, ServiceRoute: u, NonceKey: secret.NewKey(testKey),
 		Now: e.clock.Now, Rand: newRand(seed), Logger: newTestLogger(e.logs),
 	}
 	for _, f := range tweak {
