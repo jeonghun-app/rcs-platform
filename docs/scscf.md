@@ -27,14 +27,16 @@ The proxy hands each request to the part that serves it:
   server in `SCSCF_APPLICATION_SERVERS`.
 
 An application server reached by name, such as `rcs-as.<namespace>`, has
-every address of its DNS answer tried (RFC 3263 §4.3). A branch that fails
-for want of a connection, or with no response at all, goes on to the next
-address before the criterion's default handling, and is counted in
-`routing.as_failover`. The address is then tried last for the DNS TTL
-(10 s), during which a stopped task may still be in the answer. The default
-handling applies once every address has failed; SESSION_TERMINATED then
-answers 500 with `Retry-After` (#574). A server that answered, even with a
-provisional response, or whose `SCSCF_AS_TIMEOUT` passed, is not failed over.
+every address of its DNS answer tried (RFC 3263 §4.3). A branch that could
+not be sent, for want of a connection, or an INVITE with not even a 100
+Trying before Timer B, goes on to the next address before the criterion's
+default handling, and is counted in `routing.as_failover`. The address is
+then tried last for the DNS TTL (10 s), during which a stopped task may
+still be in the answer. The default handling applies once every address has
+failed; SESSION_TERMINATED then answers 500 with `Retry-After` (#574). A
+request that reached a server is not failed over: one it answered, even
+with a provisional response, one it may have sent back (a request other than
+INVITE that met Timer F), or one whose `SCSCF_AS_TIMEOUT` passed.
 
 What `scscf` sends itself, NOTIFYs and third-party REGISTERs, goes in client
 transactions over the core listener, to the first `Route` or else the

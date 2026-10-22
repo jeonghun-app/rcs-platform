@@ -292,7 +292,7 @@ func (rt *Router) asHop(req *sip.Request, pos position, set *state.Registration,
 			return b.Header.Set("P-Served-User", servedUser(pos))
 		},
 		failed: func(ctx context.Context, f proxy.BranchFailure) step {
-			if failsOver(f) {
+			if failsOver(req, f) {
 				if t.Destination != nil {
 					rt.down.mark(t.Destination.Addr, rt.cfg.Now().Add(rt.cfg.ASDownFor))
 				}

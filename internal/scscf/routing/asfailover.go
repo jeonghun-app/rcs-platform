@@ -80,20 +80,27 @@ func (rt *Router) asAddresses(ctx context.Context, server sip.URI) []transport.D
 	return append(up, down...)
 }
 
-// failsOver reports a branch to an application server that ended for want
-// of a connection, or of any response, so that the server cannot have
-// acted on the request as far as the S-CSCF can tell: the transport failed
-// (the proxy's 503, §16.9), or Timer B or F fired with nothing received.
-// The server's own timeout (ASTimeout) is not: it is the default
-// handling's, settled with the server's return (takeUp). Neither is a
-// local want of capacity, which a 503 with Retry-After answers (#574).
-func failsOver(f proxy.BranchFailure) bool {
+// failsOver reports a branch of req, a request to an application server,
+// that ended before the server could have acted on it as far as the
+// S-CSCF can tell (#574): the transport failed to send it (the proxy's
+// 503, §16.9), which happens before the request is written; or, for an
+// INVITE, Timer B fired with not even a 100 Trying, which every element
+// sends within 200 ms (RFC 3261 §16.2). A non-INVITE's Timer F is not:
+// a server that proxies it sends no 100 (RFC 4320), so it may have sent
+// the request back, which a second address would then send on again
+// (#578 code review). The server's own timeout (ASTimeout) is not either:
+// it is the default handling's, settled with the server's return (takeUp).
+// Neither is a local want of capacity, which a 503 with Retry-After
+// answers.
+func failsOver(req *sip.Request, f proxy.BranchFailure) bool {
 	switch {
 	case f.Err == nil, f.Provisional, f.Response == nil,
 		errors.Is(f.Err, proxy.ErrTargetTimeout), errors.Is(f.Err, proxy.ErrMaxBreadth),
 		errors.Is(f.Err, transport.ErrNoFlow), errors.Is(f.Err, transport.ErrQueueFull),
 		errors.Is(f.Err, transport.ErrTooManyConnections):
 		return false
+	case errors.Is(f.Err, transaction.ErrTimeout):
+		return req.Method == "INVITE"
 	}
-	return f.Response.StatusCode == 503 || errors.Is(f.Err, transaction.ErrTimeout)
+	return f.Response.StatusCode == 503
 }

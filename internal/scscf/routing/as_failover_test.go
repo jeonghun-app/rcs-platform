@@ -10,6 +10,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -159,5 +160,54 @@ func TestAServerThatHadTheRequestIsNotFailedOver(t *testing.T) {
 				t.Errorf("%d failovers", e.metrics.get("routing.as_failover"))
 			}
 		})
+	}
+}
+
+// otherLiveAS is a second live task of rcs-as.
+var otherLiveAS = netip.MustParseAddrPort("10.0.3.8:5060")
+
+// TestARequestTheServerSentBackIsNotFailedOverOnTimerF (#578 code review):
+// the server sent a MESSAGE back, so OnTimeout keeps its branch, which
+// later ends on Timer F with nothing received, as a proxying server sends
+// no 100 for a non-INVITE (RFC 4320). The server had the request: it does
+// not go to another address, which would send a second copy on.
+func TestARequestTheServerSentBackIsNotFailedOverOnTimerF(t *testing.T) {
+	for name, handling := range map[string]ifc.DefaultHandling{"terminated": ifc.SessionTerminated, "continued": ifc.SessionContinued} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.registered(binding(1, 0, time.Hour))
+			e.profile(t0, criterion(10, rcsAS, method("MESSAGE"), handling), criterion(20, thirdAS, method("MESSAGE"), ifc.SessionTerminated))
+			rt := e.router(nil, withResolver(fixedAddresses{liveAS, otherLiveAS}))
+			r := fromUser(t, "MESSAGE", impu2)
+			d := rt.Initial(bg, r)
+			rt.Initial(bg, backFrom(t, r, d, 0))
+			if d.Targets[0].OnTimeout(bg) {
+				t.Fatal("the timeout took the branch of a request sent back")
+			}
+			more := d.OnBranchFailure(bg, proxy.BranchFailure{Target: d.Targets[0], Response: &sip.Response{StatusCode: 408}, Err: transaction.ErrTimeout})
+			for _, tg := range more {
+				if tg.Destination != nil && tg.Destination.Addr == otherLiveAS {
+					t.Errorf("went on to %v after the server had sent the request back", otherLiveAS)
+				}
+			}
+			if e.metrics.get("routing.as_failover") != 0 {
+				t.Errorf("%d failovers", e.metrics.get("routing.as_failover"))
+			}
+		})
+	}
+}
+
+// TestAnINVITEWithNoAnswerAtAllGoesOnToTheNextAddress (#578 code review):
+// an INVITE's Timer B with not even a 100 Trying, which every element sends
+// within 200 ms (RFC 3261 §16.2), means the server never had it: the next
+// address is tried.
+func TestAnINVITEWithNoAnswerAtAllGoesOnToTheNextAddress(t *testing.T) {
+	e := newEnv(t)
+	e.registered(binding(1, 0, time.Hour))
+	e.profile(t0, criterion(10, rcsAS, method("INVITE"), ifc.SessionTerminated))
+	d := e.router(nil, withResolver(fixedAddresses{deadAS, liveAS})).Initial(bg, fromUser(t, "INVITE", impu2))
+	more := d.OnBranchFailure(bg, proxy.BranchFailure{Target: d.Targets[0], Response: &sip.Response{StatusCode: 408}, Err: transaction.ErrTimeout})
+	if len(more) != 1 || addrOf(t, more[0]) != liveAS || e.metrics.get("routing.as_failover") != 1 {
+		t.Fatalf("then %+v, %d failovers", more, e.metrics.get("routing.as_failover"))
 	}
 }
