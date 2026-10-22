@@ -99,8 +99,8 @@ func TestConfigNeverPrintsItsSecrets(t *testing.T) {
 			t.Errorf("printed %q", s)
 		}
 	}
-	// Every verb, valid or not, over the whole Config: an invalid one, %p
-	// or %w, calls no method and prints the fields (#506).
+	// These verbs over the whole Config, valid ones and the invalid %p and
+	// %w, which call no method and print the fields (#506, #538).
 	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
 		for _, v := range []any{c, &c} {
@@ -252,10 +252,12 @@ func TestAPIOptionsNeverPrintTheirTokens(t *testing.T) {
 		ACS:   TokenPair{Current: secret.NewString(acsToken)},
 		FT:    TokenPair{Current: secret.NewString(ftToken)},
 	}}
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
+	// These verbs, valid ones and the invalid %p and %w, and the tokens
+	// as text, in hex either case and as %d writes bytes (#538).
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%b", "%p", "%w", "%c", "%e"} {
 		for _, v := range []any{o, &o, o.Tokens, o.Tokens.Admin} {
 			out := fmt.Sprintf(verb, v)
-			for _, tok := range []string{adminToken[:12], adminTokenNext[:12], acsToken[:12], ftToken[:12], fmt.Sprintf("%x", adminToken[:6])} {
+			for _, tok := range []string{adminToken[:12], adminTokenNext[:12], acsToken[:12], ftToken[:12], fmt.Sprintf("%x", adminToken[:6]), fmt.Sprintf("%X", adminToken[:6]), strings.Trim(fmt.Sprint([]byte(adminToken[:6])), "[]")} {
 				if strings.Contains(out, tok) {
 					t.Errorf("%s printed a token: %s", verb, out)
 				}

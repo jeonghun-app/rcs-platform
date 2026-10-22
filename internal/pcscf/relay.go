@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // The relay's control API (docs/api/msrp-relay.yaml), through which pcscf
@@ -55,10 +56,11 @@ type relayPaths struct {
 	ExpiresIn          int64    `json:"expires_in,omitempty"`
 }
 
-// relayClient calls the control API with pcscf's bearer token.
+// relayClient calls the control API with pcscf's bearer token, which
+// prints as "[redacted]" under every verb (#538).
 type relayClient struct {
 	base   *url.URL
-	token  string
+	token  secret.Key
 	client *http.Client
 }
 
@@ -67,7 +69,7 @@ type relayClient struct {
 // staging and prod a runtime.InternalDialer's, so that the token reaches
 // only a private address whatever the relay's name resolves to (ADR 0007
 // §5).
-func newRelayClient(base *url.URL, token string, timeout time.Duration, dial func(ctx context.Context, network, address string) (net.Conn, error)) *relayClient {
+func newRelayClient(base *url.URL, token secret.Key, timeout time.Duration, dial func(ctx context.Context, network, address string) (net.Conn, error)) *relayClient {
 	transport := &http.Transport{
 		Proxy:               nil,
 		DialContext:         dial,
@@ -130,7 +132,7 @@ func (c *relayClient) call(ctx context.Context, method, path string, body any, w
 	if err != nil {
 		return fmt.Errorf("pcscf: relay request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+c.token.RevealString())
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

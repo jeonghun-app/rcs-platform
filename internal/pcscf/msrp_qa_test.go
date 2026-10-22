@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -494,7 +495,7 @@ func TestQAE2ETerminatingMSRPInviteFlowCloses(t *testing.T) {
 		cfg := testConfig()
 		cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 		cfg.RelayURL, _ = url.Parse(srv.URL)
-		cfg.RelayToken = relayToken{testRelayToken}
+		cfg.RelayToken = secret.NewString(testRelayToken)
 		cfg.RelayTimeout = 5 * time.Second
 		var pc *pcscf
 		s := start(t, cfg, deps{lookup: icscfLookup("127.0.0.1"), started: func(p *pcscf) { pc = p }})
@@ -570,7 +571,7 @@ func TestQAR3RunAppliesTheCoreOfferShare(t *testing.T) {
 	cfg := testConfig()
 	cfg.ICSCF = mustURI(t, "sip:"+icscf.ln.Addr().String()+";transport=tcp;lr")
 	cfg.RelayURL, _ = url.Parse(srv.URL)
-	cfg.RelayToken = relayToken{testRelayToken}
+	cfg.RelayToken = secret.NewString(testRelayToken)
 	cfg.RelayTimeout = 5 * time.Second
 	cfg.MaxCoreOfferBindingsPerFlow = 1
 	var pc *pcscf
