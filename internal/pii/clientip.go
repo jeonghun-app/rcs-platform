@@ -128,13 +128,17 @@ func parseDottedQuad(s string) (netip.Addr, bool) {
 // function is idempotent and a configured network still reads as
 // configured.
 //
-// Out of scope, as net/http and Go's net errors never write them: an
-// address with percent-encoded delimiters (%5B2001:db8::1%5D, %3A); an
-// unbracketed IPv6 address with a port, which is read as one address when
+// Its one caller is the ErrorLog of an http.Server, whose lines bracket an
+// IPv6 address that has a port. It is not built for unbracketed host:port
+// text: an unbracketed IPv6 address with a port is read as one address when
 // the port has at most four digits (2001:db8::1:443) and left whole
-// otherwise (2001:db8::1:51234); a bracketed address whose port is followed
-// by a colon ("[::1]:0:1::"), whose port stays, since net/http writes ": "
-// after one; and the inet_aton forms (0xcb.0.113.5, 3405803781).
+// otherwise (2001:db8::1:51234). A new caller that passes dial or parse
+// errors, which may write that form, needs the case handled first. Also out
+// of scope, as net/http never writes them: an address with percent-encoded
+// delimiters (%5B2001:db8::1%5D, %3A), and the inet_aton forms
+// (0xcb.0.113.5, 3405803781). The text after a bracketed address's port is
+// read as a token of its own, so its network may start with digits that
+// look like a port ("[::1]:0:1::" is written "[::/48]:1::/48").
 //
 // Some text that is no address reads as one and is rewritten: a four-part
 // number such as a version or an OID part (1.2.3.4), an EUI-64
