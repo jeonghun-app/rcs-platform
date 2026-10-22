@@ -2,6 +2,7 @@ package regevent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"strings"
@@ -236,4 +237,26 @@ func (e *env) subscribed(n *Notifier) (*sip.Response, *sip.Request) {
 		e.t.Fatalf("%d NOTIFYs after the 200", len(got)-before)
 	}
 	return res, got[len(got)-1]
+}
+
+// touched saves set's record again unchanged, as a REGISTER that changes
+// nothing a NOTIFY shows does, and returns it as stored: a change whose
+// NOTIFYs a test of their queueing can watch. A subscription made before
+// it has not been told of it, as it has of a change saved before it was
+// made (#516). Tests that change sets at once retry a save that loses.
+func (e *env) touched(set *state.Registration) *state.Registration {
+	e.t.Helper()
+	for {
+		cur, err := e.store.Registration(bg, set.Key)
+		if err != nil {
+			e.t.Fatal(err)
+		}
+		saved, err := e.store.SaveRegistration(bg, cur)
+		switch {
+		case err == nil:
+			return saved
+		case !errors.Is(err, state.ErrConflict):
+			e.t.Fatal(err)
+		}
+	}
 }

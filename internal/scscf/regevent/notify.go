@@ -99,6 +99,13 @@ func (n *Notifier) fanOut(ctx context.Context, before, after *state.Registration
 			// A subscription to another set, or to an earlier record of
 			// this one, is only checked: it ends if it has lapsed.
 			if sub.Set == after.Key && sub.Incarnation == after.Incarnation {
+				if sub.ReginfoVersion == 0 && sub.NotifiedOf >= after.Version {
+					// Made since the change was saved, the subscription
+					// has had only its first NOTIFY, the full state of a
+					// record at least as new: it knew nothing the change
+					// ended either (#516).
+					continue
+				}
 				j = job{before: before, cause: cause, ends: ends, refresh: refreshOnly(before, after, cause)}
 			}
 			n.enqueueNotify(ctx, sub, j, nil)
