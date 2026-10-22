@@ -92,7 +92,16 @@ const conditionFailed = "ConditionalCheckFailedException"
 type Store struct {
 	api   DynamoAPI
 	table string
+	// groups is the groupchats table, which a fenced enqueue
+	// (store.Message.Fence) checks the group's owner item in.
+	groups string
 }
+
+// SetGroupsTable names the groupchats table, for fenced enqueues (#121).
+func (s *Store) SetGroupsTable(table string) { s.groups = table }
+
+// GroupsTable is the table SetGroupsTable named.
+func (s *Store) GroupsTable() string { return s.groups }
 
 var _ store.Store = (*Store)(nil)
 
@@ -320,8 +329,30 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if m.InSummaryTotal() {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), 1, m.Size(), l.SummaryCount, l.SummaryBytes, ttl)})
 	}
+	if f := m.Fence; f != nil {
+		if s.groups == "" {
+			return errors.New("awsstore: enqueue: a fence without the groups table")
+		}
+		// Last: the owner item of the group, in the groupchats table, as
+		// every write of the group checks it (Groups.fence).
+		items = append(items, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+			TableName:                aws.String(s.groups),
+			Key:                      ownerKey(f.Group),
+			ConditionExpression:      aws.String(fenceCondition),
+			ExpressionAttributeNames: map[string]string{"#task": attrTask, "#epoch": attrEpoch},
+			ExpressionAttributeValues: map[string]types.AttributeValue{
+				":task": str(f.Task), ":epoch": num(f.Epoch),
+			},
+		}})
+	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok {
+		if m.Fence != nil && len(failed) == len(items) && failed[len(failed)-1] {
+			return fmt.Errorf("awsstore: enqueue: %w", store.ErrNotOwner)
+		}
+		if m.Fence != nil && len(failed) == len(items) {
+			failed = failed[:len(failed)-1]
+		}
 		switch {
 		case len(failed) > 0 && failed[0]:
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)

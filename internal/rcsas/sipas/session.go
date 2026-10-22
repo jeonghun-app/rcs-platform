@@ -366,6 +366,17 @@ func (s *Server) sessionOf(req *sip.Request) *session {
 // answered and their ACKs, and for the answers to its BYEs.
 const closeWait = 2 * time.Second
 
+// closeCtx is a context that ends after d: on the test's closeClock if it
+// set one, in real time otherwise.
+func (s *Server) closeCtx(d time.Duration) (context.Context, context.CancelFunc) {
+	if s.cfg.closeClock == nil {
+		return context.WithTimeout(context.Background(), d)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t := s.cfg.closeClock.AfterFunc(d, cancel)
+	return ctx, func() { t.Stop(); cancel() }
+}
+
 func (s *Server) closeWait() time.Duration {
 	if s.cfg.closeWait > 0 {
 		return s.cfg.closeWait
@@ -432,7 +443,7 @@ func (s *Server) close() {
 	// task (RFC 6665 §4.1.3, deactivated).
 	for _, sub := range subs {
 		wg.Go(func() {
-			ctx, cancel := context.WithTimeout(context.Background(), wait)
+			ctx, cancel := s.closeCtx(wait)
 			defer cancel()
 			// The lock may be held by a SUBSCRIBE reading the roster from
 			// a slow store: taking it counts against the bound too (QA
@@ -451,10 +462,13 @@ func (s *Server) close() {
 			case done := <-ended:
 				select {
 				case <-done:
+					return
 				case <-ctx.Done():
 				}
 			case <-ctx.Done():
 			}
+			// Its last NOTIFY, or its lock, outlasted the bound.
+			s.cfg.Metrics.Count("sip.subscription.unfinished_at_stop", 1)
 		})
 	}
 	wg.Wait()

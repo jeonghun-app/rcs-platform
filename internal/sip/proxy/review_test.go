@@ -408,6 +408,41 @@ func TestATargetTimeoutOnANonInviteIsAnswered504ThroughOnFinal(t *testing.T) {
 	}
 }
 
+// A target timeout that OnTimeout keeps does not end the branch: the
+// answer that comes after it, 6 s into a 5 s Timeout, goes upstream (#386).
+// One that OnTimeout lets apply ends it as before.
+func TestATargetTimeoutOnTimeoutKeepsLetsTheBranchAnswer(t *testing.T) {
+	for _, keep := range []bool{true, false} {
+		t.Run(map[bool]string{true: "kept", false: "applied"}[keep], func(t *testing.T) {
+			h := newHarness(t, Config{})
+			asked := make(chan struct{}, 1)
+			h.decide(Decision{Targets: []Target{{
+				URI: mustURI("sip:as@192.0.2.40"), Timeout: 5 * time.Second,
+				OnTimeout: func(context.Context) bool {
+					asked <- struct{}{}
+					return !keep
+				},
+			}}})
+			h.receive(request(t, "OPTIONS", "sip:bob@example.com"))
+			b := h.one()
+			h.advance(5 * time.Second)
+			<-asked
+			h.settle()
+			if !keep {
+				check(t, "upstream", h.upstream(), codes(504))
+				return
+			}
+			check(t, "upstream at the timeout", h.upstream(), nil)
+			h.advance(time.Second)
+			h.reply(b, 200)
+			check(t, "upstream", h.upstream(), codes(200))
+			if s := h.p.Stats(); s.TargetTimeouts != 1 || s.TargetTimeoutsKept != 1 {
+				t.Errorf("TargetTimeouts %d, kept %d", s.TargetTimeouts, s.TargetTimeoutsKept)
+			}
+		})
+	}
+}
+
 func TestTheByteBudgetIsHeldWhileA2xxCanStillBeRetransmitted(t *testing.T) {
 	h := newHarness(t, Config{})
 	h.receive(withBody(t, "INVITE", "sip:bob@example.com", strings.Repeat("x", 4096)))

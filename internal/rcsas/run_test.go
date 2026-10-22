@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
@@ -555,4 +556,28 @@ func inviteTheFactory(t *testing.T, core *coreStub, addr netip.AddrPort) (net.Co
 		}
 	}
 	return nc, r, res
+}
+
+// Run lets the messages store check a group copy's fence in the groups
+// store (#121): with DynamoDB, in the groupchats table it names; in memory,
+// in the groups store beside it.
+func TestTheStoresAreLinkedForFencedCopies(t *testing.T) {
+	dyn := awsstore.NewWithClient("messages", nil)
+	linkStores(dyn, nil, "rcs-groups")
+	if dyn.GroupsTable() != "rcs-groups" {
+		t.Fatalf("groups table %q", dyn.GroupsTable())
+	}
+	q, g := store.NewMemory(), groupstore.NewMemory()
+	linkStores(q, g, "")
+	at := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	grp := groupstore.Group{URI: "sip:chat-1@conf.ims.example.net", Version: 1, Created: at, Active: at, Expires: at.Add(time.Hour),
+		Participants: []groupstore.Participant{{Identity: "tel:+15550100001", Role: groupstore.Chairman, State: groupstore.Joined, Since: at}}}
+	if err := g.Create(t.Context(), grp, groupstore.Owner{Task: "task-a"}, "c", at); err != nil {
+		t.Fatal(err)
+	}
+	m := store.Message{Recipient: "tel:+15550100002", ID: "1", Sender: grp.URI, Mode: store.Group, CPIM: []byte("x"),
+		Enqueued: at, Expires: at.Add(time.Hour), Fence: &store.Fence{Group: grp.URI, Task: "task-a", Epoch: 1}}
+	if err := q.Enqueue(t.Context(), m, store.Limit{}); err != nil {
+		t.Fatalf("a fenced copy of the owner's = %v", err)
+	}
 }

@@ -1048,14 +1048,42 @@ func (b *branch) terminate() {
 // branch ends at once, counting as a 408, so a replacement can start without
 // waiting: an INVITE branch that has a provisional response is cancelled and
 // its transaction left to absorb the 487 (a 2xx from it is still forwarded,
-// §16.7 step 5), and any other branch's transaction is terminated. mu must be
-// held.
+// §16.7 step 5), and any other branch's transaction is terminated, unless
+// Target.OnTimeout keeps the branch. mu must be held.
 func (b *branch) armTimeout() {
 	c, p := b.c, b.c.p
 	b.timeoutTimer = p.clock.AfterFunc(b.target.Timeout, func() {
 		if p.isClosed() {
 			return
 		}
+		keep := b.target.OnTimeout
+		if keep == nil {
+			b.timeoutNow()
+			return
+		}
+		// It may block, as scscf asks its store, and a timer must not.
+		p.spawn(func() {
+			// A panic leaves applies true: the timeout ends the branch, as
+			// when scscf's store cannot say.
+			applies := true
+			p.hook("OnTimeout", func() { applies = keep(c.ctx) })
+			if applies {
+				b.timeoutNow()
+				return
+			}
+			p.stats.targetTimeouts.Add(1)
+			p.stats.targetTimeoutsKept.Add(1)
+		})
+	})
+}
+
+// timeoutNow ends the branch on its target's timeout (armTimeout).
+func (b *branch) timeoutNow() {
+	c, p := b.c, b.c.p
+	if p.isClosed() {
+		return
+	}
+	{
 		c.mu.Lock()
 		if b.final {
 			c.mu.Unlock()
@@ -1077,7 +1105,7 @@ func (b *branch) armTimeout() {
 		}
 		c.mu.Unlock()
 		b.terminate()
-	})
+	}
 }
 
 // armTimerC starts or restarts Timer C (§16.6 step 11, §16.7 step 2). mu must

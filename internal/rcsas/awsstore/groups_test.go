@@ -2,6 +2,7 @@ package awsstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore/storetest"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
 func TestTheGroupsStoreMeetsTheContractOverTheFake(t *testing.T) {
@@ -202,5 +204,43 @@ func TestTheLargestGroupFitsInOneItem(t *testing.T) {
 	const limit = 400 * 1024
 	if n := itemSize(encodeGroup(largestGroup(t0), 1, "0123456789abcdef")); n > limit*9/10 {
 		t.Fatalf("the largest group is %d bytes, over 90%% of %d", n, limit)
+	}
+}
+
+// #121 D2: a group message's copy is queued in the same transaction as a
+// check of the group's owner item: a task that lost the group queues
+// nothing, and the queue's size is untouched.
+func TestAFencedEnqueueChecksTheGroupsOwnerItem(t *testing.T) {
+	f := newFakeDynamo(t)
+	ctx := context.Background()
+	groups, queues := NewGroupsWithClient("groupchats", f), NewWithClient("messages", f)
+	queues.SetGroupsTable("groupchats")
+	g := groupstore.Group{URI: "sip:chat-1@conf.example.net", Version: 1, Created: t0, Active: t0, Expires: t0.Add(time.Hour),
+		Participants: []groupstore.Participant{{Identity: "a", Role: groupstore.Chairman, State: groupstore.Joined, Since: t0}}}
+	if err := groups.Create(ctx, g, testOwner, "c", t0); err != nil {
+		t.Fatal(err)
+	}
+	copyOf := func(id string, owner groupstore.Owner) store.Message {
+		return store.Message{Recipient: "tel:+15550100002", ID: id, Sender: g.URI, Mode: store.Group, CPIM: []byte("x"),
+			Enqueued: t0, Expires: t0.Add(time.Hour), Fence: &store.Fence{Group: g.URI, Task: owner.Task, Epoch: owner.Epoch}}
+	}
+	if err := queues.Enqueue(ctx, copyOf("1", testOwner), store.Limit{}); err != nil {
+		t.Fatalf("the owner's enqueue = %v", err)
+	}
+	if _, err := groups.TakeOver(ctx, g.URI, testOwner, groupstore.Owner{Task: "task-b"}, g.Expires, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := queues.Enqueue(ctx, copyOf("2", testOwner), store.Limit{}); !errors.Is(err, store.ErrNotOwner) {
+		t.Fatalf("the old owner's enqueue = %v", err)
+	}
+	if got, err := queues.Pending(ctx, "tel:+15550100002", "", t0, 10); err != nil || len(got) != 1 {
+		t.Fatalf("queue %+v, %v", got, err)
+	}
+	if n := nOf(f.rows[rowKey(queueSizeKey("tel:+15550100002"))][attrCount]); n != 1 {
+		t.Fatalf("queue size %d after a refused enqueue", n)
+	}
+	unfenced := NewWithClient("messages", f)
+	if err := unfenced.Enqueue(ctx, copyOf("3", testOwner), store.Limit{}); err == nil {
+		t.Fatal("a fenced enqueue without the groups table was sent")
 	}
 }

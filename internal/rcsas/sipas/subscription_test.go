@@ -653,6 +653,10 @@ func TestCloseWaitsForTheLastNotifysAnswer(t *testing.T) {
 	case <-time.After(waitFor):
 		t.Fatal("Close did not return after the answer")
 	}
+	// It waited, and did not give up (review of #457).
+	if n := g.metrics.get("sip.subscription.unfinished_at_stop"); n != 0 {
+		t.Fatalf("Close counted %d subscriptions unfinished, whose last NOTIFY was answered", n)
+	}
 }
 
 // QA on #340: a REFER's implicit subscription ends with the outcome of the
@@ -737,6 +741,50 @@ func TestAReferReportsAnInviteWithoutADialogAsAFailure(t *testing.T) {
 	}
 }
 
+// A referrer that refuses the REFER's first NOTIFY (RFC 6665 §4.2.2) has
+// ended its implicit subscription: the outcome of the INVITE is not sent
+// (#429). The core holds its answer to that INVITE until the refusal has
+// been taken, so the outcome comes after it; then the test waits for the
+// outcome's NOTIFY, which fails it, or the count of one not sent.
+func TestAReferWhoseFirstNotifyIsRefusedSendsNoOutcome(t *testing.T) {
+	g := newGroupRig(t, bob)
+	hold := make(chan struct{})
+	release := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(release)
+	g.core.setReply(func(req *sip.Request) []*sip.Response {
+		code := 200
+		switch {
+		case req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Event"), "refer"):
+			code = 481
+		case req.Method == "INVITE":
+			<-hold
+			code = 486
+		}
+		res, _ := sip.NewResponse(req, code, "", "core1")
+		return []*sip.Response{res}
+	})
+	if res := g.inSession(t, alice, "a1", g.s, 2, "REFER", []string{"Refer-To: <" + carol + ">"}, ""); res.StatusCode != 202 {
+		t.Fatalf("REFER answered %d", res.StatusCode)
+	}
+	waitUntil(t, "the refusal", func() bool { return g.metrics.get("sip.refer.notify_failed") == 1 })
+	release()
+	deadline := time.After(waitFor)
+	for g.metrics.get("sip.refer.notify_after_refusal") == 0 {
+		select {
+		case req := <-g.core.got:
+			if req.Method == "NOTIFY" && strings.HasPrefix(req.Header.Get("Subscription-State"), "terminated") {
+				t.Fatalf("the outcome %q went after the referrer refused the subscription", req.Body)
+			}
+		case <-deadline:
+			t.Fatal("the INVITE's outcome was neither sent nor dropped")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if n := g.metrics.get("sip.refer.notified"); n != 0 {
+		t.Fatalf("%d REFER subscriptions counted as told their outcome", n)
+	}
+}
+
 // Code review and QA on #340: Referred-By names whoever sent the REFER,
 // here bob, who is not the group's creator.
 func TestAReferredInviteNamesTheReferrerNotTheCreator(t *testing.T) {
@@ -753,8 +801,18 @@ func TestAReferredInviteNamesTheReferrerNotTheCreator(t *testing.T) {
 
 // A NOTIFY that is not answered, as when the subscriber's flow is gone,
 // ends the subscription at the transaction's timeout (RFC 6665 §4.2.2).
+// txClock is a fakeClock as a transaction layer's Clock: its timers run
+// only when the test says, so no ACK wait or safety net of a short T1
+// expires under load before the timeout a test is about (#430).
+type txClock struct{ *fakeClock }
+
+func (c txClock) AfterFunc(d time.Duration, f func()) transaction.Timer {
+	return c.fakeClock.AfterFunc(d, f)
+}
+
 func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
-	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{T1: 5 * time.Millisecond} })
+	txc := newFakeClock()
+	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{Clock: txClock{txc}} })
 	r.core.setAnswer(func(req *sip.Request) int {
 		switch req.Method {
 		case "INVITE":
@@ -766,13 +824,20 @@ func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
 	})
 	p := r.a.dial(t)
 	uri, s := r.create(t, p, relayPath(), bob, carol)
-	r.core.nextOf(t, "INVITE")
-	r.core.nextOf(t, "INVITE")
+	// Both INVITEs, and the ACKs of their 486s, in whatever order: the
+	// transactions are done with their Timer B before the mark below
+	// (#430).
+	r.core.nextOfEach(t, "INVITE", "INVITE", "ACK", "ACK")
 	g := &groupRig{chatRig: r, p: p, uri: uri, s: s}
+	since := txc.mark()
 	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 200 {
 		t.Fatalf("SUBSCRIBE answered %d", res.StatusCode)
 	}
 	g.nextNotify(t)
+	// Timer F of the NOTIFY, the one 64*T1 timer set since the SUBSCRIBE
+	// (#430: a T1 of 5 ms, for a quick Timer F, left the creator's ACK
+	// 320 ms, which a loaded host passed, and the group invited no one).
+	txc.fireSince(t, since, 64*transaction.DefaultT1)
 	waitUntil(t, "the subscription removed at the NOTIFY's timeout", func() bool {
 		g.a.srv.mu.Lock()
 		defer g.a.srv.mu.Unlock()
@@ -789,7 +854,8 @@ func TestAnUnansweredNotifyEndsTheSubscription(t *testing.T) {
 // its timeout on, as a refused one does: with the removal held back, a
 // roster change right after sends nothing.
 func TestAChangeRightAfterATimedOutNotifySendsNothing(t *testing.T) {
-	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{T1: 5 * time.Millisecond} })
+	txc := newFakeClock()
+	r := newChatRigWith(t, messaging.Config{}, Config{}, func(c *proxy.Config) { c.Transaction = transaction.Config{Clock: txClock{txc}} })
 	r.core.setAnswer(func(req *sip.Request) int {
 		switch req.Method {
 		case "INVITE":
@@ -801,14 +867,18 @@ func TestAChangeRightAfterATimedOutNotifySendsNothing(t *testing.T) {
 	})
 	p := r.a.dial(t)
 	uri, s := r.create(t, p, relayPath(), bob, carol)
-	r.core.nextOf(t, "INVITE")
-	r.core.nextOf(t, "INVITE")
+	// Both INVITEs, and the ACKs of their 486s, in whatever order: the
+	// transactions are done with their Timer B before the mark below
+	// (#430).
+	r.core.nextOfEach(t, "INVITE", "INVITE", "ACK", "ACK")
 	g := &groupRig{chatRig: r, p: p, uri: uri, s: s}
 	release := holdRefusals(t)
+	since := txc.mark()
 	if res, _ := g.subscribe(t, alice, "600"); res.StatusCode != 200 {
 		t.Fatalf("SUBSCRIBE answered %d", res.StatusCode)
 	}
 	g.nextNotify(t)
+	txc.fireSince(t, since, 64*transaction.DefaultT1) // its Timer F (#430)
 	waitUntil(t, "the NOTIFY's timeout", func() bool { return g.metrics.get("sip.subscription.notify_failed") == 1 })
 	g.rejoin(t, bob)
 	g.dropsNotify(t, "right after a timed-out NOTIFY")
@@ -940,9 +1010,19 @@ func TestNoNotifyAfterLeaveEvenWithAConcurrentChange(t *testing.T) {
 }
 
 // QA on #340: Close keeps its bound while a SUBSCRIBE holds its
-// subscription's lock to read the roster from a slow store.
+// subscription's lock to read the roster from a slow store. The bound runs
+// on a clock the test fires (closeClock, #432): Close arms closeWait for
+// the subscription, and no other length, has not returned before it fires,
+// returns once it has, and counts the subscription it gave up on.
 func TestCloseIsBoundedWhileARosterReadIsHeld(t *testing.T) {
-	g := newGroupRig(t, bob)
+	clk := newFakeClock()
+	g := newGroupRigWith(t, Config{closeClock: clk}, bob)
+	wait := g.a.srv.closeWait()
+	t.Cleanup(func() {
+		for _, d := range clk.armed() {
+			clk.fire(d)
+		}
+	})
 	hold, entered := make(chan struct{}), make(chan struct{}, 1)
 	release := sync.OnceFunc(func() { close(hold) })
 	defer release()
@@ -956,10 +1036,23 @@ func TestCloseIsBoundedWhileARosterReadIsHeld(t *testing.T) {
 			fields: []string{"P-Asserted-Identity: <" + alice + ">", "Contact: <sip:" + g.core.l.Addr().String() + ";transport=tcp>", "Event: conference"}})
 	}()
 	<-entered
-	start := time.Now()
-	g.a.srv.Close()
-	if took, bound := time.Since(start), 2*g.a.srv.closeWait(); took > bound+500*time.Millisecond {
-		t.Errorf("Close took %v, documented bound 2*closeWait=%v", took, bound)
+	closed := make(chan struct{})
+	go func() { g.a.srv.Close(); close(closed) }()
+	// The bound armed is closeWait, not more: Close takes at most twice it.
+	clk.waitArmed(t, wait)
+	select {
+	case <-closed:
+		t.Fatal("Close returned before its bound for the subscription was over")
+	default:
+	}
+	clk.fire(wait)
+	select {
+	case <-closed:
+	case <-time.After(waitFor):
+		t.Fatal("Close waited for the roster read that holds the subscription's lock")
+	}
+	if n := g.metrics.get("sip.subscription.unfinished_at_stop"); n != 1 {
+		t.Fatalf("Close gave up on %d subscriptions, want the one whose lock is held", n)
 	}
 }
 

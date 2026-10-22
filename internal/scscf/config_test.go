@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -194,6 +195,40 @@ func startup(t *testing.T, env map[string]string) (int, string) {
 	return status, out.String()
 }
 
+// keyForms are what would show a key of c in an output: the bytes the
+// configuration holds, the challenge's derived sealing key above all,
+// written as text, as %d and %x write them, and in base64 (#439 security
+// review). A prefix of each is enough to give it away.
+func keyForms(c ServiceConfig) []string {
+	keys := [][]byte{c.NonceKey}
+	for _, k := range c.DialogKeys {
+		keys = append(keys, k.Key)
+	}
+	for _, k := range c.ChallengeKeys {
+		keys = append(keys, k.Key)
+	}
+	var out []string
+	for _, k := range keys {
+		head := k[:8]
+		dec := fmt.Sprint(head)
+		out = append(out, fmt.Sprintf("%x", head), strings.Trim(dec, "[]"), base64.StdEncoding.EncodeToString(k)[:10])
+		if printableASCII(head) {
+			out = append(out, string(head))
+		}
+	}
+	return out
+}
+
+// printableASCII reports whether b would be written as itself by %s.
+func printableASCII(b []byte) bool {
+	for _, c := range b {
+		if c <= ' ' || c >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 // TestTheConfigurationGivesNoKeyAway: printed, formatted, logged or
 // encoded as JSON, it shows none of its keys.
 func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
@@ -221,12 +256,7 @@ func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 		fmt.Sprintf("%v %+v %#v %s %d %x", c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys, c.DialogKeys),
 		string(keys), loggedKeys.String(),
 	} {
-		for _, secret := range []string{
-			"0123456789abcdef", "fedcba9876543210", "abcdefghijklmnop",
-			// %d and %x of the nonce, challenge and dialog keys' bytes.
-			"48 49 50 51 52", "97 98 99 100 101", "102 101 100 99 98",
-			fmt.Sprintf("%x", []byte("01234567")), fmt.Sprintf("%x", []byte("abcdefgh")), fmt.Sprintf("%x", []byte("fedcba98")),
-		} {
+		for _, secret := range keyForms(c) {
 			if strings.Contains(out, secret) {
 				t.Errorf("%q gives a key away", out)
 			}
@@ -235,7 +265,7 @@ func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 }
 
 // TestAKeysIDIsTheStartOfItsSHA256: each key is named, in what it seals or
-// signs, by the first 8 hex digits of its SHA-256; the challenge key seals
+// signs, by the first 8 hex digits of its SHA-256 under a label; the challenge key seals
 // under a key of its own drawn from it, never the secret or its ID.
 func TestAKeysIDIsTheStartOfItsSHA256(t *testing.T) {
 	c, err := configure(devEnv)
@@ -243,7 +273,7 @@ func TestAKeysIDIsTheStartOfItsSHA256(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := func(k string) string {
-		sum := sha256.Sum256([]byte(k))
+		sum := sha256.Sum256([]byte("rcs scscf key id|" + k))
 		return hex.EncodeToString(sum[:4])
 	}
 	if c.DialogKeys[0].ID != id(dialogKey) || c.ChallengeKeys[0].ID != id(challengeKey) || c.SealKeyID != id(challengeKey) {
