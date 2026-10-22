@@ -133,3 +133,36 @@ func TestAWakeLeavesAOneToOneInvitationsFailureToCount(t *testing.T) {
 		t.Errorf("no_sessions %d, overtaken %d", r.m.get("invite.no_sessions"), r.m.get("invite.failed_overtaken"))
 	}
 }
+
+// TestAWakeOvertakesTheFailureOfAnInvitationStillBeingAsked (#568, as the
+// group chat developer reproduced it): the owner's queue pass is still in
+// Invite when the wake telling of bob's registration elsewhere comes, and
+// the invitation's 486 is handled after it. The failure is overtaken, and
+// bob is invited again at once.
+func TestAWakeOvertakesTheFailureOfAnInvitationStillBeingAsked(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	asked, release := make(chan Invitation, 1), make(chan struct{})
+	var held atomic.Bool
+	r.d.onInvite(func(inv Invitation) error {
+		if held.CompareAndSwap(false, true) {
+			asked <- inv
+			<-release
+		}
+		return nil
+	})
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	first := <-asked // the pass waits in Invite
+	r.e.Wake(bob, groupURI, true)
+	r.e.InviteFailed(first, ErrOffline) // the 486, come late
+	close(release)
+	r.d.nextInvite(t) // the first
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v", inv)
+	}
+	if n := r.m.get("invite.failed_overtaken"); n != 1 {
+		t.Fatalf("%d overtaken failures", n)
+	}
+}
