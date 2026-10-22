@@ -117,7 +117,11 @@ Alarm on a rise of these:
 - `routing.third_party.dropped`;
 - `routing.third_party.terminated_unanswered`;
 - `regevent.notify_dropped`;
-- `regevent.final_abandoned`.
+- `regevent.final_abandoned`;
+- `proxy.hook_panics`, panics recovered in scscf's routing (#428), and
+  `transaction.handler_panics`, in a response handler of a request scscf
+  sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
+  the request or the call it was in; alarm on any.
 
 ## Health
 
