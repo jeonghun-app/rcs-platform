@@ -60,12 +60,17 @@ const (
 	stopMargin = 5 * time.Second
 	// returnMargin is the end of stopMargin Run keeps for returning, so that
 	// it ends before the runtime's own deadline, which the default drain
-	// puts at the end of stopMargin (#439 QA). It holds the proxy's Close
-	// and the late end of the last wait: on a loaded host the process may
-	// not run for a second, and the goodbye's wait was seen to end up to
-	// 1.0 s past its deadline, a 20 ms timer to wake up to 1.2 s late
-	// (#502).
+	// puts at the end of stopMargin (#439 QA). It holds the proxy's Close,
+	// a late end of the last wait (lateWake) and the goodbye's floor.
 	returnMargin = 1500 * time.Millisecond
+	// lateWake is how late the stop's last wait was seen to end on a
+	// loaded host, where the process may not run for a while: the goodbye
+	// up to 1.35 s past its deadline under the race detector, 2 CPUs and 16
+	// busy loops (#502, #549 code review). returnMargin is sized from it.
+	lateWake = 1350 * time.Millisecond
+	// goodbyeFloor is the least time the goodbye has to send its DPR, past
+	// stopBy if it starts that late (goodbyeDeadline).
+	goodbyeFloor = 100 * time.Millisecond
 	// closeMargin is the part of stopMargin before returnMargin kept for
 	// the closes: the transport's, the sends the router gave up on, and the
 	// Cx client's goodbye to the HSS. The sends get all of it but
