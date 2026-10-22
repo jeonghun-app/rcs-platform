@@ -193,8 +193,8 @@ func TestConfigNeverPrintsTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Every verb, valid or not: an invalid one, %p or %w, calls no method
-	// and prints the fields (#506).
+	// These verbs, valid ones and the invalid %p and %w, which call no
+	// method and print the fields (#506, #538).
 	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%o", "%b", "%p", "%w", "%c", "%e"} {
 		opts := controlOptions{Namespace: "rcs.local", Tokens: c.Tokens}
 		for _, v := range []any{c, &c, c.Tokens, opts, &opts} {

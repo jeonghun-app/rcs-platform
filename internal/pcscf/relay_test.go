@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 const (
@@ -55,7 +57,7 @@ func startFakeRelay(t *testing.T, answer func(method, path string) (int, string)
 	// waitFor, not a protocol bound: these tests read what the client makes
 	// of an answer, which a loaded host may be slow to serve (#388).
 	// TestTheRelayClientIsBounded times the client with its own.
-	return f, newRelayClient(base, testRelayToken, waitFor, nil)
+	return f, newRelayClient(base, secret.NewString(testRelayToken), waitFor, nil)
 }
 
 // createdJSON is the relay's 201 to POST.
@@ -175,7 +177,7 @@ func TestTheRelayClientIsBounded(t *testing.T) {
 	t.Cleanup(slow.Close)
 	t.Cleanup(func() { close(block) })
 	base, _ := url.Parse(slow.URL)
-	c := newRelayClient(base, testRelayToken, 100*time.Millisecond, nil)
+	c := newRelayClient(base, secret.NewString(testRelayToken), 100*time.Millisecond, nil)
 	start := time.Now()
 	if _, err := c.create(context.Background(), relayPaths{ExpiresIn: 1}); err == nil {
 		t.Fatal("no error from a relay that does not answer")

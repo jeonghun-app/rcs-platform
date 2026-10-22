@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -72,7 +73,7 @@ func startRelayStackAt(t *testing.T, scscfAnswer func(*sip.Request) string, rela
 	if relayURL != nil {
 		cfg.RelayURL = relayURL
 	}
-	cfg.RelayToken = relayToken{testRelayToken}
+	cfg.RelayToken = secret.NewString(testRelayToken)
 	cfg.RelayTimeout = relayTimeout
 	d.lookup = icscfLookup("127.0.0.1")
 	d.started = func(p *pcscf) { st.pc = p }
@@ -330,12 +331,25 @@ func TestTheRelayIsDialledOnlyAtAPrivateAddress(t *testing.T) {
 // or logged.
 func TestTheRelayTokenNeverPrints(t *testing.T) {
 	cfg := testConfig()
-	cfg.RelayToken = relayToken{testRelayToken}
+	cfg.RelayToken = secret.NewString(testRelayToken)
 	var out bytes.Buffer
 	slog.New(slog.NewTextHandler(&out, nil)).Info("settings", slog.Any("cfg", cfg))
 	slog.New(slog.NewJSONHandler(&out, nil)).Info("settings", slog.Any("cfg", cfg))
-	fmt.Fprintf(&out, "%v %+v %#v %s", cfg, cfg, cfg, cfg.RelayToken)
-	if strings.Contains(out.String(), testRelayToken) || !strings.Contains(out.String(), "[redacted]") {
-		t.Errorf("the token printed:\n%s", out.String())
+	// The verbs below, valid ones and the invalid %p and %w, which call
+	// no method and print the fields (#538), over the Config and the
+	// relay client that holds the token.
+	client := newRelayClient(cfg.RelayURL, cfg.RelayToken, time.Second, nil)
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%b", "%p", "%w", "%c", "%e"} {
+		for _, v := range []any{cfg, &cfg, cfg.RelayToken, *client, client} {
+			fmt.Fprintf(&out, verb+"\n", v)
+		}
+	}
+	for _, form := range []string{testRelayToken[:12], fmt.Sprintf("%x", testRelayToken[:6]), fmt.Sprintf("%X", testRelayToken[:6]), strings.Trim(fmt.Sprint([]byte(testRelayToken[:6])), "[]")} {
+		if strings.Contains(out.String(), form) {
+			t.Fatalf("the token printed as %q:\n%s", form, out.String())
+		}
+	}
+	if !strings.Contains(out.String(), "[redacted]") {
+		t.Errorf("no placeholder:\n%s", out.String())
 	}
 }

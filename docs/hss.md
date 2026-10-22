@@ -46,10 +46,10 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_RCS_AS_URI` | `sip:rcs-as.<namespace>;transport=tcp` | application server of the default profile; `sip:host[:port]` with at most `;transport=tcp` or `tls` |
 | `HSS_MAX_AUTH_ITEMS` | `4` | AKA vectors per MAR at most (1 to 16) |
 | `HSS_CX_TIMEOUT` | `3s` | store work per Cx request, waiting for the subscriber's lock included |
-| `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included |
+| `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included; at most `10s`, so that a change's store work and its pushes' budget fit in the API's 30 s write timeout |
 | `HSS_START_TIMEOUT` | `60s` | opening the store and the keyring at start; past it the task exits. At most `240s` (see Operations) |
 | `HSS_KEYRING_BOOTSTRAP` | `false` | allow creating a first data key although subscriptions are stored (see [Secrets](#secrets)) |
-| `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and each push one provisioning request causes, on its own: a change that causes two pushes waits up to twice it |
+| `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and each push one provisioning request causes, on its own; at most `8s`. A change's pushes together take at most 18 s, so that the API answers within its 30 s write timeout (below) |
 
 In prod every token must be at least 256 bits (43 base64url characters) and no
 token may be shared between callers. Tokens come from Secrets Manager through the
@@ -101,6 +101,22 @@ Every write is conditional on the version read, so two tasks cannot both reserve
 the same AKA sequence numbers or overwrite each other's S-CSCF assignment: the
 loser reads again and decides afresh. A subscription and its IMPU items are
 written in one transaction, so an IMPU never belongs to two subscriptions.
+
+### Stored document format
+
+A subscription or a profile is stored as a JSON document with a schema number
+(`internal/hss/store/codec.go`), the same bytes in DynamoDB and in memory. A
+task decodes it strictly: a field it does not know makes the record unreadable
+to it. A new field therefore ships in two releases, so that no task of the
+release still running during a rolling deploy meets a field it refuses:
+
+1. a release whose decoder accepts the field, and does not write it;
+2. the next release, which may write it.
+
+A field written only when it has a value (`omitempty`) leaves every other
+record readable by the older decoder, but the records that carry it are not.
+`stale_sets` (#491) shipped with its writer in one release, as no `hss` was
+deployed yet; later fields follow the two releases.
 
 ## Secrets
 
@@ -169,7 +185,10 @@ RTR and PPR go by Destination-Realm to any connected peer matching
 `HSS_SCSCF_HOST_PATTERN`, with Destination-Host naming the peer chosen (ADR 0005);
 a busy or failed peer is followed by the next, at most three, as a retransmission.
 The stored state changes first, so an S-CSCF that cannot be reached never undoes a
-provisioning change: the user picks it up at the next registration.
+provisioning change. A push that fails is not sent again: the S-CSCF keeps the
+profile it holds through the user's refreshes, which say it has the data, until
+the set registers afresh (#524). Pushes left over at a change's budget (below)
+are repaired: their sets are marked stale.
 
 The HSS only answers connections, so it can push only over a connection an S-CSCF
 opened to *this* task. **Every `scscf` task must therefore hold a Cx connection to
@@ -190,12 +209,38 @@ registered and sends RTR `SERVER_CHANGE`, so the user registers again
 registered, the change's later pushes for that subscription are not sent:
 the S-CSCF no longer holds the user. If that write fails, they still go.
 The write and the RTR each have `HSS_PUSH_TIMEOUT` of their own, so a PPR
-refused near the end of its time still leaves the RTR a whole one.
+refused near the end of its time still leaves the RTR a whole one; within a
+change's budget, a PPR keeps one `HSS_PUSH_TIMEOUT` before the budget's end for
+them.
 
 One change's pushes go one at a time, each once the one before is answered
 or its own `HSS_PUSH_TIMEOUT` has passed, so a push left unanswered does not
-keep the next from going. When identities move between implicit sets, the
-sets losing them go first (§6.5.2.1):
+keep the next from going. All of a change's pushes together take at most
+18 s, the read of the profile for them included: the API answers the change
+once they are done, and must do so within its HTTP write timeout (30 s), after
+the change's store work (`HSS_API_TIMEOUT`, at most 10 s), or the client sees
+the connection cut over a change that was stored, and a retry with its ETag gets
+412 (#491). A push that would have less than 100 ms of the budget left is not
+sent, nor any after it: they are counted in `push.over_budget` and logged once
+with the masked IMPI. The implicit sets they were for (a PPR's set, a
+`SERVER_CHANGE` RTR's), and that of a push the budget cut short that then got
+no answer, are marked stale on the subscription, in the last second the budget
+keeps for it (`push.stale_marked`). Every SAR of a stale set that may carry
+User-Data gets it, even when the S-CSCF says it already has it
+(`USER_DATA_ALREADY_AVAILABLE`, which §6.6 lets the HSS override). The repair
+happens at the set's next REGISTRATION or RE_REGISTRATION SAR, the answers whose
+User-Data our S-CSCF applies when a UE registers or re-registers: the set leaves
+the stale list in that SAR's write. An UNREGISTERED_USER or NO_ASSIGNMENT SAR
+leaves it stale. Until #536, our S-CSCF drops the User-Data of an
+UNREGISTERED_USER answer, and of the REGISTRATION SARs it sends itself to
+re-assert a set or to take it over after an unregistered-user SAR; such a
+REGISTRATION still clears the mark, and the set then keeps its old data until
+a later change reaches it. An emptied set's
+`PERMANENT_TERMINATION` RTR needs no repair: its refreshes are refused, and it
+ends at the S-CSCF within a registration period. A shared profile's fan-out
+answers no request and has no budget: each of its pushes has
+`HSS_PUSH_TIMEOUT`. When identities move between implicit sets, the sets losing
+them go first (§6.5.2.1):
 - first the RTRs of the sets that lose one: an RTR only takes identities away,
   and the S-CSCF finds the set an RTR names by its identities, so after a PPR
   that moved one of them it would end the set gaining it as well;
@@ -371,11 +416,12 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   `aka.resync`, `aka.auts_invalid`, `aka.sqn_exhausted`, `profile.missing`,
   `profile.costly`, `userdata.too_large`, `keyring.created`,
   `push.rtr|ppr.sent|rejected|failed|no_peer`, `push.ppr.user_unknown`,
-  `push.ppr.data_refused`, `push.fanout.subscriptions`, `api.<operation>` (latency),
+  `push.ppr.data_refused`, `push.over_budget`, `push.stale_marked`, `push.fanout.subscriptions`, `api.<operation>` (latency),
   `api.<operation>.<status>`, `api.rate_limited`, `api.store_failure`,
   `api.data_error`.
 - Alarm candidates (Phase 7): `cx.*.error`, `lock.busy`, `api.store_failure`,
-  `api.data_error`, `push.*.no_peer`, `push.*.failed`, `aka.sqn_exhausted`,
+  `api.data_error`, `push.*.no_peer`, `push.*.failed`, `push.over_budget`,
+  `aka.sqn_exhausted`,
   `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency
   (Maximum, or the average `cx.sar.sum / cx.sar.count`) against
   `HSS_CX_TIMEOUT` (docs/architecture.md §8 has the rules for EMF alarms).

@@ -7,10 +7,12 @@ import (
 	"log/slog"
 	mathrand "math/rand/v2"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/regevent"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
@@ -324,24 +326,72 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 	}
 	key := state.SetKey{IMPI: r.UserName, IMPU: set.defaultID}
 	received := g.cfg.Now()
+	_, err = g.applyProfile(ctx, key, set, r.UserData, received, "PPR")
+	switch {
+	case errors.Is(err, errNotLive):
+		return g.notServed(ctx, r.UserName, received)
+	case err != nil:
+		return resultUnableToComply
+	}
+	g.count("registrar.ppr_stored")
+	return resultSuccess
+}
+
+// deregisterMoved tells the HSS that the set under key, whose default it
+// moved, is no longer registered here (SAR USER_DEREGISTRATION, TS 29.228
+// §6.1.2). A failure is counted and logged: the set still ends here, and
+// the HSS learns of it at the user's next registration or terminating
+// request.
+func (g *Registrar) deregisterMoved(ctx context.Context, key state.SetKey) {
+	saa, err := g.cfg.HSS.SAR(ctx, &cx.SAR{UserName: key.IMPI, PublicIdentities: []string{key.IMPU}, AssignmentType: cx.UserDeregistration})
+	var res cx.Result
+	if saa != nil {
+		res = saa.Result
+	}
+	o := cxclient.Classify(res)
+	if err != nil {
+		o = cxclient.ErrorOutcome(err)
+	}
+	if o != cxclient.Success && !permanent(o) {
+		g.count("registrar.hss_failed")
+		g.log.Warn("registrar: the HSS did not take the end of a set whose default it moved", slog.String("outcome", o.String()))
+	}
+}
+
+// errNotLive is applyProfile's error for a set without a live record here.
+var errNotLive = errors.New("registrar: no live record of the set")
+
+// applyProfile stores userData, the User-Data of the set under key, which
+// set is read from, received when its request or answer arrived, and has
+// the set's live record and its identities follow it: one that moved in
+// from another set is pointed at this one, and one that left is unpointed
+// if it still names this set; the set it moved to points it on its own. A
+// PPR does this, and so does every SAA that carries User-Data (#536). A
+// profile received later is stored already, and whoever stored it made the
+// identities follow it, so then nothing changes. The record is returned as
+// it now stands; errNotLive says there is none. what names the request in
+// the log.
+func (g *Registrar) applyProfile(ctx context.Context, key state.SetKey, set *implicitSet, userData []byte, received time.Time, what string) (*state.Registration, error) {
 	for range saveAttempts {
 		reg, f := g.set(ctx, key)
 		if f != nil {
-			return resultUnableToComply
+			return nil, f
 		}
 		if reg == nil || !live(reg, received) {
-			return g.notServed(ctx, r.UserName, received)
+			return nil, errNotLive
 		}
-		p := &state.Profile{Key: key, UserData: r.UserData, Received: received, KeepUntil: keepUntil(reg).Add(state.ProfileGrace)}
-		if err := g.cfg.Store.SaveProfile(ctx, p); err != nil && !errors.Is(err, state.ErrConflict) {
-			// ErrConflict: an SAA that arrived after this PPR was stored first,
-			// and it is the newer.
-			g.log.Error("registrar: PPR: saving the profile", slog.String("error", err.Error()))
-			return resultUnableToComply
+		p := &state.Profile{Key: key, UserData: userData, Received: received, KeepUntil: keepUntil(reg).Add(state.ProfileGrace)}
+		switch err := g.cfg.Store.SaveProfile(ctx, p); {
+		case errors.Is(err, state.ErrConflict):
+			// A profile received after this one was stored first, and it
+			// is the newer (#546 code review).
+			return reg, nil
+		case err != nil:
+			g.log.Error("registrar: "+what+": saving the profile", slog.String("error", err.Error()))
+			return nil, err
 		}
 		if slices.Equal(reg.Identities, set.identities) {
-			g.count("registrar.ppr_stored")
-			return resultSuccess
+			return reg, nil
 		}
 		next := reg.Clone()
 		next.Identities = set.identities
@@ -352,28 +402,71 @@ func (g *Registrar) HandlePPR(ctx context.Context, r *cx.PPR) cx.Result {
 			// what it left.
 			continue
 		case err != nil:
-			g.log.Error("registrar: PPR: saving the set", slog.String("error", err.Error()))
-			return resultUnableToComply
+			g.log.Error("registrar: "+what+": saving the set", slog.String("error", err.Error()))
+			return nil, err
 		}
 		if err := g.point(ctx, saved, p.KeepUntil); err != nil {
-			g.log.Error("registrar: PPR: pointing the identities", slog.String("error", err.Error()))
-			return resultUnableToComply
+			g.log.Error("registrar: "+what+": pointing the identities", slog.String("error", err.Error()))
+			return nil, err
 		}
 		left := *reg
 		left.Identities = slices.DeleteFunc(slices.Clone(reg.Identities), func(id state.SetIdentity) bool {
 			return slices.ContainsFunc(set.identities, func(n state.SetIdentity) bool { return n.IMPU == id.IMPU })
 		})
 		if err := g.unpoint(ctx, &left); err != nil {
-			// The set is stored as the PPR says; an identity that left it
-			// and still names it goes at its KeepUntil.
-			g.log.Error("registrar: PPR: unpointing the identities that left", slog.String("error", err.Error()))
-			g.count("registrar.ppr_unpoint_failed")
+			// The set is stored as the profile says; an identity that left
+			// it and still names it goes at its KeepUntil.
+			g.log.Error("registrar: "+what+": unpointing the identities that left", slog.String("error", err.Error()))
+			g.count("registrar." + strings.ToLower(what) + "_unpoint_failed")
 		}
 		g.cfg.Events.Changed(ctx, reg, saved, regevent.Changed)
-		g.count("registrar.ppr_stored")
-		return resultSuccess
+		return saved, nil
 	}
-	return resultUnableToComply
+	return nil, errors.New("registrar: the set kept changing")
+}
+
+// applySAAProfile applies the User-Data an SAA of reg's set carried, if
+// any, received when the SAA arrived, as applyProfile does: the HSS may send
+// a changed profile on any SAR, after a push this S-CSCF missed above all
+// (#524, #536). It returns the record as it now stands.
+//
+// A profile whose default identity is not reg's means the HSS moved the
+// set's default, which it tells with an RTR SERVER_CHANGE that this S-CSCF
+// missed too: the set ends here as that RTR would have ended it (endSetNow,
+// HandleRTR), its subscribers told it was deactivated and its servers that
+// it ended, so that the UE registers anew and gets the new profile and
+// default (#546 code review). The SAR that brought the profile has just
+// made the HSS hold the set registered here again, which that RTR had
+// undone: the HSS is told of the end first (USER_DEREGISTRATION), before
+// the subscribers are, so that the UE's new REGISTER always follows it.
+// It is counted, and nil is returned.
+func (g *Registrar) applySAAProfile(ctx context.Context, reg *state.Registration, userData []byte, received time.Time) *state.Registration {
+	if len(userData) == 0 {
+		return reg
+	}
+	set, err := parseSet(userData)
+	switch {
+	case err != nil:
+		g.internal("reading the profile of an SAA", err)
+		return reg
+	case set.defaultID != reg.Key.IMPU:
+		g.count("registrar.saa_profile_moved")
+		g.deregisterMoved(ctx, reg.Key)
+		if _, err := g.endSetNow(ctx, reg.Key, false, regevent.Deactivated); err != nil {
+			// A claim saved before the failure leaves the end to a sweep;
+			// without one, the set's next REGISTER gets the old profile.
+			g.internal("ending a set whose default the HSS moved", err)
+		}
+		return nil
+	}
+	saved, err := g.applyProfile(ctx, reg.Key, set, userData, received, "SAA")
+	if err != nil {
+		if !errors.Is(err, errNotLive) {
+			g.internal("applying the profile of an SAA", err)
+		}
+		return reg
+	}
+	return saved
 }
 
 // notServed answers a PPR for a set without a live record here: 5001, which

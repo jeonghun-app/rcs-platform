@@ -49,7 +49,19 @@ additionally sealed (below).
   set: an SAA for the set of the IMPU in the request, a PPR for one set at a
   time. A set is therefore keyed by the IMPI and its default IMPU
   (`state.SetKey`), which names both its registration and its profile, and a
-  PPR saves only its own set.
+  PPR saves only its own set. Whatever SAR an SAA answers, User-Data in it
+  is applied as a PPR's: the profile is saved and the set's identities follow
+  it. The HSS may send a changed profile on any SAR, after a push this
+  S-CSCF missed above all (#536). An SAA profile is stamped with when the
+  SAA arrived, so a PPR that followed it is not undone, and one that loses
+  to a newer profile leaves the identities to the newer. A profile with
+  another default identity means the HSS moved the default and its RTR
+  SERVER_CHANGE was missed too: the set ends here as that RTR would have
+  ended it, subscribers told it was deactivated and servers that it ended,
+  so that the UE registers anew with the new default. The SAR that brought
+  the profile has made the HSS hold the set registered again, so the HSS is
+  told of the end (USER_DEREGISTRATION) before the subscribers are. It is
+  counted in `registrar.saa_profile_moved`.
 - **One record per set.** The bindings that every identity of a set shares
   are one item, so a REGISTER, a deregistration or a sweep is one
   conditional save, whichever identity it came for; each IMPU's item only
