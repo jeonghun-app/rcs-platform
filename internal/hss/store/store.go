@@ -192,6 +192,11 @@ type Subscription struct {
 	// AuthPending is the authentication pending flag a MAR sets and a SAR
 	// clears (TS 29.228 §6.3.1, §6.1.2.1).
 	AuthPending bool
+	// StaleSets are the implicit registration sets whose User-Data the
+	// S-CSCF may not have: a provisioning change's pushes for them ran out
+	// of time. The next registration of each gets the data whatever the
+	// S-CSCF says it holds (TS 29.228 §6.6), and leaves the list.
+	StaleSets []int
 
 	// Version is the stored version: 1 after creation, incremented by every
 	// write. A write is accepted only if it carries the stored version.

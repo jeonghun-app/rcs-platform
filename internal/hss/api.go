@@ -1,6 +1,7 @@
 package hss
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -80,8 +81,21 @@ const (
 	maxSmallBody        = 4 << 10
 )
 
-// DefaultPushTimeout bounds each RTR and PPR a provisioning request causes.
-const DefaultPushTimeout = 5 * time.Second
+// DefaultPushTimeout bounds each RTR and PPR a provisioning request causes,
+// and MaxPushTimeout is the most HSS_PUSH_TIMEOUT may be. PushBudget bounds
+// them all together, the profile read for them included: the API answers a
+// change once its pushes are done, and must do so within apiWriteTimeout,
+// the HTTP server's, after the change's store work, which MaxAPITimeout
+// bounds (#491). staleReserve is kept at the budget's end for marking the
+// sets of the pushes left over stale.
+const (
+	DefaultPushTimeout = 5 * time.Second
+	MaxPushTimeout     = 8 * time.Second
+	PushBudget         = 18 * time.Second
+	MaxAPITimeout      = 10 * time.Second
+	apiWriteTimeout    = 30 * time.Second
+	staleReserve       = time.Second
+)
 
 // APIOptions configures the provisioning API.
 type APIOptions struct {
@@ -96,8 +110,12 @@ type APIOptions struct {
 	Notifier Notifier
 	// DefaultProfile is used by subscriptions created without one.
 	DefaultProfile string
-	// PushTimeout bounds each request one change causes, each on its own.
+	// PushTimeout bounds each request one change causes, each on its own,
+	// and PushBudget, PushBudget when zero, all of them together.
 	PushTimeout time.Duration
+	PushBudget  time.Duration
+	// staleReserve, when a test sets it, replaces staleReserve.
+	staleReserve time.Duration
 	// FanoutWorkers bounds the PPRs sent at once after a shared profile
 	// changes; 8 when zero.
 	FanoutWorkers int
@@ -138,6 +156,8 @@ type API struct {
 	notifier       Notifier
 	defaultProfile string
 	pushTimeout    time.Duration
+	pushBudget     time.Duration
+	staleReserve   time.Duration
 	storeTimeout   time.Duration
 	workers        int
 
@@ -152,11 +172,15 @@ type API struct {
 func (h *HSS) NewAPI(o APIOptions) *API {
 	a := &API{
 		h: h, mux: http.NewServeMux(), notifier: o.Notifier, defaultProfile: o.DefaultProfile,
-		pushTimeout: o.PushTimeout, workers: o.FanoutWorkers, fanouts: map[string]context.CancelFunc{},
+		pushTimeout: o.PushTimeout, pushBudget: o.PushBudget, workers: o.FanoutWorkers, fanouts: map[string]context.CancelFunc{},
 	}
 	if a.pushTimeout <= 0 {
 		a.pushTimeout = DefaultPushTimeout
 	}
+	if a.pushBudget <= 0 {
+		a.pushBudget = PushBudget
+	}
+	a.staleReserve = cmp.Or(o.staleReserve, staleReserve)
 	if a.workers <= 0 {
 		a.workers = 8
 	}
@@ -478,4 +502,10 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.status = http.StatusOK
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+// pushTimes are the bounds of one change's pushes (HSS.notify), its
+// budget running from now.
+func (a *API) pushTimes() pushTimes {
+	return pushTimes{each: a.pushTimeout, until: time.Now().Add(a.pushBudget), reserve: a.staleReserve}
 }

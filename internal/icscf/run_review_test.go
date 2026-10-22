@@ -663,15 +663,28 @@ func TestAStopAnswersARequestLeftInProgress500(t *testing.T) {
 	msg := r.sendAsyncResponse(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
 	before(t, "the MESSAGE reaching the S-CSCF", scscf.got, msg)
 	stopped := time.Now()
-	go r.stop()
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		r.stop()
+	}()
 	got := <-msg
 	if got.err != nil || got.res.StatusCode != 500 || got.res.Header.Get("Retry-After") != "5" {
 		t.Fatalf("MESSAGE left at the stop: %v %v, want 500 with Retry-After 5", got.res, got.err)
 	}
-	// It comes once the drain's time is up, and no later than the wait
-	// for answers to go out after it (QA of #310).
-	if took := got.at.Sub(stopped); took < drain || took > drain+proxy.DrainSendWait {
-		t.Errorf("answered %v after the stop, want between %v and %v", took, drain, drain+proxy.DrainSendWait)
+	// It comes once the drain's time is up: a loaded host only makes it
+	// later.
+	if took := got.at.Sub(stopped); took < drain {
+		t.Errorf("answered %v after the stop, before the drain's %v", took, drain)
+	}
+	// And within the wait for answers to go out after it (QA of #310): a
+	// 500 handed on later is cut by the transport's Close that follows
+	// Drain, and Drain counts it only if handed on in time. Neither depends
+	// on the test's wall clock, which a loaded host stretched past the
+	// drain plus that wait (#531).
+	<-ended
+	if logs := r.h.Logs("answered requests left at the stop"); len(logs) != 1 || logs[0]["requests"] != float64(1) {
+		t.Errorf("the stop logged %v, want the one request answered within the wait", logs)
 	}
 	if proxy.DrainSendWait >= stopMargin {
 		t.Errorf("the proxy's %v answer wait leaves nothing of the %v stop margin", proxy.DrainSendWait, stopMargin)
