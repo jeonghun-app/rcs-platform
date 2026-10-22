@@ -25,6 +25,9 @@ type dispatcher struct {
 	router    *routing.Router
 	log       *slog.Logger
 	firsts    firstNotifies
+	// answered, if set, runs once a SUBSCRIBE's 200 is written, before its
+	// first NOTIFY goes: a test holds the dispatcher there.
+	answered func()
 }
 
 func (d *dispatcher) Route(ctx context.Context, r *proxy.Request) proxy.Decision {
@@ -47,6 +50,9 @@ func (d *dispatcher) Route(ctx context.Context, r *proxy.Request) proxy.Decision
 			// for done once the 200 is written (#439 code review).
 			run := d.firsts.hold()
 			d.respond(u, res)
+			if d.answered != nil {
+				d.answered()
+			}
 			run(func() { after(context.WithoutCancel(ctx)) })
 		}}
 	case r.Initial():
