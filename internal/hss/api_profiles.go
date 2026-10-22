@@ -353,6 +353,6 @@ func (a *API) pushOne(ctx context.Context, impi string, p *store.ServiceProfile)
 	if len(pushes) == 0 {
 		return false
 	}
-	a.h.notify(ctx, a.notifier, s, p, pushes, a.pushTimeout)
+	a.h.notify(ctx, a.notifier, s, p, pushes, a.pushTimes())
 	return true
 }

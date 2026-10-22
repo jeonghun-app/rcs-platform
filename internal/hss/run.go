@@ -130,7 +130,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		Handler:           api,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      apiWriteTimeout,
 		IdleTimeout:       2 * time.Minute,
 		MaxHeaderBytes:    16 << 10,
 		ErrorLog:          runtime.HTTPErrorLog(rt.Logger),

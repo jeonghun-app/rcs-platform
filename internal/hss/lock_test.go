@@ -431,7 +431,7 @@ func TestARefusedPPRsRTRKeepsTimeAfterALateUpdate(t *testing.T) {
 	n := &deadlineNotifier{recordingNotifier: *newRecorder()}
 	const each = time.Hour
 	start := time.Now()
-	h.pprRejected(context.Background(), n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData), each)
+	h.pprRejected(context.Background(), n, e.sub(impi1), exp(cx.ErrorNotSupportedUserData), pushTimes{each: each, total: PushBudget, until: time.Now().Add(each * 2)})
 	end := time.Now()
 	if e.sub(impi1).Identity(impu1).State != store.NotRegistered {
 		t.Fatal("the user was not marked not registered")
@@ -478,7 +478,7 @@ func TestAnRTRAfterALateRefusalHasItsOwnTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.h.notify(t.Context(), n, e.sub(impi1), p, []push{{set: 0}}, each)
+	e.h.notify(t.Context(), n, e.sub(impi1), p, []push{{set: 0}}, pushTimes{each: each, total: PushBudget})
 	if len(n.deadlines) != 1 {
 		t.Fatalf("%d RTRs", len(n.deadlines))
 	}

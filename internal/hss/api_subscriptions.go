@@ -286,7 +286,7 @@ func (a *API) notifyChange(r *http.Request, s *store.Subscription, pushes []push
 		p, _ = a.h.store.Profile(pctx, s.Profile)
 		cancel()
 	}
-	a.h.notify(ctx, a.notifier, s, p, pushes, a.pushTimeout)
+	a.h.notify(ctx, a.notifier, s, p, pushes, a.pushTimes())
 }
 
 func needsProfile(pushes []push) bool {

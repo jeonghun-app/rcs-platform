@@ -177,6 +177,11 @@ func Configure(s *runtime.Settings) Config {
 			e.Invalid(d.name, "must be greater than zero")
 		}
 	}
+	if c.PushTimeout > MaxPushTimeout {
+		// Each push may take it, and all of a change's together at most
+		// PushBudget, within the API's write timeout (#491).
+		e.Invalid("PUSH_TIMEOUT", "must be at most 10s")
+	}
 	if c.StartTimeout > MaxStartTimeout {
 		e.Invalid("START_TIMEOUT", "must be at most 240s, which a container health check's startPeriod (300 s at most) can cover")
 	}

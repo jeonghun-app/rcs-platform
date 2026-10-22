@@ -49,7 +49,7 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included |
 | `HSS_START_TIMEOUT` | `60s` | opening the store and the keyring at start; past it the task exits. At most `240s` (see Operations) |
 | `HSS_KEYRING_BOOTSTRAP` | `false` | allow creating a first data key although subscriptions are stored (see [Secrets](#secrets)) |
-| `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and each push one provisioning request causes, on its own: a change that causes two pushes waits up to twice it |
+| `HSS_PUSH_TIMEOUT` | `5s` | each RTR or PPR attempt, and each push one provisioning request causes, on its own; at most `10s`. A change's pushes together take at most 20 s, so that the API answers within its 30 s write timeout (below) |
 
 In prod every token must be at least 256 bits (43 base64url characters) and no
 token may be shared between callers. Tokens come from Secrets Manager through the
@@ -194,7 +194,13 @@ refused near the end of its time still leaves the RTR a whole one.
 
 One change's pushes go one at a time, each once the one before is answered
 or its own `HSS_PUSH_TIMEOUT` has passed, so a push left unanswered does not
-keep the next from going. When identities move between implicit sets, the
+keep the next from going. All of a change's pushes together take at most
+20 s: the API answers the change once they are done, and must do so within
+its HTTP write timeout (30 s), or the client sees the connection cut over a
+change that was stored, and a retry with its ETag gets 412 (#491). The
+pushes left when the 20 s run out are not sent, and are counted in
+`push.over_budget`; the user picks the change up at the next registration,
+as after any push that fails. When identities move between implicit sets, the
 sets losing them go first (§6.5.2.1):
 - first the RTRs of the sets that lose one: an RTR only takes identities away,
   and the S-CSCF finds the set an RTR names by its identities, so after a PPR
@@ -371,7 +377,7 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   `aka.resync`, `aka.auts_invalid`, `aka.sqn_exhausted`, `profile.missing`,
   `profile.costly`, `userdata.too_large`, `keyring.created`,
   `push.rtr|ppr.sent|rejected|failed|no_peer`, `push.ppr.user_unknown`,
-  `push.ppr.data_refused`, `push.fanout.subscriptions`, `api.<operation>` (latency),
+  `push.ppr.data_refused`, `push.over_budget`, `push.fanout.subscriptions`, `api.<operation>` (latency),
   `api.<operation>.<status>`, `api.rate_limited`, `api.store_failure`,
   `api.data_error`.
 - Alarm candidates (Phase 7): `cx.*.error`, `lock.busy`, `api.store_failure`,

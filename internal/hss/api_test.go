@@ -973,7 +973,7 @@ func TestARefusedPPRWhoseStateCannotBeWrittenLetsTheNextGo(t *testing.T) {
 				t.Fatal(err)
 			}
 			n := &refusingOnce{recordingNotifier: newRecorder(), result: result, fs: fs}
-			e.h.notify(t.Context(), n, next, p, pushes, time.Second)
+			e.h.notify(t.Context(), n, next, p, pushes, pushTimes{each: time.Second, total: PushBudget})
 			if rtrs, pprs := n.got(); len(pprs) != 2 || len(rtrs) != 0 {
 				t.Fatalf("%d PPRs, %d RTRs; want both PPRs and no RTR", len(pprs), len(rtrs))
 			}
@@ -1139,5 +1139,85 @@ func TestDecodeStrictRefusesKeysThatDifferOnlyInCase(t *testing.T) {
 		if code, resp, _ := a.do("POST", "/v1/subscriptions", adminToken, body); code != http.StatusBadRequest {
 			t.Fatalf("variant %q = %d, acs_managed %v; want 400", variant, code, resp["acs_managed"])
 		}
+	}
+}
+
+// silentNotifier holds every push until its context ends, as an S-CSCF
+// that keeps the connection and never answers. It records when the first
+// push came and the latest deadline of any.
+type silentNotifier struct {
+	mu       sync.Mutex
+	sent     int
+	first    time.Time
+	deadline time.Time
+}
+
+func (n *silentNotifier) hold(ctx context.Context) error {
+	d, _ := ctx.Deadline()
+	n.mu.Lock()
+	if n.sent == 0 {
+		n.first = time.Now()
+	}
+	n.sent++
+	if d.After(n.deadline) {
+		n.deadline = d
+	}
+	n.mu.Unlock()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (n *silentNotifier) Deregister(ctx context.Context, _ *cx.RTR) error { return n.hold(ctx) }
+
+func (n *silentNotifier) PushProfile(ctx context.Context, _ *cx.PPR) error { return n.hold(ctx) }
+
+// #491: a change of a subscription served in seven implicit sets, at an
+// S-CSCF that never answers, takes no longer than the push budget, which
+// keeps the API's answer within its write timeout: the pushes left when it
+// runs out are not sent, and are counted.
+func TestAChangesPushesStayWithinTheBudget(t *testing.T) {
+	const each, budget = 200 * time.Millisecond, 300 * time.Millisecond
+	silent := &silentNotifier{}
+	a := newAPIEnv(t, func(o *APIOptions) { o.Notifier, o.PushTimeout, o.PushBudget = silent, each, budget })
+	ids := []any{impu1, 0, tel1, 1, impu2, 2, "tel:+15550100002", 3, impu3, 4, "tel:+15550100003", 5, impu4, 6}
+	if code, body, _ := a.do("POST", "/v1/subscriptions", adminToken, setsBody(impi1, ids...)); code != http.StatusCreated {
+		t.Fatalf("create = %d %v", code, body)
+	}
+	a.modify(impi1, func(s *store.Subscription) {
+		s.ServerName = scscfName
+		for i := range s.PublicIdentities {
+			s.PublicIdentities[i].State = store.Registered
+		}
+	})
+	profile := `{"id":"chat","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[{"group":[0],"method":"MESSAGE"}]},` +
+		`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_TERMINATED"}}],"mandatory_capabilities":[1]}`
+	if code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile); code != http.StatusCreated {
+		t.Fatalf("profile = %d %v", code, body)
+	}
+	// Another profile: a PPR for each of the seven served sets.
+	moved := strings.Replace(setsBody(impi1, ids...), `"acs_managed":true}`, `"acs_managed":true,"service_profile":"chat"}`, 1)
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, moved); code != http.StatusOK {
+		t.Fatalf("put = %d %v", code, body)
+	}
+	silent.mu.Lock()
+	defer silent.mu.Unlock()
+	sent, skipped := int64(silent.sent), a.metrics.get("push.over_budget")
+	// The first push has its timeout, the second what is left of the
+	// budget, and the five after none.
+	if sent+skipped != 7 || sent > 2 {
+		t.Fatalf("%d pushes sent, %d left over budget; want the seven, at most two sent", sent, skipped)
+	}
+	// No push had longer than the budget from the first's start: the
+	// deadlines are compared, not the time the host took (#275).
+	if late := silent.deadline.Sub(silent.first.Add(budget)); late > 0 {
+		t.Errorf("a push's deadline is %v past the budget", late)
+	}
+}
+
+// #491: HSS_PUSH_TIMEOUT is at most MaxPushTimeout, so that a push fits in
+// the change's budget, and the API's answer in its write timeout.
+func TestThePushTimeoutIsBounded(t *testing.T) {
+	if MaxPushTimeout > PushBudget || PushBudget >= apiWriteTimeout {
+		t.Fatalf("timeout %v, budget %v, write timeout %v", MaxPushTimeout, PushBudget, apiWriteTimeout)
 	}
 }

@@ -246,17 +246,30 @@ func deletePushes(s *store.Subscription) []push {
 }
 
 // notify sends pushes for s, whose profile is p (needed for User-Data), one
-// after the other, each with each to be answered in: a push that is not
+// after the other, each with t.each to be answered in: a push that is not
 // answered in time leaves the next its own time, so that a slow answer for
 // the set losing an identity does not cost the set gaining it its PPR (QA on
 // #476). Failures are logged and counted, not returned: the stored change
 // stands.
-func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, pushes []push, each time.Duration) {
+//
+// All of them together take at most t.total, within which each has at
+// most t.each: the provisioning API answers once they are done, before its
+// HTTP write timeout (#491). The pushes left when it runs out are not sent,
+// and counted in push.over_budget; the user picks the change up at the
+// next registration, as after any push that fails.
+func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, pushes []push, t pushTimes) {
 	if n == nil {
 		return
 	}
-	for _, ps := range pushes {
-		if h.notifyOne(ctx, n, s, p, ps, each) {
+	t.until = time.Now().Add(t.total)
+	for i, ps := range pushes {
+		if time.Until(t.until) <= 0 {
+			h.metrics.Count("push.over_budget", int64(len(pushes)-i))
+			h.log.Warn("the S-CSCF requests of a provisioning change ran out of time",
+				pii.Identity("impi", s.IMPI), slog.Int("left", len(pushes)-i))
+			return
+		}
+		if h.notifyOne(ctx, n, s, p, ps, t) {
 			// The user is no longer registered at the S-CSCF, which knows
 			// it no longer or is deregistering it: a set's PPR after this
 			// one, the set gaining a moved identity say, has nothing left
@@ -266,10 +279,22 @@ func (h *HSS) notify(ctx context.Context, n Notifier, s *store.Subscription, p *
 	}
 }
 
-// notifyOne sends ps within each, and reports whether it left the user no
+// pushTimes bound the pushes of one change (notify): each one, all of them,
+// and until when, from when the first starts.
+type pushTimes struct {
+	each, total time.Duration
+	until       time.Time
+}
+
+// next is how long the next request of the change may take.
+func (t pushTimes) next() time.Duration {
+	return max(min(t.each, time.Until(t.until)), 0)
+}
+
+// notifyOne sends ps within t, and reports whether it left the user no
 // longer registered (pprRejected).
-func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, each time.Duration) bool {
-	pctx, cancel := context.WithTimeout(ctx, each)
+func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push, t pushTimes) bool {
+	pctx, cancel := context.WithTimeout(ctx, t.next())
 	defer cancel()
 	err := h.send(pctx, n, s, p, ps)
 	if err != nil {
@@ -281,7 +306,7 @@ func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, 
 			pii.Identity("impi", s.IMPI), slog.String("request", kind), slog.String("error", pii.Redact(err.Error())))
 	}
 	var rejected *RejectedError
-	return !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result, each)
+	return !ps.deregister && errors.As(err, &rejected) && h.pprRejected(ctx, n, s, rejected.Result, t)
 }
 
 // pprRejected acts on a PPA failure as TS 29.228 §6.2.2.1 asks of an HSS
@@ -298,11 +323,12 @@ func (h *HSS) notifyOne(ctx context.Context, n Notifier, s *store.Subscription, 
 // It reports whether it acted on the failure: once the user is marked not
 // registered here, it is no longer registered at the S-CSCF either.
 //
-// The not-registered write and the RTR each get each of their own, from
+// The not-registered write and the RTR each get t.each of their own, from
 // when they start, rather than what the refused PPR left of its own: an
 // S-CSCF that refuses late would otherwise leave the RTR almost none, and
-// the user registered there with the old data (code review on #476).
-func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result, each time.Duration) bool {
+// the user registered there with the old data (code review on #476). Both
+// stay within the change's t.total all the same (#491).
+func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription, r cx.Result, t pushTimes) bool {
 	if r.Vendor != cx.Vendor3GPP {
 		return false
 	}
@@ -311,7 +337,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	default:
 		return false
 	}
-	uctx, cancel := context.WithTimeout(ctx, each)
+	uctx, cancel := context.WithTimeout(ctx, t.next())
 	defer cancel()
 	_, err := h.update(uctx, s.IMPI, func(cur *store.Subscription) error {
 		if !served(cur) && !cur.AuthPending && cur.ServerName == "" {
@@ -335,7 +361,7 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 		return true
 	}
 	h.metrics.Count("push.ppr.data_refused", 1)
-	rctx, rcancel := context.WithTimeout(ctx, each)
+	rctx, rcancel := context.WithTimeout(ctx, t.next())
 	defer rcancel()
 	err = n.Deregister(rctx, &cx.RTR{UserName: s.IMPI, DeregistrationReason: cx.DeregistrationReason{Code: cx.ServerChange}})
 	if err != nil {
