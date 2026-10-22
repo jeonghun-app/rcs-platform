@@ -87,7 +87,7 @@ func FuzzGroupView(f *testing.F) {
 		// A roster name is valid UTF-8 (the group package checks).
 		author := cpim.Address{Name: strings.ToValidUTF8(name, "\ufffd"), URI: alice}
 		if out, err := groupView(c, author, groupURI); err == nil {
-			if from := readAddresses(t, out, author, "<"+groupURI+">"); string(from.Body) != string(c.Body) {
+			if from := readAddresses(t, out, author, "<"+groupURI+">"); string(from.Body.Bytes()) != string(c.Body.Bytes()) {
 				t.Fatalf("body %q, want %q", from.Body, c.Body)
 			}
 		}

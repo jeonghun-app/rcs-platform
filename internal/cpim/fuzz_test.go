@@ -3,7 +3,6 @@ package cpim
 import (
 	"bytes"
 	"encoding/json"
-	"reflect"
 	"testing"
 	"unicode"
 	"unicode/utf8"
@@ -46,7 +45,7 @@ func FuzzParse(f *testing.F) {
 		}
 		tolerated := *m
 		tolerated.deviations = 0
-		if !reflect.DeepEqual(again, &tolerated) {
+		if !sameMessage(again, &tolerated) {
 			t.Fatalf("round trip changed the message:\n%#v\n%#v", m, again)
 		}
 		if twice, err := again.Marshal(); err != nil || !bytes.Equal(twice, out) {

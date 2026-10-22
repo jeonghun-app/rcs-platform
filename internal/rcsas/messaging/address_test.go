@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -97,7 +98,7 @@ func TestAOneToOneMessageNamesItsSenderOnce(t *testing.T) {
 			t.Fatalf("%s does not parse: %v", name, err)
 		}
 		for _, mode := range []store.Mode{store.Chat, store.Standalone} {
-			o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: mode, CPIM: body}
+			o := Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: mode, CPIM: content.BodyOf(body)}
 			if got := rejected(r.e.Submit(t.Context(), o)); got != ReasonMalformed {
 				t.Errorf("%s (%v): %q", name, mode, got)
 			}
@@ -118,10 +119,10 @@ func TestAOneToOneMessageNamesItsSenderOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := r.d.nextPager(t)
-	if string(d.CPIM) != string(body) {
+	if string(d.CPIM.Bytes()) != string(body) {
 		t.Fatalf("delivered %q", d.CPIM)
 	}
-	readAddresses(t, d.CPIM, cpim.Address{URI: AnonymousURI}, "<"+AnonymousURI+">")
+	readAddresses(t, d.CPIM.Bytes(), cpim.Address{URI: AnonymousURI}, "<"+AnonymousURI+">")
 }
 
 // A group's participants read the author rcs-as checked, under the name the
@@ -193,8 +194,8 @@ func TestTheRosterNamesTheAuthorOfAGroupMessage(t *testing.T) {
 	if err != nil || len(ms) != 2 {
 		t.Fatalf("bob's queue %+v, %v", ms, err)
 	}
-	readAddresses(t, ms[0].CPIM, cpim.Address{Name: "Alice", URI: alice}, "<"+groupURI+">")
-	readAddresses(t, ms[1].CPIM, cpim.Address{URI: carol}, "<"+groupURI+">")
+	readAddresses(t, ms[0].CPIM.Bytes(), cpim.Address{Name: "Alice", URI: alice}, "<"+groupURI+">")
+	readAddresses(t, ms[1].CPIM.Bytes(), cpim.Address{URI: carol}, "<"+groupURI+">")
 }
 
 // The fuzz targets check the same: what ParseMessage accepts names one
@@ -233,7 +234,7 @@ func TestASendersOwnAddressInAnotherFormIsItsOwn(t *testing.T) {
 		if err := r.e.SubmitGroup(t.Context(), groupFrom(asserted, body)); err != nil {
 			t.Errorf("in the group, From %s: %v", from, err)
 		}
-		if err := r.e.Submit(t.Context(), Origin{Sender: asserted, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: body}); err != nil {
+		if err := r.e.Submit(t.Context(), Origin{Sender: asserted, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(body)}); err != nil {
 			t.Errorf("1-to-1, From %s: %v", from, err)
 		}
 	}
@@ -241,7 +242,7 @@ func TestASendersOwnAddressInAnotherFormIsItsOwn(t *testing.T) {
 	if got := rejected(r.e.SubmitGroup(t.Context(), groupFrom(asserted, other))); got != ReasonFromMismatch {
 		t.Fatalf("someone else's From in the group: %q", got)
 	}
-	if got := rejected(r.e.Submit(t.Context(), Origin{Sender: asserted, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: other})); got != ReasonFromMismatch {
+	if got := rejected(r.e.Submit(t.Context(), Origin{Sender: asserted, Recipient: alice, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(other)})); got != ReasonFromMismatch {
 		t.Fatalf("someone else's From 1-to-1: %q", got)
 	}
 	for uri, want := range map[string]bool{
@@ -284,5 +285,5 @@ func TestAGroupSenderIsNamedAsTheGroupNamesIt(t *testing.T) {
 	if err != nil || len(ms) != 1 || ms[0].Author != alice {
 		t.Fatalf("bob's queue %+v, %v", ms, err)
 	}
-	readAddresses(t, ms[0].CPIM, cpim.Address{URI: alice}, "<"+groupURI+">")
+	readAddresses(t, ms[0].CPIM.Bytes(), cpim.Address{URI: alice}, "<"+groupURI+">")
 }

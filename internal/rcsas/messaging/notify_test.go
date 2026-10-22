@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -39,7 +40,7 @@ func TestForgedNotificationsAreRefused(t *testing.T) {
 		"claiming delivery on behalf of the recipient": {
 			standalone(intermediary, alice, receipt(t, "m1", imdn.DeliveryNotification, imdn.Delivered)), ReasonIMDNForged},
 		"naming another sender in CPIM": {
-			Origin{Sender: carol, Recipient: alice, Mode: store.Standalone, CPIM: forgedFrom(t, bob, "m1")}, ReasonFromMismatch},
+			Origin{Sender: carol, Recipient: alice, Mode: store.Standalone, CPIM: content.BodyOf(forgedFrom(t, bob, "m1"))}, ReasonFromMismatch},
 	} {
 		if got := rejected(r.e.Submit(t.Context(), c.o)); got != c.want {
 			t.Errorf("a notification %s: %q, want %q", name, got, c.want)
@@ -72,16 +73,16 @@ func TestGenuineNotificationsReachTheSender(t *testing.T) {
 	r := newRig(t, Config{Intermediaries: []string{intermediary}})
 	sentToBob(t, r, imdn.PositiveDelivery|imdn.NegativeDelivery|imdn.Processing|imdn.Display)
 	for name, o := range map[string]Origin{
-		"from the recipient":                  {Sender: bob, Recipient: alice, Mode: store.Standalone, CPIM: receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed)},
-		"from the recipient's other identity": {Sender: bob, Identities: []string{"sip:bob@ims.example.net"}, Recipient: alice, Mode: store.Standalone, CPIM: forgedFrom(t, "sip:bob@ims.example.net", "m1")},
-		"of failure from an intermediary":     {Sender: intermediary, Recipient: alice, Mode: store.Standalone, CPIM: receipt(t, "m1", imdn.DeliveryNotification, imdn.Failed)},
-		"of processing from an intermediary":  {Sender: intermediary, Recipient: alice, Mode: store.Standalone, CPIM: receipt(t, "m1", imdn.ProcessingNotification, imdn.Stored)},
+		"from the recipient":                  {Sender: bob, Recipient: alice, Mode: store.Standalone, CPIM: content.BodyOf(receipt(t, "m1", imdn.DisplayNotification, imdn.Displayed))},
+		"from the recipient's other identity": {Sender: bob, Identities: []string{"sip:bob@ims.example.net"}, Recipient: alice, Mode: store.Standalone, CPIM: content.BodyOf(forgedFrom(t, "sip:bob@ims.example.net", "m1"))},
+		"of failure from an intermediary":     {Sender: intermediary, Recipient: alice, Mode: store.Standalone, CPIM: content.BodyOf(receipt(t, "m1", imdn.DeliveryNotification, imdn.Failed))},
+		"of processing from an intermediary":  {Sender: intermediary, Recipient: alice, Mode: store.Standalone, CPIM: content.BodyOf(receipt(t, "m1", imdn.ProcessingNotification, imdn.Stored))},
 	} {
 		if err := r.e.Submit(t.Context(), o); err != nil {
 			t.Errorf("a notification %s: %v", name, err)
 			continue
 		}
-		if d := r.d.nextPager(t); d.Recipient != alice || !d.Notification || !bytes.Equal(d.CPIM, o.CPIM) {
+		if d := r.d.nextPager(t); d.Recipient != alice || !d.Notification || !bytes.Equal(d.CPIM.Bytes(), o.CPIM.Bytes()) {
 			t.Errorf("a notification %s was delivered as %+v", name, d)
 		}
 	}
@@ -98,7 +99,7 @@ func TestANotificationLeavesRcsAsOutOfItsRoute(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := r.d.nextPager(t)
-	m, err := cpim.Parse(d.CPIM)
+	m, err := cpim.Parse(d.CPIM.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +107,7 @@ func TestANotificationLeavesRcsAsOutOfItsRoute(t *testing.T) {
 	if len(routes) != 1 || routes[0].Value != "<"+elsewhere+">" || d.Route != elsewhere {
 		t.Fatalf("routes %+v, Route %q", routes, d.Route)
 	}
-	if n := readNotification(t, d.CPIM); n.MessageID != "m1" || n.Status != imdn.Delivered {
+	if n := readNotification(t, d.CPIM.Bytes()); n.MessageID != "m1" || n.Status != imdn.Delivered {
 		t.Fatalf("notification %+v", n)
 	}
 }
@@ -140,7 +141,7 @@ func TestOnlyATrustedRouteIsFollowed(t *testing.T) {
 			t.Fatal(err)
 		}
 		d := r.d.nextPager(t)
-		if !bytes.Equal(d.CPIM, body) || d.Route != want {
+		if !bytes.Equal(d.CPIM.Bytes(), body) || d.Route != want {
 			t.Errorf("route %s: Route %q, want %q", route, d.Route, want)
 		}
 		if untrusted := r.m.get("imdn.route_untrusted"); (want == "") != (untrusted == 1) {
@@ -176,7 +177,7 @@ func TestANegativeNotificationKeepsOnlyTrustedRecordRoutes(t *testing.T) {
 	}
 	r.d.nextPager(t)
 	d := r.d.nextPager(t)
-	n, err := cpim.Parse(d.CPIM)
+	n, err := cpim.Parse(d.CPIM.Bytes())
 	if err != nil {
 		t.Fatal(err)
 	}

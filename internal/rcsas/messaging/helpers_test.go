@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -407,7 +408,7 @@ func readNotification(t *testing.T, body []byte) imdn.Notification {
 }
 
 func standalone(sender, recipient string, body []byte) Origin {
-	return Origin{Sender: sender, Recipient: recipient, Conversation: conv, Mode: store.Standalone, Pager: true, CPIM: body}
+	return Origin{Sender: sender, Recipient: recipient, Conversation: conv, Mode: store.Standalone, Pager: true, CPIM: content.BodyOf(body)}
 }
 
 func rejected(err error) Reason {

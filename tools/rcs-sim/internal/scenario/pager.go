@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -138,7 +139,7 @@ func (c *sipClient) await(ctx context.Context, id, token string) (*sip.Request, 
 			return m, nil, skipped, err
 		}
 		h, _ := cm.Get(imdn.Namespace, imdn.HeaderMessageID)
-		if h.Value == id || (token != "" && strings.Contains(string(cm.Body), token)) {
+		if h.Value == id || (token != "" && strings.Contains(string(cm.Body.Bytes()), token)) {
 			return m, cm, skipped, nil
 		}
 	}
@@ -232,7 +233,7 @@ func pagerMessage(r *run) error {
 		switch {
 		case request.MessageID != id:
 			return detail, errors.New("the message received is not the one sent")
-		case string(c.Body) != text:
+		case string(c.Body.Bytes()) != text:
 			return detail, errors.New("the message's text changed on the way")
 		case !request.Dispositions.Wants(imdn.DeliveryNotification, imdn.Delivered):
 			return detail, errors.New("the delivery notification request was lost")
@@ -330,7 +331,7 @@ func pagerMessage(r *run) error {
 		if err != nil {
 			return detail, fmt.Errorf("MESSAGE to the unregistered peer answered %d, and it never arrived after the peer registered again", res.StatusCode)
 		}
-		if got, err := imdn.ParseRequest(c); err != nil || got.MessageID != msgID || string(c.Body) != text {
+		if got, err := imdn.ParseRequest(c); err != nil || got.MessageID != msgID || string(c.Body.Bytes()) != text {
 			return detail, errors.New("the stored message changed on the way")
 		}
 		detail["stored"] = 1
@@ -359,7 +360,7 @@ func (r *run) pagerBody(self, peer cpim.Address, text string) ([]byte, string, e
 		return nil, "", err
 	}
 	m.ContentHeaders = []cpim.Field{{Name: "Content-Type", Value: "text/plain;charset=utf-8"}}
-	m.Body = []byte(text)
+	m.Body = content.BodyOf([]byte(text))
 	body, err := m.Marshal()
 	return body, id, err
 }

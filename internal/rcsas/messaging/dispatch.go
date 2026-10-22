@@ -352,7 +352,7 @@ func (e *Engine) deliver(ctx context.Context, m store.Message, behind bool) outc
 	if m.Mode == store.Group {
 		return e.deliverGroup(ctx, m, behind)
 	}
-	fits := len(m.CPIM) <= e.cfg.PagerLimit
+	fits := m.CPIM.Len() <= e.cfg.PagerLimit
 	if m.Mode == store.Chat || m.Notification {
 		if l := e.chatLeg(m.Recipient, m.Sender); l != nil {
 			if behind {
@@ -616,7 +616,7 @@ func (e *Engine) sendClaimed(ctx context.Context, l *Leg, m store.Message) outco
 // claimed then, so no pass sees it in between.
 func (e *Engine) sendClaimedThen(ctx context.Context, l *Leg, m store.Message, over func()) outcome {
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
-	code, err := l.send(ctx, m.CPIM)
+	code, err := l.send(ctx, m.CPIM.Bytes())
 	cancel()
 	if over != nil {
 		over()
@@ -655,13 +655,13 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 		Recipient: m.Recipient, Sender: m.Sender, Mode: m.Mode, Notification: m.Notification, CPIM: m.CPIM,
 		Conversation: Conversation{ID: m.Conversation, Contribution: m.Contribution, InReplyTo: m.InReplyTo},
 	}
-	if c, err := e.parseCPIM(m.CPIM); err == nil {
+	if c, err := e.parseCPIM(m.CPIM.Bytes()); err == nil {
 		if from, err := c.From(); err == nil {
 			d.SenderName = EscapeDisplayName(from.Name)
 		}
 	}
 	if m.Notification {
-		d.Route = e.nextRoute(m.CPIM)
+		d.Route = e.nextRoute(m.CPIM.Bytes())
 	}
 	ctx, cancel := e.withTimeout(ctx, e.cfg.DeliveryTimeout)
 	err := e.deliverer.Pager(ctx, d)

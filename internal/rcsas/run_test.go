@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
@@ -579,7 +580,7 @@ func TestTheStoresAreLinkedForFencedCopies(t *testing.T) {
 	if err := g.Create(t.Context(), grp, groupstore.Owner{Task: "task-a"}, "c", at); err != nil {
 		t.Fatal(err)
 	}
-	m := store.Message{Recipient: "tel:+15550100002", ID: "1", Sender: grp.URI, Mode: store.Group, CPIM: []byte("x"),
+	m := store.Message{Recipient: "tel:+15550100002", ID: "1", Sender: grp.URI, Mode: store.Group, CPIM: content.BodyOf([]byte("x")),
 		Enqueued: at, Expires: at.Add(time.Hour), Fence: &store.Fence{Group: grp.URI, Task: "task-a", Epoch: 1}}
 	if err := q.Enqueue(t.Context(), m, store.Limit{}); err != nil {
 		t.Fatalf("a fenced copy of the owner's = %v", err)
