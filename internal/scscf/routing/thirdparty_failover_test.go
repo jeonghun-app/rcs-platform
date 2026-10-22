@@ -87,6 +87,7 @@ func TestAThirdPartyREGISTERThatMayHaveArrivedIsNotFailedOver(t *testing.T) {
 		"reset":                errors.New("connection reset by peer"),
 		"its time":             context.DeadlineExceeded,
 		"too many connections": fmt.Errorf("%w: %w", ErrNotSent, transport.ErrTooManyConnections),
+		"queue full":           fmt.Errorf("%w: %w", ErrNotSent, transport.ErrQueueFull),
 	} {
 		t.Run(name, func(t *testing.T) {
 			e := newEnv(t)
@@ -102,5 +103,57 @@ func TestAThirdPartyREGISTERThatMayHaveArrivedIsNotFailedOver(t *testing.T) {
 				t.Errorf("failovers %d, unanswered %d", e.metrics.get("routing.as_failover"), e.metrics.get("routing.third_party.unanswered"))
 			}
 		})
+	}
+}
+
+// TestAThirdPartyREGISTERNoAddressTakesIsUnansweredOnce (#592 code review):
+// three addresses, none of which can be connected to: two failovers, and
+// the REGISTER is unanswered once.
+func TestAThirdPartyREGISTERNoAddressTakesIsUnansweredOnce(t *testing.T) {
+	e := newEnv(t)
+	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+	s := &addressedSender{fail: fmt.Errorf("%w: connection refused", ErrNotSent)}
+	rt := e.router(nil, withSender(s), withResolver(fixedAddresses{deadAS, liveAS, otherLiveAS}))
+	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+	rt.Stop()
+	if got := s.sentTo(); len(got) != 3 {
+		t.Errorf("sent to %v, want every address", got)
+	}
+	if e.metrics.get("routing.as_failover") != 2 || e.metrics.get("routing.third_party.unanswered") != 1 {
+		t.Errorf("failovers %d, unanswered %d", e.metrics.get("routing.as_failover"), e.metrics.get("routing.third_party.unanswered"))
+	}
+}
+
+// slowDial is an addressedSender whose send to deadAS takes the dial's
+// whole time, past the REGISTER's, before it fails.
+type slowDial struct{ addressedSender }
+
+func (s *slowDial) SendTo(ctx context.Context, req *sip.Request, dst transport.Destination) (*sip.Response, error) {
+	if dst.Addr == deadAS {
+		s.mu.Lock()
+		s.to = append(s.to, dst.Addr)
+		s.mu.Unlock()
+		<-ctx.Done()
+		return nil, fmt.Errorf("%w: dial tcp %v: i/o timeout", ErrNotSent, dst.Addr)
+	}
+	return s.addressedSender.SendTo(ctx, req, dst)
+}
+
+// TestAThirdPartyREGISTERWhoseTimeRanOutGoesNowhereElse (#592 code
+// review): the first address takes the dial past ThirdPartyTimeout; the
+// REGISTER is not sent to the next address with no time left, and nothing
+// is counted as a failover.
+func TestAThirdPartyREGISTERWhoseTimeRanOutGoesNowhereElse(t *testing.T) {
+	e := newEnv(t)
+	e.profile(t0, criterion(40, rcsAS, registerTrigger(), ifc.SessionContinued))
+	s := &slowDial{}
+	rt := e.router(nil, withSender(s), withResolver(fixedAddresses{deadAS, liveAS}), func(c *Config) { c.ThirdPartyTimeout = 50 * time.Millisecond })
+	rt.Registered(bg, registration(t, ifc.InitialRegistration, time.Hour))
+	rt.Stop()
+	if got := s.sentTo(); len(got) != 1 {
+		t.Errorf("sent to %v, want the first address only", got)
+	}
+	if e.metrics.get("routing.as_failover") != 0 || e.metrics.get("routing.third_party.unanswered") != 1 {
+		t.Errorf("failovers %d, unanswered %d", e.metrics.get("routing.as_failover"), e.metrics.get("routing.third_party.unanswered"))
 	}
 }

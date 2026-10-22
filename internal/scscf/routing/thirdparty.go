@@ -414,6 +414,12 @@ func (rt *Router) sendThirdParty(ctx context.Context, req *sip.Request, server s
 			return res, err
 		}
 		rt.down.mark(dst.Addr, rt.cfg.Now().Add(rt.cfg.ASDownFor))
+		if ctx.Err() != nil {
+			// The REGISTER's time ran out, or the stop cut it, while this
+			// address took its dial: none is left for another (#592 code
+			// review), and a send would only be written and abandoned.
+			return nil, err
+		}
 		if i+1 < len(addrs) {
 			rt.count("routing.as_failover")
 		}
