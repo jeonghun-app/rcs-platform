@@ -37,6 +37,11 @@ type IMSCore struct {
 	// goroutine for a NOTIFY, so two calls may run at once and a Rewrite
 	// that keeps state must lock it.
 	Rewrite func(*sip.Request)
+	// RewriteResponse, when set before any request, changes each response
+	// the core relays back for a request it forwarded, req, as a faulty
+	// network element would. It runs on the transaction's goroutine and
+	// must not block.
+	RewriteResponse func(req *sip.Request, res *sip.Response)
 	// NotifyAnswered, when set before any request, hears how each NOTIFY
 	// the core sent ended: the subscriber's final response, or the error
 	// that ended its transaction. It runs on the transaction's goroutine
@@ -62,6 +67,12 @@ type IMSCore struct {
 	// Offline, when set before any request, is what the core does with a
 	// request to an IMPU that has no binding.
 	Offline Offline
+	// RepeatFirstNotify, when set before any request, has the core send
+	// the first subscription's first NOTIFY twice, the state the same and
+	// the version raised, as scscf may when an initial registration's
+	// change reaches a subscription made after it (#473 QA).
+	RepeatFirstNotify bool
+	repeated          atomic.Bool
 
 	t     testing.TB
 	tr    *transport.Transport
@@ -655,6 +666,9 @@ func (c *IMSCore) subscribe(tx *transaction.ServerTransaction) {
 		c.notifyLocked(s, "terminated;reason=timeout", contact, event, registered, gate)
 	default:
 		c.notifyLocked(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered, gate)
+		if c.RepeatFirstNotify && c.repeated.CompareAndSwap(false, true) {
+			c.notifyLocked(s, "active;expires="+strconv.FormatUint(uint64(expires), 10), contact, event, registered, gate)
+		}
 	}
 	c.mu.Unlock()
 	res, _ := sip.NewResponse(req, 200, "", s.tag)
@@ -893,6 +907,9 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 			back := res.Clone()
 			if err := back.Header.RemoveFirstElement("Via"); err != nil {
 				return
+			}
+			if c.RewriteResponse != nil {
+				c.RewriteResponse(req, back)
 			}
 			_ = tx.Respond(back)
 		})

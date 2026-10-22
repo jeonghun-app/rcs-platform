@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
 // The compose stack as deploy/docker-compose.yml names it: the test runs on
@@ -126,7 +128,7 @@ func TestE2EComposeStack(t *testing.T) {
 	// The client's default profile first: a run cut short before it put
 	// it back would leave the stub's, whose AS is gone, and fail the
 	// first OPTIONS with a 500 that says nothing of why (#473 code review).
-	putProfile(ctx, t, impi, impu, "tel:"+composeMSISDN, "")
+	putProfile(ctx, t, impi, "")
 	pcscf := doc.value("LBO_P-CSCF_Address", "Address")
 	sipCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
@@ -149,8 +151,9 @@ func TestE2EComposeStack(t *testing.T) {
 	// rcs-as is not in the stack, so a stub on this container takes the
 	// client's OPTIONS, as an AS acting as a proxy does, and sends them back
 	// to scscf, which goes on along the chain to icscf and the peer.
-	as := startStubAS(t, self)
-	throughStubAS(ctx, t, as.uri, impi, impu, "tel:"+composeMSISDN)
+	as := startStubAS(t, self, stubASPort, "")
+	next := startStubAS(t, self, nextStubASPort, stubASPort)
+	throughStubAS(ctx, t, []sip.URI{as.uri, next.uri}, impi)
 	asCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
 		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
@@ -168,6 +171,13 @@ func TestE2EComposeStack(t *testing.T) {
 	// Both OPTIONS went through the stub, each with scscf's iFC position.
 	if n, odi := as.requests.Load(), as.withODI.Load(); n != 2 || odi != 2 {
 		t.Errorf("the stub AS took %d requests, %d with an iFC position; want both OPTIONS with one", n, odi)
+	}
+	// And scscf went on from that position to the next criterion: the
+	// second stub took both, each after the first. A request whose
+	// position scscf ignored would have been routed as terminating, past
+	// the second stub (#473 QA).
+	if n, odi, after := next.requests.Load(), next.withODI.Load(), next.afterPrev.Load(); n != 2 || odi != 2 || after != 2 {
+		t.Errorf("the second stub AS took %d requests, %d with an iFC position, %d after the first; want both OPTIONS so", n, odi, after)
 	}
 }
 
