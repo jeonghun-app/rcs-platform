@@ -84,7 +84,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	// Self needs; a request that arrives before is dropped, and its sender
 	// retransmits or tries another task.
 	var p atomic.Pointer[proxy.Proxy]
-	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, WriteTimeout: d.writeTimeout, Logger: rt.Logger}, func(in transport.Inbound) {
+	tr, err := transport.New(transport.Config{DialTimeout: coreDialTimeout, Dialer: d.sipDialer, WriteTimeout: d.writeTimeout, Logger: rt.Logger, Metrics: rt.Metrics}, func(in transport.Inbound) {
 		if px := p.Load(); px != nil {
 			px.Receive(in)
 		}

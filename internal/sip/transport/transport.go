@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -249,7 +250,16 @@ type Config struct {
 	// Logger receives operational events, never message content, addresses or
 	// flow IDs. Nil discards them.
 	Logger *slog.Logger
+	// Metrics, if set, counts the panics recovered from Admit, OnFlowClosed
+	// and OnPong as MetricCallbackPanics, at once (#445); Stats counts them
+	// too. A panic in Admit refuses the flow; one in the others ends that
+	// call only.
+	Metrics panics.Counter
 }
+
+// MetricCallbackPanics counts the panics recovered from the service's
+// callbacks.
+const MetricCallbackPanics = "transport.callback_panics"
 
 func (c Config) withDefaults() Config {
 	setDefault(&c.MaxConnections, DefaultMaxConnections)
@@ -365,6 +375,8 @@ type Transport struct {
 	budget   queueBudget
 	// closures delivers OnFlowClosed; nil when there is none.
 	closures *closureQueue
+	// panics recovers the service's callbacks' panics.
+	panics *panics.Guard
 	// shedMu serializes shedding scans; lastShedScan is when the last one
 	// looked at every flow, in Unix nanoseconds.
 	shedMu       sync.Mutex
@@ -414,8 +426,13 @@ func New(cfg Config, h Handler) (*Transport, error) {
 		pending: make(map[net.Conn]struct{}),
 	}
 	t.budget.max = int64(cfg.MaxQueuedBytes)
+	t.panics = panics.New(panics.Config{
+		Metric: MetricCallbackPanics, Message: "transport: a service callback panicked", Log: cfg.Logger, Metrics: cfg.Metrics,
+	})
 	if cfg.OnFlowClosed != nil {
-		t.closures = newClosureQueue(cfg.OnFlowClosed)
+		t.closures = newClosureQueue(func(id FlowID, info FlowInfo) {
+			t.panics.Run("OnFlowClosed", func() { cfg.OnFlowClosed(id, info) })
+		})
 	}
 	t.flows = newFlowTable(key, cfg.Now, tableConfig{
 		udpTimeout:  cfg.UDPFlowTimeout,
@@ -505,7 +522,12 @@ func (q *closureQueue) stop() {
 
 // admit asks Config.Admit about a new inbound flow.
 func (t *Transport) admit(f *flow) bool {
-	if t.cfg.Admit == nil || t.cfg.Admit(f.id, f.info()) {
+	if t.cfg.Admit == nil {
+		return true
+	}
+	// A panic refuses the flow.
+	admitted := false
+	if t.panics.Run("Admit", func() { admitted = t.cfg.Admit(f.id, f.info()) }) && admitted {
 		return true
 	}
 	t.stats.refused.Add(1)
@@ -697,6 +719,9 @@ type Stats struct {
 	// ProxyHeaderErrors counts every other failure of a header begun, so
 	// that it says the NLB is not sending the header.
 	ProxyHeaderEmpty uint64
+	// CallbackPanics counts the panics recovered from Admit, OnFlowClosed
+	// and OnPong.
+	CallbackPanics uint64
 }
 
 type counters struct {
@@ -842,6 +867,7 @@ func (t *Transport) Stats() Stats {
 		ListenerConnections:    perListener,
 		ProxyHeaderTimeouts:    c.proxyHeaderTimeouts.Load(),
 		ProxyHeaderEmpty:       c.proxyHeaderEmpty.Load(),
+		CallbackPanics:         t.panics.Panics(),
 	}
 }
 

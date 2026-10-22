@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -454,5 +455,25 @@ func TestAServePanicAfterACancelIsAnswered487(t *testing.T) {
 	check(t, "upstream", h.upstream(), codes(200, 487))
 	if n := h.p.Stats().HookPanics; n != 1 {
 		t.Errorf("HookPanics = %d, want 1", n)
+	}
+}
+
+// The proxy's transaction layer counts a service's response handler's
+// panics where the proxy counts its hooks' (#445): pcscf's SUBSCRIBE goes
+// through Layer().Request.
+func TestTheProxysLayerCountsAResponseHandlersPanics(t *testing.T) {
+	metrics := &countingMetrics{}
+	h := newHarness(t, Config{Metrics: metrics})
+	req := request(t, "SUBSCRIBE", "sip:bob@192.0.2.30", "Via: SIP/2.0/TCP proxy.example.net;branch=z9hG4bKsub1")
+	if _, err := h.p.Layer().Request(req, transport.Destination{Network: transport.TCP, ServerName: "s"}, func(res *sip.Response, err error) {
+		if res != nil {
+			panic("handler")
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h.reply(h.one(), 200)
+	if n := metrics.count(transaction.MetricHandlerPanics); n != 1 {
+		t.Errorf("%s = %d, want 1", transaction.MetricHandlerPanics, n)
 	}
 }

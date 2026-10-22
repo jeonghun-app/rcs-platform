@@ -17,6 +17,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/msrprelay/store"
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
 	"github.com/jeonghun-app/rcs-platform/internal/proxyproto"
 )
@@ -148,6 +149,13 @@ func newRelay(o relayOptions) (*Relay, error) {
 	o.Edge.UnboundTimeout = o.IdleTimeout
 	o.Edge.Clock, o.Edge.Rand, o.Edge.OnEvent = o.Clock, o.Rand, logged(o.Log, "client", o.Metrics.onEvent(mClientPrefix))
 	o.Core.Clock, o.Core.Rand, o.Core.OnEvent = o.Clock, o.Rand, logged(o.Log, "core", o.Metrics.onEvent(mCorePrefix))
+	// One guard for every connection, both sides, and the goroutines that
+	// read a client's PROXY header (handle), so that the log limit holds
+	// for all of them (#445).
+	guard := panics.New(panics.Config{
+		Metric: msrp.MetricCallbackPanics, Message: "msrp-relay: a panic ended a connection's work", Log: o.Log, Metrics: o.Metrics,
+	})
+	o.Edge.Panics, o.Core.Panics = guard, guard
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Relay{
 		o:        o,
@@ -232,7 +240,9 @@ func (r *Relay) Serve(ln net.Listener) error {
 			continue
 		}
 		r.handled.Add(1)
-		go r.handle(nc)
+		// A panic ends this connection only; handle's deferred calls
+		// close it and count it out first.
+		go r.o.Edge.Panics.Run("handle", func() { r.handle(nc) })
 	}
 }
 

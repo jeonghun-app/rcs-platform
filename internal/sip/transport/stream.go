@@ -168,7 +168,7 @@ func (t *Transport) serveStream(f *flow, accepted bool) {
 		}
 		d.keepAlive(br)
 		if t.cfg.OnPong != nil {
-			t.cfg.OnPong(f.id)
+			t.panics.Run("OnPong", func() { t.cfg.OnPong(f.id) })
 		}
 	}
 	r.OnKeepAlive = func() {

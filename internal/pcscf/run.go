@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -90,6 +91,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		TLS:            tlsCfg,
 		MaxConnections: cfg.MaxConnections,
 		Admit:          fl.admit,
+		Metrics:        rt.Metrics,
 		OnFlowClosed: func(id transport.FlowID, info transport.FlowInfo) {
 			fl.closed(id, info)
 			// A request the core sent the client over this flow gets 430
@@ -141,6 +143,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	pc.clientFlow = func(id transport.FlowID) bool { return isClientFlow(tr, id) }
 	subCtx, stopSubs := context.WithCancel(context.Background())
 	pc.subs = newSubscriptions(subCtx)
+	bgPanics := panics.New(panics.Config{
+		Metric: metricBackgroundPanics, Message: "pcscf: background work panicked", Log: rt.Logger, Metrics: rt.Metrics,
+	})
+	pc.subs.name, pc.subs.panics = "regevent", bgPanics
 	// After the proxy closes, so that every SUBSCRIBE under way has ended.
 	defer pc.subs.close()
 	defer stopSubs()
@@ -151,6 +157,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	anchorCtx, stopAnchor := context.WithCancel(context.Background())
 	pc.msrp = newMSRPAnchor(anchorCtx, relay, newBindingLimit(cfg.MaxBindingsPerFlow, cfg.MaxBindings, cfg.BindingsPerMinute, d.now).
 		coreOfferShare(cfg.MaxCoreOfferBindingsPerFlow, cfg.CoreOfferBindingsPerMinute))
+	pc.msrp.name, pc.msrp.panics = "msrp", bgPanics
 	defer pc.msrp.close()
 	defer stopAnchor()
 	// A closed flow's registrations and MSRP sessions are gone (RFC 5626
