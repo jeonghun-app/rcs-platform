@@ -33,7 +33,6 @@ const (
 	composePeerMSISDN = "+15550100002"
 	hssAPI            = "http://hss:8081"
 	acsURL            = "http://acs:8080"
-	relayControl      = "http://msrp-relay:8082"
 )
 
 func TestE2EComposeStack(t *testing.T) {
@@ -91,19 +90,15 @@ func TestE2EComposeStack(t *testing.T) {
 	}
 
 	// rcs-sim: file transfer through ft-server on S3Mock and DynamoDB Local
-	// with its credentials looked up in hss, and chat through msrp-relay on
-	// DynamoDB Local, rcs-sim standing in for pcscf and rcs-as: it has no
-	// chat over SIP yet (#135). The relay connects to the stand-in on this
-	// container's address.
+	// with its credentials looked up in hss. Chat goes over SIP below,
+	// through pcscf, scscf, rcs-as and msrp-relay (#135); its stand-in
+	// scenarios, which play pcscf and rcs-as themselves, are make e2e's.
 	bin := build(t, "./tools/rcs-sim")
 	self := ownAddress(t)
 	cmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
 		"-ft-upload-url", uploadURL, "-ft-user", impi,
-		"-relay-control", relayControl,
-		"-core-listen", net.JoinHostPort(self, "2855"), "-core-advertise", self,
-		"-msrp-keepalive", "300ms", "-idle-wait", "1500ms",
-		"all")
-	cmd.Env = append(os.Environ(), "RCS_SIM_FT_PASSWORD="+issued.Password, "RCS_SIM_RELAY_TOKEN="+env(t, "RELAY_PCSCF_TOKEN"))
+		"ft", "ft-resume")
+	cmd.Env = append(os.Environ(), "RCS_SIM_FT_PASSWORD="+issued.Password)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
@@ -114,9 +109,7 @@ func TestE2EComposeStack(t *testing.T) {
 	checkResults(t, stdout.String(), stderr.String(), []string{
 		"ft/upload", "ft/download", "ft/download-range", "ft/download-resume", "ft/download-thumbnail",
 		"ft-resume/interrupted-upload", "ft-resume/get_upload_info", "ft-resume/resume", "ft-resume/download",
-		"chat-client-originated/client-to-core", "chat-client-originated/keep-alive", "chat-client-originated/release",
-		"chat-core-originated/connect-then-answer", "chat-core-originated/core-sends-first", "chat-core-originated/release",
-	}, issued.Password, env(t, "RELAY_PCSCF_TOKEN"), impi, self)
+	}, issued.Password, impi)
 
 	// rcs-sim over SIP (#14 PR F2): both subscribers register with IMS AKA,
 	// with the keys stack-seed gave hss, at the P-CSCF acs provisions,
@@ -128,7 +121,12 @@ func TestE2EComposeStack(t *testing.T) {
 	// a MESSAGE, which the default profile takes to rcs-as: rcs-as stores it
 	// and delivers it to the peer, the peer's delivery notification goes
 	// back the same way, and a message to the peer unregistered waits in
-	// rcs-as's queue until it registers again (#135).
+	// rcs-as's queue until it registers again (#135). chat-invite sends
+	// the peer an INVITE with an MSRP offer, which pcscf anchors at
+	// msrp-relay and scscf takes to rcs-as; rcs-as opens a chat to the peer
+	// for the client's message, and a message goes each way, each with its
+	// report and notifications, before the client's BYE ends the chat and
+	// its relay binding.
 	// The client's default profile first: a run cut short before it put
 	// it back would leave the stub's, whose AS is gone, and fail the
 	// first OPTIONS with a 500 that says nothing of why (#473 code review).
@@ -137,7 +135,7 @@ func TestE2EComposeStack(t *testing.T) {
 	sipCmd := exec.CommandContext(ctx, filepath.Join(bin, "rcs-sim"),
 		"-sip-proxy", net.JoinHostPort(pcscf, "5060"), "-sip-transport", "tcp",
 		"-sip-impi", impi, "-sip-peer-impi", composePeerIMSI+"@"+domain,
-		"reg-event", "options", "pager-message")
+		"reg-event", "options", "pager-message", "chat-invite")
 	var sipOut, sipErr bytes.Buffer
 	sipCmd.Stdout, sipCmd.Stderr = &sipOut, &sipErr
 	err = sipCmd.Run()
@@ -150,6 +148,8 @@ func TestE2EComposeStack(t *testing.T) {
 		"options/register", "options/tel-uri", "options/capabilities",
 		"pager-message/register", "pager-message/message", "pager-message/receive",
 		"pager-message/delivery-notification", "pager-message/peer-offline",
+		"chat-invite/register", "chat-invite/invite", "chat-invite/connect", "chat-invite/client-to-peer",
+		"chat-invite/peer-to-client", "chat-invite/bye", "chat-invite/released", "chat-invite/clean",
 	}, env(t, "RCS_SIM_AKA_K"), env(t, "RCS_SIM_AKA_OPC"), env(t, "RCS_SIM_PEER_AKA_K"), env(t, "RCS_SIM_PEER_AKA_OPC"),
 		composeIMSI, composePeerIMSI)
 	// rcs-as took both messages: it answers 202 to one it has stored, which
@@ -158,6 +158,10 @@ func TestE2EComposeStack(t *testing.T) {
 	// to the peer unregistered, reached it once it registered again.
 	if r := sipResults["pager-message/message"]; r.Detail["status"] != 202 {
 		t.Errorf("the MESSAGE was answered %d, not rcs-as's 202", r.Detail["status"])
+	}
+	// So did the peer's delivery notification, a MESSAGE of its own.
+	if r := sipResults["pager-message/delivery-notification"]; r.Detail["status"] != 202 {
+		t.Errorf("the delivery notification's MESSAGE was answered %d, not rcs-as's 202", r.Detail["status"])
 	}
 	if r := sipResults["pager-message/peer-offline"]; r.Detail["status"] != 202 || r.Detail["stored"] != 1 {
 		t.Errorf("the MESSAGE to the unregistered peer was answered %d (stored and delivered: %d), want rcs-as's 202 and its delivery once the peer registered",
@@ -372,8 +376,8 @@ func acsConfiguration(ctx context.Context, t *testing.T, adminToken string) prov
 	return doc
 }
 
-// ownAddress is this container's address on the compose network, where the
-// relay reaches the rcs-as stand-in.
+// ownAddress is this container's address on the compose network, where
+// scscf reaches the stub application servers.
 func ownAddress(t *testing.T) string {
 	t.Helper()
 	addrs, err := net.InterfaceAddrs()

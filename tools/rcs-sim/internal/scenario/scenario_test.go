@@ -141,7 +141,7 @@ func TestUnknownScenariosAreRefusedBeforeAnythingRuns(t *testing.T) {
 	if !errors.Is(err, scenario.ErrUnknown) || ran {
 		t.Fatalf("Run = %v, ran %v", err, ran)
 	}
-	if names := scenario.Names(); strings.Join(names, " ") != "chat-client-originated chat-core-originated ft ft-resume options pager-message reg-event" {
+	if names := scenario.Names(); strings.Join(names, " ") != "chat-client-originated chat-core-originated chat-invite ft ft-resume options pager-message reg-event" {
 		t.Fatalf("Names = %v", names)
 	}
 }

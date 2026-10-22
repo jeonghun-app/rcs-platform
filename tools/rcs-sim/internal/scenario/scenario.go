@@ -120,6 +120,7 @@ var scenarios = map[string]func(*run) error{
 	"ft-resume":              fileTransferResumed,
 	"chat-client-originated": chatClientOriginated,
 	"chat-core-originated":   chatCoreOriginated,
+	"chat-invite":            chatInvite,
 	"pager-message":          pagerMessage,
 	"reg-event":              regEvent,
 	"options":                options,
@@ -129,7 +130,7 @@ var scenarios = map[string]func(*run) error{
 // SIP configuration at all, as a stack without pcscf cannot run them
 // (#135). With SIP configured they run, and one that lacks a setting it
 // needs, such as the peer, fails at its first step rather than vanish.
-var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true, "options": true}
+var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true, "options": true, "chat-invite": true}
 
 // Names lists the built-in scenarios, sorted.
 func Names() []string {

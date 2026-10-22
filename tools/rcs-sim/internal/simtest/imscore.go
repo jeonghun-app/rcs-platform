@@ -789,8 +789,20 @@ func (c *IMSCore) flowFor(uri sip.URI) (transport.FlowID, bool) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	flow, ok := c.bindings[aorKey(uri)]
-	return flow, ok
+	if flow, ok := c.bindings[aorKey(uri)]; ok {
+		return flow, true
+	}
+	// A request in a dialog names the far end's Contact, the dialog's
+	// remote target (RFC 3261 §12.2.1.1), not its IMPU: it goes to the
+	// flow of the registration with that Contact, by user, host and port.
+	for key, contact := range c.contacts {
+		ct, err := sip.ParseURI(contact)
+		if err == nil && ct.User == uri.User && strings.EqualFold(ct.Host, uri.Host) && ct.Port == uri.Port {
+			flow, ok := c.bindings[key]
+			return flow, ok
+		}
+	}
+	return "", false
 }
 
 // route forwards a request to the flow its Request-URI is registered on,
