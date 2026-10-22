@@ -277,6 +277,45 @@ func TestStalledUploadIsCutOffAtTheIdleTimeout(t *testing.T) {
 	}
 }
 
+// The 408 still reaches the client when the handler, having seen the idle
+// timeout, does not get to write it for longer than the idle timeout again,
+// as on a loaded host: the answer's write has no deadline to miss (#211).
+// The handler is held three idle timeouts, a lower bound only.
+func TestAStalledUploadsAnswerSurvivesASlowHandler(t *testing.T) {
+	const idle = 100 * time.Millisecond
+	hold := func() { time.Sleep(3 * idle) }
+	answeringFailure.Store(&hold)
+	t.Cleanup(func() { answeringFailure.Store(nil) })
+	e := newEnv(t, func(o *Options) { o.IdleTimeout = idle })
+	srv := e.serve()
+	u := e.user(alice)
+	conn, err := net.Dial("tcp", srv.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/ft", nil)
+	u.sign(req)
+	body := multipartBody(tidPart("stall"), filePart("a", "text/plain", pattern(testPart)))
+	head := "POST /ft HTTP/1.1\r\nHost: ft\r\nContent-Type: " + formType +
+		"\r\nAuthorization: " + req.Header.Get("Authorization") +
+		"\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n"
+	if _, err := io.WriteString(conn, head+body[:len(body)/2]); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		t.Fatalf("no answer to a stalled upload whose handler was slow: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestTimeout {
+		t.Fatalf("status = %d, want 408", resp.StatusCode)
+	}
+}
+
 // badRecordSource answers like an HSS whose record for the user is
 // unusable.
 type badRecordSource struct{}

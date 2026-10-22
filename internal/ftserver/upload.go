@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
@@ -472,12 +473,28 @@ func (s *Server) failUpload(w http.ResponseWriter, err error) {
 	}
 }
 
-// uploadFailed counts the failure under reason and answers status.
+// uploadFailed counts the failure under reason and answers status. The
+// answer is a few bytes on a connection the server has written nothing to,
+// which the socket takes at once, so its write has no deadline: one of
+// IdleTimeout from here, as extendWrite sets, passed while a loaded host
+// kept the handler from returning, and net/http then closed the connection
+// with no answer at all (#211).
 func (s *Server) uploadFailed(w http.ResponseWriter, reason string, status int) {
 	s.metrics.Count("upload.failed."+reason, 1)
-	s.extendWrite(w)
+	if s.o.IdleTimeout > 0 {
+		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	}
+	if f := answeringFailure.Load(); f != nil {
+		(*f)()
+	}
 	http.Error(w, http.StatusText(status), status)
 }
+
+// answeringFailure, empty but in tests, runs in uploadFailed before the
+// answer is written, so that a test can keep the handler from returning
+// for as long as a loaded host might (#211). It is atomic since a server
+// may outlive the test that set it.
+var answeringFailure atomic.Pointer[func()]
 
 // sweepBatch bounds the records one sweep handles.
 const sweepBatch = 100
