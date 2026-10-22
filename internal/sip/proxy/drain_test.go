@@ -503,13 +503,13 @@ func TestDrainWaitsForItsAnswersForDrainSendWaitInAll(t *testing.T) {
 		}
 	}
 	// Not returned, and not about to on its own: a Drain that gave up at
-	// its context's 50 ms rather than its DrainSendWait returns within
-	// this, while a right one waits for fire however long the host takes
-	// (review of #437).
+	// its context's 50 ms, or on a timer of its own of up to this long,
+	// rather than at its DrainSendWait returns within this, while a right
+	// one waits for fire however long the host takes (reviews of #437).
 	select {
 	case <-done:
 		t.Fatal("Drain returned before its DrainSendWait was over, with its answers still queued")
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond):
 	}
 	close(fire)
 	select {

@@ -433,11 +433,13 @@ func (p *Proxy) answerForStop() int {
 		}
 	}
 	deadline := time.Now().Add(drainSendWait)
-	// One timer for all the answers, not one each (QA of #310).
-	expired := time.After(drainSendWait)
+	// One timer for all the answers, not one each (QA of #310), of one
+	// length whether a test stands in for the timer or not (QA of #437).
+	after := time.After
 	if f := drainTimer.Load(); f != nil {
-		expired = (*f)(drainSendWait)
+		after = *f
 	}
+	expired := after(drainSendWait)
 	for _, ch := range sent {
 		select {
 		case <-ch:
