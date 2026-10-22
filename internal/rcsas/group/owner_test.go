@@ -19,9 +19,10 @@ type ownedStore struct {
 	failBeats                                   atomic.Bool
 	gets, updates, owners, tasks, takeovers, bs atomic.Int64
 	// takeOverGate, when set, holds each TakeOver until it is closed, and
-	// beatGate each Beat, as a store call slower than the lease would.
-	takeOverGate, beatGate atomic.Pointer[chan struct{}]
-	arrived, beatsHeld     atomic.Int64
+	// beatGate each Beat, as a store call slower than the lease would;
+	// ownerGate holds the answer of each Owner read, made already.
+	takeOverGate, beatGate, ownerGate atomic.Pointer[chan struct{}]
+	arrived, beatsHeld, ownersHeld    atomic.Int64
 }
 
 func newOwnedStore() *ownedStore { return &ownedStore{Memory: groupstore.NewMemory()} }
@@ -38,7 +39,12 @@ func (s *ownedStore) Update(ctx context.Context, g groupstore.Group, o groupstor
 
 func (s *ownedStore) Owner(ctx context.Context, uri string) (groupstore.Owner, error) {
 	s.owners.Add(1)
-	return s.Memory.Owner(ctx, uri)
+	o, err := s.Memory.Owner(ctx, uri)
+	if g := s.ownerGate.Load(); g != nil {
+		s.ownersHeld.Add(1)
+		<-*g
+	}
+	return o, err
 }
 
 func (s *ownedStore) Task(ctx context.Context, id string) (groupstore.Task, error) {
@@ -492,5 +498,40 @@ func TestALapseOfItsOwnIsNotTakenForAnotherOwner(t *testing.T) {
 	a.pass(t, time.Second) // the next beat lands, within a heartbeat
 	if owns, err := a.s.Owns(t.Context(), g.URI); err != nil || !owns {
 		t.Fatalf("a's Owns once a beat landed = %v, %v", owns, err)
+	}
+}
+
+// The code review's reproduction (#440, re-review minor): an owner read
+// whose answer is held up past the lease, while another task takes the
+// group over and this task's late beat forgets its groups, is remembered
+// as of when it was asked, not when it came: the next Owns reads the
+// owner again, rather than taking the old answer for a fresh one for a
+// heartbeat.
+func TestAnOwnerAnswerHeldPastTheLeaseIsNotTakenForFresh(t *testing.T) {
+	a, b, sa, _ := twoTasks(t, Config{}, Config{})
+	g := a.create(bob)
+	a.pass(t, DefaultTaskHeartbeat) // what a remembers is a heartbeat old
+	gate := make(chan struct{})
+	sa.ownerGate.Store(&gate)
+	asked := make(chan bool, 1)
+	go func() {
+		owns, _ := a.s.Owns(context.Background(), g.URI)
+		asked <- owns
+	}()
+	waitFor(t, "the held owner read", func() bool { return sa.ownersHeld.Load() == 1 })
+	sa.failBeats.Store(true)
+	a.passFailing(t, sa, DefaultTaskLease)
+	// a's last stored beat was a heartbeat in.
+	b.pass(t, DefaultTaskHeartbeat+DefaultTaskLease+DefaultTaskSkew)
+	if err := b.add(t, g.URI, carol); err != nil {
+		t.Fatal(err)
+	}
+	sa.failBeats.Store(false)
+	a.pass(t, DefaultTaskHeartbeat) // the late beat forgets a's groups
+	sa.ownerGate.Store(nil)
+	close(gate)
+	<-asked // the held call's own answer is the old one: no fence for it
+	if owns, err := a.s.Owns(t.Context(), g.URI); err != nil || owns {
+		t.Fatalf("a's next Owns = %v, %v", owns, err)
 	}
 }
