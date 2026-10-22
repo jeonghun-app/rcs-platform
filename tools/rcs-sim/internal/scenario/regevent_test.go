@@ -401,19 +401,24 @@ func staleContact(body string) string {
 		`<contact id="c9" state="active" event="registered" expires="600"><uri>sip:192.0.2.9:5060;transport=tcp</uri></contact></registration>`, 1)
 }
 
-// TestTheRegEventToleratesARepeatedFullNotify (#473 QA): a network that
-// sends a subscription's first NOTIFY twice, the state the same and the
-// version raised, still passes: each step waits for the NOTIFY of the
-// change it made, and skips, counted, those before it.
-func TestTheRegEventToleratesARepeatedFullNotify(t *testing.T) {
+// TestTheRegEventToleratesRepeatedNotifies (#473 QA, #516): a network
+// that sends every NOTIFY of an active subscription twice, the state the
+// same and the version raised, still passes: each step waits for the
+// NOTIFY of the change it made, and skips, counted, the repeat before it.
+// The core gives each active contact its REGISTER's CSeq, as scscf does,
+// so re-register accepts its NOTIFY by the CSeq.
+func TestTheRegEventToleratesRepeatedNotifies(t *testing.T) {
 	cfg, core := sipStack(t)
 	cfg.StepTimeout = 3 * time.Second
-	core.RepeatFirstNotify = true
+	core.RepeatNotifies = true
 	ok, results := runAll(t, cfg, "reg-event")
 	if !ok {
 		t.Fatalf("results %+v", results)
 	}
-	if got := byStep(results)["re-register"].Detail["skipped"]; got != 1 {
-		t.Errorf("re-register skipped %d NOTIFYs, want the repeated one", got)
+	steps := byStep(results)
+	for _, step := range []string{"re-register", "unregister", "network-deregister"} {
+		if got := steps[step].Detail["skipped"]; got != 1 {
+			t.Errorf("%s skipped %d NOTIFYs, want the repeated one", step, got)
+		}
 	}
 }
