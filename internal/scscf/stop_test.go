@@ -192,11 +192,11 @@ func (b *blackholeDialer) DialContext(ctx context.Context, network, address stri
 // TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling (#439
 // code review): a set's third-party REGISTERs go one after the other to a
 // server whose address drops the SYN, each dial lasting the dial timeout.
-// The one dialling when the stop gives up neither ends with its context nor
-// with the transport's Close (#462); closeMargin is longer than the dial
-// timeout, so it still ends before the stop's deadline. The stop is timed
-// so that, with a closeMargin of 1 s, a dial would begin just before the
-// waits end and run 1.8 s past the deadline.
+// The one dialling when the stop gives up does not end with its context
+// (#462), but the transport's Close cuts it (#474), so the stop ends before
+// its deadline although the dial timeout, 2.5 s, is longer than the 2 s
+// step 5 waits for the sends. The stop is timed so that, with a
+// closeMargin of 1 s, a dial would begin just before the waits end.
 func TestAStopEndsWithinItsBudgetWithAThirdPartyREGISTERStillDialling(t *testing.T) {
 	const dialTimeout = 2500 * time.Millisecond
 	hss := startHSS(t)

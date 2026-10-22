@@ -66,10 +66,10 @@ const (
 	// closeMargin is the part of stopMargin before returnMargin kept for
 	// the closes: the transport's, the sends the router gave up on, and the
 	// Cx client's goodbye to the HSS. The sends get all of it but
-	// goodbyeMargin, which is longer than coreDialTimeout, so that one that
-	// began to open its connection just before the waits ended is done
-	// within it even should the transport's Close not cut its dial (#439
-	// code review, #474).
+	// goodbyeMargin, as long as coreDialTimeout. The transport's Close cuts
+	// a dial in progress (#474); were it not to, a send that began to open
+	// its connection just before the waits ended would still be done
+	// within that time (#439 code review).
 	closeMargin = 3 * time.Second
 	// goodbyeMargin is the end of closeMargin the Cx client's goodbye (DPR)
 	// always has, however long the router's sends take to return (#502).

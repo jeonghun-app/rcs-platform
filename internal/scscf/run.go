@@ -66,8 +66,9 @@ type deps struct {
 	// sendQueueBytes its SendQueueBytes.
 	writeTimeout   time.Duration
 	sendQueueBytes int
-	// dialTimeout replaces coreDialTimeout when set; it must stay below
-	// closeMargin.
+	// dialTimeout replaces coreDialTimeout when set. It may be longer than
+	// the sends' wait, closeMargin less goodbyeMargin, since the
+	// transport's Close cuts a dial (#474).
 	dialTimeout time.Duration
 	// router, if set, routes in place of the dispatcher.
 	router proxy.Router
