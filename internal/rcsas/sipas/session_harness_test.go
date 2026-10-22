@@ -473,6 +473,30 @@ func (c *fakeClock) fireSince(t *testing.T, mark int, d time.Duration) {
 	}
 }
 
+// fireFirstSince waits for a timer of duration d to be armed since mark,
+// and runs the first one armed, once: for a test that knows which of
+// several comes first.
+func (c *fakeClock) fireFirstSince(t *testing.T, mark int, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(waitFor)
+	for {
+		c.mu.Lock()
+		for _, tm := range c.timers[mark:] {
+			if !tm.stopped && tm.d == d {
+				tm.stopped = true
+				c.mu.Unlock()
+				tm.f()
+				return
+			}
+		}
+		c.mu.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatalf("no timer of %v armed since the mark", d)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // fire runs every armed timer of duration d, once.
 func (c *fakeClock) fire(d time.Duration) {
 	c.mu.Lock()
