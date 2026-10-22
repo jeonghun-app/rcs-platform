@@ -311,6 +311,16 @@ func (q quietSender) SendResponse(res *sip.Response, src transport.Source, opts 
 	return q.Sender.SendResponse(res, src, opts...)
 }
 
+// holdFinal holds res for a *transport.Transport sender's Flush until its
+// SendResponse begins, and returns the release, which respondFinal calls
+// once the transaction has done with it, whether it sent it or not.
+func (p *Proxy) holdFinal(res *sip.Response) (release func()) {
+	if tr, ok := p.sender.(*transport.Transport); ok {
+		return tr.HoldResponse(res)
+	}
+	return func() {}
+}
+
 // silence ends a server transaction without a response (RFC 4320 §4.2, and
 // Decision.Discard): the transaction is given res, which quietSender never
 // sends, so it completes and absorbs retransmissions as if it had answered.
