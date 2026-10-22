@@ -258,6 +258,9 @@ func TestARegistrationOnAnotherTaskWakesTheOwner(t *testing.T) {
 		t.Fatalf("REGISTER answered %d", res.StatusCode)
 	}
 	waitUntil(t, "a woken", func() bool { return ga.metrics.get("sip.group.woken") == 1 })
+	// b counts the wake once its send returns, which a may answer first
+	// (#564).
+	waitUntil(t, "the wake counted sent", func() bool { return gb.metrics.get("group.wake_sent") >= 1 })
 	if gb.metrics.get("group.wake_sent") != 1 || gb.metrics.get("sip.loop") != 0 || ga.metrics.get("sip.loop") != 0 {
 		t.Fatalf("wakes sent %d; loops %d, %d", gb.metrics.get("group.wake_sent"), gb.metrics.get("sip.loop"), ga.metrics.get("sip.loop"))
 	}

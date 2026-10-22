@@ -481,7 +481,7 @@ type gatedHSS struct {
 }
 
 func (g *gatedHSS) MAR(ctx context.Context, r *cx.MAR) (*cx.MAA, error) {
-	if len(r.AuthDataItem.Authorization) > 0 {
+	if !r.AuthDataItem.Authorization.IsZero() {
 		g.entered <- struct{}{}
 		<-g.gate
 		if g.fail {
@@ -602,7 +602,7 @@ type overloadedHSS struct {
 func (o *overloadedHSS) fail(ctx context.Context, r *cx.MAR) (*cx.MAA, error, bool) {
 	o.mu.Lock()
 	mode := o.mode
-	resync := len(r.AuthDataItem.Authorization) > 0
+	resync := !r.AuthDataItem.Authorization.IsZero()
 	switch {
 	case mode == "resync-timeout" && resync:
 		o.mode = ""

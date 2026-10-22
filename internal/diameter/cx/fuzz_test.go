@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/diameter"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // requestMessage and answerMessage are what every typed request and answer
@@ -52,7 +53,7 @@ func fuzzSeeds(tb testing.TB) [][]byte {
 		AuthDataItem: AuthDataItem{Scheme: SchemeSIPDigest}}).Message(scscf))
 	add(mar, nil)
 	add((&MAA{Answer: answer(ResultCode(diameter.ResultSuccess)), NumberAuthItems: 2, AuthDataItems: []AuthDataItem{
-		{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5, Authenticate: seq(32, 0), Authorization: seq(8, 0), ConfidentialityKey: seq(16, 0), IntegrityKey: seq(16, 0)},
+		{ItemNumber: 1, Scheme: SchemeDigestAKAv1MD5, Authenticate: seq(32, 0), Authorization: secret.NewKey(seq(8, 0)), ConfidentialityKey: secret.NewKey(seq(16, 0)), IntegrityKey: secret.NewKey(seq(16, 0))},
 		{ItemNumber: 2, Scheme: SchemeSIPDigest, Digest: &DigestAuthenticate{Realm: realm, Algorithm: "MD5", QoP: "auth", HA1: "00"}},
 	}}).Message(hss, mar))
 	rtr := must((&RTR{Request: Request{DestinationHost: scscfHost, DestinationRealm: realm}, UserName: impi, PublicIdentities: []string{impu},
@@ -106,7 +107,7 @@ func FuzzParseCommands(f *testing.F) {
 		if rebuilt == nil {
 			return
 		}
-		if !reflect.DeepEqual(got, again) {
+		if !deepEqual(got, again) {
 			t.Fatalf("rebuilt message parses differently:\n%+v\n%+v", got, again)
 		}
 	})

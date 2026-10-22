@@ -57,7 +57,8 @@ type relayPaths struct {
 }
 
 // relayClient calls the control API with pcscf's bearer token, which
-// prints as "[redacted]" under every verb (#538).
+// prints as "[redacted]" under the valid verbs and as its closure's address
+// under the invalid ones, never as its bytes (#538, #570).
 type relayClient struct {
 	base   *url.URL
 	token  secret.Key

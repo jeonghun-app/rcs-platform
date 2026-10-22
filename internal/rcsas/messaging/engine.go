@@ -206,9 +206,15 @@ type Engine struct {
 	legs       map[legKey][]*Leg
 	invites    map[inviteKey]inviteMark
 	pagerOnly  map[string]struct{}
-	// flows numbers each user's latest registration on a new flow
-	// (UserRegistered), from flowSeq; see Invitation.flow.
+	// flows numbers each user's latest registration on a new flow here
+	// (UserRegistered), from flowSeq; see Invitation.flow. wokeAt numbers,
+	// from the same sequence, the latest wake that told the owner of a
+	// group invitation's registration on another task (Wake): only that
+	// group's invitations are overtaken by it, and only flows is told on
+	// to other owners (wakeOwner), so that a registration relayed once is
+	// not relayed back (#564, code review of #576).
 	flows   map[string]uint64
+	wokeAt  map[inviteKey]uint64
 	flowSeq uint64
 	groups  GroupHandler
 	// departed marks the participants that left a group on this task
@@ -222,8 +228,8 @@ type Engine struct {
 	// read their queue (GroupHandler.WakeOwner), until when it does not
 	// ask again.
 	woken map[legKey]time.Time
-	// wokeFlow is the user's registration on a new flow (flows) the last
-	// wake for a participant told the owner of, and wakesOut the wakes on
+	// wokeFlow is the user's registration on a new flow here (flows) the
+	// last wake for a participant told the owner of, and wakesOut the wakes on
 	// their way, at most maxWakesOut.
 	wokeFlow map[legKey]uint64
 	wakesOut int
@@ -271,8 +277,8 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		legs:       map[legKey][]*Leg{},
 		invites:    map[inviteKey]inviteMark{},
 		pagerOnly:  map[string]struct{}{},
-		flows:      map[string]uint64{},
-		departed:   map[legKey]time.Time{}, unreachable: map[legKey]time.Time{}, woken: map[legKey]time.Time{},
+		flows:      map[string]uint64{}, wokeAt: map[inviteKey]uint64{},
+		departed: map[legKey]time.Time{}, unreachable: map[legKey]time.Time{}, woken: map[legKey]time.Time{},
 		wokeFlow: map[legKey]uint64{}, wakeRetries: map[string]bool{},
 		groupLegs: map[string]int{},
 		summaries: map[legKey]*summaryState{},
@@ -625,6 +631,15 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 func (e *Engine) InviteFailed(inv Invitation, err error) {
 	key := inviteKey{inv.Recipient, inv.Peer, inv.Mode, inv.QueueID}
 	e.mu.Lock()
+	woke, wokeOK := e.wokeAt[key]
+	if wokeOK && inv.asked < woke && !errors.Is(err, ErrLooped) {
+		// A wake told of the recipient's registration on another task
+		// after this group's session was asked for, and had its copies
+		// read again (Wake).
+		e.mu.Unlock()
+		e.metrics.Count("invite.failed_overtaken", 1)
+		return
+	}
 	if cur, ok := e.flows[inv.Recipient]; ok && cur != inv.flow && !errors.Is(err, ErrLooped) {
 		// The recipient registered on a new flow after the session was
 		// asked for: marking the failure now would hold the queue past
