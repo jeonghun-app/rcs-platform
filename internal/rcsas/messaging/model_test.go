@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
@@ -243,7 +244,7 @@ func TestMessagesOfAPairWithoutAConversationIDShareOne(t *testing.T) {
 		{Sender: alice, Recipient: bob, Conversation: Conversation{ID: "own", Contribution: "c3"}},
 		{Sender: alice, Recipient: bob},
 	} {
-		o.Mode, o.Pager, o.CPIM = store.Standalone, true, chat(t, "", "hi", 0)
+		o.Mode, o.Pager, o.CPIM = store.Standalone, true, content.BodyOf(chat(t, "", "hi", 0))
 		if err := r.e.Submit(t.Context(), o); err != nil {
 			t.Fatal(err)
 		}

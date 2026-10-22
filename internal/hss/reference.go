@@ -34,6 +34,9 @@ func (r *refRequest) SDPLines() []string              { return r.sdp }
 const (
 	refUser = "sip:user@example.invalid"
 	refPeer = "sip:peer@example.invalid"
+	// refConference is a group chat's conference URI, at a conference host
+	// outside the home domain, as rcs-as gives one.
+	refConference = "sip:chat-0123456789abcdef0123456789abcdef@conf.example.invalid"
 )
 
 // rcsTags are the feature tags of a client with the common RCS services.
@@ -100,7 +103,16 @@ func referenceRequests() []*refRequest {
 		ifc.HeaderField{Name: "P-Preferred-Service", Value: "urn:urn-7:3gpp-service.ims.icsi.oma.cpm.msg"},
 		ifc.HeaderField{Name: "Content-Type", Value: "message/cpim"},
 	)
-	return []*refRequest{register, invite, message}
+	// A group chat's roster SUBSCRIBE (RFC 4575), to its conference URI,
+	// as rcsjta sends it.
+	subscribe := &refRequest{name: "roster SUBSCRIBE", method: "SUBSCRIBE", uri: refConference}
+	subscribe.headers = append(commonHeaders("SUBSCRIBE"),
+		ifc.HeaderField{Name: "Contact", Value: "<" + refUser + ";gr=urn:uuid:00000000-0000-4000-8000-000000000000>" + rcsTags},
+		ifc.HeaderField{Name: "Event", Value: "conference"},
+		ifc.HeaderField{Name: "Accept", Value: "application/conference-info+xml"},
+		ifc.HeaderField{Name: "Expires", Value: "3600"},
+	)
+	return []*refRequest{register, invite, message, subscribe}
 }
 
 // referenceContexts are the session cases a profile is evaluated in.

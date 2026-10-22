@@ -48,11 +48,14 @@ type diameterHSS struct {
 	addr  string
 	node  *diameter.Node
 	asURI atomic.Pointer[string]
-	mu    sync.Mutex
-	sars  []*cx.SAR
-	aka   *milenage.Milenage
-	sqn   milenage.SQN
-	rands uint64
+	// asMethod, if set, is the method the server's criterion triggers on,
+	// in place of REGISTER.
+	asMethod atomic.Pointer[string]
+	mu       sync.Mutex
+	sars     []*cx.SAR
+	aka      *milenage.Milenage
+	sqn      milenage.SQN
+	rands    uint64
 }
 
 // startHSS starts an HSS whose subscriber registers with SIP Digest.
@@ -115,9 +118,13 @@ func startHSSOf(t *testing.T, aka *milenage.Milenage) *diameterHSS {
 		h.mu.Unlock()
 		sp := ifc.ServiceProfile{PublicIdentities: []ifc.PublicIdentity{{Identity: impu}}}
 		if as := h.asURI.Load(); as != nil {
+			method := "REGISTER"
+			if m := h.asMethod.Load(); m != nil {
+				method = *m
+			}
 			sp.InitialFilterCriteria = []ifc.FilterCriteria{{
 				Priority:          40,
-				TriggerPoint:      &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: []ifc.SPT{{Condition: ifc.Method("REGISTER"), Groups: []int{0}}}},
+				TriggerPoint:      &ifc.TriggerPoint{ConditionTypeCNF: true, SPTs: []ifc.SPT{{Condition: ifc.Method(method), Groups: []int{0}}}},
 				ApplicationServer: ifc.ApplicationServer{ServerName: *as, DefaultHandling: ifc.SessionContinued},
 			}}
 		}

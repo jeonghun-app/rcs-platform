@@ -193,7 +193,7 @@ func TestAGroupIsCreatedAtTheFactoryAndItsInviteesInvited(t *testing.T) {
 		}
 		from, _ := c.From()
 		to, _ := c.To()
-		if from.URI != alice || from.Name != "Alice" || len(to) != 1 || to[0].URI != uri || string(c.Body) != "hi all" {
+		if from.URI != alice || from.Name != "Alice" || len(to) != 1 || to[0].URI != uri || string(c.Body.Bytes()) != "hi all" {
 			t.Fatalf("%s got From %v To %v: %q", who, from, to, c.Body)
 		}
 	}

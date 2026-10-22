@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
@@ -34,7 +35,7 @@ func message(recipient, id string, enqueued time.Time) store.Message {
 	return store.Message{
 		Recipient: recipient, ID: id, Sender: alice,
 		Conversation: "conv-1", Contribution: "contrib-1", Mode: store.Chat,
-		MessageID: "m-" + id, CPIM: []byte("From: <" + alice + ">\r\n\r\nContent-Type: text/plain\r\n\r\nhi " + id),
+		MessageID: "m-" + id, CPIM: content.BodyOf([]byte("From: <" + alice + ">\r\n\r\nContent-Type: text/plain\r\n\r\nhi " + id)),
 		Enqueued: enqueued, Expires: enqueued.Add(time.Hour),
 	}
 }
@@ -79,7 +80,7 @@ func pendingOrder(t *testing.T, s store.Store) {
 	}
 	want := message(bob, "0001", t0.Add(time.Second))
 	if g := got[0]; g.Sender != want.Sender || g.Conversation != want.Conversation || g.Contribution != want.Contribution ||
-		g.Mode != want.Mode || g.MessageID != want.MessageID || !bytes.Equal(g.CPIM, want.CPIM) ||
+		g.Mode != want.Mode || g.MessageID != want.MessageID || !bytes.Equal(g.CPIM.Bytes(), want.CPIM.Bytes()) ||
 		!g.Enqueued.Equal(want.Enqueued) || !g.Expires.Equal(want.Expires) || g.Owner != "" {
 		t.Fatalf("Pending returned %+v, want %+v", g, want)
 	}
@@ -273,7 +274,7 @@ func retriedWrites(t *testing.T, s store.Store) {
 	}
 	// The repeat of a claim that took effect gets the message again; the
 	// same owner with another lease is a new claim, which is refused.
-	if again, err := s.Claim(ctx, bob, "0001", "task-a", t0, until); err != nil || again.Owner != "task-a" || !bytes.Equal(again.CPIM, m.CPIM) {
+	if again, err := s.Claim(ctx, bob, "0001", "task-a", t0, until); err != nil || again.Owner != "task-a" || !bytes.Equal(again.CPIM.Bytes(), m.CPIM.Bytes()) {
 		t.Fatalf("repeated Claim = %+v, %v", again, err)
 	}
 	if _, err := s.Claim(ctx, bob, "0001", "task-a", t0, until.Add(time.Second)); !errors.Is(err, store.ErrConflict) {

@@ -40,6 +40,8 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 )
 
 // ContentType is the MIME type of a CPIM body.
@@ -117,8 +119,9 @@ type Message struct {
 	// §2.4 requires a Content-Type among them.
 	ContentHeaders []Field
 	// Body is the encapsulated content, ending where the transport's framing
-	// ends (RFC 3862 §2).
-	Body []byte
+	// ends (RFC 3862 §2). It is chat content, held where no verb or encoder
+	// shows it (#547).
+	Body content.Body
 
 	deviations Deviation
 }
@@ -294,7 +297,7 @@ func (l Limits) Parse(data []byte) (*Message, error) {
 		}
 		m.ContentHeaders = append(m.ContentHeaders, f)
 	}
-	m.Body = bytes.Clone(rest)
+	m.Body = content.BodyOf(bytes.Clone(rest))
 
 	if err := m.checkStructure(); err != nil {
 		return nil, err
@@ -340,7 +343,7 @@ func (m *Message) Marshal() ([]byte, error) {
 		b.WriteString("\r\n")
 	}
 	b.WriteString("\r\n")
-	b.Write(m.Body)
+	b.Write(m.Body.Bytes())
 	return b.Bytes(), nil
 }
 

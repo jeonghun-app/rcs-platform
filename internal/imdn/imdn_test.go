@@ -9,6 +9,7 @@ import (
 	"testing/iotest"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 )
 
@@ -231,7 +232,7 @@ func chatToBob(t *testing.T) *cpim.Message {
 		}
 	}
 	m.ContentHeaders = []cpim.Field{{Name: "Content-Type", Value: "text/plain"}}
-	m.Body = []byte("Hi")
+	m.Body = content.BodyOf([]byte("Hi"))
 	return m
 }
 

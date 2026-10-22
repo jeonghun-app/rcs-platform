@@ -68,7 +68,7 @@ type loggedMessage struct {
 }
 
 func (m Message) logged() loggedMessage {
-	l := loggedMessage{Headers: make([]string, len(m.Headers)), BodyBytes: len(m.Body)}
+	l := loggedMessage{Headers: make([]string, len(m.Headers)), BodyBytes: m.Body.Len()}
 	for i, h := range m.Headers {
 		l.Headers[i] = pii.Redact(h.Name)
 	}

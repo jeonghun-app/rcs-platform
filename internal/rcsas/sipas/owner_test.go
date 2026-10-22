@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
@@ -248,7 +249,7 @@ func TestARegistrationOnAnotherTaskWakesTheOwner(t *testing.T) {
 	ga, gb := twoTasks(t, bob)
 	now := time.Now() // the engines' clock
 	if err := gb.store.Enqueue(t.Context(), store.Message{Recipient: bob, ID: "c1", Sender: ga.uri, Author: alice, Mode: store.Group,
-		CPIM: []byte(cpimBody("m1", "hi")), Enqueued: now, Expires: now.Add(time.Hour)}, store.Limit{}); err != nil {
+		CPIM: content.BodyOf([]byte(cpimBody("m1", "hi"))), Enqueued: now, Expires: now.Add(time.Hour)}, store.Limit{}); err != nil {
 		t.Fatal(err)
 	}
 	reg := msg{method: "REGISTER", uri: "sip:rcs-as." + domain, from: "<sip:scscf." + domain + ">;tag=s1",

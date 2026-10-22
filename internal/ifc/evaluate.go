@@ -71,7 +71,7 @@ const (
 	// Patterns near MaxPatternBytes fit the instruction budget in dozens,
 	// and 47 of them took about half a second (#111); now the tenth is
 	// refused. A profile of MaxCriteria ordinary RCS criteria costs about
-	// 921 000 units, and the default RCS profile about 21 000. Measured on
+	// 921 000 units, and the default RCS profile about 36 000. Measured on
 	// a 32-core development host at load 140 to 230, a set at the bound of
 	// the baseline shape (case-folded negated classes, 4 KiB) took 39 to
 	// 48 ms of CPU, 33 to 70 ms of wall time; sets of other 4 KiB shapes

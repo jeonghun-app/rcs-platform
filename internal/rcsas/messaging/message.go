@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -21,8 +22,9 @@ const AnonymousURI = "sip:anonymous@anonymous.invalid"
 // what the engine needs from its headers.
 type Message struct {
 	// Raw is the message/cpim body as received, which is what gets
-	// forwarded.
-	Raw  []byte
+	// forwarded: chat content, held where no verb or encoder shows it
+	// (#547).
+	Raw  content.Body
 	CPIM *cpim.Message
 	From cpim.Address
 	// Request is what the sender asked for; zero Dispositions when nothing,
@@ -58,7 +60,7 @@ func ParseMessage(raw []byte, maxSize int) (*Message, error) {
 	if !singleAddresses(c) {
 		return nil, reject(ReasonMalformed, errAmbiguousSender)
 	}
-	m := &Message{Raw: raw, CPIM: c, From: from}
+	m := &Message{Raw: content.BodyOf(raw), CPIM: c, From: from}
 	if imdn.IsNotification(c) {
 		n, err := imdn.ParseNotificationMessage(c)
 		if err != nil {

@@ -26,6 +26,18 @@ The proxy hands each request to the part that serves it:
   was set up through, a P-CSCF on `RCS_PCSCF_CORE_PORT`, or an application
   server in `SCSCF_APPLICATION_SERVERS`.
 
+An application server reached by name, such as `rcs-as.<namespace>`, has
+every address of its DNS answer tried (RFC 3263 §4.3). A branch that could
+not be sent, for want of a connection, or an INVITE with not even a 100
+Trying before Timer B, goes on to the next address before the criterion's
+default handling, and is counted in `routing.as_failover`. The address is
+then tried last for the DNS TTL (10 s), during which a stopped task may
+still be in the answer. The default handling applies once every address has
+failed; SESSION_TERMINATED then answers 500 with `Retry-After` (#574). A
+request that reached a server is not failed over: one it answered, even
+with a provisional response, one it may have sent back (a request other than
+INVITE that met Timer F), or one whose `SCSCF_AS_TIMEOUT` passed.
+
 What `scscf` sends itself, NOTIFYs and third-party REGISTERs, goes in client
 transactions over the core listener, to the first `Route` or else the
 Request-URI.
@@ -132,6 +144,11 @@ Alarm on a rise of these:
   sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
   the request or the call it was in; alarm on any.
 
+`routing.as_failover` counts requests sent on to another address of an
+application server whose first could not be reached: a stopped task still in
+the DNS answer. A burst at a deploy is expected; a steady rate says an
+address in the answer is gone.
+
 `routing.third_party.evicted` counts refreshes an end took the place of in a
 full queue: a server that does not keep up. Each is made good by the user's
 next re-registration, so it needs no alarm of its own, but a steady rate says
@@ -156,16 +173,18 @@ On `SIGTERM`, `scscf` keeps its listener open and runs these steps in order:
 5. It closes the transport, disconnects from the HSS tasks (DPR), and closes
    the proxy.
 
-The stop ends by its deadline, `SCSCF_DRAIN_TIMEOUT` plus 4.5 s from the
-`SIGTERM`: half a second inside `RCS_SHUTDOWN_TIMEOUT` at the default drain,
-for the proxy's Close and the return. Steps 3 and 4 end 3 s before that
-deadline, and step 5 has those 3 s. Closing the transport cuts a connection
-still opening to a peer. In step 5, the third-party REGISTERs given up on in
-step 3 are waited for once the transport has closed, for 2 s, until 1 s
-before the deadline. That is as long as a connection takes to open or fail,
-so a REGISTER that began to open one as the waits ended would be done within
-it even if the close did not cut it. Then the Cx client says goodbye: it
-always has that last second, however slow the REGISTERs are to return.
+The stop ends by its deadline, `SCSCF_DRAIN_TIMEOUT` plus 3.5 s from the
+`SIGTERM`. At the default drain, its own work therefore finishes 1.5 s before
+`RCS_SHUTDOWN_TIMEOUT`. That time is for the proxy's Close and the return,
+and for the last wait to end late on a loaded host, where the process may not
+run for a while: a goodbye was seen to end 1.35 s past its deadline (#502).
+Steps 3 and 4 end 2 s before that deadline, and step 5 has those 2 s. Closing
+the transport cuts a connection still opening to a peer, so the third-party
+REGISTERs given up on in step 3 return at once. They get 1 s, until 1 s
+before the deadline. Then the Cx client says goodbye in that last second,
+however slow the REGISTERs are to return. A stop that reaches the goodbye
+late, on a host that did not run it for a while, still gives it 100 ms to
+send its DPR, out of the 1.5 s.
 
 An application server that missed a third-party REGISTER at a stop hears of
 the registration at its next refresh. What the stop leaves undone is the other
