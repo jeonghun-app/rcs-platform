@@ -562,6 +562,16 @@ func (s *Session) chunk(id string, out Outgoing, sr ReportMode, r ByteRange, dat
 // sendEmpty sends a bodiless SEND, the form §5.4 uses to bind a connection
 // and §7.1 suggests for keeping NAT bindings alive.
 func (s *Session) sendEmpty(ctx context.Context, c *Conn, onResult func(code int, comment string)) error {
+	return s.sendBodiless(ctx, c, sendWait, onResult)
+}
+
+// sendProbe sends a bodiless SEND as c's probe, which waits ProbeTimeout
+// for its answer (Config.ProbeOnTimeout).
+func (s *Session) sendProbe(c *Conn, onResult func(code int, comment string)) error {
+	return s.sendBodiless(context.Background(), c, sendMode{timeout: c.cfg.ProbeTimeout, probe: true}, onResult)
+}
+
+func (s *Session) sendBodiless(ctx context.Context, c *Conn, mode sendMode, onResult func(code int, comment string)) error {
 	id, err := NewMessageID(c.cfg.Rand)
 	if err != nil {
 		return err
@@ -573,7 +583,7 @@ func (s *Session) sendEmpty(ctx context.Context, c *Conn, onResult func(code int
 		FromPath:  []URI{s.local},
 		MessageID: id,
 		ByteRange: &ByteRange{Start: 1, End: 0, Total: 0},
-	}, sendWait, onResult)
+	}, mode, onResult)
 }
 
 func (s *Session) armKeepAlive(c *Conn, after time.Duration) {

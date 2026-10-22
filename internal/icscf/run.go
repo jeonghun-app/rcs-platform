@@ -54,6 +54,11 @@ type deps struct {
 	sipDialer transport.Dialer
 	// hssResolver, if set, resolves hss.<namespace> for DNS discovery.
 	hssResolver cxclient.Resolver
+	// hssReconnect, when set, is the Cx connections' reconnect delay,
+	// first and longest, in place of the backoff that grows to 30 s: a
+	// test then sees an HSS that comes back reconnected at once, however
+	// long it was gone.
+	hssReconnect time.Duration
 	// listening, if set, hears the core listener's bound address.
 	listening func(netip.AddrPort)
 	// transport, if set, gets the SIP transport once it is made.
@@ -258,7 +263,7 @@ func newCxClient(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d 
 	c, err := cxclient.New(cxclient.Config{
 		OriginHost: host, OriginRealm: cfg.OriginRealm, DestinationRealm: cfg.HSSRealm,
 		Discovery: disc, HSS: "hss." + cfg.Namespace, Resolver: d.hssResolver, HSSHostPattern: cfg.HSSHostPattern,
-		RequestTimeout: cfg.CxTimeout, Node: diameter.Config{Dial: d.dial},
+		RequestTimeout: cfg.CxTimeout, Node: diameter.Config{Dial: d.dial, ReconnectMin: d.hssReconnect, ReconnectMax: d.hssReconnect},
 		Metrics: rt.Metrics, Logger: rt.Logger,
 	})
 	if err != nil {
