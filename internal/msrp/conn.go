@@ -52,6 +52,10 @@ const (
 	// DefaultMaxReassemblyLifetime gives a 1 MiB message room to arrive at
 	// about 4 KiB/s.
 	DefaultMaxReassemblyLifetime = 5 * time.Minute
+	// DefaultProbeTimeout is how long a probe (Config.ProbeOnTimeout)
+	// waits for its answer. The next hop answers a bodiless SEND itself,
+	// so it needs far less than a transaction may take.
+	DefaultProbeTimeout = 10 * time.Second
 )
 
 // unboundQueueBytes bounds the answers queued on a passive connection
@@ -172,6 +176,23 @@ type Config struct {
 	// strategy §7.1.1 allows. Zero means DefaultChunkSize.
 	ChunkSize int
 
+	// ProbeOnTimeout makes a request that times out on this connection
+	// send a probe at once: a bodiless SEND on one of its sessions, which
+	// the next hop answers itself without forwarding it (a relay, Bridge)
+	// or as the endpoint it is. A probe unanswered within ProbeTimeout
+	// fails the connection with ErrPathStalled, as an unanswered keep-alive
+	// does, so that a connection whose path has stopped carrying anything
+	// ends within about TransactionTimeout plus ProbeTimeout rather than at
+	// a quiet session's keep-alive, and Pool dials a new one. Any answer
+	// keeps it: the request that timed out was slow at the far end, which
+	// a relay's per-session flow control makes it for a slow client. One
+	// probe is in flight per connection at a time. It is for the
+	// connection msrp-relay and rcs-as share (#517), and is off by
+	// default.
+	ProbeOnTimeout bool
+	// ProbeTimeout is how long a probe waits; DefaultProbeTimeout if zero.
+	ProbeTimeout time.Duration
+
 	// refusalFlush is refusalFlushTimeout unless a test sets it.
 	refusalFlush time.Duration
 	// refusalAfter starts the flush's bound; time.After unless a test
@@ -248,6 +269,9 @@ func (cfg Config) withDefaults() (Config, error) {
 	if cfg.ChunkSize == 0 {
 		cfg.ChunkSize = DefaultChunkSize
 	}
+	if cfg.ProbeTimeout <= 0 {
+		cfg.ProbeTimeout = DefaultProbeTimeout
+	}
 	if cfg.ChunkSize < 1 || cfg.ChunkSize > maxPlainChunk {
 		return cfg, fmt.Errorf("msrp: chunk size %d outside 1..%d", cfg.ChunkSize, maxPlainChunk)
 	}
@@ -256,7 +280,10 @@ func (cfg Config) withDefaults() (Config, error) {
 
 // Errors of the connection layer.
 var (
-	ErrPeerNotReading   = errors.New("msrp: peer is not reading")
+	ErrPeerNotReading = errors.New("msrp: peer is not reading")
+	// ErrPathStalled ends a connection whose probe went unanswered
+	// (Config.ProbeOnTimeout): nothing sent on it reaches the peer.
+	ErrPathStalled      = errors.New("msrp: path to the peer stalled: a probe went unanswered")
 	ErrConnClosed       = errors.New("msrp: connection closed")
 	ErrSessionClosed    = errors.New("msrp: session closed")
 	ErrNoSession        = errors.New("msrp: no such session")
@@ -318,6 +345,9 @@ type Conn struct {
 	failedBinds int
 	failWindow  time.Time
 
+	// probing is set while a probe is in flight (Config.ProbeOnTimeout).
+	probing atomic.Bool
+
 	mu         sync.Mutex
 	sessions   map[string]*Session
 	pending    map[string]*transaction
@@ -348,6 +378,8 @@ type transaction struct {
 	onResult func(code int, comment string)
 	timer    Timer
 	slot     bool // holds one of c.slots
+	// probe marks a probe, whose own timeout sends no probe.
+	probe bool
 }
 
 // NewActiveConn starts serving nc, a connection this side opened.
@@ -795,6 +827,10 @@ type sendMode struct {
 	// written, for a queued request, is called once it has been written
 	// or dropped.
 	written func(error)
+	// timeout, when set, replaces TransactionTimeout for this request;
+	// probe marks it as a probe (Config.ProbeOnTimeout).
+	timeout time.Duration
+	probe   bool
 	// windowed means the request already holds a place in its session's
 	// SendWindow, which bounds it. It then takes no connection slot:
 	// otherwise sessions that a slow peer holds at a full window would use
@@ -827,7 +863,7 @@ func (c *Conn) sendRequest(ctx context.Context, m *Message, mode sendMode, onRes
 	}
 	fr := m.FailureMode()
 	track := m.Method != MethodReport && fr != ReportNo && onResult != nil
-	t := &transaction{mode: fr, onResult: onResult}
+	t := &transaction{mode: fr, onResult: onResult, probe: mode.probe}
 	if o := mode.owner; o != nil && o.backlog.Load()+int64(len(b)) > c.cfg.MaxRelayBacklog {
 		c.fail(ErrPeerNotReading)
 		return ErrPeerNotReading
@@ -883,7 +919,11 @@ func (c *Conn) sendRequest(ctx context.Context, m *Message, mode sendMode, onRes
 		// the write, never looser.
 		c.mu.Lock()
 		if c.pending[tid] == t {
-			t.timer = c.cfg.Clock.AfterFunc(c.cfg.TransactionTimeout, func() { c.expire(tid, t) })
+			timeout := c.cfg.TransactionTimeout
+			if mode.timeout > 0 {
+				timeout = mode.timeout
+			}
+			t.timer = c.cfg.Clock.AfterFunc(timeout, func() { c.expire(tid, t) })
 		}
 		c.mu.Unlock()
 	}
@@ -902,6 +942,52 @@ func (c *Conn) expire(tid string, t *transaction) {
 	if t.mode == ReportYes {
 		t.onResult(StatusRequestTimeout, StatusText(StatusRequestTimeout))
 	}
+	if c.cfg.ProbeOnTimeout && !t.probe {
+		c.probe()
+	}
+}
+
+// probe sends a bodiless SEND on one of c's sessions, unless one is in
+// flight already, and fails c with ErrPathStalled if it is not answered
+// within ProbeTimeout (Config.ProbeOnTimeout).
+func (c *Conn) probe() {
+	if !c.probing.CompareAndSwap(false, true) {
+		return
+	}
+	s := c.probeSession()
+	if s == nil {
+		// Nothing to address it to; the next timeout tries again.
+		c.probing.Store(false)
+		return
+	}
+	err := s.sendProbe(c, func(code int, _ string) {
+		c.probing.Store(false)
+		if code == StatusRequestTimeout {
+			c.fail(ErrPathStalled)
+		}
+	})
+	if err != nil {
+		// A connection that failed meanwhile, or a write that did, which
+		// fails it on its own.
+		c.probing.Store(false)
+	}
+}
+
+// probeSession is a session of c whose peer's path is known, nil if none.
+func (c *Conn) probeSession() *Session {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	for _, s := range c.sessions {
+		select {
+		case <-s.remoteSet:
+			return s
+		default:
+		}
+	}
+	return nil
 }
 
 // releaseSlotOf returns the token of a request that is no longer awaited,

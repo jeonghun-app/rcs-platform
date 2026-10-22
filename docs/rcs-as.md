@@ -1099,6 +1099,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_MAX_INCOMING_SESSIONS_PER_USER` | `32` | Sessions rcs-as opens to one user on this task; a delivery beyond it waits |
 | `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` | `32` | Subscriptions to group rosters one user holds on this task, across its groups; a SUBSCRIBE beyond it is answered 486 |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
+| `RCSAS_MSRP_PROBE_TIMEOUT` | `10s` | When a request on an MSRP connection from msrp-relay times out, a bodiless SEND probes it; unanswered this long, the connection and its sessions end ([#517](https://github.com/jeonghun-app/rcs-platform/issues/517)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
 | `RCSAS_DYNAMODB_ENDPOINT` | AWS | Local containers only (refused in staging and prod) |

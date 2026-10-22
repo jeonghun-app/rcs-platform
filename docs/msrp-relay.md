@@ -192,6 +192,20 @@ succeeds. The task role needs
   (#517). Neither the relay nor `rcs-as` sets `SO_RCVBUF` on it, so the
   kernel's autotuning sizes it. A buffer set there later should be 32 KiB or
   more.
+- **A stalled connection toward rcs-as is ended.** Whatever stalls it, a
+  shrunk window as above or a path that drops everything, the relay notices
+  once a request on it times out: it sends a probe, a bodiless SEND that
+  `rcs-as` answers itself, at once, and ends the connection if the probe is
+  not answered within `RELAY_CORE_PROBE_TIMEOUT` (10 s). Every session on
+  it ends then, as with an unanswered keep-alive, and the next binding
+  dials anew; this is counted as `Core.Closed.PathStalled`. Without it, a
+  connection with traffic both ways stood still until a quiet session's
+  keep-alive timed out, about 270 s. Any answer keeps the connection: a
+  request toward a slow client can time out without the path being at
+  fault, and the probe is answered all the same. `rcs-as` probes its side
+  the same way (`RCSAS_MSRP_PROBE_TIMEOUT`). `TCP_USER_TIMEOUT` does not end
+  this stall: the same ACKs that cause it keep the kernel from checking it
+  (#517).
 - **Connections without a session.** A new connection must name a session
   within 30 s (the active side sends its first SEND at once, RFC 4975 §5.4),
   or it is closed (`ClientsClosedUnbound`). A connection whose last bridge
@@ -235,6 +249,7 @@ start with that value.
 | `RELAY_KEEPALIVE_INTERVAL` | `240s` | MSRP keep-alive; must be shorter than the idle timeout |
 | `RELAY_IDLE_TIMEOUT` | `300s` | close a client connection silent this long |
 | `RELAY_TCP_USER_TIMEOUT` | `60s` | `TCP_USER_TIMEOUT` on client sockets: give up on data unacknowledged this long |
+| `RELAY_CORE_PROBE_TIMEOUT` | `10s` | how long the probe of a connection toward `rcs-as` waits, once a request on it has timed out, before the connection is ended |
 | `RELAY_DRAIN_TIMEOUT` | `15s` | how long bridges are kept after SIGTERM; plus 3 s (control API shutdown and the last flush) it must not exceed `RCS_SHUTDOWN_TIMEOUT` |
 | `RELAY_METRICS_INTERVAL` | `1m` | how often counters are written |
 
@@ -267,7 +282,7 @@ not multiply them. Names come from fixed sets and never carry an identifier.
 | `Refused.<reason>` | count | `ConnectionLimit`, `SourceLimit`, `ProxyHeader`, `SourceLookupBudget`, `BindOverload`, `UnknownSession`, `EndedSession`, `IncompleteBinding`, `AlreadyClaimed`, `CoreUnreachable`, `StoreUnavailable`, `Draining`, `ControlUnauthorized`, `ControlForbidden`, `ControlInvalid` |
 | `Client.Refused.<code>`, `Core.Refused.<code>` | count | MSRP requests refused on client connections or toward `rcs-as` (`internal/msrp` events) |
 | `msrp.callback_panics` | count | panics recovered on a connection's goroutines (#445). One while reading the peer's input or binding a session closes that connection, which counts as `Client.Closed.Panicked` or `Core.Closed.Panicked`; one while reading a client's PROXY header closes the connection before it is a session connection, so it counts in no `Closed.*`; one in an event's count drops that event only, and the connection goes on. Alarm on any |
-| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PeerNotReading`, `TooManyUnknownSessions`, `Panicked`, …). `Dropped.KeepAliveNotSent` is a keep-alive the relay could not build (its random source failed); it is also logged at error level, and the next interval tries again |
+| `Client.Dropped.<reason>`, `Client.Closed.<reason>`, `Core.…` | count | drops and connection ends by `internal/msrp` reason (`KeepAliveTimeout`, `PathStalled`, `PeerNotReading`, `TooManyUnknownSessions`, `Panicked`, …). `Dropped.KeepAliveNotSent` is a keep-alive the relay could not build (its random source failed); it is also logged at error level, and the next interval tries again |
 
 Alarm candidates for Phase 7, each to get a runbook section:
 

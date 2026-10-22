@@ -137,6 +137,9 @@ type Config struct {
 	DrainTimeout            time.Duration
 	MetricsInterval         time.Duration
 	UserTimeout             time.Duration
+	// CoreProbeTimeout is how long the probe of a core connection waits
+	// once a request on it has timed out (msrp.Config.ProbeOnTimeout).
+	CoreProbeTimeout time.Duration
 }
 
 // interfaceAddrs finds this task's addresses; tests replace it.
@@ -170,6 +173,7 @@ func Configure(s *runtime.Settings) Config {
 		DrainTimeout:            e.Duration("DRAIN_TIMEOUT", DefaultDrainTimeout),
 		MetricsInterval:         e.Duration("METRICS_INTERVAL", DefaultMetricsInterval),
 		UserTimeout:             e.Duration("TCP_USER_TIMEOUT", DefaultUserTimeout),
+		CoreProbeTimeout:        e.Duration("CORE_PROBE_TIMEOUT", msrp.DefaultProbeTimeout),
 	}
 	for _, a := range []struct{ name, v string }{{"LISTEN_ADDR", c.ListenAddr}, {"CONTROL_ADDR", c.ControlAddr}} {
 		if _, _, err := net.SplitHostPort(a.v); err != nil {
@@ -203,7 +207,7 @@ func Configure(s *runtime.Settings) Config {
 		{"STORE_TIMEOUT", c.StoreTimeout}, {"MAX_EXPIRES_IN", c.MaxExpiresIn}, {"PATH_WAIT", c.PathWait},
 		{"CORE_CONNECT_TIMEOUT", c.CoreConnectTimeout}, {"KEEPALIVE_INTERVAL", c.KeepAlive},
 		{"IDLE_TIMEOUT", c.IdleTimeout}, {"DRAIN_TIMEOUT", c.DrainTimeout}, {"METRICS_INTERVAL", c.MetricsInterval},
-		{"TCP_USER_TIMEOUT", c.UserTimeout},
+		{"TCP_USER_TIMEOUT", c.UserTimeout}, {"CORE_PROBE_TIMEOUT", c.CoreProbeTimeout},
 	} {
 		if d.v == 0 {
 			e.Invalid(d.name, "must be greater than zero")
