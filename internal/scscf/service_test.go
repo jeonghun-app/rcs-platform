@@ -21,6 +21,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 )
 
@@ -613,6 +614,51 @@ func waitForProgress(t *testing.T, what string, value func() int64, done func(in
 			last, since = v, time.Now()
 		} else if time.Since(since) > realWait {
 			t.Fatalf("waited for %s, with no progress for %v at %d", what, realWait, v)
+		}
+	}
+}
+
+// panicOnceRouter panics on its first request, quoting the message, and
+// refuses the next ones with 403.
+type panicOnceRouter struct{ n atomic.Int64 }
+
+func (r *panicOnceRouter) Route(_ context.Context, req *proxy.Request) proxy.Decision {
+	if r.n.Add(1) == 1 {
+		panic("hook-secret " + req.Message.Header.Get("From"))
+	}
+	return proxy.Decision{Status: 403}
+}
+
+// TestAHookPanicIsCountedInScscfsMetrics: scscf gives its proxy its
+// metrics, as the other services do (#428): a Router that panics gets the
+// request a 500, the next request is served, and proxy.hook_panics reaches
+// the service's metrics, without the message in the output.
+func TestAHookPanicIsCountedInScscfsMetrics(t *testing.T) {
+	r := startSCSCFWith(t, startHSS(t), state.NewMemory(), 1, func(_ *ServiceConfig, d *deps) { d.router = &panicOnceRouter{} })
+	p := dialSCSCF(t, r)
+	options := func(n int) *sip.Response {
+		return p.send(t, []string{
+			"OPTIONS " + impu + " SIP/2.0",
+			fmt.Sprintf("Via: SIP/2.0/TCP 127.0.0.1:5070;branch=z9hG4bK-panic%d", n),
+			"Max-Forwards: 69",
+			"From: <" + impu + ">;tag=panic", "To: <" + impu + ">",
+			fmt.Sprintf("Call-ID: panic-%d", n), "CSeq: 1 OPTIONS", "Content-Length: 0",
+		})
+	}
+	if res := options(1); res.StatusCode != 500 {
+		t.Fatalf("first request: %d, want 500", res.StatusCode)
+	}
+	if res := options(2); res.StatusCode != 403 {
+		t.Fatalf("next request: %d, want the Router's 403", res.StatusCode)
+	}
+	if v, _ := r.h.Metric(proxy.MetricHookPanics); v != 1 {
+		t.Errorf("%s = %v, want 1", proxy.MetricHookPanics, v)
+	}
+	// The realm is in scscf's own Diameter logs, so the From's number
+	// stands for the message here.
+	for _, secret := range []string{"hook-secret", "15550100001"} {
+		if strings.Contains(r.h.Output(), secret) {
+			t.Errorf("the output holds %q", secret)
 		}
 	}
 }

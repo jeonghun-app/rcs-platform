@@ -68,6 +68,8 @@ type deps struct {
 	// dialTimeout replaces coreDialTimeout when set; it must stay below
 	// closeMargin.
 	dialTimeout time.Duration
+	// router, if set, routes in place of the dispatcher.
+	router proxy.Router
 	// transportMade, if set, hears of the transport once it is made.
 	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
@@ -183,16 +185,23 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	third.router.Store(router)
 
 	disp := &dispatcher{registrar: g, notifier: notifier, router: router, log: rt.Logger}
+	var pr proxy.Router = disp
+	if d.router != nil {
+		pr = d.router
+	}
 	tcfg, maxContexts, maxContextBytes := proxyLimits(cfg)
 	px, err := proxy.New(tr, proxy.Config{
 		Self:            self,
-		Router:          disp,
+		Router:          pr,
 		Resolver:        resolver,
 		Supported:       []string{"path"},
 		Logger:          rt.Logger,
 		Transaction:     tcfg,
 		MaxContexts:     maxContexts,
 		MaxContextBytes: maxContextBytes,
+		// The panics recovered from the hooks, as the other services count
+		// them (#428).
+		Metrics: rt.Metrics,
 	})
 	if err != nil {
 		return err
