@@ -349,6 +349,9 @@ func (c *conn) setPeer(p *Peer, caps capabilities, apps []uint32) {
 // run serves an open connection until it closes.
 func (c *conn) run() {
 	n := c.node
+	if h := testHookRun.Load(); h != nil {
+		(*h)(c)
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -413,10 +416,15 @@ func (c *conn) close(reason error) {
 	})
 }
 
+// available reports whether c can take a request: it runs, so that a
+// Shutdown says goodbye to it with a DPR, and is neither closing nor out
+// of the watchdog's OKAY state. A connection the exchange has just opened
+// is not yet available: a stop that came before run would close it with
+// no DPR, though its peer had been reported available (#587).
 func (c *conn) available() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return !c.closed && !c.closing && c.state == watchdogOkay
+	return c.running && !c.closed && !c.closing && c.state == watchdogOkay
 }
 
 func (c *conn) remoteDisconnectCause() (int32, bool) {
@@ -499,6 +507,9 @@ var (
 	// testHookQueuing runs in a request's sender after its closing check,
 	// before it waits for room in the main queue.
 	testHookQueuing atomic.Pointer[func(*conn, *Message)]
+	// testHookRun runs as an open connection starts to run, before it
+	// takes the connection's lock.
+	testHookRun atomic.Pointer[func(*conn)]
 )
 
 // writeLoop writes the control queue first, then handlers' answers, then
