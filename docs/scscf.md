@@ -53,8 +53,12 @@ required. `RCS_PCSCF_CORE_PORT` (default `5070`) is shared with `pcscf`. It is
 the port of pcscf's core listener, the only one where `scscf` sends a P-CSCF
 the requests inside a dialog.
 
-Keys come from Secrets Manager and are the same on every task. Each key list
-is `id:base64` pairs, comma separated, the first the one that signs or seals.
+Keys come from Secrets Manager and are the same on every task. Each is a plain
+secret, such as CloudFormation's `GenerateSecretString` writes, used as its
+bytes; one shorter than 32 bytes is refused, by its name alone. A key is named
+in what it seals or signs by the first 8 hex digits of its SHA-256. To rotate
+one, set the new key, and the old one as its `_PREVIOUS`, until what the old
+one sealed or signed has expired.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -70,10 +74,11 @@ is `id:base64` pairs, comma separated, the first the one that signs or seals.
 | `SCSCF_STORE` | `dynamodb` | `dynamodb`, or `memory` for one task in development (refused in staging and prod) |
 | `SCSCF_REGISTRATIONS_TABLE`, `SCSCF_CHALLENGES_TABLE`, `SCSCF_SUBSCRIPTIONS_TABLE` | `registrations`, `auth-challenges`, `reg-subscriptions` | the tables ([docs/scscf-state.md](scscf-state.md)) |
 | `SCSCF_DYNAMODB_ENDPOINT` | none | DynamoDB Local's address in the compose stack; refused in staging and prod |
-| `SCSCF_CHALLENGE_KEYS` | none; required with `dynamodb` | AES-256 keys the challenges are sealed with in the table |
-| `SCSCF_CHALLENGE_SEAL_KEY_ID` | the only key | the key that seals, during a rotation |
-| `SCSCF_NONCE_KEY` | none; required | base64 key, at least 32 bytes, that authenticates Digest nonces |
-| `SCSCF_DIALOG_KEYS` | none; required | the current key and at most the previous one, at least 32 bytes each, that sign the `Record-Route` values and iFC positions (odi) |
+| `SCSCF_CHALLENGE_KEY` | none; required with `dynamodb` | the secret, at least 32 bytes, from which the AES-256 key that seals the challenges in the table is drawn |
+| `SCSCF_CHALLENGE_KEY_PREVIOUS` | none | during a rotation, the key `SCSCF_CHALLENGE_KEY` replaced: it no longer seals, but opens what it sealed |
+| `SCSCF_NONCE_KEY` | none; required | the secret, at least 32 bytes, that authenticates Digest nonces |
+| `SCSCF_DIALOG_KEY` | none; required | the secret, at least 32 bytes, that signs the `Record-Route` values and iFC positions (odi) |
+| `SCSCF_DIALOG_KEY_PREVIOUS` | none | during a rotation, the key `SCSCF_DIALOG_KEY` replaced: it no longer signs, but verifies what it signed |
 | `SCSCF_ICSCF_URI` | `sip:icscf.<namespace>:5060;transport=tcp;lr` | where an originating request goes once its chain is done |
 | `SCSCF_APPLICATION_SERVERS` | `sip:rcs-as.<namespace>:5060;transport=tcp` | the application servers' SIP listeners, comma separated: a request inside a dialog may go to their port and transport |
 | `SCSCF_EDGE_PROXY_PUBLIC_HOSTS` | none | the names and addresses clients reach pcscf at, comma separated; a next hop naming one ends a dialog's route set; required in staging and prod |

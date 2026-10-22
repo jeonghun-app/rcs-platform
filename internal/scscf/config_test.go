@@ -3,7 +3,8 @@ package scscf
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,22 +18,27 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/routing"
+	"github.com/jeonghun-app/rcs-platform/internal/scscf/state/dynamostore"
 )
 
-var (
-	nonceKey     = base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
-	dialogKey    = base64.StdEncoding.EncodeToString([]byte("fedcba9876543210fedcba9876543210"))
-	challengeKey = base64.StdEncoding.EncodeToString([]byte("abcdefghijklmnopqrstuvwxyz012345"))
+// The keys are plain secrets of 32 bytes, as GenerateSecretString writes
+// them; made up for the tests.
+const (
+	nonceKey     = "0123456789abcdef0123456789abcdef"
+	dialogKey    = "fedcba9876543210fedcba9876543210"
+	challengeKey = "abcdefghijklmnopqrstuvwxyz012345"
+	// previousKey is a key a rotation replaced.
+	previousKey = "ZYXWVUTSRQPONMLKJIHGFEDCBA987654"
 )
 
 // devEnv is a minimal valid dev configuration.
 var devEnv = map[string]string{
-	"RCS_ENV":              "dev",
-	"RCS_IMS_DOMAIN":       realm,
-	"SCSCF_CORE_HOST":      "10.0.4.9",
-	"SCSCF_NONCE_KEY":      nonceKey,
-	"SCSCF_DIALOG_KEYS":    "k1:" + dialogKey,
-	"SCSCF_CHALLENGE_KEYS": "c1:" + challengeKey,
+	"RCS_ENV":             "dev",
+	"RCS_IMS_DOMAIN":      realm,
+	"SCSCF_CORE_HOST":     "10.0.4.9",
+	"SCSCF_NONCE_KEY":     nonceKey,
+	"SCSCF_DIALOG_KEY":    dialogKey,
+	"SCSCF_CHALLENGE_KEY": challengeKey,
 }
 
 // prodEnv is a valid production configuration.
@@ -86,7 +92,8 @@ func TestConfigureTakesTheDefaults(t *testing.T) {
 	if len(c.ApplicationServers) != 1 || c.ApplicationServers[0].String() != "sip:rcs-as.rcs.local:5060;transport=tcp" {
 		t.Errorf("ApplicationServers %v", c.ApplicationServers)
 	}
-	if len(c.DialogKeys) != 1 || c.DialogKeys[0].ID != "k1" || len(c.ChallengeKeys) != 1 || c.ChallengeKeys[0].ID != "c1" || len(c.NonceKey) != 32 {
+	if len(c.DialogKeys) != 1 || string(c.DialogKeys[0].Key) != dialogKey || len(c.ChallengeKeys) != 1 ||
+		c.SealKeyID != c.ChallengeKeys[0].ID || string(c.NonceKey) != nonceKey {
 		t.Error("the keys were not read")
 	}
 }
@@ -112,12 +119,15 @@ func TestConfigureRefusesWhatCannotRun(t *testing.T) {
 		"unknown discovery":      {with(devEnv, "SCSCF_HSS_DISCOVERY", "static"), "SCSCF_HSS_DISCOVERY"},
 		"bad host pattern":       {with(devEnv, "SCSCF_HSS_HOST_PATTERN", "hss-**.rcs.local"), "SCSCF_HSS_HOST_PATTERN"},
 		"unknown store":          {with(devEnv, "SCSCF_STORE", "redis"), "SCSCF_STORE"},
-		"no challenge keys":      {with(devEnv, "SCSCF_CHALLENGE_KEYS", ""), "SCSCF_CHALLENGE_KEYS"},
-		"bad challenge keys":     {with(devEnv, "SCSCF_CHALLENGE_KEYS", "c1"), "SCSCF_CHALLENGE_KEYS"},
+		"no challenge key":       {with(devEnv, "SCSCF_CHALLENGE_KEY", ""), "SCSCF_CHALLENGE_KEY"},
+		"short challenge key":    {with(devEnv, "SCSCF_CHALLENGE_KEY", challengeKey[:31]), "SCSCF_CHALLENGE_KEY"},
+		"short previous":         {with(devEnv, "SCSCF_CHALLENGE_KEY_PREVIOUS", previousKey[:31]), "SCSCF_CHALLENGE_KEY_PREVIOUS"},
+		"previous alone":         {with(devEnv, "SCSCF_STORE", StoreMemory, "SCSCF_CHALLENGE_KEY", "", "SCSCF_CHALLENGE_KEY_PREVIOUS", previousKey), "SCSCF_CHALLENGE_KEY_PREVIOUS"},
+		"previous is current":    {with(devEnv, "SCSCF_DIALOG_KEY_PREVIOUS", dialogKey), "SCSCF_DIALOG_KEY_PREVIOUS"},
 		"no nonce key":           {with(devEnv, "SCSCF_NONCE_KEY", ""), "SCSCF_NONCE_KEY"},
-		"bad nonce key":          {with(devEnv, "SCSCF_NONCE_KEY", "%%%"), "SCSCF_NONCE_KEY"},
-		"no dialog keys":         {with(devEnv, "SCSCF_DIALOG_KEYS", ""), "SCSCF_DIALOG_KEYS"},
-		"bad dialog key":         {with(devEnv, "SCSCF_DIALOG_KEYS", "k1:%%%"), "SCSCF_DIALOG_KEYS"},
+		"short nonce key":        {with(devEnv, "SCSCF_NONCE_KEY", nonceKey[:31]), "SCSCF_NONCE_KEY"},
+		"no dialog key":          {with(devEnv, "SCSCF_DIALOG_KEY", ""), "SCSCF_DIALOG_KEY"},
+		"short dialog key":       {with(devEnv, "SCSCF_DIALOG_KEY", dialogKey[:31]), "SCSCF_DIALOG_KEY"},
 		"bad I-CSCF":             {with(devEnv, "SCSCF_ICSCF_URI", "tel:+15550100001"), "SCSCF_ICSCF_URI"},
 		"bad core port":          {with(devEnv, "RCS_PCSCF_CORE_PORT", "70000"), "RCS_PCSCF_CORE_PORT"},
 		"bad AS":                 {with(devEnv, "SCSCF_APPLICATION_SERVERS", "http://rcs-as"), "SCSCF_APPLICATION_SERVERS"},
@@ -134,7 +144,7 @@ func TestConfigureRefusesWhatCannotRun(t *testing.T) {
 		})
 	}
 	// The memory store needs no challenge keys: nothing is sealed.
-	if _, err := configure(with(devEnv, "SCSCF_STORE", StoreMemory, "SCSCF_CHALLENGE_KEYS", "")); err != nil {
+	if _, err := configure(with(devEnv, "SCSCF_STORE", StoreMemory, "SCSCF_CHALLENGE_KEY", "")); err != nil {
 		t.Errorf("memory store without challenge keys: %v", err)
 	}
 }
@@ -212,7 +222,7 @@ func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 		string(keys), loggedKeys.String(),
 	} {
 		for _, secret := range []string{
-			"0123456789abcdef", "fedcba9876543210", "abcdefghijklmnop", nonceKey, dialogKey, challengeKey,
+			"0123456789abcdef", "fedcba9876543210", "abcdefghijklmnop",
 			// %d and %x of the nonce, challenge and dialog keys' bytes.
 			"48 49 50 51 52", "97 98 99 100 101", "102 101 100 99 98",
 			fmt.Sprintf("%x", []byte("01234567")), fmt.Sprintf("%x", []byte("abcdefgh")), fmt.Sprintf("%x", []byte("fedcba98")),
@@ -220,6 +230,65 @@ func TestTheConfigurationGivesNoKeyAway(t *testing.T) {
 			if strings.Contains(out, secret) {
 				t.Errorf("%q gives a key away", out)
 			}
+		}
+	}
+}
+
+// TestAKeysIDIsTheStartOfItsSHA256: each key is named, in what it seals or
+// signs, by the first 8 hex digits of its SHA-256; the challenge key seals
+// under a key of its own drawn from it, never the secret or its ID.
+func TestAKeysIDIsTheStartOfItsSHA256(t *testing.T) {
+	c, err := configure(devEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := func(k string) string {
+		sum := sha256.Sum256([]byte(k))
+		return hex.EncodeToString(sum[:4])
+	}
+	if c.DialogKeys[0].ID != id(dialogKey) || c.ChallengeKeys[0].ID != id(challengeKey) || c.SealKeyID != id(challengeKey) {
+		t.Errorf("IDs %s and %s, seal %s", c.DialogKeys[0].ID, c.ChallengeKeys[0].ID, c.SealKeyID)
+	}
+	seal := c.ChallengeKeys[0].Key
+	if len(seal) != dynamostore.KeySize || string(seal) == challengeKey || strings.Contains(hex.EncodeToString(seal), c.SealKeyID) {
+		t.Error("the challenge seal key is the secret, or holds its ID")
+	}
+}
+
+// TestARotationKeepsTheReplacedKeyForWhatItSealedAndSigned: once the
+// current key becomes the previous one, the new current key seals and
+// signs, and the previous one, the same ID and key as before, still opens
+// and verifies what it did (dynamostore and routing open and verify by
+// the ID the item carries).
+func TestARotationKeepsTheReplacedKeyForWhatItSealedAndSigned(t *testing.T) {
+	before, err := configure(with(devEnv, "SCSCF_DIALOG_KEY", previousKey, "SCSCF_CHALLENGE_KEY", previousKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	after, err := configure(with(devEnv,
+		"SCSCF_DIALOG_KEY_PREVIOUS", previousKey, "SCSCF_CHALLENGE_KEY_PREVIOUS", previousKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after.DialogKeys) != 2 || after.DialogKeys[1].ID != before.DialogKeys[0].ID ||
+		!bytes.Equal(after.DialogKeys[1].Key, before.DialogKeys[0].Key) || after.DialogKeys[0].ID == before.DialogKeys[0].ID {
+		t.Errorf("dialog keys after the rotation: %v, before: %v", after.DialogKeys, before.DialogKeys)
+	}
+	if len(after.ChallengeKeys) != 2 || after.ChallengeKeys[1].ID != before.ChallengeKeys[0].ID ||
+		!bytes.Equal(after.ChallengeKeys[1].Key, before.ChallengeKeys[0].Key) || after.SealKeyID != after.ChallengeKeys[0].ID ||
+		after.SealKeyID == before.SealKeyID {
+		t.Errorf("challenge keys after the rotation: %v seal %s, before: %v seal %s", after.ChallengeKeys, after.SealKeyID, before.ChallengeKeys, before.SealKeyID)
+	}
+}
+
+// TestARefusedKeyIsNotPrinted: a key refused for its length is named by
+// its variable, its value nowhere in the error.
+func TestARefusedKeyIsNotPrinted(t *testing.T) {
+	short := "s3cr3t-but-too-short-for-a-key"
+	for _, name := range []string{"SCSCF_NONCE_KEY", "SCSCF_DIALOG_KEY", "SCSCF_DIALOG_KEY_PREVIOUS", "SCSCF_CHALLENGE_KEY", "SCSCF_CHALLENGE_KEY_PREVIOUS"} {
+		_, err := configure(with(devEnv, name, short))
+		if err == nil || !strings.Contains(err.Error(), name) || strings.Contains(err.Error(), short) || strings.Contains(err.Error(), "s3cr3t") {
+			t.Errorf("%s: %v", name, err)
 		}
 	}
 }
