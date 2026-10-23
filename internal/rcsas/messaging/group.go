@@ -730,6 +730,7 @@ func (e *Engine) sendSummary(ctx context.Context, l *Leg, m store.Message) outco
 	case err == nil:
 		e.forgetSummary(m)
 		e.metrics.Count("group.summary.expanded", 1)
+		e.markReached(m.Recipient)
 		return done
 	case errors.Is(err, store.ErrMarksChanged):
 		e.summaryProgressed(m)

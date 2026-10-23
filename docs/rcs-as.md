@@ -544,13 +544,69 @@ What the last pass over a queue found decides what reads it again:
 | Last pass | A new message | Reads the whole queue |
 |---|---|---|
 | Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg |
-| Messages wait for a session | is tried on its own | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer |
-| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits; one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer |
+| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark |
+| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark |
 
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
 `RCSAS_MAX_RETRY_INTERVAL` while the queue stays held. A recipient that never
 comes back costs a read an hour, not one per message sent to it. The reads of
 a queue grow with its messages, not with their square.
+
+### A recipient reached on another task
+
+A hold is the task's own. With several tasks, the core gives each third-party
+REGISTER to any of them. The session an invitation brings opens on the task
+that asked for it. So another task may reach the recipient and deliver the
+shared queue while this one still holds it (#605). The tasks tell each other
+through the store:
+
+- **Marks.** A task puts its own marks of the recipient in the `messages`
+  table, of two kinds:
+  - **A delivery got through:** in pager mode, on a leg, or a summary. A task
+    writes this at most once a minute per recipient. Once it is stored, the
+    task reads the queue once more after the pass, unless that pass found the
+    recipient unreachable: another task may have queued a message this task's
+    pass did not read, and looked for a mark just before this one was
+    written.
+  - **A registration on a new flow:** written after the pass that
+    registration ran, if that pass found anything queued. It is not followed
+    by another read. A message that another task queued during that pass, and
+    holds for a session, may wait for that task's next look or its own
+    timers. It is not blocked for its retry timer, as the delivery mark covers
+    that case.
+- **The look.** A task that holds a queue reads the recipient's marks when a
+  new message comes in (one strongly consistent query). Another task's mark
+  counts if it is newer than the newest of its kind this task already acted
+  on, and no earlier than a minute plus `RCSAS_TASK_SKEW` before the pass that
+  left the queue held: the minute between one task's delivery marks, and
+  `RCSAS_TASK_SKEW` for the tasks' clocks. A task's own marks never count,
+  since it knows what its deliveries did. A counted mark does this:
+  - **A delivery elsewhere** releases the hold and has the queue read, as a
+    refresh here would. The invitations asked for and the pager-only marker
+    stay.
+  - **A registration on a new flow elsewhere** also clears those, as one here
+    does, and a failure of an invitation asked before it is not marked. It is
+    not told on to group owners: the task that took the registration tells
+    them.
+- **When a stale mark counts.** A mark from before the hold, inside that
+  margin, costs one more attempt, once, as each mark counts once.
+- **A second hold within the minute.** Because each mark counts once, a mark
+  this task already acted on does not release a later hold. If the recipient
+  is lost again and this task holds the queue again, another task that
+  reaches the recipient within a minute of its last delivery mark writes no
+  new one. This task's next message then waits for its retry timer. The
+  counted mark reset that timer's backoff, so the wait is about
+  `RCSAS_RETRY_INTERVAL`, not up to `RCSAS_MAX_RETRY_INTERVAL`. The other
+  task's next delivery after that minute marks the recipient again. This is
+  the price of counting each mark once; otherwise one mark would release a
+  hold, and read the queue, for every new message. The exception is a
+  registration on a new flow on the other task whose pass finds the queue:
+  it writes a registration mark, which releases the hold at once.
+- **Cost.** A delivery costs no more than one write a minute per recipient
+  and task, and a registration on a new flow with something queued one write.
+  Each message to a held recipient costs one read. The queue is read once
+  more after a delivery mark, at most once a minute, and once for each mark
+  another task counts.
 
 ### Claims and shutdown
 
@@ -1155,7 +1211,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, 4 × 10 × (`RCSAS_GROUP_MAX_PARTICIPANTS` − 1) (`3960` for 100), at least `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, and a quarter of the burst must cover 10 messages to a full group. With the defaults, one sender in a full group of 100 may send 10 messages at once and then 15 a minute; in a full group of 200, 10 at once and then 7 a minute |
 | `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
-| `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121): a task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
+| `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121). `RCSAS_TASK_SKEW` is also the margin for another task's reached marks, with group chat on or off (#605). A task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
 
 A rate of `0` turns that limit off.
 
@@ -1172,6 +1228,7 @@ There is one table with partition key `pk` and sort key `sk` (both strings).
 | Queue size | `c#<len>#<recipient>` | `n` |
 | A sender's share of a queue | `c#<len>#<recipient>` | `s#<len>#<sender>` |
 | Sent-message record | `s#<len>#<sender>` | IMDN Message-ID; for a group message, one under the group and one under the author, which names the group (`group`) |
+| Reached mark (#605) | `r#<len>#<recipient>` | `t#<len>#<task>`: one per task that delivered to the recipient lately; `f#<len>#<task>`: one per task that took its registration on a new flow with something queued. Each has `task`, `reached_at` and `expires` |
 
 There is one global secondary index, `expiry`:
 
@@ -1238,19 +1295,28 @@ The table's properties:
   only the backstop that keeps the table small, because TTL deletion can lag
   by days:
   - for queue and size items: the expiry plus one day;
-  - for sent-message records: their expiry.
+  - for sent-message records: their expiry;
+  - for reached marks: their expiry, `RCSAS_MAX_RETRY_INTERVAL` plus a minute
+    plus `RCSAS_TASK_SKEW` after the mark. That is as long as a task that held the queue
+    within the margin may still look before its retry timer reads the queue
+    anyway.
+- **Reached marks.** Each task puts its own mark of each kind over its last,
+  with no condition, so no task's mark hides another's. A mark of a kind a
+  task does not know is left out of its look. The look is a consistent
+  query of the recipient's partition. Old tasks never read or write these
+  items.
 
 The task role needs these IAM actions:
 
 | Action | Resource | Used by |
 |---|---|---|
 | `dynamodb:GetItem` | table | `Sent`; reads after a refused conditional write; recounts |
-| `dynamodb:PutItem` | table | `RecordSent`, and the `Put` inside the enqueue transaction |
+| `dynamodb:PutItem` | table | `RecordSent`, `MarkReached`, and the `Put` inside the enqueue transaction |
 | `dynamodb:UpdateItem` | table | `Claim`, `Release`, `MarkNotified`, `UnmarkNotified`, size corrections, and the `Update`s inside both transactions |
 | `dynamodb:DeleteItem` | table | the `Delete` inside the removal transactions |
 | `dynamodb:ConditionCheckItem` | table | the `ConditionCheck` inside a summary's removal |
 | `dynamodb:ConditionCheckItem` | the `groupchats` table | the `ConditionCheck` of a group's owner inside a group message copy's enqueue (#121) |
-| `dynamodb:Query` | table | `Pending`, recounts |
+| `dynamodb:Query` | table | `Pending`, `Reached`, recounts |
 | `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
 | `dynamodb:DescribeTable` | table | readiness |
 
@@ -1412,8 +1478,9 @@ identifier ever appears in a metric name.
 | `delivery.msrp`, `delivery.pager`, `delivery.msrp_failed`, `delivery.pager_failed` | Delivery attempts |
 | `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
+| `delivery.reached_marked`, `delivery.registered_marked`, `delivery.reached_elsewhere`, `delivery.registered_elsewhere` | #605: marks of a delivery and of a registration on a new flow this task stored, and other tasks' marks of each kind it acted on |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
-| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, which leave no mark (the registration had the queue read already); a group's 482 is never one |
+| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, here or, as its mark told, on another task, which leave no mark (the registration had the queue read already); a group's 482 is never one |
 | `invite.held_for_join`, `invite.join_untracked` | Group invitations not asked for because the participant's own `INVITE` to the group was being served, and joins past the bound that held nothing back |
 | `leg.opened`, `leg.unanswered` | MSRP legs, and offers that got no answer |
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
@@ -1480,7 +1547,11 @@ Signals to alarm on (Phase 7):
   for a message read more than a day after it could have expired is refused
   as `imdn_unknown`.
 - **Per-task state.** The rate limit, the pager-only marker and the retry
-  timers are per task. A sender spread over N tasks gets N times the rate.
+  timers are per task. A sender spread over N tasks gets N times the rate. A
+  hold gives way when another task reaches the recipient. The invitations a
+  task asked for and its pager-only marker give way only when another task
+  takes a registration on a new flow whose pass finds something queued (see
+  [A recipient reached on another task](#a-recipient-reached-on-another-task)).
 - **No processing notifications.** rcs-as does not send "stored" processing
   notifications on its own.
 - **No IMDN-Record-Route entry.** rcs-as does not add itself to

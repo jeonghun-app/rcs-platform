@@ -261,6 +261,9 @@ func Configure(s *runtime.Settings) Config {
 		TaskSkew:      e.Duration("TASK_SKEW", group.DefaultTaskSkew),
 	}
 	c.Group.HomeDomain = c.HomeDomain
+	// The margin for the tasks' clocks the groups' leases use is the one
+	// for another task's reached marks too (#605).
+	c.Messaging.ClockSkew = c.Group.TaskSkew
 	// One spelling, which the group writes its conference URIs with and
 	// the SIP layer compares with: lower case, without a trailing dot.
 	c.Group.ConferenceHost = strings.ToLower(strings.TrimSuffix(c.Group.ConferenceHost, "."))

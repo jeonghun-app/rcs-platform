@@ -147,6 +147,74 @@ func TestIntegrationTwoEnginesShareTheQueueAndDeliverEachMessageOnce(t *testing.
 	}
 }
 
+// #605 over the table: task-0 finds bob unreachable and holds his queue
+// for its retry timer, a minute; bob comes back through a registration
+// task-1 takes. task-1's delivery marks him reached, and the next message
+// task-0 takes goes out well within that minute.
+func TestIntegrationAReachedMarkReleasesAnotherTasksHold(t *testing.T) {
+	s := integrationStore(t)
+	p := &pagerCount{got: map[string]int{}}
+	var engines []*messaging.Engine
+	for i := range 2 {
+		e, err := messaging.New(messaging.Config{InstanceID: fmt.Sprint("task-", i), MSRPHost: "127.0.0.1", MSRPPort: 2855}, s, p, nopCounter{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(e.Close)
+		engines = append(engines, e)
+	}
+	const bob = "tel:+15550100002"
+	submit := func(e *messaging.Engine, text string) {
+		t.Helper()
+		body := "From: <tel:+15550100001>\r\nTo: <" + bob + ">\r\n\r\nContent-Type: text/plain\r\n\r\n" + text
+		o := messaging.Origin{Sender: "tel:+15550100001", Recipient: bob, Mode: store.Standalone, Pager: true, CPIM: content.BodyOf([]byte(body))}
+		if err := e.Submit(t.Context(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	delivered := func() int {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return len(p.got)
+	}
+	start := time.Now()
+	submit(engines[0], "one")
+	// task-0's attempt fails and leaves m1 queued.
+	for left := 0; left == 0; {
+		ms, err := s.Pending(t.Context(), bob, "", time.Now(), 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		left = len(ms)
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond) // task-0's pass settles into its hold
+	p.online.Store(true)
+	engines[1].UserRegistered(bob, true)
+	waitUntil(t, "m1 delivered by task-1", func() bool { return delivered() == 1 })
+	submit(engines[0], "two")
+	waitUntil(t, "m2 delivered", func() bool { return delivered() == 2 })
+	if d := time.Since(start); d >= messaging.DefaultRetryInterval {
+		t.Fatalf("m2 took %v, as long as task-0's retry timer", d)
+	}
+	marks, err := s.Reached(t.Context(), bob, time.Now())
+	if err != nil || !slices.ContainsFunc(marks, func(m store.Mark) bool { return m.Task == "task-1" && m.Kind == store.Delivered }) {
+		t.Fatalf("Reached = %v, %v; want task-1's mark of a delivery", marks, err)
+	}
+}
+
+// waitUntil polls cond for up to 30 s.
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // The recount that corrects a drifted queue size, with its rate limit, as
 // DynamoDB itself evaluates the expressions.
 func TestIntegrationADriftedQueueSizeIsCorrectedOnce(t *testing.T) {
