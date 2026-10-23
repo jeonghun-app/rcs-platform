@@ -3,6 +3,7 @@ package registrar
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -58,7 +59,67 @@ func TestANonceCountStoreFailureIsAnInternalErrorNotAnAuthFailure(t *testing.T) 
 	}
 }
 
-func TestAReplayedRegisterIsStillRefused(t *testing.T) {
+// replayingCounts is a nonce-count store that has seen every count.
+type replayingCounts struct{}
+
+func (replayingCounts) Advance(context.Context, string, string, uint32, time.Time) (bool, error) {
+	return false, nil
+}
+
+func TestAReplayedNonceCountIsRefusedNotInternal(t *testing.T) {
+	// The store answering, with "used", is a replay: still refused as a
+	// failed authentication, not taken for a store failure (#621).
+	for name, user := range map[string]func(*env) *ue{
+		"digest": func(e *env) *ue { return e.digestUser(impi1, impu1) },
+		"aka":    func(e *env) *ue { return e.akaUser(impi1, impu1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			m := &counts{}
+			g := e.instance(1, func(c *Config) { c.Metrics = m })
+			withCounts(t, g, replayingCounts{})
+			wantStatus(t, user(e).registerWith(g, 600), 403)
+			if m.get("registrar.auth_failed") != 1 || m.get("registrar.internal_errors") != 0 {
+				t.Errorf("auth_failed %d, internal_errors %d", m.get("registrar.auth_failed"), m.get("registrar.internal_errors"))
+			}
+		})
+	}
+}
+
+// unusableCounts is a nonce-count store whose record of every nonce cannot
+// be read.
+type unusableCounts struct{}
+
+func (unusableCounts) Advance(context.Context, string, string, uint32, time.Time) (bool, error) {
+	return false, fmt.Errorf("%w: item is malformed", digest.ErrNonceCountUnusable)
+}
+
+func TestAnUnusableNonceCountRecordGetsAStaleChallenge(t *testing.T) {
+	// #621: the fault stays with the nonce, so the UE is given a new one
+	// rather than a 500 it would meet again with the same nonce.
+	for name, user := range map[string]func(*env) *ue{
+		"digest": func(e *env) *ue { return e.digestUser(impi1, impu1) },
+		"aka":    func(e *env) *ue { return e.akaUser(impi1, impu1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			m := &counts{}
+			g := e.instance(1, func(c *Config) { c.Metrics = m })
+			withCounts(t, g, unusableCounts{})
+			u := user(e)
+			res := u.registerWith(g, 600)
+			wantStatus(t, res, 401)
+			if !u.challengeOf(res, 0).Stale {
+				t.Error("the new challenge is not stale")
+			}
+			if m.get("registrar.auth_failed") != 0 || m.get("registrar.internal_errors") != 0 {
+				t.Errorf("auth_failed %d, internal_errors %d", m.get("registrar.auth_failed"), m.get("registrar.internal_errors"))
+			}
+		})
+	}
+}
+
+func TestAnAnsweredChallengeIsNotAnsweredAgainWith500(t *testing.T) {
 	e := newEnv(t)
 	m := &counts{}
 	g := e.instance(1, func(c *Config) { c.Metrics = m })

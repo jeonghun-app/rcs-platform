@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"math/rand/v2"
 	"strings"
@@ -419,6 +420,36 @@ func TestNonceCountStoreFailureFailsVerification(t *testing.T) {
 	}
 	if errors.Is(err, ErrReplayed) {
 		t.Fatal("a store failure looks like a replay")
+	}
+	if errors.Is(err, ErrStaleNonce) {
+		t.Fatal("a store failure sends the client to a new nonce")
+	}
+}
+
+// unusableCounts is a store whose record of every nonce cannot be read.
+type unusableCounts struct{}
+
+func (unusableCounts) Advance(context.Context, string, string, uint32, time.Time) (bool, error) {
+	return false, fmt.Errorf("%w: item is malformed", ErrNonceCountUnusable)
+}
+
+func TestAnUnusableNonceCountRecordMakesTheNonceStale(t *testing.T) {
+	// #621: the fault stays with the nonce, so the client is given a new
+	// one rather than told to retry this one later.
+	h := newHarness(t)
+	h.server.counts = unusableCounts{}
+	c := answer(t, h.challenge(t, MD5), testPass, 1)
+	err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass)))
+	if !errors.Is(err, ErrStaleNonce) || !errors.Is(err, ErrNonceCountUnusable) || !strings.Contains(err.Error(), "item is malformed") {
+		t.Fatalf("err = %v, want ErrStaleNonce wrapping the store's error", err)
+	}
+	if errors.Is(err, ErrNonceCountStore) || errors.Is(err, ErrReplayed) {
+		t.Fatalf("err = %v, an unusable record is neither a store failure nor a replay", err)
+	}
+	// Still after the response: a wrong one is refused as before.
+	c = answer(t, h.challenge(t, MD5), "wrong", 1)
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass))); !errors.Is(err, ErrWrongResponse) {
+		t.Fatalf("a wrong response over an unusable record = %v", err)
 	}
 }
 

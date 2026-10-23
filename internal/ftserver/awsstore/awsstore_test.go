@@ -342,9 +342,15 @@ func TestMalformedNonceCountItemIsAnError(t *testing.T) {
 		"string count":    {attrPK: str(k), attrNC: str("1"), attrExpires: num(exp.UnixMilli())},
 	} {
 		ddb.rows[k] = item
-		if ok, err := s.NonceCounts.Advance(t.Context(), "alice", "n", 2, exp); ok || err == nil {
+		// Unusable, not a store failure: the item stays bad until it
+		// expires, so the client is sent to a new nonce (#621).
+		if ok, err := s.NonceCounts.Advance(t.Context(), "alice", "n", 2, exp); ok || !errors.Is(err, digest.ErrNonceCountUnusable) {
 			t.Errorf("%s: Advance = %v, %v", name, ok, err)
 		}
+	}
+	ddb.fail = &fakeAPIError{code: "ProvisionedThroughputExceededException"}
+	if _, err := s.NonceCounts.Advance(t.Context(), "alice", "n", 2, exp); err == nil || errors.Is(err, digest.ErrNonceCountUnusable) {
+		t.Errorf("a throttled read = %v, want a store failure", err)
 	}
 }
 

@@ -195,7 +195,7 @@ and answers it as MD5.
   user, a wrong password, a replayed nonce-count and a wrong `uri` all get the
   same 401 with fresh challenges, so a client cannot learn which user names
   exist. The one exception is a correct response with an expired nonce, which
-  gets `stale=true`.
+  gets `stale=true`, as does one whose nonce-count record is unusable (below).
 - **Nonce-counts may arrive out of order.** A count is accepted once if it is
   among the 32 counts ending at the highest one used with the nonce
   (`digest.NonceCountWindow`). A client that breaks an upload may send its next
@@ -218,7 +218,11 @@ and answers it as MD5.
   right, but whether its nonce-count was used could not be told (#621). Each
   is counted in `auth.backend_error` and logged without the user name. It says
   nothing about the user, and clients retry a 503 but give up after a second
-  401.
+  401. A nonce-count item that cannot be decoded is the exception: it stays
+  bad until the nonce expires, so a 503 would bring the client back to it on
+  every retry. It gets 401 with `stale=true` instead, and the client moves to
+  a new nonce at once. It is counted in `auth.stale` and logged as "nonce
+  count record unusable", without the user name.
 - **Lookups are bounded.** Each task runs at most `FT_MAX_CONCURRENT_LOOKUPS` at
   once and answers `503` beyond that (`auth.lookup_busy`). Anyone who has
   fetched a nonce can trigger a lookup with a made-up user name. The HSS client
