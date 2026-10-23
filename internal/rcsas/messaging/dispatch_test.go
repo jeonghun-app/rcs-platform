@@ -324,6 +324,40 @@ func TestARefreshKeepsTheInvitationsStillOut(t *testing.T) {
 	noInvite("a refresh after carol's failure")
 }
 
+// Code review of #655: bob stays registered, refreshes every 30 min, and
+// every invitation to him fails. Each refresh finds a failed mark and has
+// the queue read, but leaves its retry timer as it is: the refresh says
+// nothing of when to try next. So over 6 h the refreshes add at most one
+// invitation each to those the retry timer asks for on its own; restarting
+// the backoff at each refresh sent 49 instead of 21.
+func TestRefreshesAddOneInvitationEachToAFailingRecipient(t *testing.T) {
+	count := func(refresh bool) int64 {
+		r := newRig(t, Config{InviteTimeout: 2 * time.Minute, RetryInterval: time.Minute, MaxRetryInterval: time.Hour})
+		var invites atomic.Int64
+		r.d.discardInvites.Store(true)
+		r.d.onInvite(func(Invitation) error { invites.Add(1); return ErrOffline })
+		r.e.UserRegistered(bob, true)
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "idle", r.idle)
+		for minute := 1; minute <= 6*60; minute++ {
+			r.clock.Advance(time.Minute)
+			waitFor(t, "idle", r.idle)
+			if refresh && minute%30 == 0 {
+				r.e.UserRegistered(bob, false)
+				waitFor(t, "idle", r.idle)
+			}
+		}
+		return invites.Load()
+	}
+	alone, refreshed := count(false), count(true)
+	t.Logf("%d invitations with refreshes, %d without", refreshed, alone)
+	if refreshes := int64(6 * 60 / 30); refreshed > alone+refreshes {
+		t.Fatalf("%d invitations with a refresh every 30 min, %d without: more than one per refresh", refreshed, alone)
+	}
+}
+
 // cancelStore fails what records an outcome on a cancelled context, as
 // the SDK does.
 type cancelStore struct{ store.Store }

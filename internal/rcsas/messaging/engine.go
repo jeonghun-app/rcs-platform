@@ -598,7 +598,7 @@ func (e *Engine) countDeviations(d cpim.Deviation) {
 // messages waiting for a session, so only a queue that found the user
 // unreachable is tried again, unless an invitation failed: a refresh clears
 // the marks of failed invitations, not of those still out, and has the
-// queue tried again.
+// queue read again, its retry timer left as it is.
 func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
 	if newFlow {
@@ -634,7 +634,16 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 		// Whatever the hold: a queue that found the user unreachable
 		// may also keep a message whose invitation failed.
 		failed := e.dropFailedInvites(user)
-		if r := e.recipients[user]; r != nil && r.hold == holdWaiting && !failed {
+		if r := e.recipients[user]; r != nil && r.hold == holdWaiting {
+			if failed && !e.closed {
+				// The pass asks for the cleared invitations again. The
+				// retry timer stays as it is: the refresh says nothing of
+				// when to try next, and a recipient whose invitations keep
+				// failing would otherwise get several more per refresh
+				// (code review of #655).
+				r.full = true
+				e.schedule(user, r)
+			}
 			e.mu.Unlock()
 			return
 		}

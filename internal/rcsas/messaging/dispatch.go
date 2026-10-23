@@ -24,8 +24,8 @@ import (
 //     queue again would find them waiting still, so a new message is tried
 //     on its own. The whole queue is read on what can let them go: a leg
 //     opening, a registration on a new flow, a failed invitation that makes
-//     pager mode the way, a refresh after an invitation failed, or the
-//     retry timer.
+//     pager mode the way, a refresh after an invitation failed (which
+//     leaves the retry timer as it is), or the retry timer.
 //   - The recipient could not be reached (holdBlocked): a new message
 //     waits too. Any registration, a leg, or the retry timer reads the
 //     queue. A message that comes in while such a pass runs is noted:
