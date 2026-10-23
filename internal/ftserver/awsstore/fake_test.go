@@ -123,17 +123,40 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 	if f.fail != nil {
 		return nil, f.fail
 	}
-	if aws.ToString(in.ConditionExpression) != "attribute_not_exists(#nc) OR #nc < :nc OR #e < :now" ||
-		aws.ToString(in.UpdateExpression) != "SET #nc = :nc, #e = :e, #ttl = :ttl" {
-		f.t.Fatalf("UpdateItem %q %q", aws.ToString(in.ConditionExpression), aws.ToString(in.UpdateExpression))
+	if got := aws.ToString(in.UpdateExpression); got != "SET #nc = :nc, #w = :w, #at = :nc, #e = :e, #ttl = :ttl, #by = :by" {
+		f.t.Fatalf("UpdateItem %q", got)
+	}
+	for name, attr := range map[string]string{"#nc": attrNC, "#w": attrNCWindow, "#at": attrNCWindowAt, "#e": attrExpires, "#ttl": attrTTL, "#by": attrNCWriter} {
+		if got := in.ExpressionAttributeNames[name]; got != attr {
+			f.t.Fatalf("UpdateItem names %s as %q", name, got)
+		}
 	}
 	pk := pkOf(in.Key)
 	v := in.ExpressionAttributeValues
-	cur, ok := f.rows[pk]
-	if ok && n(cur[attrNC]) >= n(v[":nc"]) && n(cur[attrExpires]) >= n(v[":now"]) {
-		return nil, &dtypes.ConditionalCheckFailedException{}
+	cur := f.rows[pk]
+	for _, clause := range strings.Split(aws.ToString(in.ConditionExpression), " AND ") {
+		var held bool
+		if name, ok := strings.CutPrefix(clause, "attribute_not_exists("); ok && strings.HasSuffix(name, ")") {
+			_, exists := cur[in.ExpressionAttributeNames[strings.TrimSuffix(name, ")")]]
+			held = !exists
+		} else if name, value, ok := strings.Cut(clause, " = "); ok && strings.HasPrefix(name, "#") && strings.HasPrefix(value, ":") {
+			was, exists := cur[in.ExpressionAttributeNames[name]]
+			held = exists && v[value] != nil && n(was) == n(v[value])
+		} else {
+			f.t.Fatalf("UpdateItem condition %q", aws.ToString(in.ConditionExpression))
+		}
+		if !held {
+			failed := &dtypes.ConditionalCheckFailedException{}
+			if in.ReturnValuesOnConditionCheckFailure == dtypes.ReturnValuesOnConditionCheckFailureAllOld {
+				failed.Item = maps.Clone(cur)
+			}
+			return nil, failed
+		}
 	}
-	f.rows[pk] = map[string]dtypes.AttributeValue{attrPK: in.Key[attrPK], attrNC: v[":nc"], attrExpires: v[":e"], attrTTL: v[":ttl"]}
+	f.rows[pk] = map[string]dtypes.AttributeValue{
+		attrPK: in.Key[attrPK], attrNC: v[":nc"], attrNCWindow: v[":w"], attrNCWindowAt: v[":nc"],
+		attrExpires: v[":e"], attrTTL: v[":ttl"], attrNCWriter: v[":by"],
+	}
 	return &dynamodb.UpdateItemOutput{}, nil
 }
 

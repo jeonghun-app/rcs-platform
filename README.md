@@ -58,7 +58,7 @@ See [docs/architecture.md](docs/architecture.md) and the
 Only Docker is needed; Go runs in a pinned container.
 
 ```bash
-make check     # format, vet, tests, race detector, build, docs links, privacy
+make check     # format, vet, tests, race detector, build, print guard, docs links, privacy
 make fuzz      # every parser's fuzz target
 make vuln      # go mod verify + govulncheck
 ```

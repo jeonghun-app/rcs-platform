@@ -55,6 +55,7 @@ func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	if c.Store != StoreDynamoDB || c.DynamoDB.Table != "messages" || c.MSRPListenAddr != ":2855" || m.MSRPPort != 2855 ||
 		m.MSRPHost != "10.0.0.7" || m.StoreTTL != 7*24*time.Hour || m.SentTTL != 8*24*time.Hour || m.PagerLimit != 1300 ||
 		m.MaxMessageSize != 256<<10 || m.SenderRate.PerMinute != 60 || m.MSRP.KeepAliveInterval != 240*time.Second ||
+		!m.MSRP.ProbeOnTimeout || m.MSRP.ProbeTimeout != 10*time.Second ||
 		c.MaxSessions != 20_000 || c.MaxOutgoingPerUser != 32 || c.MaxIncomingPerUser != 32 ||
 		c.GroupChat || c.MaxSubscriptionsPerUser != 32 {
 		t.Fatalf("config %+v", c)
@@ -68,7 +69,7 @@ func TestEverySettingIsRead(t *testing.T) {
 		"RCSAS_IMDN_INTERMEDIARIES", "sip:mstore.example.org", "RCSAS_MAX_MESSAGE_SIZE", "65536", "RCSAS_PAGER_LIMIT", "1000",
 		"RCSAS_STORE_TTL", "48h", "RCSAS_SENT_TTL", "72h", "RCSAS_SENDER_RATE", "10", "RCSAS_SENDER_BURST", "5",
 		"RCSAS_NOTIFICATION_RATE", "100", "RCSAS_NOTIFICATION_BURST", "50", "RCSAS_DELIVERY_TIMEOUT", "10s",
-		"RCSAS_INVITE_TIMEOUT", "1m", "RCSAS_STORE_TIMEOUT", "2s", "RCSAS_SWEEP_INTERVAL", "30s", "RCSAS_MSRP_KEEPALIVE", "100s",
+		"RCSAS_INVITE_TIMEOUT", "1m", "RCSAS_STORE_TIMEOUT", "2s", "RCSAS_SWEEP_INTERVAL", "30s", "RCSAS_MSRP_KEEPALIVE", "100s", "RCSAS_MSRP_PROBE_TIMEOUT", "4s",
 		"RCSAS_TRUSTED_ROUTES", "sip:as.ims.example.net;lr", "RCSAS_QUEUE_SENDER_SHARE", "4", "RCSAS_MAX_QUEUE_MESSAGES", "50", "RCSAS_MAX_QUEUE_BYTES", "1048576",
 		"RCSAS_ANSWER_TIMEOUT", "20s", "RCSAS_RETRY_INTERVAL", "30s", "RCSAS_MAX_RETRY_INTERVAL", "10m",
 		"RCSAS_MAX_SESSIONS", "500", "RCSAS_MAX_OUTGOING_SESSIONS_PER_USER", "8", "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "9",
@@ -81,7 +82,7 @@ func TestEverySettingIsRead(t *testing.T) {
 		len(m.Self) != 2 || m.Intermediaries[0] != "sip:mstore.example.org" || m.MaxMessageSize != 65536 || m.PagerLimit != 1000 ||
 		m.StoreTTL != 48*time.Hour || m.SentTTL != 72*time.Hour || m.SenderRate.Burst != 5 || m.NotificationRate.PerMinute != 100 ||
 		m.DeliveryTimeout != 10*time.Second || m.InviteTimeout != time.Minute || m.StoreTimeout != 2*time.Second ||
-		m.SweepInterval != 30*time.Second || m.MSRP.KeepAliveInterval != 100*time.Second ||
+		m.SweepInterval != 30*time.Second || m.MSRP.KeepAliveInterval != 100*time.Second || m.MSRP.ProbeTimeout != 4*time.Second ||
 		m.TrustedRoutes[0] != "sip:as.ims.example.net;lr" || m.QueueSenderShare != 4 || m.MaxQueueMessages != 50 || m.MaxQueueBytes != 1<<20 ||
 		m.AnswerTimeout != 20*time.Second || m.RetryInterval != 30*time.Second || m.MaxRetryInterval != 10*time.Minute ||
 		c.MaxSessions != 500 || c.MaxOutgoingPerUser != 8 || c.MaxIncomingPerUser != 9 ||

@@ -196,6 +196,15 @@ and answers it as MD5.
   same 401 with fresh challenges, so a client cannot learn which user names
   exist. The one exception is a correct response with an expired nonce, which
   gets `stale=true`.
+- **Nonce-counts may arrive out of order.** A count is accepted once if it is
+  among the 32 counts ending at the highest one used with the nonce
+  (`digest.NonceCountWindow`). A client that breaks an upload may send its next
+  request under the same nonce at once, and that request may be verified first.
+  The broken upload is still accepted and keeps its whole parts (#66). A count
+  already used, or one below the window, is refused (RFC 7616 §3.4). An
+  upload or resume with a body whose credentials do not verify, for this or any
+  other reason, is counted in `upload.failed.auth`: none of its content is
+  kept.
 - **Unusable records get the same 401.** Sometimes the HSS answers `200` but the
   record cannot be used: it is for another realm or algorithm, it has no IMPU,
   its HA1 is malformed, or the body is not a credential. That is the fault of
@@ -367,10 +376,18 @@ holds three kinds of item:
 |---|---|
 | `f#<file id>` | The upload record: owner, tid, state, file name, content type, sizes, SHA-256, hash state, object key, multipart id and parts (number, ETag, size, CRC32), thumbnail, times, lease, version |
 | `t#<len(owner)>#<owner><tid>` | The owner's tid, pointing at the file id. It is created in one transaction with the record |
-| `n#<len(user)>#<user><nonce>` | Highest Digest nonce-count seen for (user, nonce) |
+| `n#<len(user)>#<user><nonce>` | The Digest nonce-counts used with (user, nonce): the highest (`nc`), which of the 32 counts ending at it were used, as a bitmap (`nc_window`), the highest count that bitmap was written for (`nc_window_at`), and a random token of the last write (`nc_writer`) |
 
-Every record write is conditional on the version read. Request reads are
-strongly consistent; the sweeper's scan is not (see below). Records and tid
+Every record write is conditional on the version read. A nonce-count write is
+conditional on the item being as it was read, and on a conflict the item is
+read again, up to 16 times, after a random wait that doubles with each
+conflict (2 ms at first, 50 ms at most). Within a task, one update at a time
+works on each nonce, so requests in flight on one nonce do not conflict with
+each other; each costs one read and one write. When the SDK resends a
+nonce-count write whose answer was lost, the item that fails the resend's
+condition names the write's own token, so the store does not report the count
+as used. Request reads are strongly consistent; the sweeper's scan is not (see
+below). Records and tid
 items expire 30 days after their validity ends. Nonce-counts expire one hour
 after their nonce. An upload has at most 4999 parts, which keeps a record well
 inside DynamoDB's 400 KB item limit.
@@ -417,6 +434,7 @@ identifier ever appears in a metric name:
 | `download.served`, `download.partial`, `download.bytes`, `download.not_found`, `download.unsatisfiable` | Downloads |
 | `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.uploader_busy`, `download.failed.missing_object` | Failed downloads |
 | `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.bad_credential_record`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
+| `auth.nonce_contended` | DynamoDB store: a nonce-count update that waited for another on the same nonce in the task, or lost its conditional write to one on another task |
 | `sweep.expired`, `sweep.failed`, `sweep.duration` (ms) | Sweeper |
 
 The reasons in `upload.failed.<reason>`:
@@ -429,6 +447,8 @@ The reasons in `upload.failed.<reason>`:
 - Content and storage: `length_mismatch`, `storage`, `interrupted`.
 - Form problems: `not_multipart`, `bad_tid`, `file_missing`, `extra_part`,
   `malformed`, and others.
+- Authentication: `auth`, an upload or resume with a body whose credentials do
+  not verify. It is counted on top of the `auth.*` metric for the failure.
 
 File content, file names, tids and file ids are never logged. A file id is a
 download capability. The S3 adapter strips request URLs, which contain the
