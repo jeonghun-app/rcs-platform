@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"errors"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 func md5hex(s string) string {
@@ -18,7 +20,7 @@ func TestAnAKAChallengeWithoutQOPIsAnsweredInTheFormWithoutQOP(t *testing.T) {
 	// response = MD5(HA1:nonce:HA2), and no cnonce, nc or qop.
 	res := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	ch := Challenge{Realm: "ims.example.com", Nonce: "bm9uY2U=", Algorithm: AKAv1MD5, Opaque: "op"}
-	c, err := Respond(ch, ClientParams{Username: "u@ims.example.com", Password: res, Method: "REGISTER", URI: "sip:ims.example.com"})
+	c, err := Respond(ch, ClientParams{Username: "u@ims.example.com", Password: secret.NewKey(res), Method: "REGISTER", URI: "sip:ims.example.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,14 +35,14 @@ func TestAnAKAChallengeWithoutQOPIsAnsweredInTheFormWithoutQOP(t *testing.T) {
 	}
 	// AUTS is answered the same way, with the empty password (RFC 3310 §3.4).
 	auts := make([]byte, 14)
-	c, err = Respond(ch, ClientParams{Username: "u@ims.example.com", Password: res, Method: "REGISTER", URI: "sip:ims.example.com", AUTS: auts})
+	c, err = Respond(ch, ClientParams{Username: "u@ims.example.com", Password: secret.NewKey(res), Method: "REGISTER", URI: "sip:ims.example.com", AUTS: auts})
 	if err != nil || c.Response != md5hex(md5hex("u@ims.example.com:ims.example.com:")+":"+ch.Nonce+":"+md5hex("REGISTER:sip:ims.example.com")) || len(c.AUTS) != 14 {
 		t.Fatalf("AUTS credentials = %v, %v", c, err)
 	}
 }
 
 func TestOnlyAKAMayGoWithoutQOP(t *testing.T) {
-	p := ClientParams{Username: "u", Password: []byte("p"), Method: "REGISTER", URI: "sip:x", CNonce: "c", NC: 1}
+	p := ClientParams{Username: "u", Password: secret.NewKey([]byte("p")), Method: "REGISTER", URI: "sip:x", CNonce: "c", NC: 1}
 	for name, ch := range map[string]Challenge{
 		"MD5 without qop":     {Realm: "r", Nonce: "n", Algorithm: MD5},
 		"SHA-256 without qop": {Realm: "r", Nonce: "n", Algorithm: SHA256},
@@ -64,7 +66,7 @@ func TestVerifyAKARefusesCredentialsWithoutQOP(t *testing.T) {
 		t.Fatal(err)
 	}
 	ch.QOP = nil
-	answer, err := Respond(ch, ClientParams{Username: testUser, Password: v.XRES[:], Method: "REGISTER", URI: testURI})
+	answer, err := Respond(ch, ClientParams{Username: testUser, Password: secret.NewKey(v.XRES[:]), Method: "REGISTER", URI: testURI})
 	if err != nil {
 		t.Fatal(err)
 	}
