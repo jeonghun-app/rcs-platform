@@ -761,6 +761,15 @@ func (e *Engine) ask(ctx context.Context, inv Invitation, key inviteKey) {
 		e.mu.Unlock()
 		return
 	}
+	// The recipient's own INVITE to the group is being served, and will
+	// open the leg m goes on (Joining); its end reads the queue again if
+	// it opens none.
+	if h := e.joins[legKey{inv.Recipient, inv.Peer}]; inv.Mode == store.Group && h != nil && now.Before(h.until) {
+		h.held = true
+		e.mu.Unlock()
+		e.metrics.Count("invite.held_for_join", 1)
+		return
+	}
 	if len(e.invites) >= e.cfg.MaxTracked {
 		for k, mark := range e.invites {
 			if !now.Before(mark.until) {
