@@ -176,6 +176,15 @@ func TestAMessageHeldElsewhereIsLookedForAFewTimesOnly(t *testing.T) {
 	if got := r.m.get("delivery.held_elsewhere"); got != 8 {
 		t.Errorf("the queue was read again %d times for the held message, want 8", got)
 	}
+	// Code review on #646: once the looks have run out, nothing keeps
+	// bob's state; a look that fired and stayed recorded would keep it
+	// for the task's life.
+	r.e.mu.Lock()
+	x := r.e.recipients[bob]
+	r.e.mu.Unlock()
+	if x != nil {
+		t.Errorf("bob's state kept after the looks ran out (look waiting: %v)", x.lookTimer != nil)
+	}
 }
 
 // Only a registration has the queue looked at for held messages: a new
@@ -491,31 +500,43 @@ func TestARefreshOfAWaitingQueueDeliversAMessageHeldElsewhere(t *testing.T) {
 
 // Code review on #646: a registration ends the series of looks it finds
 // waiting. Once nothing is held any more, its pass starts none, and the
-// earlier series reads the queue no more.
+// earlier series reads the queue no more. The same for a refresh of a
+// queue that waits for a session.
 func TestARegistrationEndsTheLooksBeforeIt(t *testing.T) {
-	st := &heldReadCounter{Store: store.NewMemory()}
-	r := newRigWith(t, Config{InstanceID: "task-2"}, st, newFakeClock())
-	m := store.Message{Recipient: bob, ID: "0001", Sender: alice, Mode: store.Standalone,
-		CPIM: standalone(alice, bob, chat(t, "m1", "one", 0)).CPIM, Enqueued: r.clock.Now(), Expires: r.clock.Now().Add(24 * time.Hour)}
-	if err := st.Enqueue(t.Context(), m, store.Limit{}); err != nil {
-		t.Fatal(err)
-	}
-	c, err := st.Claim(t.Context(), bob, "0001", "task-9", r.clock.Now(), r.clock.Now().Add(12*time.Hour))
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.e.UserRegistered(bob, true)
-	waitFor(t, "the first look", func() bool { return r.idle() && r.clock.armed(time.Second) })
-	// task-9 delivers m1; bob registers again before the look is due.
-	if err := st.Remove(t.Context(), c, "task-9"); err != nil {
-		t.Fatal(err)
-	}
-	r.e.UserRegistered(bob, true)
-	waitFor(t, "idle", r.idle)
-	before := st.n.Load()
-	stepUntil(t, r.clock, 5*time.Minute, r.idle, func() bool { return false })
-	if got := st.n.Load() - before; got != 0 {
-		t.Errorf("the series the first registration began read the queue %d more times", got)
+	for _, waiting := range []bool{false, true} {
+		t.Run(map[bool]string{false: "new flow", true: "refresh of a waiting queue"}[waiting], func(t *testing.T) {
+			st := &heldReadCounter{Store: store.NewMemory()}
+			r := newRigWith(t, Config{InstanceID: "task-2", RetryInterval: time.Hour, InviteTimeout: time.Hour}, st, newFakeClock())
+			drainInvites(t, r.d)
+			if waiting {
+				if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "c1", 0))}); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, "idle", r.idle)
+			}
+			m := store.Message{Recipient: bob, ID: "0001", Sender: alice, Mode: store.Standalone,
+				CPIM: standalone(alice, bob, chat(t, "m1", "one", 0)).CPIM, Enqueued: r.clock.Now(), Expires: r.clock.Now().Add(24 * time.Hour)}
+			if err := st.Enqueue(t.Context(), m, store.Limit{}); err != nil {
+				t.Fatal(err)
+			}
+			c, err := st.Claim(t.Context(), bob, "0001", "task-9", r.clock.Now(), r.clock.Now().Add(12*time.Hour))
+			if err != nil {
+				t.Fatal(err)
+			}
+			r.e.UserRegistered(bob, !waiting)
+			waitFor(t, "the first look", func() bool { return r.idle() && r.clock.armed(time.Second) })
+			// task-9 delivers m1; bob registers again before the look is due.
+			if err := st.Remove(t.Context(), c, "task-9"); err != nil {
+				t.Fatal(err)
+			}
+			r.e.UserRegistered(bob, !waiting)
+			waitFor(t, "idle", r.idle)
+			before := st.n.Load()
+			stepUntil(t, r.clock, 5*time.Minute, r.idle, func() bool { return false })
+			if got := st.n.Load() - before; got != 0 {
+				t.Errorf("the series the first registration began read the queue %d more times", got)
+			}
+		})
 	}
 }
 
@@ -531,9 +552,37 @@ func TestARefreshOfAWaitingQueueKeepsItsBackoff(t *testing.T) {
 	waitFor(t, "the first retry armed", func() bool { return r.idle() && r.clock.armed(time.Minute) })
 	r.clock.Advance(time.Minute)
 	waitFor(t, "the second retry armed", func() bool { return r.idle() && r.clock.armed(2*time.Minute) })
+	asked := r.m.get("invite.sent")
 	r.e.UserRegistered(bob, false)
 	waitFor(t, "idle", r.idle)
+	if got := r.m.get("invite.sent") - asked; got != 0 {
+		t.Errorf("the refresh asked %d invitations, within RCSAS_INVITE_TIMEOUT of the last", got)
+	}
 	if !r.clock.armed(2*time.Minute) || r.clock.armed(time.Minute) {
 		t.Errorf("after the refresh: 2 min retry armed %v, 1 min retry armed %v", r.clock.armed(2*time.Minute), r.clock.armed(time.Minute))
+	}
+}
+
+// Code review on #646, as docs/rcs-as.md says: the read a refresh has a
+// waiting queue make asks again an invitation older than
+// RCSAS_INVITE_TIMEOUT, however far the retry timer has backed off.
+func TestARefreshOfAWaitingQueueAsksAnInvitationPastItsTimeout(t *testing.T) {
+	r := newRig(t, Config{InstanceID: "task-2", RetryInterval: time.Hour, InviteTimeout: 2 * time.Minute})
+	drainInvites(t, r.d)
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "c1", 0))}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first invitation", func() bool { return r.idle() && r.m.get("invite.sent") == 1 })
+	r.clock.Advance(time.Minute)
+	r.e.UserRegistered(bob, false)
+	waitFor(t, "idle", r.idle)
+	r.clock.Advance(2 * time.Minute)
+	r.e.UserRegistered(bob, false)
+	waitFor(t, "idle", r.idle)
+	if got := r.m.get("invite.sent"); got != 2 {
+		t.Errorf("%d invitations after refreshes 1 and 3 min after the first, want 2", got)
+	}
+	if !r.clock.armed(time.Hour) {
+		t.Error("the refreshes stopped the retry timer")
 	}
 }

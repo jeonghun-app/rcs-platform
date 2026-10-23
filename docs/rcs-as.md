@@ -544,7 +544,7 @@ What the last pass over a queue found decides what reads it again:
 | Last pass | A new message | Reads the whole queue |
 |---|---|---|
 | Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg |
-| Messages wait for a session | is tried on its own | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer |
+| Messages wait for a session | is tried on its own | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, a refresh (without restarting the retry timer; an invitation asked for more than `RCSAS_INVITE_TIMEOUT` ago is asked again, #632) |
 | The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits; one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer |
 
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
@@ -576,7 +576,10 @@ starts it over, so a client that registers again and again costs about two
 reads per registration, not a series each. A refresh on a queue that waits
 for a session reads the queue too, with its retry timer left as it is: what
 waits for a session still waits, and an invitation asked for within
-`RCSAS_INVITE_TIMEOUT` is not asked again. The
+`RCSAS_INVITE_TIMEOUT` is not asked again. One asked for longer ago is asked
+again, however far the retry timer has backed off: a client that does not
+answer chat invitations gets one per refresh past that timeout, a large-mode
+message one each, and group copies have their owner woken. The
 store's read tells of the held message at no extra cost (`PendingHeld`), so a
 registration with nothing held costs nothing more. A message that comes in
 on the holding task meanwhile is #605's case: a hold on one task after
