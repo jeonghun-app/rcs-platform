@@ -190,8 +190,9 @@ type run struct {
 	failed   bool
 	cleanups []func()
 
-	// refusal is why the peer last refused an offer the network sent it
-	// (answerCalls), which a step that then waits in vain reports.
+	// refusal is why the peer or the client last refused an offer the
+	// network sent it (answerCalls), which a step that then waits in vain
+	// reports.
 	refusalMu sync.Mutex
 	refusal   string
 }

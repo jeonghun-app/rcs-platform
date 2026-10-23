@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,7 +47,7 @@ func (r *run) atRelay(u msrp.URI) bool {
 }
 
 // refuseCall answers call code and keeps why, which the step then waiting
-// for the peer reports (peerRefused) instead of a time out.
+// for the peer or the client reports (peerRefused) instead of a time out.
 func (r *run) refuseCall(call *sipua.IncomingCall, code int, why string) {
 	r.refusalMu.Lock()
 	r.refusal = why
@@ -54,8 +55,8 @@ func (r *run) refuseCall(call *sipua.IncomingCall, code int, why string) {
 	_ = call.Reject(code)
 }
 
-// peerRefused is the reason the peer last refused an offer, as an error,
-// or err if it refused none.
+// peerRefused is the reason the peer or the client last refused an offer, as
+// an error, or err if neither refused one.
 func (r *run) peerRefused(err error) error {
 	r.refusalMu.Lock()
 	defer r.refusalMu.Unlock()
@@ -73,8 +74,8 @@ const releasePoll = 50 * time.Millisecond
 // of the run follows, which tells its messages from an earlier run's.
 const sipChatText = "hello over SIP"
 
-// peerSession is a chat the network opened to the peer: the INVITE's
-// dialog, the session the peer bound at the relay, and the peer's
+// peerSession is a chat the network opened to the peer or the client: the
+// INVITE's dialog, the session bound at the relay, and, for the peer, its
 // registration the INVITE came in.
 type peerSession struct {
 	dialog       *sipua.Dialog
@@ -82,14 +83,20 @@ type peerSession struct {
 	registration int64
 }
 
-// peerCall is an INVITE to the peer, with the peer's registration when it
-// came: peer-offline counts one more once the peer's next REGISTER has been
-// answered, so that a chat opened before then, while it was unregistered
-// or as it registered, is told from one opened after (code review on #559).
+// peerCall is an INVITE to the peer or the client, with the peer's
+// registration when it came: peer-offline counts one more once the peer's
+// next REGISTER has been answered, so that a chat opened before then, while
+// it was unregistered or as it registered, is told from one opened after
+// (code review on #559).
 type peerCall struct {
 	call         *sipua.IncomingCall
 	registration int64
 }
+
+// fromNetwork counts what the network sent the chat-invite client outside
+// the sessions it opened itself: chats it opened to it (invites), and
+// notifications in pager mode (pagers).
+type fromNetwork struct{ invites, pagers atomic.Int64 }
 
 // chatInvite is the chat-invite scenario (#135 AC 4): the client sends an
 // INVITE for a 1-to-1 chat with an MSRP offer to the peer's IMPU, through
@@ -99,7 +106,13 @@ type peerCall struct {
 // the peer for what the client sends, by an INVITE of its own, which the
 // peer answers and connects to the relay for. Then a message each way, each
 // with its success report and its delivery and display notifications, and
-// a BYE, after which the relay no longer binds the client's session.
+// a BYE, after which the relay no longer binds the client's session. The
+// client takes what the network sends it outside its own sessions, as a
+// device does: a chat the network opens to it, answered as the peer
+// answers its own, and a notification in pager mode, which counts as one
+// in a session. A task of rcs-as that holds no session with the client
+// sends a notification so, and opens a session for a chat message
+// (docs/rcs-as.md, Delivery), as with two tasks (#647).
 func chatInvite(r *run) error {
 	switch {
 	case r.cfg.SIP == nil:
@@ -109,12 +122,22 @@ func chatInvite(r *run) error {
 	case r.cfg.RelayPublic == "":
 		return r.step("register", func(context.Context) (map[string]int64, error) { return nil, errNoRelay })
 	}
-	calls := make(chan peerCall, queueLength)
+	calls, clientCalls := make(chan peerCall, queueLength), make(chan peerCall, queueLength)
 	var registration atomic.Int64
+	var taken fromNetwork
 	var a, b *sipClient
 	if err := r.step("register", func(ctx context.Context) (map[string]int64, error) {
 		var err error
-		if a, err = r.newSIPClient(ctx, *r.cfg.SIP, r.cfg.Self); err != nil {
+		self := *r.cfg.SIP
+		self.OnInvite = func(c *sipua.IncomingCall) {
+			taken.invites.Add(1)
+			select {
+			case clientCalls <- peerCall{call: c}:
+			default:
+				_ = c.Reject(486)
+			}
+		}
+		if a, err = r.newSIPClient(ctx, self, r.cfg.Self); err != nil {
 			return nil, sipError(err)
 		}
 		peer := *r.cfg.SIPPeer
@@ -144,14 +167,15 @@ func chatInvite(r *run) error {
 	sessions := make(chan peerSession, queueLength)
 	release := make(chan chan struct{})
 	answerer, stop := context.WithCancel(context.Background())
-	answering := make(chan struct{})
-	go func() {
-		defer close(answering)
-		r.answerCalls(answerer, calls, bEnd, sessions, release)
-	}()
-	// The answerer ends what it opened once stopped; the scenario's end
+	var answering sync.WaitGroup
+	answering.Go(func() { r.answerCalls(answerer, calls, bEnd, sessions, release) })
+	// The client's chats are not released at peer-offline: only the peer
+	// unregisters.
+	answering.Go(func() { r.answerCalls(answerer, clientCalls, aEnd, nil, nil) })
+	answering.Go(func() { pagerNotifications(answerer, a, aEnd, &taken.pagers) })
+	// The answerers end what they opened once stopped; the scenario's end
 	// waits for that.
-	r.onEnd(func() { stop(); <-answering })
+	r.onEnd(func() { stop(); answering.Wait() })
 
 	local, err := chat.LocalURI(r.cfg.Rand)
 	if err != nil {
@@ -346,7 +370,7 @@ func chatInvite(r *run) error {
 		return err
 	}
 	if err := r.step("peer-offline", func(ctx context.Context) (map[string]int64, error) {
-		return r.chatToOfflinePeer(ctx, b, a, aEnd, bEnd, sessions, release, &registration, token)
+		return r.chatToOfflinePeer(ctx, b, a, aEnd, bEnd, sessions, release, &registration, &taken, token)
 	}); err != nil {
 		return err
 	}
@@ -371,11 +395,14 @@ func chatInvite(r *run) error {
 // 2xx, as rcs-as does, must store the message: once the peer registers
 // again the network opens a chat to it, and the message, its text and
 // Message-ID intact, arrives there, and its notifications come back to the
-// client (stored). One that accepts the chat and loses the message fails,
-// and so does one that sends it on a chat opened before the peer
-// registered again, whether the peer had it already or the network opened
-// it to a binding it kept (code review on #559).
-func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, sessions <-chan peerSession, release chan<- chan struct{}, registration *atomic.Int64, token string) (map[string]int64, error) {
+// client (stored), on its chat, on one the network opens to it
+// (client_invites counts those), or in pager mode (pager_notifications):
+// rcs-as sends them so when the peer's registration lands on a task other
+// than the one with the client's chat (#647). One that accepts the chat and loses the message fails, and so
+// does one that sends it on a chat opened before the peer registered again,
+// whether the peer had it already or the network opened it to a binding it
+// kept (code review on #559).
+func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, sessions <-chan peerSession, release chan<- chan struct{}, registration *atomic.Int64, taken *fromNetwork, token string) (map[string]int64, error) {
 	// A UE releases the dialogs on its flow before it de-registers (TS
 	// 24.229 §5.1.1.6.1): answerCalls ends every chat it opened to the
 	// peer. A chat left open would carry the message at once, and nothing
@@ -403,6 +430,7 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	if _, err := b.ua.Unregister(ctx); err != nil {
 		return nil, fmt.Errorf("peer: %w", sipError(err))
 	}
+	invites, pagers := taken.invites.Load(), taken.pagers.Load()
 	local, err := chat.LocalURI(r.cfg.Rand)
 	if err != nil {
 		return nil, err
@@ -485,24 +513,30 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 		return detail, errors.New("the stored message came on a chat the network opened before the peer registered again")
 	}
 	detail["new_session"] = 1
-	if err := awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI); err != nil {
-		return detail, err
+	err = awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
+	// Read after the notifications: each is counted before it is passed
+	// on, and an INVITE that carried them came before them.
+	detail["client_invites"] = taken.invites.Load() - invites
+	detail["pager_notifications"] = taken.pagers.Load() - pagers
+	if err != nil {
+		return detail, r.peerRefused(err)
 	}
 	detail["stored"] = 1
 	return detail, nil
 }
 
-// answerCalls answers each chat the network opens to the peer: an MSRP
-// offer naming the relay, a=setup:actpass, answered with the peer's own
-// path and a=setup:active, and the peer connecting to the relay at once, as
-// a device behind NAT does. Each session goes to sessions; an offer the
-// peer cannot take is refused 488, and why is kept for the step waiting on
-// the peer (peerRefused). It runs on a goroutine of its own until ctx
-// ends, and then closes the sessions it opened and hangs up their dialogs
-// before it returns: the caller cancels ctx and waits for it at the
-// scenario's end (onEnd is the scenario goroutine's alone). A channel sent
-// on release has it do the same at once, for every session it has opened
-// so far, queued or not, and close the channel when it has.
+// answerCalls answers each chat the network opens to end, the peer or the
+// client: an MSRP offer naming the relay, a=setup:actpass, answered
+// with its own path and a=setup:active, and connecting to the relay at
+// once, as a device behind NAT does. Each session goes to sessions while
+// there is room, never for nil; an offer it cannot take is refused 488, and
+// why is kept for the step that then waits (peerRefused). It runs on a
+// goroutine of its own until ctx ends, and then closes the sessions it
+// opened and hangs up their dialogs before it returns: the caller cancels
+// ctx and waits for it at the scenario's end (onEnd is the scenario
+// goroutine's alone). A channel sent on release, nil for none, has it do
+// the same at once, for every session it has opened so far, queued or not,
+// and close the channel when it has.
 func (r *run) answerCalls(ctx context.Context, calls <-chan peerCall, end *chat.Endpoint, sessions chan<- peerSession, release <-chan chan struct{}) {
 	var opened []peerSession
 	endOpened := func() {
@@ -513,6 +547,11 @@ func (r *run) answerCalls(ctx context.Context, calls <-chan peerCall, end *chat.
 		opened = nil
 	}
 	defer endOpened()
+	// Named in the reasons for a refusal, which a step may report.
+	who := "peer"
+	if end.Self.URI == r.cfg.Self.URI {
+		who = "client"
+	}
 	for {
 		var pc peerCall
 		select {
@@ -530,13 +569,13 @@ func (r *run) answerCalls(ctx context.Context, calls <-chan peerCall, end *chat.
 		path, setup, err := chatAnswer(call.Request().Body)
 		switch {
 		case err != nil:
-			r.refuseCall(call, 488, "the network's offer to the peer has no MSRP path it can take")
+			r.refuseCall(call, 488, "the network's offer to the "+who+" has no MSRP path it can take")
 			continue
 		case setup != sdp.SetupActPass:
-			r.refuseCall(call, 488, "the network's offer to the peer has a=setup:"+string(setup)+", not actpass (RFC 6135 §4.2.2)")
+			r.refuseCall(call, 488, "the network's offer to the "+who+" has a=setup:"+string(setup)+", not actpass (RFC 6135 §4.2.2)")
 			continue
 		case !r.atRelay(path):
-			r.refuseCall(call, 488, "the network's offer to the peer has an a=path that is not msrp-relay's client_path (ADR 0004)")
+			r.refuseCall(call, 488, "the network's offer to the "+who+" has an a=path that is not msrp-relay's client_path (ADR 0004)")
 			continue
 		}
 		local, err := chat.LocalURI(r.cfg.Rand)
@@ -565,6 +604,34 @@ func (r *run) answerCalls(ctx context.Context, calls <-chan peerCall, end *chat.
 		select {
 		case sessions <- s:
 		default:
+		}
+	}
+}
+
+// pagerNotifications hands each IMDN notification the network sends c in
+// pager mode (RFC 5438 §12.1.3.1) to e, as if it had come in a session,
+// and counts it in n before it does. Other MESSAGEs are passed over: an
+// earlier run may have left some. It runs until ctx ends or c's flow goes.
+func pagerNotifications(ctx context.Context, c *sipClient, e *chat.Endpoint, n *atomic.Int64) {
+	for {
+		m, err := c.next(ctx)
+		if err != nil {
+			return
+		}
+		cm, err := readCPIM(m)
+		if err != nil || !imdn.IsNotification(cm) {
+			continue
+		}
+		note, err := imdn.ParseNotificationMessage(cm)
+		if err != nil {
+			e.Malformed.Add(1)
+			continue
+		}
+		n.Add(1)
+		select {
+		case e.Notifications <- note:
+		default:
+			e.Dropped.Add(1)
 		}
 	}
 }
