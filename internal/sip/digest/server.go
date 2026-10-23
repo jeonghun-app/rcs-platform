@@ -16,10 +16,11 @@ import (
 )
 
 // Verification outcomes. Callers answer ErrStaleNonce with a new challenge
-// carrying stale=true and a *SyncFailure as its documentation says. Every
-// other error, including a failed secret lookup, should get one and the same
-// answer (a fresh challenge, or a rejection by local policy), so that a client
-// cannot tell an unknown user from a wrong password.
+// carrying stale=true, a *SyncFailure as its documentation says, and
+// ErrNonceCountStore as a failure of their own backend. Every other error,
+// including a failed secret lookup, should get one and the same answer (a
+// fresh challenge, or a rejection by local policy), so that a client cannot
+// tell an unknown user from a wrong password.
 var (
 	// ErrRealmMismatch means the credentials name another realm.
 	ErrRealmMismatch = errors.New("digest: credentials are for another realm")
@@ -32,12 +33,28 @@ var (
 	ErrInvalidNonce = errors.New("digest: nonce was not issued by this server")
 	// ErrWrongResponse means the response does not match the secret.
 	ErrWrongResponse = errors.New("digest: response does not match")
-	// ErrStaleNonce means the response was right but the nonce has expired.
+	// ErrStaleNonce means the response was right but the nonce has expired,
+	// or the NonceCountStore can no longer use its record of the nonce
+	// (ErrNonceCountUnusable, which the error then wraps too).
 	ErrStaleNonce = errors.New("digest: nonce has expired")
 	// ErrReplayed means the nonce-count has already been used with this
 	// nonce, or lies below the NonceCountWindow counts ending at the highest
 	// one used (RFC 7616 §3.4, §5.5).
 	ErrReplayed = errors.New("digest: nonce count already used")
+	// ErrNonceCountStore wraps an error of the NonceCountStore: the
+	// response was right, but whether its nonce-count was used could not
+	// be told, so the credentials are neither accepted nor refused. It comes
+	// only after the response has verified, so answering it apart from the
+	// other errors tells a client nothing it did not know (#621).
+	ErrNonceCountStore = errors.New("digest: the nonce count store failed")
+	// ErrNonceCountUnusable is for a NonceCountStore to wrap when its
+	// record of one (username, nonce) cannot be read, a malformed item
+	// say. Verification then fails with ErrStaleNonce rather than
+	// ErrNonceCountStore: the fault stays with that nonce, so a client
+	// told to retry later would meet it on every retry until the nonce
+	// expired, while one given a new nonce gets a new record at once
+	// (#621).
+	ErrNonceCountUnusable = errors.New("digest: the nonce count record is unusable")
 )
 
 // SyncFailure is returned by VerifyAKA when an AKA client reported that the
@@ -78,7 +95,9 @@ type NonceCountStore interface {
 	// write must be one atomic step across every instance sharing the store,
 	// for example a DynamoDB conditional write. The entry must be kept until
 	// expires and may be discarded after it: no credentials for the nonce
-	// verify later.
+	// verify later. An error that wraps ErrNonceCountUnusable says the
+	// entry itself is at fault and a new nonce would not meet it; any
+	// other error is taken as a failure of the store.
 	Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error)
 }
 
@@ -391,8 +410,11 @@ func (s *Server) consume(ctx context.Context, c Credentials, deadline time.Time)
 		nonce = autsCountPrefix + nonce
 	}
 	fresh, err := s.counts.Advance(ctx, c.Username, nonce, c.NC, deadline)
+	if errors.Is(err, ErrNonceCountUnusable) {
+		return fmt.Errorf("%w: %w", ErrStaleNonce, err)
+	}
 	if err != nil {
-		return fmt.Errorf("digest: recording the nonce count: %w", err)
+		return fmt.Errorf("%w: %w", ErrNonceCountStore, err)
 	}
 	if !fresh {
 		return ErrReplayed
