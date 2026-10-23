@@ -110,8 +110,9 @@ func (e *Engine) Wake(user, group string, registered bool) {
 
 // ReadQueues has the queues of users read again at once, as a kick does:
 // for the group package, which takes a group over and must deliver, or
-// invite for, the copies its old owner queued and left (#607). A queue
-// that holds none of the group's costs one read.
+// invite for, the copies its old owner queued and left (#607). Each read
+// is a pass over the whole queue, which also tries whatever else waits in
+// it and starts its retry wait again from RetryInterval.
 func (e *Engine) ReadQueues(users []string) {
 	for _, u := range users {
 		e.kickEvent(u)
