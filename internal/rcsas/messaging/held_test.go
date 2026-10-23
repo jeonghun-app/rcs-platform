@@ -395,3 +395,145 @@ func TestARegistrationPassThatLosesALegsClaimDeliversOnceTheAttemptFails(t *test
 		t.Fatalf("task-2's leg got %q", m.Body.Bytes())
 	}
 }
+
+// heldReadCounter counts the engine's reads of a queue.
+type heldReadCounter struct {
+	store.Store
+	n atomic.Int64
+}
+
+func (s *heldReadCounter) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+	s.n.Add(1)
+	return s.Store.PendingHeld(ctx, r, after, owner, now, limit)
+}
+
+// Code review on #646: a client that registers again and again while
+// another task keeps holding a message has one series of looks, which
+// each registration starts over, not a series per registration. With
+// registrations 1.7 s apart, each costs its own pass and the 1 s look
+// after it; the last one's series runs out as usual.
+func TestRegistrationsThatComeOftenShareOneSeriesOfLooks(t *testing.T) {
+	for _, regs := range []int{1, 18} {
+		st := &heldReadCounter{Store: store.NewMemory()}
+		r := newRigWith(t, Config{InstanceID: "task-2"}, st, newFakeClock())
+		if err := st.Enqueue(t.Context(), store.Message{Recipient: bob, ID: "0001", Sender: alice, Mode: store.Standalone,
+			CPIM: standalone(alice, bob, chat(t, "m1", "one", 0)).CPIM, Enqueued: r.clock.Now(), Expires: r.clock.Now().Add(24 * time.Hour)}, store.Limit{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := st.Claim(t.Context(), bob, "0001", "task-9", r.clock.Now(), r.clock.Now().Add(12*time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		const step = 100 * time.Millisecond
+		next, done := time.Duration(0), 0
+		for moved := time.Duration(0); moved < 15*time.Minute; moved += step {
+			if done < regs && moved >= next {
+				r.e.UserRegistered(bob, true)
+				done++
+				next += 1700 * time.Millisecond
+			}
+			waitFor(t, "idle", r.idle)
+			r.clock.Advance(step)
+		}
+		waitFor(t, "idle", r.idle)
+		// One registration: its pass and 8 looks. Each earlier one: its
+		// pass and one look.
+		if got, want := st.n.Load(), int64(2*(regs-1)+9); got > want {
+			t.Errorf("%d registrations read the queue %d times, want at most %d", regs, got, want)
+		}
+	}
+}
+
+// Code review on #646: a refresh on a task whose queue for bob waits for a
+// session read no queue, and so neither looked for m1, which task-1's
+// attempt held, nor delivered it once that attempt had failed. A client
+// that moves to a new flow before its registration runs out comes in as a
+// refresh (sipas).
+func TestARefreshOfAWaitingQueueDeliversAMessageHeldElsewhere(t *testing.T) {
+	for _, newFlow := range []bool{true, false} {
+		for _, failedFirst := range []bool{false, true} {
+			name := map[bool]string{true: "new flow", false: "refresh"}[newFlow] + map[bool]string{true: ", attempt failed first", false: ""}[failedFirst]
+			t.Run(name, func(t *testing.T) {
+				st := store.NewMemory()
+				clock := newFakeClock()
+				r1 := newRigWith(t, Config{InstanceID: "task-1", RetryInterval: time.Hour}, st, clock)
+				r2 := newRigWith(t, Config{InstanceID: "task-2", Rand: seeded(2), RetryInterval: time.Hour}, st, clock)
+				drainInvites(t, r1.d)
+				drainInvites(t, r2.d)
+				h := newHeldAttempt(t)
+				r1.d.onPager(h.pager)
+				r2.d.onPager(h.pager)
+				// carol's c1 waits on task-2 for a session.
+				if err := r2.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "c1", 0))}); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, "task-2 idle", r2.idle)
+				if err := r1.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "one", 0))); err != nil {
+					t.Fatal(err)
+				}
+				waitDone(t, h.in)
+				if failedFirst {
+					h.release()
+					waitFor(t, "task-1's failed attempt", func() bool { return r1.m.get("delivery.pager_failed") == 1 && r1.idle() })
+				}
+				r2.e.UserRegistered(bob, newFlow)
+				waitFor(t, "task-2's registration pass", r2.idle)
+				h.release()
+				waitFor(t, "task-1's failed attempt", func() bool { return r1.m.get("delivery.pager_failed") == 1 && r1.idle() })
+				idle := func() bool { return r1.idle() && r2.idle() }
+				moved, ok := stepUntil(t, clock, 10*time.Minute, idle, func() bool { return h.delivered.Load() == 1 })
+				if !ok || moved > 5*time.Second {
+					t.Fatalf("m1 delivered %v, %v after task-1's attempt failed (its retry timer: 1 h)", ok, moved)
+				}
+			})
+		}
+	}
+}
+
+// Code review on #646: a registration ends the series of looks it finds
+// waiting. Once nothing is held any more, its pass starts none, and the
+// earlier series reads the queue no more.
+func TestARegistrationEndsTheLooksBeforeIt(t *testing.T) {
+	st := &heldReadCounter{Store: store.NewMemory()}
+	r := newRigWith(t, Config{InstanceID: "task-2"}, st, newFakeClock())
+	m := store.Message{Recipient: bob, ID: "0001", Sender: alice, Mode: store.Standalone,
+		CPIM: standalone(alice, bob, chat(t, "m1", "one", 0)).CPIM, Enqueued: r.clock.Now(), Expires: r.clock.Now().Add(24 * time.Hour)}
+	if err := st.Enqueue(t.Context(), m, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	c, err := st.Claim(t.Context(), bob, "0001", "task-9", r.clock.Now(), r.clock.Now().Add(12*time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.e.UserRegistered(bob, true)
+	waitFor(t, "the first look", func() bool { return r.idle() && r.clock.armed(time.Second) })
+	// task-9 delivers m1; bob registers again before the look is due.
+	if err := st.Remove(t.Context(), c, "task-9"); err != nil {
+		t.Fatal(err)
+	}
+	r.e.UserRegistered(bob, true)
+	waitFor(t, "idle", r.idle)
+	before := st.n.Load()
+	stepUntil(t, r.clock, 5*time.Minute, r.idle, func() bool { return false })
+	if got := st.n.Load() - before; got != 0 {
+		t.Errorf("the series the first registration began read the queue %d more times", got)
+	}
+}
+
+// The read a refresh has a waiting queue make leaves its retry timer
+// alone: the refresh says nothing about the session the messages wait for,
+// so the backoff goes on.
+func TestARefreshOfAWaitingQueueKeepsItsBackoff(t *testing.T) {
+	r := newRig(t, Config{InstanceID: "task-2", RetryInterval: time.Minute, InviteTimeout: time.Hour})
+	drainInvites(t, r.d)
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "c1", 0))}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first retry armed", func() bool { return r.idle() && r.clock.armed(time.Minute) })
+	r.clock.Advance(time.Minute)
+	waitFor(t, "the second retry armed", func() bool { return r.idle() && r.clock.armed(2*time.Minute) })
+	r.e.UserRegistered(bob, false)
+	waitFor(t, "idle", r.idle)
+	if !r.clock.armed(2*time.Minute) || r.clock.armed(time.Minute) {
+		t.Errorf("after the refresh: 2 min retry armed %v, 1 min retry armed %v", r.clock.armed(2*time.Minute), r.clock.armed(time.Minute))
+	}
+}

@@ -570,7 +570,13 @@ reads it. So a pass a registration asked for that passed over a message
 another task held, or lost a claim, reads the queue again after a second. It
 reads again after 2, 4, 8 s and so on while such a message is still held,
 until a wait reaches the lease. By then any attempt begun before the
-registration is over, and one begun after it went to the new flow. The
+registration is over, and one begun after it went to the new flow. A
+recipient has one series of these reads at a time, and each registration
+starts it over, so a client that registers again and again costs about two
+reads per registration, not a series each. A refresh on a queue that waits
+for a session reads the queue too, with its retry timer left as it is: what
+waits for a session still waits, and an invitation asked for within
+`RCSAS_INVITE_TIMEOUT` is not asked again. The
 store's read tells of the held message at no extra cost (`PendingHeld`), so a
 registration with nothing held costs nothing more. A message that comes in
 on the holding task meanwhile is #605's case: a hold on one task after

@@ -66,8 +66,10 @@ type recipient struct {
 	// look has the next pass over the whole queue look out for messages
 	// another task holds, after a registration (lookAgain); lookWait is
 	// the wait that led to that look, zero for a registration's own.
-	look     bool
-	lookWait time.Duration
+	// lookTimer is the one look waiting for its time.
+	look      bool
+	lookWait  time.Duration
+	lookTimer msrp.Timer
 	// arrived notes a message queued while a pass ran with the queue
 	// blocked (see hold).
 	arrived bool
@@ -97,6 +99,11 @@ func (e *Engine) schedule(user string, r *recipient) {
 func (e *Engine) kickEvent(user string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.kickEventLocked(user)
+}
+
+// kickEventLocked is kickEvent for a caller holding e.mu.
+func (e *Engine) kickEventLocked(user string) {
 	if e.closed {
 		return
 	}
@@ -222,7 +229,7 @@ func (e *Engine) work() {
 			}
 		}
 		r.run = runIdle
-		if r.hold == holdNone && r.retry == nil {
+		if r.hold == holdNone && r.retry == nil && r.lookTimer == nil {
 			delete(e.recipients, user)
 		}
 		e.mu.Unlock()

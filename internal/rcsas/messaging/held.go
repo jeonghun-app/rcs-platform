@@ -1,6 +1,10 @@
 package messaging
 
-import "time"
+import (
+	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+)
 
 // A registration says the recipient can be reached now, but a message
 // another task is trying to deliver at that moment is claimed, so the pass
@@ -13,7 +17,9 @@ import "time"
 // backoff while the message is still held, until the waits reach a lease.
 // By then any attempt begun before the registration is over; one begun
 // after it went to the new flow. The holder's own retry timer still runs,
-// and finds nothing.
+// and finds nothing. A recipient has one look waiting at a time, and a
+// registration starts the backoff over, so registrations that come often
+// cost a read or two each, not a series each.
 
 // heldRetry is the first wait before the queue is read again for a message
 // held elsewhere; it doubles from there.
@@ -24,10 +30,18 @@ const heldRetry = time.Second
 // delivers the message a second time.
 func (e *Engine) lease() time.Duration { return 3 * e.cfg.DeliveryTimeout }
 
+// registeredLook has the pass a registration runs look for messages held
+// elsewhere, starting the backoff over: the look already waiting is
+// dropped, so that a recipient has one series of looks however often it
+// registers. It needs e.mu.
+func (e *Engine) registeredLook(user string) {
+	e.state(user).lookTimer = nil
+	e.lookOut(user, 0)
+}
+
 // lookOut has the next pass over user's whole queue look for messages held
 // elsewhere, wait being the wait that led to it. The shortest wait asked
-// for counts, so that a registration starts the backoff over. It needs
-// e.mu.
+// for counts. It needs e.mu.
 func (e *Engine) lookOut(user string, wait time.Duration) {
 	r := e.state(user)
 	if !r.look || wait < r.lookWait {
@@ -51,22 +65,36 @@ func (e *Engine) takeLook(user string) (bool, time.Duration) {
 }
 
 // lookAgain reads user's queue again, looking again, after twice the last
-// wait, unless that wait had reached a lease.
+// wait, unless that wait had reached a lease. The look replaces any other
+// waiting for user, and keeps user's state until it is made.
 func (e *Engine) lookAgain(user string, wait time.Duration) {
 	if wait >= e.lease() {
 		return
 	}
 	next := max(2*wait, heldRetry)
 	e.metrics.Count("delivery.held_elsewhere", 1)
-	e.clock.AfterFunc(next, func() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed {
+		return
+	}
+	r := e.state(user)
+	var t msrp.Timer
+	t = e.clock.AfterFunc(next, func() {
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		if e.closed {
+		r := e.recipients[user]
+		// Only the look waiting now counts; one replaced, or dropped by a
+		// registration, does nothing when it fires. This check, not Stop,
+		// keeps one series: Stop cannot hold back a callback already
+		// under way.
+		if e.closed || r == nil || r.lookTimer != t {
 			return
 		}
+		r.lookTimer = nil
 		e.lookOut(user, next)
-		r := e.recipients[user]
 		r.full = true
 		e.schedule(user, r)
 	})
+	r.lookTimer = t
 }
