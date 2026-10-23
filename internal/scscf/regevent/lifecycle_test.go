@@ -1138,8 +1138,16 @@ func TestAStoreFailureSendsNoDocumentWithoutTheSet(t *testing.T) {
 	if r.StatusCode != 500 || r.Header.Get("Retry-After") == "" || after != nil {
 		t.Errorf("refresh while the store fails: %d, Retry-After %q", r.StatusCode, r.Header.Get("Retry-After"))
 	}
+	// A change's NOTIFY carries the change's record and reads none
+	// (#492). A late change's, run after a later record was notified,
+	// reads the record as it is now (#516): that read is the one to fail.
+	v1 := e.touched(before)
+	v2 := e.touched(v1)
+	n.Changed(bg, v1, v2, Registered)
+	n.Wait()
+	k = len(e.send.notifies())
 	fs.registration = 1
-	n.Changed(bg, before, e.touched(before), Registered)
+	n.Changed(bg, before, v1, Registered)
 	n.Wait()
 	if got := len(e.send.notifies()) - k; got != 0 {
 		t.Errorf("%d NOTIFYs sent without the set", got)
@@ -1147,7 +1155,7 @@ func TestAStoreFailureSendsNoDocumentWithoutTheSet(t *testing.T) {
 	if subs := e.subscriptions(impu1); len(subs) != 1 {
 		t.Errorf("%d subscriptions left", len(subs))
 	}
-	n.Changed(bg, before, e.touched(before), Registered)
+	n.Changed(bg, before, v1, Registered)
 	n.Wait()
 	got := e.send.notifies()
 	if doc, _, _ := info(t, got[len(got)-1]); len(got) != k+1 || len(activeURIs(doc, impu1)) != 1 {

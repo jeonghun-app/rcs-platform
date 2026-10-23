@@ -40,6 +40,11 @@ type job struct {
 	before *state.Registration
 	cause  Cause
 	ends   map[string]Cause
+	// after is the set as the change saved it, which the NOTIFY carries
+	// rather than reading the record again (#492): nil for a NOTIFY that
+	// reads the set when it is sent, a first one, a sweep's, or one that
+	// only checks a subscription to another set.
+	after *state.Registration
 	// ended says the registrar ended the set: the NOTIFY tells of before's
 	// end, whatever the store still has of a record being deleted.
 	ended bool
@@ -108,7 +113,7 @@ func (n *Notifier) fanOut(ctx context.Context, before, after *state.Registration
 					// again: it reads the set when it is sent (prepare).
 					continue
 				}
-				j = job{before: before, cause: cause, ends: ends, refresh: refreshOnly(before, after, cause)}
+				j = job{before: before, after: after, cause: cause, ends: ends, refresh: refreshOnly(before, after, cause)}
 			}
 			n.enqueueNotify(ctx, sub, j, nil)
 		}
@@ -304,12 +309,18 @@ func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job
 	}
 }
 
-// prepare makes the NOTIFY j to sub of its set as the store has it now, and
-// returns what sends it and acts on the answer, or nil if there is nothing
-// to send. It never carries a state older than one a NOTIFY with a lower
-// number carried: the number is taken by NextNotify for the record's
-// version read, which a later number's read cannot be below (#256 QA and
-// code review). A read that fails sends nothing, rather than a document
+// prepare makes the NOTIFY j to sub of its set, as the change saved it or
+// as the store has it now, and returns what sends it and acts on the
+// answer, or nil if there is nothing to send. It never carries a state
+// older than one a NOTIFY with a lower number carried: the number is taken
+// by NextNotify for the version of the record it carries, and a NOTIFY of
+// an older version than one already numbered is not sent (#256 QA and
+// code review). A change's NOTIFY carries the change's record, saved
+// before the change was told of, rather than reading it again (#492): a
+// newer save has NOTIFYs of its own, numbered after this one. One that a
+// newer record's NOTIFY was numbered before reads the record as it is now
+// instead, so that it still tells what its change ended (#516). A read
+// that fails sends nothing, rather than a document
 // without the set, which a subscriber takes for its end (#256 code review);
 // the next change or refresh brings the full state, and the next sweep an
 // end.
@@ -324,7 +335,11 @@ func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job
 func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) func() {
 	now := n.cfg.Now()
 	var set *state.Registration
-	if !j.ended {
+	switch {
+	case j.ended:
+	case j.after != nil && j.after.Key == sub.Set:
+		set = j.after
+	default:
 		var err error
 		set, err = n.cfg.Store.Registration(ctx, sub.Set)
 		switch {
@@ -334,9 +349,9 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 			n.internalLog("reading a registration", err)
 			return nil
 		}
-		if set != nil && set.Incarnation != sub.Incarnation {
-			set = nil
-		}
+	}
+	if set != nil && set.Incarnation != sub.Incarnation {
+		set = nil
 	}
 	// Changed gives a before only to the subscriptions of its record.
 	before := j.before
@@ -402,6 +417,12 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 		switch {
 		case errors.Is(err, state.ErrNotFound):
 			return nil
+		case errors.Is(err, state.ErrStale) && !j.final && set == j.after:
+			// A later record than the change's was notified first: this
+			// NOTIFY still tells what the change ended, of the record as
+			// it is now, which is read for it, as before #492 (#516).
+			j.after = nil
+			return n.prepare(ctx, sub, j)
 		case errors.Is(err, state.ErrStale):
 			// A NOTIFY of a later state, or the last, has its number: this
 			// one would tell less. A final one numbered elsewhere is sent,
