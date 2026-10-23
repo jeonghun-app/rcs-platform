@@ -75,6 +75,7 @@ func FuzzRedact(f *testing.F) {
 		"bytes=0-1048575 [0.25 0.5 0.75]",
 		"From: <im:alice.smith@" + testDomain + ">",
 		"pres:" + testMSISDN + "@" + testDomain,
+		"im:\u200b\"bob \\\"x\"\u0301@" + testDomain + " pres:\u0301\"a\" said",
 		"msisdn=１５５５０１００００１ ２０２６年",
 		"imsi ٠٠١٠١٠٠٠٠٠٠٠٠٠١ 1555０１００\xff００1",
 		"tel:+15550100001-２３４５６７",

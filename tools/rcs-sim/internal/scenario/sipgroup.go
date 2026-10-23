@@ -497,7 +497,7 @@ func groupChat(r *run) error {
 	// are its sessions with the group; any other, a 1-to-1 chat or another
 	// group's copy an earlier run left queued say, is answered apart and
 	// never taken for one (QA on #602).
-	calls, strays := make(chan *sipua.IncomingCall, queueLength), make(chan *sipua.IncomingCall, queueLength)
+	calls, strays := make(chan peerCall, queueLength), make(chan peerCall, queueLength)
 	// invites counts the group INVITEs the network sends the peer, as they
 	// come: one comes before any message can arrive on the session it
 	// opens, so a step reads it once its message has arrived. group is the
@@ -528,7 +528,7 @@ func groupChat(r *run) error {
 					to = calls
 				}
 				select {
-				case to <- c:
+				case to <- peerCall{call: c}:
 				default:
 					_ = c.Reject(486)
 				}
@@ -556,8 +556,9 @@ func groupChat(r *run) error {
 	sessions, strayed := make(chan peerSession, queueLength), make(chan peerSession, queueLength)
 	answerer, stop := context.WithCancel(context.Background())
 	var answering sync.WaitGroup
-	answering.Go(func() { r.answerCalls(answerer, calls, bEnd, sessions) })
-	answering.Go(func() { r.answerCalls(answerer, strays, bEnd, strayed) })
+	// No release: the peer keeps its sessions until the scenario ends.
+	answering.Go(func() { r.answerCalls(answerer, calls, bEnd, sessions, nil) })
+	answering.Go(func() { r.answerCalls(answerer, strays, bEnd, strayed, nil) })
 	r.onEnd(func() { stop(); answering.Wait() })
 
 	var conf sip.URI
