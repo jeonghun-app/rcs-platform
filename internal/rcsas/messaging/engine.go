@@ -596,7 +596,9 @@ func (e *Engine) countDeviations(d cpim.Deviation) {
 // pager-only marker and pending invitations are cleared and every stored
 // message is tried at once. A refresh on the same flow changes nothing for
 // messages waiting for a session, so only a queue that found the user
-// unreachable is tried again.
+// unreachable is tried again, unless an invitation failed: a refresh clears
+// the marks of failed invitations, not of those still out, and has the
+// queue tried again.
 func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
 	if newFlow {
@@ -628,22 +630,47 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 				delete(e.woken, k)
 			}
 		}
-	} else if r := e.recipients[user]; r != nil && r.hold == holdWaiting {
-		e.mu.Unlock()
-		return
+	} else {
+		// Whatever the hold: a queue that found the user unreachable
+		// may also keep a message whose invitation failed.
+		failed := e.dropFailedInvites(user)
+		if r := e.recipients[user]; r != nil && r.hold == holdWaiting && !failed {
+			e.mu.Unlock()
+			return
+		}
 	}
 	e.mu.Unlock()
 	e.kickEvent(user)
+}
+
+// dropFailedInvites clears the marks of user's invitations that failed,
+// and reports whether there were any. It needs e.mu.
+//
+// A refresh can be a registration after a de-registration another task
+// took, which this task never heard of (sipas): the core gives each
+// third-party REGISTER to any task. An invitation that failed while the
+// user was away, a 480 say, would hold the queue for InviteTimeout though
+// the user is back (#653). One still out keeps its mark, so that the user
+// is not invited twice for it.
+func (e *Engine) dropFailedInvites(user string) bool {
+	dropped := false
+	for k, mark := range e.invites {
+		if k.user == user && mark.failed {
+			delete(e.invites, k)
+			dropped = true
+		}
+	}
+	return dropped
 }
 
 // InviteFailed reports that the session Invite asked for did not come
 // about. ErrNoSessions marks the recipient as reachable by pager mode only
 // until it registers on a new flow, and sends it what fits; for any other
 // error the next invitation waits for InviteTimeout or the next
-// registration on a new flow. ErrUndeliverable for a group gives up what
-// is queued for the recipient from the group, unless it opens a session
-// with the group itself or is added again: the invitation will never
-// reach it.
+// registration, a refresh too (#653). ErrUndeliverable for a group gives
+// up what is queued for the recipient from the group, unless it opens a
+// session with the group itself or is added again: the invitation will
+// never reach it.
 //
 // A failure of an invitation asked for before the recipient's latest
 // registration on a new flow is of the old flow, and is not marked: the
@@ -687,7 +714,7 @@ func (e *Engine) InviteFailed(inv Invitation, err error) {
 		e.kickEvent(inv.Recipient)
 		return
 	}
-	e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout)}
+	e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout), failed: true}
 	unreachable := inv.Mode == store.Group && errors.Is(err, ErrUndeliverable)
 	if unreachable {
 		e.mark(e.unreachable, legKey{inv.Recipient, inv.Peer})

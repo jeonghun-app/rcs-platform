@@ -523,6 +523,10 @@ message the worker does the first of these that applies:
    that takes no terminating sessions.
 3. **A terminating session** (`Invite`), at most once per recipient, peer and
    mode within `RCSAS_INVITE_TIMEOUT`, or until a registration on a new flow.
+   One that failed waits only for the next registration, a refresh too: the
+   core may give the user's de-registration to another task, and this task
+   then takes the next registration for a refresh (#653). One still waiting
+   for its answer is not asked for again on a refresh.
    - **Chat.** A chat session carries everything queued for it.
    - **Large mode.** A larger standalone message gets a large-mode session of
      its own, named by `Invitation.QueueID`. That leg delivers that message
@@ -544,7 +548,7 @@ What the last pass over a queue found decides what reads it again:
 | Last pass | A new message | Reads the whole queue |
 |---|---|---|
 | Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg |
-| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark |
+| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark, a refresh after an invitation failed (#653) |
 | The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark |
 
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
@@ -1606,11 +1610,13 @@ Signals to alarm on (Phase 7):
   client's REGISTER (the default profile does not ask for it), so a client
   that moves to a new flow before its registration runs out looks like one
   refreshing. It keeps a pager-only marker until it de-registers, misses a
-  refresh, or opens a session itself; and what is queued for it after a
-  delivery on the old flow failed waits for the invitation's
+  refresh, or opens a session itself; and what is queued for it behind an
+  invitation on the old flow that is still unanswered at the refresh waits for
   `RCSAS_INVITE_TIMEOUT` (2 min) or the queue's retry interval (1 min and
-  growing) instead of going at once. Registrations are remembered per task, up
-  to 100 000 users.
+  growing) instead of going at once. An invitation that had already failed
+  holds nothing: the refresh clears its mark. Registrations are remembered per
+  task, up to 100 000 users, so a task that did not take a user's
+  de-registration takes the next registration for a refresh (#653).
 - **Large messages from one sender go one session at a time.** The next one to
   the same recipient waits for the queue's next pass after the session ends.
 - **One user per registration.** `UserRegistered` gets the identity in the
