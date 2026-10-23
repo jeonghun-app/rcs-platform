@@ -321,3 +321,130 @@ func TestQAR3InlineCreatorRetryWhilePendingThroughNonOwner(t *testing.T) {
 		t.Fatalf("the retry on b answered %d, Retry-After %q", res.StatusCode, res.Header.Get("Retry-After"))
 	}
 }
+
+// Code review on #628: bob's rejoin INVITE is what has b take the group
+// over from its stopped owner, and the takeover has the participants'
+// queues read before bob's join has opened his leg. b does not invite bob,
+// which would ring his client with a second session with the group: his
+// copy goes on the session his INVITE opened. carol, who has no session,
+// is invited for hers.
+func TestARejoinThatTakesTheGroupOverIsNotInvited(t *testing.T) {
+	ga, gb := twoTasks(t, bob, carol)
+	now := time.Now() // the engines' clock
+	for _, who := range []string{bob, carol} {
+		if err := gb.store.Enqueue(t.Context(), store.Message{Recipient: who, ID: "c1", Sender: ga.uri, Author: alice, Mode: store.Group,
+			CPIM: content.BodyOf([]byte(cpimBody("m1", "hi"))), Enqueued: now, Expires: now.Add(time.Hour)}, store.Limit{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a stops: the store names an owner with no heartbeat.
+	mine, err := ga.groupStore.Owner(t.Context(), ga.uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ga.groupStore.TakeOver(t.Context(), ga.uri, mine, groupstore.Owner{Task: "task-gone"}, ga.clock.Now().Add(time.Hour), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	// bob's join writes the roster, and so opens his leg, only once the
+	// takeover's read of his queue has come to his copy: the order the
+	// review found, made certain. Reached without the hold, it invites
+	// bob, and both invitations fail (486).
+	asked := func() {
+		deadline := time.Now().Add(waitFor)
+		for gb.metrics.get("invite.held_for_join") == 0 && gb.metrics.get("invite.failed") < 2 && time.Now().Before(deadline) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	gb.groupReads.updateHook.Store(&asked)
+	path := relayPath()
+	s := gb.rejoinAt(t, bob, path)
+	if m := gb.connect(t, path, s.path).next(t); !strings.Contains(string(m.Body.Bytes()), "hi") {
+		t.Fatalf("bob's session got %q", m.Body.Bytes())
+	}
+	toBob := func(req *sip.Request) {
+		t.Helper()
+		if req.Method == "INVITE" && req.URI.String() == bob {
+			t.Fatal("b invited bob, who was joining")
+		}
+	}
+	deadline := time.After(waitFor)
+	for invited := false; !invited; {
+		select {
+		case req := <-gb.core.got:
+			toBob(req)
+			invited = req.Method == "INVITE" && req.URI.String() == carol
+		case <-deadline:
+			t.Fatal("b did not invite carol")
+		}
+	}
+	quiet := time.After(200 * time.Millisecond)
+	for waiting := true; waiting; {
+		select {
+		case req := <-gb.core.got:
+			toBob(req)
+		case <-quiet:
+			waiting = false
+		}
+	}
+	if gb.metrics.get("group.owner_takeover") != 1 || sessionsOf(gb.a.srv, ga.uri) != 1 {
+		t.Fatalf("%d takeovers; b holds %d sessions with the group", gb.metrics.get("group.owner_takeover"), sessionsOf(gb.a.srv, ga.uri))
+	}
+}
+
+// Code review on #628: bob's rejoin that takes the group over and is then
+// refused, its offer a file transfer's, holds his invitation back no
+// longer: b invites him for his copy at once, not after AnswerTimeout.
+func TestARefusedRejoinThatTakesTheGroupOverInvites(t *testing.T) {
+	ga, gb := twoTasks(t, bob)
+	now := time.Now() // the engines' clock
+	if err := gb.store.Enqueue(t.Context(), store.Message{Recipient: bob, ID: "c1", Sender: ga.uri, Author: alice, Mode: store.Group,
+		CPIM: content.BodyOf([]byte(cpimBody("m1", "hi"))), Enqueued: now, Expires: now.Add(time.Hour)}, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	mine, err := ga.groupStore.Owner(t.Context(), ga.uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ga.groupStore.TakeOver(t.Context(), ga.uri, mine, groupstore.Owner{Task: "task-gone"}, ga.clock.Now().Add(time.Hour), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	m := gb.groupInvite(ga.uri, sdpType, offerSDP(relayPath(), "active")+"a=file-selector:name:\"a.txt\" type:text/plain size:1\r\n")
+	m.from, m.to, m.fields[0] = "<"+bob+">;tag=f1", "<"+ga.uri+">", "P-Asserted-Identity: <"+bob+">"
+	if res := gb.p.send(m); res.StatusCode != 403 {
+		t.Fatalf("the rejoin answered %d", res.StatusCode)
+	}
+	if gb.metrics.get("group.owner_takeover") != 1 {
+		t.Fatalf("%d takeovers", gb.metrics.get("group.owner_takeover"))
+	}
+	ownerInvites(t, gb, bob)
+}
+
+// Code review on #628: a rejoin a task forwards to the group's owner holds
+// nothing back there: when that task takes the group over later, it
+// invites the participant for its copy at once.
+func TestAForwardedRejoinHoldsNothingBack(t *testing.T) {
+	ga, gb := twoTasks(t, bob)
+	gb.rejoin(t, bob) // served on a
+	if n := sessionsOf(gb.a.srv, ga.uri); n != 0 || gb.metrics.get("group.forwarded") == 0 {
+		t.Fatalf("b holds %d sessions with the group, forwarded %d", n, gb.metrics.get("group.forwarded"))
+	}
+	mine, err := ga.groupStore.Owner(t.Context(), ga.uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ga.groupStore.TakeOver(t.Context(), ga.uri, mine, groupstore.Owner{Task: "task-gone"}, ga.clock.Now().Add(time.Hour), "t1"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now() // the engines' clock
+	if err := gb.store.Enqueue(t.Context(), store.Message{Recipient: bob, ID: "c1", Sender: ga.uri, Author: alice, Mode: store.Group,
+		CPIM: content.BodyOf([]byte(cpimBody("m1", "hi"))), Enqueued: now, Expires: now.Add(time.Hour)}, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	// b reads the owner again, a heartbeat on (Place), well within its
+	// own lease and AnswerTimeout.
+	gb.clock.Advance(group.DefaultTaskHeartbeat)
+	if owns, err := gb.groups.Owns(t.Context(), ga.uri); err != nil || !owns {
+		t.Fatalf("b's Owns = %v, %v", owns, err)
+	}
+	ownerInvites(t, gb, bob)
+}

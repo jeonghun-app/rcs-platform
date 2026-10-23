@@ -176,11 +176,35 @@ func (s *Server) routeGroup(ctx context.Context, r *proxy.Request) proxy.Decisio
 		return s.refuseMethod(r, groupAllowed)
 	}
 	if uri, ok := s.groupOf(r.Message); ok {
+		done := s.joining(r.Message, uri)
 		if d, ok := s.toOwner(ctx, r, uri); ok {
+			done()
 			return d
+		}
+		join := serve
+		serve = func(ctx context.Context, u *proxy.UAS) {
+			defer done()
+			join(ctx, u)
 		}
 	}
 	return proxy.Decision{Serve: serve}
+}
+
+// joining holds back the engine's invitations of the sender of req, if it
+// is a client's INVITE to the conference URI uri, while the request is
+// routed and served (messaging.Engine.Joining): routing it may take the
+// group over, which has the participants' queues read before the INVITE
+// has opened the sender's leg (code review on #628). Any other request
+// holds nothing back.
+func (s *Server) joining(req *sip.Request, uri string) (done func()) {
+	if s.groups == nil || req.Method != "INVITE" || s.isFactory(req.URI) {
+		return func() {}
+	}
+	user, _, ok := s.assertedUser(req)
+	if !ok {
+		return func() {}
+	}
+	return s.engine.Joining(user, uri)
 }
 
 // groupInvite answers a client's INVITE to a group chat (RCC.07 Group
