@@ -210,16 +210,19 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		"remote:2001:db8:5:6::8 cafe:2001:db8:5:6:7:8:9:a conn...203.0.113.9 来自203.0.113.9。",
 		"2002:cb00:7109::/48 203.0.113.5/24x ::ffff:cb00:7105/96 udp/2001:db8::1",
 		"A/0:0:0:0:0:ffff::/0",
+		"host:2001:db8::/48:2001:db8:5:6::8 2001:db8::a/32:2001:db8:5:6::8",
+		"0.0.0.0:1:01::",
 	} {
 		f.Add(s)
 	}
 	run := regexp.MustCompile(`[0-9A-Fa-f:.]+`)
-	ipv4Port := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24(:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
 	// A port may be followed by the colon net/http writes after one
-	// ("]:443: EOF"). One followed by a colon and an address character
-	// is not looked for: that text is a token of its own, whose network
-	// may start with digits that look like a port ("[::/48]:1::/48",
-	// see TruncateIPsIn's doc; #500).
+	// (":51234: EOF", "]:443: EOF"). One followed by a colon and an
+	// address character is not looked for: that text is a token of its
+	// own, whose network may start with digits that look like a port
+	// ("[::/48]:1::/48", "0.0.0.0/24:1::/48", see TruncateIPsIn's doc;
+	// #500).
+	ipv4Port := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24(:[0-9]{1,5})([^0-9.:]|:[^0-9A-Fa-f:]|:$|\.[^0-9]|\.$|$)`)
 	bracketPort := regexp.MustCompile(`\[[0-9A-Fa-f:.]+/[0-9]+\](:[0-9]{1,5})([^0-9.:]|:[^0-9A-Fa-f:]|:$|\.[^0-9]|\.$|$)`)
 	// letter is what makes a run part of a longer word: an ASCII letter
 	// past f, or "_" (digits and hex letters are in the run itself).
@@ -236,7 +239,8 @@ func FuzzTruncateIPsIn(f *testing.F) {
 	// s did not hold, unless the run is part of a longer word. It returns
 	// the addresses of s that got leaves whole.
 	leftWhole := func(s, got string) (left []string) {
-		for _, m := range run.FindAllStringIndex(got, -1) {
+		matches := run.FindAllStringIndex(got, -1)
+		for mi, m := range matches {
 			if m[1] < len(got) && letter(got[m[1]]) {
 				continue // a longer word, as 1.2.3.4x
 			}
@@ -257,8 +261,10 @@ func FuzzTruncateIPsIn(f *testing.F) {
 			// address, whose network would be its /16; and a part of
 			// "00:0:0:0:0:ffff::/0", a network written out, is none (#500).
 			// Only a reading the code may start counts: the run itself
-			// after no letter and after no "/" that follows a decimal digit
-			// (a length, as the code reads one), or a part after a colon.
+			// after no letter and after no length's "/", or a part after a
+			// colon. A "/" is a length's after a decimal digit, as the code
+			// reads one, and after an address, whose length the code reads
+			// it as ("2001:db8::/48:…", #593 security review).
 			reads := func(v string) bool {
 				v = strings.Trim(v, ".")
 				for _, w := range []string{v, strings.TrimSuffix(v, ":")} {
@@ -268,8 +274,25 @@ func FuzzTruncateIPsIn(f *testing.F) {
 				}
 				return false
 			}
-			afterDecimalLength := m[0] >= 2 && got[m[0]-1] == '/' && '0' <= got[m[0]-2] && got[m[0]-2] <= '9'
-			read := (m[0] == 0 || !letter(got[m[0]-1])) && !afterDecimalLength && reads(r)
+			// addressBefore reports whether the run that ends at the "/"
+			// before this one, or a part of it after a colon, is an address.
+			addressBefore := func() bool {
+				if mi == 0 || matches[mi-1][1] != m[0]-1 {
+					return false
+				}
+				p := got[matches[mi-1][0]:matches[mi-1][1]]
+				if reads(p) {
+					return true
+				}
+				for k := 0; k < len(p); k++ {
+					if p[k] == ':' && reads(p[k+1:]) {
+						return true
+					}
+				}
+				return false
+			}
+			lengthBefore := m[0] >= 2 && got[m[0]-1] == '/' && ('0' <= got[m[0]-2] && got[m[0]-2] <= '9' || addressBefore())
+			read := (m[0] == 0 || !letter(got[m[0]-1])) && !lengthBefore && reads(r)
 			for k := 0; k < len(r); k++ {
 				if r[k] == ':' && !read {
 					cands = append(cands, r[k+1:])

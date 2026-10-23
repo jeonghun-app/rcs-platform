@@ -14,8 +14,10 @@
 // MD5 and SHA-256 nonces are stateless: each carries its issue time and an HMAC
 // under a key every instance of the service shares, so any instance can verify
 // a nonce another instance issued (ADR 0005) and a nonce expires without a
-// table. The one piece of state Digest needs, the highest nonce-count seen per
-// (username, nonce), sits behind NonceCountStore so it can live in DynamoDB.
+// table. The one piece of state Digest needs, the nonce-counts used per
+// (username, nonce) (UsedCounts: the highest, and a window of the
+// NonceCountWindow counts ending at it), sits behind NonceCountStore so it
+// can live in DynamoDB.
 //
 // An AKA nonce is, by default, exactly base64(RAND ‖ AUTN): the form deployed
 // UE stacks decode, although RFC 3310 §3.2 allows server data after it. It

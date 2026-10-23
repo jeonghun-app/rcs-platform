@@ -250,9 +250,22 @@ func TestReplayedNonceCountIsRejected(t *testing.T) {
 	if err := h.server.Verify(ctx, "REGISTER", third, secret); err != nil {
 		t.Fatalf("nc 3 after 1: %v", err)
 	}
+	// A count that arrives late is accepted once, inside the window.
 	second := answer(t, ch, testPass, 2)
+	if err := h.server.Verify(ctx, "REGISTER", second, secret); err != nil {
+		t.Fatalf("nc 2 after 3: %v", err)
+	}
 	if err := h.server.Verify(ctx, "REGISTER", second, secret); !errors.Is(err, ErrReplayed) {
-		t.Fatalf("nc 2 after 3: err = %v, want ErrReplayed", err)
+		t.Fatalf("nc 2 again: err = %v, want ErrReplayed", err)
+	}
+	ahead := answer(t, ch, testPass, 4+NonceCountWindow)
+	if err := h.server.Verify(ctx, "REGISTER", ahead, secret); err != nil {
+		t.Fatal(err)
+	}
+	for _, nc := range []uint32{2, 4} { // used, and unused, both below the window now
+		if err := h.server.Verify(ctx, "REGISTER", answer(t, ch, testPass, nc), secret); !errors.Is(err, ErrReplayed) {
+			t.Fatalf("nc %d below the window: err = %v, want ErrReplayed", nc, err)
+		}
 	}
 }
 

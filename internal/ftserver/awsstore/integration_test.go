@@ -6,6 +6,8 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store/storetest"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
 // The integration tests run the store contract against an S3-compatible
@@ -72,17 +75,63 @@ func TestIntegrationStoresMeetTheContract(t *testing.T) {
 	storetest.Blobs(t, s.Blobs, 5<<20)
 }
 
-func TestIntegrationNonceCountsOnlyAdvance(t *testing.T) {
+func TestIntegrationNonceCountsAcceptEachCountOnceInsideTheWindow(t *testing.T) {
 	s := integrationStores(t)
 	ctx := context.Background()
 	exp := time.Now().Add(time.Minute)
 	for i, c := range []struct {
 		nc   uint32
 		want bool
-	}{{1, true}, {1, false}, {5, true}, {4, false}} {
+	}{
+		{1, true}, {1, false}, {5, true}, {4, true}, {4, false},
+		{6 + digest.NonceCountWindow, true}, {6, false}, {7, true}, {7, false},
+	} {
 		got, err := s.NonceCounts.Advance(ctx, "alice", "nonce", c.nc, exp)
 		if err != nil || got != c.want {
 			t.Fatalf("step %d: %v, %v", i, got, err)
+		}
+	}
+
+	// An item the version before #66 wrote: nc alone.
+	n := s.NonceCounts
+	if _, err := n.api.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(n.table),
+		Item: map[string]dtypes.AttributeValue{
+			attrPK: str(nonceKey("alice", "old")), attrNC: num(5), attrExpires: num(exp.UnixMilli()),
+			attrTTL: num(exp.Add(time.Hour).Unix()),
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, c := range []struct {
+		nc   uint32
+		want bool
+	}{{4, false}, {6, true}, {5, false}, {7, true}} {
+		if got, err := n.Advance(ctx, "alice", "old", c.nc, exp); err != nil || got != c.want {
+			t.Fatalf("old item, step %d: %v, %v", i, got, err)
+		}
+	}
+
+	// The conditional writes under real contention: every count once.
+	var accepted [maxNonceCountAttempts + 1]atomic.Int32
+	var wg sync.WaitGroup
+	for nc := uint32(1); nc <= maxNonceCountAttempts; nc++ {
+		for range 2 {
+			wg.Go(func() {
+				ok, err := s.NonceCounts.Advance(ctx, "alice", "concurrent", nc, exp)
+				if err != nil {
+					t.Errorf("Advance(%d): %v", nc, err)
+				}
+				if ok {
+					accepted[nc].Add(1)
+				}
+			})
+		}
+	}
+	wg.Wait()
+	for nc := 1; nc <= maxNonceCountAttempts; nc++ {
+		if got := accepted[nc].Load(); got != 1 {
+			t.Errorf("nc %d accepted %d times", nc, got)
 		}
 	}
 }

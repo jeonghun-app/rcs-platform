@@ -2,9 +2,13 @@ package awsstore
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"math"
+	mrand "math/rand/v2"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
 // DynamoAPI is the part of the DynamoDB client the stores use;
@@ -58,6 +63,9 @@ const (
 	attrLeaseUntil = "lease_until"
 	attrVersion    = "version"
 	attrNC         = "nc"
+	attrNCWindow   = "nc_window"
+	attrNCWindowAt = "nc_window_at"
+	attrNCWriter   = "nc_writer"
 )
 
 // PartitionKey is the name of the table's partition key, for whoever
@@ -260,34 +268,193 @@ type NonceCounts struct {
 	api   DynamoAPI
 	table string
 	now   func() time.Time
+	// contended, if set, runs each time an Advance waits for another on
+	// the same nonce in this task, or loses its conditional write to one
+	// on another task.
+	contended func()
+	// sleep waits d or until ctx ends; sleepCtx when nil.
+	sleep func(ctx context.Context, d time.Duration) error
+	locks nonceLocks
 }
 
-// Advance implements digest.NonceCountStore with one conditional update:
-// written only if no count is stored, the stored one is lower, or it has
-// expired (DynamoDB deletes expired items late, so expiry is checked here).
+// Backoff between the conditional writes of one Advance: a random wait below
+// nonceBackoffBase doubled for each write lost, up to nonceBackoffMax (full
+// jitter), so that tasks racing on one nonce spread out rather than read and
+// write again in step.
+const (
+	nonceBackoffBase = 2 * time.Millisecond
+	nonceBackoffMax  = 50 * time.Millisecond
+)
+
+// nonceBackoff is the longest wait after lost writes lost.
+func nonceBackoff(lost int) time.Duration {
+	return min(nonceBackoffMax, nonceBackoffBase<<min(lost-1, 10))
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (n *NonceCounts) countContention() {
+	if n.contended != nil {
+		n.contended()
+	}
+}
+
+// maxNonceCountAttempts bounds the reads and conditional writes of one
+// Advance. A write fails only if another request recorded a count with the
+// same (user, nonce) after the read, so this many requests in flight on one
+// nonce all get through.
+const maxNonceCountAttempts = 16
+
+// errNonceCountContended ends an Advance that lost maxNonceCountAttempts
+// races. It is not a replay: the count is still unused.
+var errNonceCountContended = errors.New("awsstore: advance nonce count: too many concurrent updates")
+
+// nonceCountAttrs are the attributes an Advance reads, by the names its
+// expressions give them. It writes them back only if none has changed.
+var nonceCountAttrs = []struct{ name, attr string }{
+	{"#nc", attrNC}, {"#w", attrNCWindow}, {"#at", attrNCWindowAt}, {"#e", attrExpires},
+}
+
+// Advance implements digest.NonceCountStore. It reads the counts recorded
+// (digest.UsedCounts), and writes them back with nc added on condition that
+// the item is still as read; when another request got in between, it reads
+// again. The item holds the highest count in nc, the window in nc_window and,
+// in nc_window_at, the highest count nc_window was written for: a task
+// running the version before #66 advances nc alone, which would misplace the
+// window, so the window counts only where nc_window_at equals nc. Elsewhere
+// every count up to nc is taken as used, as that version did. DynamoDB
+// deletes expired items late, so expiry is checked here.
+//
+// Within the task, one Advance at a time works on each (user, nonce)
+// (nonceLocks), so the conditional writes race only those of other tasks,
+// and between those it backs off with jitter. A request then costs one read
+// and one write unless another task wrote the same item in between.
+//
+// Each Advance writes a random token of its own in nc_writer. The SDK resends
+// a write whose answer was lost; if the first one had landed, the resend
+// fails its condition, and the item that comes back carries this token, so
+// the count is recorded rather than refused.
 func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
-	_, err := n.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
-		TableName:        aws.String(n.table),
-		Key:              key(nonceKey(username, nonce)),
-		UpdateExpression: aws.String("SET #nc = :nc, #e = :e, #ttl = :ttl"),
-		ConditionExpression: aws.String(
-			"attribute_not_exists(#nc) OR #nc < :nc OR #e < :now"),
-		ExpressionAttributeNames: map[string]string{"#nc": attrNC, "#e": attrExpires, "#ttl": attrTTL},
-		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":nc":  num(int64(nc)),
-			":e":   num(expires.UnixMilli()),
-			":ttl": num(expires.Add(time.Hour).Unix()),
-			":now": num(n.now().UnixMilli()),
-		},
-	})
-	var failed *types.ConditionalCheckFailedException
-	if errors.As(err, &failed) {
-		return false, nil
+	pk := nonceKey(username, nonce)
+	unlock, waited, err := n.locks.lock(ctx, pk)
+	if waited {
+		n.countContention()
 	}
 	if err != nil {
-		return false, sanitize("advance nonce count", err)
+		return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
 	}
-	return true, nil
+	defer unlock()
+	sleep := n.sleep
+	if sleep == nil {
+		sleep = sleepCtx
+	}
+	k := key(pk)
+	writer := rand.Text()
+	for lost := range maxNonceCountAttempts {
+		if lost > 0 {
+			if err := sleep(ctx, mrand.N(nonceBackoff(lost))); err != nil {
+				return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
+			}
+		}
+		out, err := n.api.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName:      aws.String(n.table),
+			Key:            k,
+			ConsistentRead: aws.Bool(true),
+		})
+		if err != nil {
+			return false, sanitize("read nonce count", err)
+		}
+		used, err := n.usedCounts(out.Item)
+		if err != nil {
+			return false, err
+		}
+		next, ok := used.Use(nc)
+		if !ok {
+			return false, nil
+		}
+		names := map[string]string{"#ttl": attrTTL, "#by": attrNCWriter}
+		values := map[string]types.AttributeValue{
+			":nc":  num(int64(next.Highest)),
+			":w":   num(int64(next.Window)),
+			":e":   num(expires.UnixMilli()),
+			":ttl": num(expires.Add(time.Hour).Unix()),
+			":by":  str(writer),
+		}
+		var unchanged []string
+		for _, a := range nonceCountAttrs {
+			names[a.name] = a.attr
+			if v, ok := out.Item[a.attr]; ok {
+				values[":was_"+a.attr] = v
+				unchanged = append(unchanged, a.name+" = :was_"+a.attr)
+			} else {
+				unchanged = append(unchanged, "attribute_not_exists("+a.name+")")
+			}
+		}
+		_, err = n.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName:                           aws.String(n.table),
+			Key:                                 k,
+			UpdateExpression:                    aws.String("SET #nc = :nc, #w = :w, #at = :nc, #e = :e, #ttl = :ttl, #by = :by"),
+			ConditionExpression:                 aws.String(strings.Join(unchanged, " AND ")),
+			ExpressionAttributeNames:            names,
+			ExpressionAttributeValues:           values,
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		})
+		var failed *types.ConditionalCheckFailedException
+		if errors.As(err, &failed) {
+			// The token matches only if no other write landed between
+			// this write and the SDK's resend of it. If one did, this
+			// write is not recognised: the item is read again and the
+			// count, already recorded, is refused, a 401 the client
+			// answers with a fresh challenge. The miss goes that safe
+			// way, never to a count accepted twice.
+			if by, ok := failed.Item[attrNCWriter].(*types.AttributeValueMemberS); ok && by.Value == writer {
+				return true, nil
+			}
+			n.countContention()
+			continue
+		}
+		if err != nil {
+			return false, sanitize("advance nonce count", err)
+		}
+		return true, nil
+	}
+	return false, errNonceCountContended
+}
+
+// usedCounts decodes the counts a nonce-count item records: none if there is
+// no item or it has expired.
+func (n *NonceCounts) usedCounts(item map[string]types.AttributeValue) (digest.UsedCounts, error) {
+	if len(item) == 0 {
+		return digest.UsedCounts{}, nil
+	}
+	d := decoder{item: item}
+	expires := d.num(attrExpires, true)
+	highest := d.num(attrNC, true)
+	window := d.num(attrNCWindow, false)
+	at := d.num(attrNCWindowAt, false)
+	switch {
+	case d.err != nil:
+		return digest.UsedCounts{}, d.err
+	case highest < 0 || highest > math.MaxUint32 || window < 0 || window > math.MaxUint32:
+		return digest.UsedCounts{}, errors.New("awsstore: nonce count item is malformed")
+	case expires < n.now().UnixMilli():
+		return digest.UsedCounts{}, nil
+	case item[attrNCWindowAt] == nil || at != highest || window&1 == 0:
+		// Written by the version before #66, or advanced by it since: the
+		// window is missing or misplaced. (A window always has the highest
+		// count's bit set.)
+		return digest.UsedCounts{Highest: uint32(highest), Window: math.MaxUint32}, nil
+	}
+	return digest.UsedCounts{Highest: uint32(highest), Window: uint32(window)}, nil
 }
 
 // encodeRecord is the item of r. Optional values are left out rather than

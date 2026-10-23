@@ -30,6 +30,8 @@ jobs:
       - run: make test
       - run: make race
       - run: make build
+      # After build, so go list -export finds the cache warm (#599).
+      - run: make printguard
 
   fuzz:
     name: fuzz every parser briefly

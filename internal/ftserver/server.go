@@ -373,11 +373,22 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 	default:
 		s.metrics.Count("auth.failed", 1)
 	}
+	if !errors.Is(err, digest.ErrNoCredentials) && carriesContent(r) {
+		// Content sent under credentials that did not verify, so none of
+		// it is kept: a broken upload refused this way is lost (#66).
+		s.metrics.Count("upload.failed.auth", 1)
+	}
 	if err := s.o.Digest.ChallengeHTTP(w, stale); err != nil {
 		s.log.Error("cannot issue a digest challenge", slog.String("error", err.Error()))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
 	return identity{}, false
+}
+
+// carriesContent reports whether r is an upload or a resume with a body,
+// not the empty pre-check POST.
+func carriesContent(r *http.Request) bool {
+	return (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.ContentLength != 0
 }
 
 // serviceUnavailable answers 503 with Retry-After, which RCS clients honour
