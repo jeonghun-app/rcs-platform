@@ -638,8 +638,8 @@ answer chat invitations gets one per refresh past that timeout, a large-mode
 message one each, and group copies have their owner woken. The
 store's read tells of the held message at no extra cost (`PendingHeld`), so a
 registration with nothing held costs nothing more. A message that comes in
-on the holding task meanwhile is #605's case: a hold on one task after
-another task delivered.
+on the holding task meanwhile goes once the delivery here stores its reached
+mark ([A recipient reached on another task](#a-recipient-reached-on-another-task)).
 
 `Close` takes no new work, then lets the attempts in progress finish, for at
 most a delivery and two store calls, before it cancels the rest. The store
@@ -1343,7 +1343,7 @@ The task role needs these IAM actions:
 | `dynamodb:DeleteItem` | table | the `Delete` inside the removal transactions |
 | `dynamodb:ConditionCheckItem` | table | the `ConditionCheck` inside a summary's removal |
 | `dynamodb:ConditionCheckItem` | the `groupchats` table | the `ConditionCheck` of a group's owner inside a group message copy's enqueue (#121) |
-| `dynamodb:Query` | table | `Pending`, `Reached`, recounts |
+| `dynamodb:Query` | table | `Pending`, `PendingHeld`, `Reached`, recounts |
 | `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
 | `dynamodb:DescribeTable` | table | readiness |
 
