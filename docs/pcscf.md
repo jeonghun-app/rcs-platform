@@ -349,6 +349,13 @@ for a 2xx, which cannot be answered 503, is dropped past it and counted in
 `requests.ack_rate_discarded`, and follows the route rule too. No registration is needed, so a call can still be ended after the
 client deregisters.
 
+A NOTIFY gets `pcscf`'s two Record-Route values again, as it set them in
+the dialog's first request, with the core-facing one on top: a subscriber in
+the core takes its route set from the first NOTIFY (RFC 6665 §4.4.1), and
+`scscf` signs the hop below its own value, which must then be this flow and
+not a value or a Contact the client wrote
+([#550](https://github.com/jeonghun-app/rcs-platform/issues/550)).
+
 The forwarded request gets a `P-Charging-Vector` with the dialog's icid,
 read back from the core-facing Record-Route value in its route, and the
 `orig-ioi` (§5.2.6.3.5 7), §5.2.6.3.9 3)). The client holds that value, but
@@ -396,6 +403,13 @@ request is sent over that flow whatever its Route or Request-URI say below.
   core's own Record-Route does not parse, nothing is put back: the
   answer's goes up as the client wrote it, counted in
   `terminating.record_route_malformed`.
+  A NOTIFY inside a dialog gets `pcscf`'s two values again, as the
+  request that set the dialog up had them: a subscriber takes its route set
+  from the NOTIFY that creates its dialog, not from the 2xx to its SUBSCRIBE
+  (RFC 6665 §4.4.1), so without them its refresh and unsubscribe would be
+  refused by the client-side route rule
+  ([#550](https://github.com/jeonghun-app/rcs-platform/issues/550)). Later
+  NOTIFYs carry them too, which the subscriber ignores.
 - **Dialogs.** The core-facing Record-Route value, of a dialog either side
   set up, binds the flow to the dialog: `dlg` is a MAC over the flow token,
   the Call-ID and the icid, each after its length, under a key drawn at

@@ -159,6 +159,105 @@ func TestAGroupsDialogReachesRcsAsAtTheConferenceContact(t *testing.T) {
 	}
 }
 
+// notifyInDialog is inDialog as a NOTIFY with contact as its Contact and
+// extra fields.
+func notifyInDialog(t *testing.T, target, route, contact string, routed []sip.Address, extra ...string) *proxy.Request {
+	t.Helper()
+	r := inDialog(t, target, route, routed...)
+	r.Message.Method = "NOTIFY"
+	if err := r.Message.Header.Set("CSeq", "1 NOTIFY"); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range append([]string{"Contact: <" + contact + ">"}, extra...) {
+		name, value, _ := strings.Cut(f, ": ")
+		if err := r.Message.Header.Add(name, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return r
+}
+
+// recorded is the branch d makes of r, with d's Record-Route on top, as
+// the proxy builds it.
+func recorded(t *testing.T, d proxy.Decision, r *proxy.Request) *sip.Request {
+	t.Helper()
+	if d.Status != 0 || len(d.Targets) != 1 || len(d.RecordRoute) != 1 || d.Prepare == nil {
+		t.Fatalf("status %d, %d targets, Record-Route %v", d.Status, len(d.Targets), d.RecordRoute)
+	}
+	b := r.Message.Clone()
+	if err := b.Header.Prepend("Record-Route", d.RecordRoute[0].String()); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Prepare(bg, d.Targets[0], b); err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestANOTIFYGetsAValueSignedForItsNotifier (#550): a subscriber takes its
+// route set from the NOTIFY that creates its dialog (RFC 6665 §4.4.1), so
+// a NOTIFY gets the S-CSCF's value, signed for the hop toward the
+// notifier. rcs-as, which records no route, is signed at its Contact, and
+// the subscriber's refresh and unsubscribe along the value reach it and
+// nothing else. A client's NOTIFY comes with pcscf's core-facing value on
+// top, which pcscf records, so its value signs that flow, never the
+// Contact or a Record-Route value the client wrote below (threat model
+// T2). A BYE gets no value.
+func TestANOTIFYGetsAValueSignedForItsNotifier(t *testing.T) {
+	e := newEnv(t)
+	rt := e.router(nil)
+	ue := "sip:ue@192.0.2.40:5060;transport=tcp"
+	focus := "sip:group-1@" + realm + ";transport=tcp"
+	t.Run("from rcs-as", func(t *testing.T) {
+		// Along the route set the SUBSCRIBE's Record-Route gave rcs-as.
+		r := notifyInDialog(t, ue, "<"+pcscfUE+">", focus, []sip.Address{signedFor(rt, pcscfUE)})
+		b := recorded(t, rt.InDialog(bg, r), r)
+		if got := b.Header.Values("Route"); len(got) != 1 || got[0] != "<"+pcscfUE+">" {
+			t.Errorf("Route %q, want the P-CSCF's flow kept", got)
+		}
+		value := ourEntry(t, &b.Header)
+		for name, c := range map[string]struct {
+			target string
+			status int
+		}{
+			// An unsubscribe goes the same way: Expires is not read here.
+			"the refresh to its Contact": {focus, 0},
+			"to rcs-as's task":           {asTask, 403},
+			"to the I-CSCF":              {"sip:10.0.130.25:5060;transport=tcp", 403},
+		} {
+			refresh := inDialog(t, c.target, "", value)
+			refresh.Message.Method = "SUBSCRIBE"
+			d := rt.InDialog(bg, refresh)
+			if d.Status != c.status {
+				t.Errorf("%s: %d, want %d", name, d.Status, c.status)
+			}
+			if d.Status == 0 && d.RecordRoute != nil {
+				t.Errorf("%s: recorded %v", name, d.RecordRoute)
+			}
+		}
+	})
+	t.Run("from a client", func(t *testing.T) {
+		// Toward rcs-as, through pcscf, with a Contact and a value below
+		// pcscf's of the client's choosing.
+		icscf := "sip:10.0.130.25:5060;transport=tcp"
+		callerPCSCF := "sip:" + flow(2) + "@198.51.100.5:5070;transport=tcp;lr"
+		r := notifyInDialog(t, asTask, "", icscf, []sip.Address{signedFor(rt, asTask, pcscfUE)},
+			"Record-Route: <"+callerPCSCF+">", "Record-Route: <"+icscf+";lr>")
+		value := ourEntry(t, &recorded(t, rt.InDialog(bg, r), r).Header)
+		if d := rt.InDialog(bg, inDialog(t, ue, "<"+callerPCSCF+">", value)); d.Status != 0 {
+			t.Errorf("toward the client's pcscf flow: %d", d.Status)
+		}
+		for _, target := range []string{icscf, icscf + ";lr"} {
+			if d := rt.InDialog(bg, inDialog(t, target, "", value)); d.Status != 403 {
+				t.Errorf("toward %s, which the client wrote: %d", target, d.Status)
+			}
+		}
+	})
+	if d := rt.InDialog(bg, inDialog(t, asTask, "", signedFor(rt, asTask))); d.Status != 0 || d.RecordRoute != nil || d.Prepare != nil {
+		t.Errorf("a BYE: status %d, Record-Route %v", d.Status, d.RecordRoute)
+	}
+}
+
 // relabelled is a with its signature's key ID changed to id.
 func relabelled(a sip.Address, id string) sip.Address {
 	v, _ := a.URI.Param(dlgParam)
