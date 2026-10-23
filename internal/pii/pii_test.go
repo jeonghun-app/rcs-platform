@@ -390,6 +390,8 @@ func TestRedactIsLinear(t *testing.T) {
 		"invisibles before a scheme's rest": "u\u200b\u200b\u200b",
 		"marks after digits":                "1\u0301\u20e3",
 		"invisibles in a user":              "sip:\u200ba",
+		"hidden runs around quotes":         "im:\u200b\"a\"\u0301",
+		"a hidden run before no quote":      "pres:\u200b\u0301",
 	} {
 		t.Run(name, func(t *testing.T) {
 			small := strings.Repeat(unit, max(1, 1024/len(unit)))
@@ -641,6 +643,14 @@ func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 		"call +1 (555) 010-X0001",
 		"call +X15550100001",
 	}
+	// Next to an im or pres user's quotes, a hidden character leaves the
+	// quoted user read as it is without it (#597).
+	quotedTemplates := []string{
+		`im:X"bob smith"@` + testDomain,
+		`im:"bob smith"X@` + testDomain,
+		`pres:X"bob smith"@` + testDomain,
+		`pres:"bob smith"X@` + testDomain,
+	}
 	type class struct {
 		name  string
 		table *unicode.RangeTable
@@ -674,6 +684,7 @@ func TestRedactReadsEveryHiddenCharacterAsItsPlainForm(t *testing.T) {
 						}
 						if cl.plain == "" {
 							ts = append(slices.Clone(ts), markTemplates...)
+							ts = append(ts, quotedTemplates...)
 						}
 						for _, tmpl := range ts {
 							wide := strings.Replace(tmpl, "X", string(r), 1)
@@ -735,6 +746,13 @@ func TestRedactReadsAURIWithInvisiblesAsWithout(t *testing.T) {
 		"sip:ali\u200bce.smith@x":               "sip:alice.smith@x",
 		"im:\u2060alice.smith\u00ad@x":          "im:alice.smith@x",
 		"sip:+1555\u200b0100001\u200b@x":        "sip:+15550100001@x",
+		// Around an im or pres user's quotes, invisible characters and
+		// the marks drawn over the ":" or the closing quote (#597).
+		"im:\u200b\"bob smith\"@x":                     `im:"bob smith"@x`,
+		"im:\"bob smith\"\u200b@x":                     `im:"bob smith"@x`,
+		"im:\u0301\"bob smith\"@x":                     `im:"bob smith"@x`,
+		"im:\"bob smith\"\u0301@x":                     `im:"bob smith"@x`,
+		"pres:\u2060\u0301\"bob smith\"\u20e3\u00ad@x": `pres:"bob smith"@x`,
 	} {
 		got, want := k.Redact(wide), k.Redact(plain)
 		if asciiForm(withoutInvisibles(got)) != want {
@@ -742,7 +760,7 @@ func TestRedactReadsAURIWithInvisiblesAsWithout(t *testing.T) {
 		}
 	}
 	// Elsewhere such a character stays, as text.
-	for _, in := range []string{"si\u200bx:alice", "sip:host\u200b>", "s\u200bi"} {
+	for _, in := range []string{"si\u200bx:alice", "sip:host\u200b>", "s\u200bi", "im:\"bob smith\"\u200b said", "im:\u200b\"bob smith\" said"} {
 		if got := k.Redact(in); got != in {
 			t.Errorf("Redact(%q) = %q, want it unchanged", in, got)
 		}

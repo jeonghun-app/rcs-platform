@@ -57,6 +57,22 @@ type IMSCore struct {
 	// 3261 §9.1).
 	Forwarding  func(*sip.Request)
 	CancelTaken func()
+	// AnswerOffline, when set before any request, answers an INVITE to an
+	// IMPU without a binding itself, 200 with the SDP it returns and the
+	// core's Contact, as a network element that takes a chat for an
+	// unregistered user does; nil leaves the INVITE to Offline. It runs on
+	// the sender's reading goroutine.
+	AnswerOffline func(req *sip.Request) []byte
+	// HoldRegister, when set before any request, runs for each REGISTER
+	// answered 200, once the binding has changed and before the answer
+	// goes, on the sender's reading goroutine; it must not block. The core
+	// answers once the channel it returns is closed (at once for nil), as
+	// a network that sends the user something before it answers would.
+	HoldRegister func(req *sip.Request) <-chan struct{}
+	// KeepBindings, when set before any request, answers a REGISTER with
+	// Expires: 0 as usual but keeps the binding, so that requests to the
+	// IMPU still reach its flow, as a faulty registrar would.
+	KeepBindings bool
 	// answered, if set (export_test.go), runs once a REGISTER that changed
 	// a registration has been answered.
 	answered func(*sip.Request)
@@ -328,19 +344,28 @@ func (c *IMSCore) Request(tx *transaction.ServerTransaction) {
 	switch {
 	case req.Method == "REGISTER":
 		res, answered, deliver := c.register(tx)
-		c.respond(tx, res)
-		if answered != nil {
-			answered()
+		answer := func() {
+			c.respond(tx, res)
+			if answered != nil {
+				answered()
+			}
+			if deliver != nil {
+				go deliver()
+			}
+			c.mu.Lock()
+			hook := c.answered
+			c.mu.Unlock()
+			if hook != nil && answered != nil {
+				hook(req)
+			}
 		}
-		if deliver != nil {
-			go deliver()
+		if c.HoldRegister != nil && res.StatusCode == 200 {
+			if gate := c.HoldRegister(req); gate != nil {
+				go func() { <-gate; answer() }()
+				return
+			}
 		}
-		c.mu.Lock()
-		hook := c.answered
-		c.mu.Unlock()
-		if hook != nil && answered != nil {
-			hook(req)
-		}
+		answer()
 	case req.Method == "SUBSCRIBE" && strings.EqualFold(eventPackage(req), "reg"):
 		c.subscribe(tx)
 	case req.Method == "CANCEL":
@@ -529,7 +554,9 @@ func (c *IMSCore) register(tx *transaction.ServerTransaction) (res *sip.Response
 		change.event = "refreshed"
 	}
 	if expires == 0 {
-		delete(c.bindings, key)
+		if !c.KeepBindings {
+			delete(c.bindings, key)
+		}
 		change.contact, change.event = c.contacts[key], "unregistered"
 		delete(c.contacts, key)
 		delete(c.events, key)
@@ -835,6 +862,18 @@ func (c *IMSCore) route(tx *transaction.ServerTransaction) {
 	}
 	flow, ok := c.flowFor(req.URI)
 	fwd, err := c.forwarded(req)
+	if !ok && err == nil && req.Method == "INVITE" && c.AnswerOffline != nil {
+		if body := c.AnswerOffline(req); body != nil {
+			tag, _ := c.ids.Tag()
+			if res, err := sip.NewResponse(req, 200, "", tag); err == nil &&
+				res.Header.Add("Contact", "<sip:core.invalid:5060;transport=tcp>") == nil &&
+				res.Header.Add("Content-Type", "application/sdp") == nil {
+				res.Body = body
+				c.respond(tx, res)
+			}
+			return
+		}
+	}
 	switch {
 	case err != nil:
 		answer(500)

@@ -57,7 +57,7 @@ var (
 // first.
 var eventErrs = []error{
 	ErrHandlerBusy, ErrReassemblyTimeout, ErrMalformedResponse, ErrTooManyUnknownSessions, ErrKeepAliveNotSent, ErrPanicked,
-	ErrPeerNotReading, ErrKeepAliveTimeout, ErrUnbound, ErrFraming, ErrWriteTimeout, ErrConnClosed,
+	ErrPeerNotReading, ErrKeepAliveTimeout, ErrPathStalled, ErrUnbound, ErrFraming, ErrWriteTimeout, ErrConnClosed,
 }
 
 func eventErr(err error) error {

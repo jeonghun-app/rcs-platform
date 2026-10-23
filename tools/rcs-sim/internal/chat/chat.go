@@ -40,6 +40,8 @@ type Received struct {
 	Body        []byte
 	// Request is what the sender asked to be notified of.
 	Request imdn.Request
+	// Session is the session it came on.
+	Session *msrp.Session
 }
 
 // Endpoint is one end of a chat session: an msrp.Handler that unwraps CPIM,
@@ -126,7 +128,7 @@ func (e *Endpoint) HandleMessage(s *msrp.Session, m *msrp.Message) error {
 		return nil
 	}
 	from, _ := c.From()
-	r := Received{From: from, ContentType: c.ContentType(), Body: c.Body.Bytes(), Request: req}
+	r := Received{From: from, ContentType: c.ContentType(), Body: c.Body.Bytes(), Request: req, Session: s}
 	// Counted before the message is handed over, so that whoever has the
 	// message and calls Wait waits for its notifications too.
 	e.pending.Add(1)

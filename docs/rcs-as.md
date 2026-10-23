@@ -1130,6 +1130,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_MAX_INCOMING_SESSIONS_PER_USER` | `32` | Sessions rcs-as opens to one user on this task; a delivery beyond it waits |
 | `RCSAS_MAX_SUBSCRIPTIONS_PER_USER` | `32` | Subscriptions to group rosters one user holds on this task, across its groups; a SUBSCRIBE beyond it is answered 486 |
 | `RCSAS_MSRP_KEEPALIVE` | `240s` | Idle time before an empty SEND, below the NLB's 350 s TLS idle timeout ([ADR 0003](adr/0003-aws-topology.md)) |
+| `RCSAS_MSRP_PROBE_TIMEOUT` | `10s` | When a request on an MSRP connection from msrp-relay times out, a bodiless SEND probes it; unanswered this long, the connection and its sessions end ([#517](https://github.com/jeonghun-app/rcs-platform/issues/517)) |
 | `RCSAS_STORE` | `dynamodb` | `dynamodb` or `memory` (refused in staging and prod) |
 | `RCSAS_DYNAMODB_TABLE` | `messages` | Queue and sent-message table |
 | `RCSAS_DYNAMODB_ENDPOINT` | AWS | Local containers only (refused in staging and prod) |
@@ -1407,6 +1408,7 @@ identifier ever appears in a metric name.
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
 | `proxy.hook_panics` | Panics recovered while rcs-as routed or served a request: it was answered 500 if it had no answer yet (#428); alarm on any |
 | `transaction.handler_panics`, `msrp.callback_panics` | Panics recovered in a response handler of rcs-as's own requests, and in MSRP: a message handler's (answered with a 403 failure report), a report's (dropped), an event's, or a connection's reading (that connection closed). Each ends only that call or connection (#445); alarm on any |
+| `msrp.path_stalled` | MSRP connections from msrp-relay that rcs-as ended because a probe, sent once a request on them timed out, went unanswered (#517), with a warning at most once a minute and no identifier. msrp-relay counts the stalls it ends itself as `Core.Closed.PathStalled`, and one rcs-as ends as `Core.Closed.PeerGone`; see [msrp-relay](msrp-relay.md) |
 | `background.panics` | Panics recovered in the work an answer to rcs-as's own INVITE starts on goroutines of its own: that work ends, and a session whose ACK or confirmation panicked is ended with a BYE, its invitation failing as one whose session could not be kept (#445, #471); alarm on any |
 | `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
 | `sip.invite.sent`, `sip.invite.accepted`, `sip.invite.<status>`, `sip.invite.timeout`, `sip.invite.cancelled`, `sip.invite.unsent`, `sip.invite.unresolved`, `sip.invite.unusable_answer`, `sip.invite.no_dialog`, `sip.invite.fork_dropped` | INVITEs rcs-as sent: sent, set up, failed by final status, without a final answer, cancelled, not sent, without a next hop, answered with an SDP it could not use, answered without a dialog, and second forks ended |
