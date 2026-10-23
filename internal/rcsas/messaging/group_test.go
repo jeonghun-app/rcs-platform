@@ -990,3 +990,126 @@ func TestWakesPastTheBoundAreTriedAgainSoon(t *testing.T) {
 	}
 	waitFor(t, "every owner woken", func() bool { return h.woken.Load() == n })
 }
+
+// Code review on #628: while the SIP layer serves a participant's own
+// INVITE to the group (Joining), a queue pass that finds its copy and no
+// leg yet does not invite it: the focus's INVITE would ring the client
+// with a second session with the group. The copy goes on the leg the
+// INVITE opens, and the join's end then reads the queue no more.
+func TestAJoiningParticipantIsNotInvited(t *testing.T) {
+	st := &pendingReads{Store: store.NewMemory()}
+	r := newRigWith(t, Config{}, st, newFakeClock())
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	done := r.e.Joining(bob, groupURI)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the invitation held", func() bool { return r.m.get("invite.held_for_join") == 1 })
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 {
+		t.Fatalf("%d invitations to a participant joining", n)
+	}
+	l := r.listen(t)
+	_, c := r.connect(t, l, LegParams{User: bob, Peer: groupURI, Conversation: conv, Mode: store.Group})
+	if m := c.next(t); !strings.Contains(string(m.Body.Bytes()), "hi") {
+		t.Fatalf("delivered %q", m.Body.Bytes())
+	}
+	waitFor(t, "idle", r.idle)
+	reads := st.n.Load()
+	done()
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 || r.m.get("invite.held_for_join") != 1 {
+		t.Fatalf("%d invitations, %d held, after the join", n, r.m.get("invite.held_for_join"))
+	}
+	if n := st.n.Load() - reads; n != 0 {
+		t.Fatalf("the join's end read a queue %d times", n)
+	}
+}
+
+// pendingReads counts the reads of the queues.
+type pendingReads struct {
+	store.Store
+	n atomic.Int64
+}
+
+func (p *pendingReads) Pending(ctx context.Context, r, after string, now time.Time, n int) ([]store.Message, error) {
+	p.n.Add(1)
+	return p.Store.Pending(ctx, r, after, now, n)
+}
+
+// Code review on #628: a join that opens no leg, refused say, has the
+// queue read again as it ends, so that the copy it held back is invited
+// for at once rather than at the next message or retry. Ending it twice
+// is ending it once.
+func TestARefusedJoinInvitesForTheCopyItHeld(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	done := r.e.Joining(bob, groupURI)
+	other := r.e.Joining(bob, groupURI) // the same client's INVITE twice
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the invitation held", func() bool { return r.m.get("invite.held_for_join") == 1 })
+	waitFor(t, "idle", r.idle)
+	done()
+	done()
+	waitFor(t, "idle", r.idle)
+	if n := len(r.d.invites); n != 0 {
+		t.Fatalf("%d invitations while the other join is served", n)
+	}
+	other()
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v", inv)
+	}
+}
+
+// Code review on #628: a join whose end never comes, as for a request the
+// proxy, closing, never serves, holds the invitations back for no more
+// than AnswerTimeout.
+func TestAJoinHoldsBackForAnswerTimeoutAtMost(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.e.Joining(bob, groupURI)
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the invitation held", func() bool { return r.m.get("invite.held_for_join") == 1 })
+	waitFor(t, "idle", r.idle)
+	r.clock.Advance(r.e.cfg.AnswerTimeout)
+	r.e.Wake(bob, groupURI, false)
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v", inv)
+	}
+}
+
+// Code review on #628: a join holds back the invitations to its own group
+// only.
+func TestAJoinHoldsBackOnlyItsGroupsInvitations(t *testing.T) {
+	r := newRig(t, Config{})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.e.Joining(bob, "sip:chat-2@conf.ims.example.net")
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if inv := r.d.nextInvite(t); inv.Recipient != bob || inv.Peer != groupURI {
+		t.Fatalf("invitation %+v", inv)
+	}
+}
+
+// Code review on #628: past MaxTracked joins held, the next is not, and
+// its participant is invited as before.
+func TestJoinsPastTheBoundAreNotHeld(t *testing.T) {
+	r := newRig(t, Config{MaxTracked: 1})
+	r.e.SetGroupHandler(members{all: []string{alice, bob}})
+	r.e.Joining(alice, groupURI)
+	r.e.Joining(bob, groupURI)()
+	if r.m.get("invite.join_untracked") != 1 {
+		t.Fatalf("%d joins untracked", r.m.get("invite.join_untracked"))
+	}
+	if err := r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "m1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	if inv := r.d.nextInvite(t); inv.Recipient != bob {
+		t.Fatalf("invitation %+v", inv)
+	}
+}

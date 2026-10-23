@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/conference"
+	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
@@ -149,8 +150,15 @@ func (g *groupRig) noNotify(t *testing.T, what string) {
 // tag; it returns the session, acknowledged.
 func (g *groupRig) rejoin(t *testing.T, who string) answered {
 	t.Helper()
+	return g.rejoinAt(t, who, relayPath())
+}
+
+// rejoinAt is rejoin with the relay's core path path, which the relay's
+// end of the session's leg connects from (connect).
+func (g *groupRig) rejoinAt(t *testing.T, who string, path msrp.URI) answered {
+	t.Helper()
 	tag := "r" + who[len(who)-2:]
-	m := g.groupInvite(g.uri, sdpType, offerSDP(relayPath(), "active"))
+	m := g.groupInvite(g.uri, sdpType, offerSDP(path, "active"))
 	m.from, m.to = "<"+who+">;tag="+tag, "<"+g.uri+">"
 	m.fields[0] = "P-Asserted-Identity: <" + who + ">"
 	s := answeredBy(t, g.p.send(m))

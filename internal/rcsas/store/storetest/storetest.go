@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -60,6 +61,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 	t.Run("ASummaryGoesOnlyOnceItsMarksAreSent", func(t *testing.T) { summaries(t, newStore(t)) })
+	t.Run("EachTasksReachedMarkIsItsOwnAndExpires", func(t *testing.T) { reached(t, newStore(t)) })
 }
 
 func pendingOrder(t *testing.T, s store.Store) {
@@ -818,4 +820,73 @@ func groupMessage(t *testing.T, s store.Store) {
 	if got.Sender != m.Sender || got.Author != alice || got.Mode != store.Group || store.Group.String() != "group" {
 		t.Fatalf("Claim = %+v", got)
 	}
+}
+
+// reached: each task's mark of each kind of a recipient is its own,
+// replaced by its next, never hides another task's or another kind's, and
+// is gone once it expires (#605).
+func reached(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	if got, err := s.Reached(ctx, bob, t0); err != nil || len(got) != 0 {
+		t.Fatalf("Reached before any mark = %v, %v; want none", got, err)
+	}
+	soon, later := t0.Add(time.Hour), t0.Add(2*time.Hour)
+	marks := []struct {
+		m       store.Mark
+		expires time.Time
+	}{
+		{store.Mark{Task: "task-1", Kind: store.Delivered, At: t0.Add(time.Second)}, soon},
+		{store.Mark{Task: "task-2", Kind: store.Delivered, At: t0.Add(3 * time.Second)}, later},
+		// task-1's next replaces its first, though task-2's is later.
+		{store.Mark{Task: "task-1", Kind: store.Delivered, At: t0.Add(2 * time.Second)}, later},
+		// A repeat, as an SDK retry would send, changes nothing.
+		{store.Mark{Task: "task-1", Kind: store.Delivered, At: t0.Add(2 * time.Second)}, later},
+		// Another kind is a mark of its own.
+		{store.Mark{Task: "task-1", Kind: store.NewFlow, At: t0.Add(4 * time.Second)}, soon},
+	}
+	for _, m := range marks {
+		if err := s.MarkReached(ctx, bob, m.m, m.expires); err != nil {
+			t.Fatalf("MarkReached(%+v): %v", m.m, err)
+		}
+	}
+	if err := s.MarkReached(ctx, carol, store.Mark{Task: "task-3", Kind: store.Delivered, At: t0}, later); err != nil {
+		t.Fatal(err)
+	}
+	want := []store.Mark{
+		{Task: "task-1", Kind: store.Delivered, At: t0.Add(2 * time.Second)},
+		{Task: "task-2", Kind: store.Delivered, At: t0.Add(3 * time.Second)},
+		{Task: "task-1", Kind: store.NewFlow, At: t0.Add(4 * time.Second)},
+	}
+	if got, err := s.Reached(ctx, bob, t0); err != nil || !equalMarks(got, want) {
+		t.Fatalf("Reached = %v, %v; want %v", got, err, want)
+	}
+	// Neither the queue nor its bounds see the marks.
+	if ms, err := s.Pending(ctx, bob, "", t0, 10); err != nil || len(ms) != 0 {
+		t.Fatalf("Pending after the marks = %v, %v; want an empty queue", idsOf(ms), err)
+	}
+	if err := s.Enqueue(ctx, message(bob, "0001", t0), store.Limit{Count: 1}); err != nil {
+		t.Fatalf("Enqueue into a one-message queue beside the marks: %v", err)
+	}
+	if got, err := s.Reached(ctx, bob, soon); err != nil || !equalMarks(got, want[:2]) {
+		t.Fatalf("Reached once the new-flow mark expired = %v, %v; want %v", got, err, want[:2])
+	}
+	if got, err := s.Reached(ctx, bob, later); err != nil || len(got) != 0 {
+		t.Fatalf("Reached once every mark expired = %v, %v; want none", got, err)
+	}
+}
+
+// equalMarks compares marks in any order.
+func equalMarks(a, b []store.Mark) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := slices.Clone(b)
+	for _, m := range a {
+		i := slices.IndexFunc(left, func(n store.Mark) bool { return n.Task == m.Task && n.Kind == m.Kind && n.At.Equal(m.At) })
+		if i < 0 {
+			return false
+		}
+		left = slices.Delete(left, i, i+1)
+	}
+	return true
 }

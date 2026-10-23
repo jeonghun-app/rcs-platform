@@ -1098,7 +1098,9 @@ func TestReceiptsForManyMessagesAreNotHeldToTheSenderShare(t *testing.T) {
 
 // Messages from one sender that wait for a session do not slow another
 // sender's live chat: only a sender with waiting messages takes the slow
-// path that reads the queue again.
+// path that reads the queue again. The first delivery marks bob reached
+// for the other tasks, and that has the whole queue read once (#605), at
+// most once every reachedEvery: carol's 100 and at most the live one.
 func TestALiveChatDoesNotReReadAQueueHeldByAnotherSender(t *testing.T) {
 	st := &readCounter{Store: store.NewMemory()}
 	r := newRigWith(t, Config{SenderRate: Rate{PerMinute: -1}}, st, newFakeClock())
@@ -1120,8 +1122,11 @@ func TestALiveChatDoesNotReReadAQueueHeldByAnotherSender(t *testing.T) {
 		}
 		b.next(t)
 	}
-	if got := st.items.Load() - before; got > 100 {
+	if got := st.items.Load() - before; got > 100+101 {
 		t.Fatalf("100 live messages read %d queue items", got)
+	}
+	if n := r.m.get("delivery.reached_marked"); n != 1 {
+		t.Fatalf("bob marked reached %d times within reachedEvery, want once", n)
 	}
 }
 
