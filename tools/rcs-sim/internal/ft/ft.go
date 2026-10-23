@@ -89,11 +89,14 @@ type Client struct {
 }
 
 // Secret is a password that prints as a placeholder, so a Client in a log
-// line or an error cannot reveal it.
-type Secret struct{ b []byte }
+// line or an error cannot reveal it. String and GoString cover the verbs
+// that call them; the bytes are in a secret.Key so that a verb that prints
+// the fields by reflection instead (%d, %p, %w, or %s on a Client inside a
+// slice or struct) reaches only a closure's address (#635).
+type Secret struct{ k secret.Key }
 
 // NewSecret wraps a password.
-func NewSecret(p string) Secret { return Secret{b: []byte(p)} }
+func NewSecret(p string) Secret { return Secret{k: secret.NewString(p)} }
 
 func (Secret) String() string   { return "[redacted]" }
 func (Secret) GoString() string { return "[redacted]" }
@@ -232,7 +235,7 @@ func (c *Client) authorize(r *http.Request, uri string) error {
 	ch := *c.challenge
 	ch.Algorithm = ""
 	cred, err := digest.Respond(ch, digest.ClientParams{
-		Username: c.User, Password: secret.NewKey(c.Password.b), Method: r.Method, URI: uri, CNonce: cnonce, NC: c.nc,
+		Username: c.User, Password: c.Password.k, Method: r.Method, URI: uri, CNonce: cnonce, NC: c.nc,
 	})
 	if err != nil {
 		return fmt.Errorf("ft: answering the challenge: %w", err)
