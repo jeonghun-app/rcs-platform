@@ -198,11 +198,12 @@ additionally sealed (below).
   every NOTIFY. RFC 3680 §4.7.2 alone would let the notifier skip it (#277).
   Each such NOTIFY costs, per subscription, the conditional `NextNotify`
   write on `reg-subscriptions` and a SIP round trip to the P-CSCF or the UE.
-  It carries the record the change saved, so it reads none, unless a later
-  record's NOTIFY was numbered first (#492). The change also lists the
-  subscriptions of each of the set's identities: a query of `impu-index`
-  and a strongly consistent read of each subscription it finds. The rate is about U × S ÷ T for U
-  registered users, S subscriptions a set (one from the P-CSCF per default
+  It carries the record the change saved, so it reads none (#492), unless
+  the subscription has numbered no NOTIFY yet, the record would end the
+  subscription, or a later record's NOTIFY was numbered first. The change
+  also lists the subscriptions of each of the set's identities: a query of
+  `impu-index` and a strongly consistent read of each subscription it
+  finds. The rate is about U × S ÷ T for U registered users, S subscriptions a set (one from the P-CSCF per default
   identity, one more for a UE that subscribes) and T between re-registrations
   (clients without outbound re-register within 600 s, the expiry `pcscf`
   caps them to): 1 million users, two subscriptions and 480 s make about
@@ -297,10 +298,13 @@ The registrar tells the notifier of every change of a set, refreshes
 included, and each change sends a NOTIFY to every subscription of the set
 but one made after it (#516): about two per user, the P-CSCF's and the
 UE's. Each NOTIFY is prepared on
-one of `Workers` (8) workers: the `NextNotify` update, a read of the set
-only for a first NOTIFY, a sweep's or a late change's, and a delete when it
-ends, some 10–20 ms, so an instance prepares about `Workers` / 15 ms, some
-500 a second.
+one of `Workers` (8) workers: the `NextNotify` update, a read of the set,
+and a delete when it ends, some 10–20 ms, so an instance prepares about
+`Workers` / 15 ms, some 500 a second. A change's NOTIFY reads the set only
+to a subscription that has numbered none yet, before it would end the
+subscription, or after a later record's NOTIFY was numbered (late); a
+first NOTIFY, a sweep's and the check of a subscription to another set
+read it always.
 
 In capacity units, a refresh of a set with S subscriptions and I
 identities costs I index queries (0.5 RRU each, keys only), S strongly
@@ -309,7 +313,8 @@ consistent reads of the subscriptions the queries find (1 RRU each) and S
 subscription item is about 1 KB, over it with a typical route set (1.1 KB
 measured on #492), so 2 WRU. With S = 2 and I = 3 that is 2.5 RRU and 4 WRU
 the change, 1.25 RRU and 2 WRU a NOTIFY. Before #492 each NOTIFY also read
-the set's record, 1 RRU more. The wait for the answer is not a
+the set's record, 1 RRU more; now a subscription's first change's NOTIFY
+still does. The wait for the answer is not a
 worker's; it is bounded instead per set (`SetConcurrency`, 2) and per next
 hop (`HopConcurrency`, 32). A P-CSCF task, the next hop of its users' UE
 subscriptions too, therefore takes about `HopConcurrency` / round trip: a UE

@@ -64,47 +64,66 @@ func TestAChangesNotifiesCarryItsRecordWithoutReadingItAgain(t *testing.T) {
 }
 
 // TestAMergedNotifyCarriesTheNewerRecordWhicheverCameFirst: two changes'
-// NOTIFYs to the same subscriptions merge while they wait, the newer
-// change's fan-out queued first. The NOTIFY that goes carries the newer
-// record: binding 2 removed by the first change and binding 3 by the second
-// are both gone from it.
+// NOTIFYs to the same subscriptions merge while they wait, in either order
+// of their fan-outs. The NOTIFY that goes carries the newer record: binding
+// 2 removed by the first change and binding 3 by the second are both gone
+// from it.
 func TestAMergedNotifyCarriesTheNewerRecordWhicheverCameFirst(t *testing.T) {
-	e := newEnv(t)
-	s0 := e.registered(binding(1, time.Hour), binding(2, time.Hour), binding(3, time.Hour))
-	e.subscribedMany(1)
-	g := &recGate{release: make(chan struct{})}
-	m := &counts{}
-	n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.SetConcurrency, c.Metrics = 1, m })
-	// A third change takes the set's one slot, so the two after it wait.
-	s1 := s0.Clone()
-	s1.Contacts[0].Expires = t0.Add(2 * time.Hour)
-	s1 = e.saved(s1)
-	n.Changed(bg, s0, s1, Registered)
-	settled(t, n, 0)
-	s2 := s1.Clone()
-	s2.Contacts = []state.Contact{s1.Contacts[0], s1.Contacts[2]}
-	s2 = e.saved(s2)
-	s3 := s2.Clone()
-	s3.Contacts = s3.Contacts[:1]
-	s3 = e.saved(s3)
-	n.Changed(bg, s2, s3, Expired)
-	settled(t, n, 1)
-	n.Changed(bg, s1, s2, Registered)
-	settled(t, n, 1)
-	close(g.release)
-	n.Wait()
-	if m.get("regevent.notify_merged") != 1 {
-		t.Fatalf("%d merged, want 1", m.get("regevent.notify_merged"))
-	}
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	last := g.sent[len(g.sent)-1]
-	doc, _, _ := info(t, last)
-	reg, _ := doc.ByAOR(sip.URI{Scheme: "sip", User: "+15550100001", Host: realm})
-	for _, c := range reg.Contacts {
-		if c.Active() && c.URI != binding(1, 0).URI {
-			t.Errorf("the merged NOTIFY has %s active, want binding 1 alone, as the newer record has it", c.URI)
-		}
+	for _, tc := range []struct {
+		name       string
+		newerFirst bool
+	}{
+		{"the newer change's fan-out first", true},
+		{"the older change's fan-out first", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			s0 := e.registered(binding(1, time.Hour), binding(2, time.Hour), binding(3, time.Hour))
+			e.subscribedMany(1)
+			g := &recGate{release: make(chan struct{})}
+			m := &counts{}
+			n := newNotifierWith(t, e, e.store, g, func(c *Config) { c.SetConcurrency, c.Metrics = 1, m })
+			// A third change takes the set's one slot, so the two after
+			// it wait. Its NOTIFY numbers the subscription's first, so
+			// that theirs carry their records (prepare).
+			s1 := s0.Clone()
+			s1.Contacts[0].Expires = t0.Add(2 * time.Hour)
+			s1 = e.saved(s1)
+			n.Changed(bg, s0, s1, Registered)
+			settled(t, n, 0)
+			s2 := s1.Clone()
+			s2.Contacts = []state.Contact{s1.Contacts[0], s1.Contacts[2]}
+			s2 = e.saved(s2)
+			s3 := s2.Clone()
+			s3.Contacts = s3.Contacts[:1]
+			s3 = e.saved(s3)
+			changes := []func(){
+				func() { n.Changed(bg, s1, s2, Registered) },
+				func() { n.Changed(bg, s2, s3, Expired) },
+			}
+			if tc.newerFirst {
+				changes[0], changes[1] = changes[1], changes[0]
+			}
+			for _, c := range changes {
+				c()
+				settled(t, n, 1)
+			}
+			close(g.release)
+			n.Wait()
+			if m.get("regevent.notify_merged") != 1 {
+				t.Fatalf("%d merged, want 1", m.get("regevent.notify_merged"))
+			}
+			g.mu.Lock()
+			defer g.mu.Unlock()
+			last := g.sent[len(g.sent)-1]
+			doc, _, _ := info(t, last)
+			reg, _ := doc.ByAOR(sip.URI{Scheme: "sip", User: "+15550100001", Host: realm})
+			for _, c := range reg.Contacts {
+				if c.Active() && c.URI != binding(1, 0).URI {
+					t.Errorf("the merged NOTIFY has %s active, want binding 1 alone, as the newer record has it", c.URI)
+				}
+			}
+		})
 	}
 }
 

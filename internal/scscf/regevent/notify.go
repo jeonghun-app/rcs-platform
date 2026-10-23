@@ -32,7 +32,7 @@ func terminated(reason string) sip.SubscriptionState {
 }
 
 // job is what a NOTIFY tells besides the state of the set, which it reads
-// when it is sent.
+// when it is sent or carries (after).
 type job struct {
 	// before is the set before a change and cause the change: what before
 	// had and the set has no more is listed as ended with cause's event, or
@@ -303,8 +303,8 @@ func anyLive(set *state.Registration, now time.Time) bool {
 	return false
 }
 
-// notifySub sends sub a NOTIFY of its set as the store has it now and
-// waits for the answer (prepare).
+// notifySub sends sub a NOTIFY of its set and waits for the answer
+// (prepare).
 func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job) {
 	if rest := n.prepare(ctx, sub, j); rest != nil {
 		rest()
