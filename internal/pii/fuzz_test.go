@@ -210,16 +210,18 @@ func FuzzTruncateIPsIn(f *testing.F) {
 		"2002:cb00:7109::/48 203.0.113.5/24x ::ffff:cb00:7105/96 udp/2001:db8::1",
 		"A/0:0:0:0:0:ffff::/0",
 		"host:2001:db8::/48:2001:db8:5:6::8 2001:db8::a/32:2001:db8:5:6::8",
+		"0.0.0.0:1:01::",
 	} {
 		f.Add(s)
 	}
 	run := regexp.MustCompile(`[0-9A-Fa-f:.]+`)
-	ipv4Port := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24(:[0-9]{1,5})([^0-9.]|\.[^0-9]|\.$|$)`)
 	// A port may be followed by the colon net/http writes after one
-	// ("]:443: EOF"). One followed by a colon and an address character
-	// is not looked for: that text is a token of its own, whose network
-	// may start with digits that look like a port ("[::/48]:1::/48",
-	// see TruncateIPsIn's doc; #500).
+	// (":51234: EOF", "]:443: EOF"). One followed by a colon and an
+	// address character is not looked for: that text is a token of its
+	// own, whose network may start with digits that look like a port
+	// ("[::/48]:1::/48", "0.0.0.0/24:1::/48", see TruncateIPsIn's doc;
+	// #500).
+	ipv4Port := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.0/24(:[0-9]{1,5})([^0-9.:]|:[^0-9A-Fa-f:]|:$|\.[^0-9]|\.$|$)`)
 	bracketPort := regexp.MustCompile(`\[[0-9A-Fa-f:.]+/[0-9]+\](:[0-9]{1,5})([^0-9.:]|:[^0-9A-Fa-f:]|:$|\.[^0-9]|\.$|$)`)
 	// letter is what makes a run part of a longer word: an ASCII letter
 	// past f, or "_" (digits and hex letters are in the run itself).
