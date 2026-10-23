@@ -594,6 +594,45 @@ func TestADeliveredSummaryMarksItsRecipient(t *testing.T) {
 	}
 }
 
+// QA on #624: task-1 already acted on task-2's delivery mark; bob is lost
+// again and back within the minute by a registration on a new flow that
+// task-2 takes. Its delivery mark is left out within reachedEvery, so only
+// the registration mark tells task-1, and it alone releases the hold.
+func TestARegistrationMarkAloneReleasesAHold(t *testing.T) {
+	r1, r2 := twoTasks(t, nil, nil)
+	online, got := reachable(r1, r2)
+	online.Store(true)
+	if err := r2.e.Submit(t.Context(), standalone(carol, bob, chat(t, "s1", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "task-2's delivery mark", func() bool { return r2.m.get("delivery.reached_marked") == 1 && r2.idle() })
+	online.Store(false)
+	r1.clock.Advance(10 * time.Second)
+	if err := r1.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "one", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "task-1's failed try", func() bool { return r1.m.get("delivery.pager_failed") == 1 && r1.idle() })
+	if err := r1.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m2", "two", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "task-1 used the delivery mark", func() bool { return r1.m.get("delivery.reached_elsewhere") == 1 && r1.idle() })
+	r1.clock.Advance(10 * time.Second)
+	online.Store(true)
+	r2.e.UserRegistered(bob, true)
+	waitFor(t, "task-2's registration pass", func() bool { return r2.m.get("delivery.registered_marked") == 1 && r2.idle() })
+	if n := r2.m.get("delivery.reached_marked"); n != 1 {
+		t.Fatalf("task-2 stored %d delivery marks, want 1 (the second within reachedEvery)", n)
+	}
+	before := got.Load()
+	if err := r1.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m3", "three", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "m3 delivered with task-1's retry timer still to come", func() bool { return got.Load() == before+1 })
+	if d, f := r1.m.get("delivery.reached_elsewhere"), r1.m.get("delivery.registered_elsewhere"); d != 1 || f != 1 {
+		t.Errorf("task-1 acted on %d delivery marks and %d registration marks, want 1 and 1", d, f)
+	}
+}
+
 // Code review and QA on #624: task-1 invited bob for alice's chat (inv1);
 // bob then registered on a new flow with task-2, whose mark had task-1
 // invite him again (inv2). A late ErrNoSessions for inv1 is of the old
