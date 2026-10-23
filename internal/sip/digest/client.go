@@ -7,18 +7,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // ClientParams is what a client supplies to answer a challenge. It formats as
-// a redacted placeholder because it holds the password. Its fields are
-// exported for ease of use, so build it where it is used rather than keeping
-// it in an unexported field of a long-lived struct, where fmt would print the
-// password bytes.
+// a redacted placeholder because it holds the password, under the valid fmt
+// verbs. Under an invalid one, such as %p or %w, fmt calls no method and
+// prints the fields, so the password is a secret.Key, which prints as
+// "[redacted]" or its closure's address, never as its bytes (#609).
 type ClientParams struct {
 	Username string
 	// Password is the user's password, or for AKAv1-MD5 the RES the card
 	// computed (RFC 3310 §3.3). Ignored when AUTS is set.
-	Password []byte
+	Password secret.Key
 	Method   string // SIP or HTTP method of the request being authorised
 	URI      string // Request-URI (SIP) or request-target (HTTP)
 	// CNonce is the client nonce; NewCNonce makes one. A parameter so that
@@ -66,7 +68,7 @@ func Respond(ch Challenge, p ClientParams) (Credentials, error) {
 			return Credentials{}, errors.New("digest: value contains a control character")
 		}
 	}
-	password := p.Password
+	password := p.Password.Reveal()
 	if len(p.AUTS) > 0 {
 		password = nil
 	}

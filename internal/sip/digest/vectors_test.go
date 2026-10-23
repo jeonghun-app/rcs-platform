@@ -3,6 +3,8 @@ package digest
 import (
 	"reflect"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // The examples below are the published examples of RFC 2617 §3.5 and
@@ -88,7 +90,7 @@ func TestPublishedExamplesProduceThePublishedResponse(t *testing.T) {
 			}
 			got, err := Respond(ch, ClientParams{
 				Username: "Mufasa",
-				Password: []byte(c.password),
+				Password: secret.NewKey([]byte(c.password)),
 				Method:   "GET",
 				URI:      "/dir/index.html",
 				CNonce:   c.cnonce,

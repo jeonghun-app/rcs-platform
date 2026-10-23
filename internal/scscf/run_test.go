@@ -398,7 +398,7 @@ func TestARegistrationRunsThroughTheWiredService(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	creds, err := digest.Respond(ch, digest.ClientParams{Username: impi, Password: password, Method: "REGISTER", URI: "sip:" + realm, CNonce: "0a4f113b", NC: 1})
+	creds, err := digest.Respond(ch, digest.ClientParams{Username: impi, Password: secret.NewKey(password), Method: "REGISTER", URI: "sip:" + realm, CNonce: "0a4f113b", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -446,7 +446,7 @@ func registered(t *testing.T, p *pcscfConn, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	creds, err := digest.Respond(ch, digest.ClientParams{Username: impi, Password: password, Method: "REGISTER", URI: "sip:" + realm, CNonce: "0a4f113b", NC: 1})
+	creds, err := digest.Respond(ch, digest.ClientParams{Username: impi, Password: secret.NewKey(password), Method: "REGISTER", URI: "sip:" + realm, CNonce: "0a4f113b", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -47,6 +47,19 @@ func everyFormatting(v any) []string {
 	return append(outs, buf.String())
 }
 
+// everyVerb formats v, and a slice and a struct that hold it, under the
+// valid verbs and invalid ones such as %p, %w and %t, for which fmt calls no
+// method and prints the fields by reflection (#609).
+func everyVerb(v any) []string {
+	var outs []string
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%t", "%x", "%X", "%o", "%O", "%b", "%p", "%w", "%c", "%U", "%e", "%f", "%g"} {
+		for _, w := range []any{v, []any{v}, struct{ V any }{v}} {
+			outs = append(outs, fmt.Sprintf(verb, w))
+		}
+	}
+	return outs
+}
+
 func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 	h := newHarness(t)
 	_, v := set1(t)
@@ -68,7 +81,7 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	params := ClientParams{Username: testUser, Password: []byte(testPass), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1}
+	params := ClientParams{Username: testUser, Password: secret.NewKey([]byte(testPass)), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1}
 	formatted := map[string]any{
 		"Password secret": Password([]byte(testPass)),
 		"RES secret":      Password(v.XRES[:]),
@@ -84,7 +97,7 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 		srv *Server
 	}{Password([]byte(testPass)), ha1Secret, h.server}
 	for name, value := range formatted {
-		for _, out := range everyFormatting(value) {
+		for _, out := range append(everyFormatting(value), everyVerb(value)...) {
 			s.check(t, name, out)
 		}
 	}
@@ -128,7 +141,7 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 		errs = append(errs, h.server.VerifyAKA(context.Background(), "REGISTER", c, v.XRES[:], expires))
 	}
 	verifyAKA(sync, h.vectorExpires)
-	res, _ := Respond(aka, ClientParams{Username: testUser, Password: []byte("x"), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	res, _ := Respond(aka, ClientParams{Username: testUser, Password: secret.NewKey([]byte("x")), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	verifyAKA(res, h.vectorExpires)
 	verifyAKA(res, h.clock.now().Add(-time.Second))
 	verify(res, Password(v.XRES[:]))
@@ -137,7 +150,7 @@ func TestNoSecretAppearsInErrorsOrFormattedValues(t *testing.T) {
 	errs = append(errs, err)
 	_, err = HA1(SHA256, md5HA1)
 	errs = append(errs, err)
-	_, err = Respond(ch, ClientParams{Username: testUser, Password: []byte(testPass)})
+	_, err = Respond(ch, ClientParams{Username: testUser, Password: secret.NewKey([]byte(testPass))})
 	errs = append(errs, err)
 	_, err = ParseCredentials(`Digest username="` + testPass + `"`)
 	errs = append(errs, err)
@@ -171,7 +184,7 @@ func TestCredentialsAndChallengesLogASummaryWithoutIdentityOrNonce(t *testing.T)
 	h := newHarness(t)
 	_, v := set1(t)
 	aka, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
-	creds, err := Respond(aka, ClientParams{Username: testUser, Password: v.XRES[:], Method: "REGISTER", URI: testURI, CNonce: "cnonce-x", NC: 1})
+	creds, err := Respond(aka, ClientParams{Username: testUser, Password: secret.NewKey(v.XRES[:]), Method: "REGISTER", URI: testURI, CNonce: "cnonce-x", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
