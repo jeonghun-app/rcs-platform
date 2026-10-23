@@ -346,13 +346,18 @@ var nonceCountAttrs = []struct{ name, attr string }{
 func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
 	pk := nonceKey(username, nonce)
 	unlock, waited, err := n.locks.lock(ctx, pk)
+	if err != nil {
+		if waited {
+			n.countContention()
+		}
+		return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
+	}
+	// Before the callback, so that one that panics cannot leave the key
+	// held (code review on #610).
+	defer unlock()
 	if waited {
 		n.countContention()
 	}
-	if err != nil {
-		return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
-	}
-	defer unlock()
 	sleep := n.sleep
 	if sleep == nil {
 		sleep = sleepCtx
@@ -431,7 +436,9 @@ func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc ui
 }
 
 // usedCounts decodes the counts a nonce-count item records: none if there is
-// no item or it has expired.
+// no item or it has expired. An item it cannot decode is
+// digest.ErrNonceCountUnusable: it stays as it is until it expires, so the
+// client is better off with a new nonce than with retrying this one (#621).
 func (n *NonceCounts) usedCounts(item map[string]types.AttributeValue) (digest.UsedCounts, error) {
 	if len(item) == 0 {
 		return digest.UsedCounts{}, nil
@@ -443,9 +450,9 @@ func (n *NonceCounts) usedCounts(item map[string]types.AttributeValue) (digest.U
 	at := d.num(attrNCWindowAt, false)
 	switch {
 	case d.err != nil:
-		return digest.UsedCounts{}, d.err
+		return digest.UsedCounts{}, fmt.Errorf("%w: %w", digest.ErrNonceCountUnusable, d.err)
 	case highest < 0 || highest > math.MaxUint32 || window < 0 || window > math.MaxUint32:
-		return digest.UsedCounts{}, errors.New("awsstore: nonce count item is malformed")
+		return digest.UsedCounts{}, fmt.Errorf("%w: awsstore: nonce count item is malformed", digest.ErrNonceCountUnusable)
 	case expires < n.now().UnixMilli():
 		return digest.UsedCounts{}, nil
 	case item[attrNCWindowAt] == nil || at != highest || window&1 == 0:

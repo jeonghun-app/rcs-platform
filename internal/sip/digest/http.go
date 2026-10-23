@@ -29,8 +29,9 @@ type SecretLookup func(ctx context.Context, username string, alg Algorithm) (Sec
 // lookup runs only after the nonce and opaque have verified, so a forged
 // nonce costs no lookup. A genuine nonce is free to obtain, though, so lookup
 // can still run for any username a client sends, and its error comes back
-// wrapped. Callers must answer every error except ErrStaleNonce (and, if they
-// wish, ErrURIMismatch) with the same 401 from ChallengeHTTP, with no
+// wrapped. Callers must answer every error except ErrStaleNonce,
+// ErrNonceCountStore (a failure of their backend, such as 503) and, if they
+// wish, ErrURIMismatch with the same 401 from ChallengeHTTP, with no
 // difference in body or timing they can avoid, so that a client cannot tell
 // which usernames exist.
 //

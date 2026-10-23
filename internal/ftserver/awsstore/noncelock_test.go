@@ -190,3 +190,43 @@ func TestNonceLocksPastTheirBoundGoUnserialised(t *testing.T) {
 		t.Fatalf("%d keys held, want the bound", l.len())
 	}
 }
+
+func TestAPanickingContentionCallbackLeavesTheNonceFree(t *testing.T) {
+	// Code review on #610: NonceContended is a public hook; one that
+	// panics once an Advance has the lock must not leave the key held.
+	_, _, ddb := fakeStores(t)
+	held := &heldDynamo{fakeDynamo: ddb, reached: make(chan struct{}), release: make(chan struct{})}
+	n := &NonceCounts{api: held, table: "files", now: func() time.Time { return storetest.T0 },
+		contended: func() { panic("metrics") }}
+	exp := storetest.T0.Add(time.Minute)
+	first := make(chan error, 1)
+	go func() {
+		_, err := n.Advance(context.Background(), "alice", "n", 1, exp)
+		first <- err
+	}()
+	<-held.reached
+	key := nonceKey("alice", "n")
+	panicked := make(chan any, 1)
+	go func() {
+		defer func() { panicked <- recover() }()
+		_, _ = n.Advance(context.Background(), "alice", "n", 2, exp)
+	}()
+	for n.locks.users(key) != 2 {
+		time.Sleep(time.Millisecond)
+	}
+	close(held.release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if p := <-panicked; p != "metrics" {
+		t.Fatalf("the waiting Advance ended with %v, want the callback's panic", p)
+	}
+	if l := n.locks.len(); l != 0 {
+		t.Fatalf("%d nonce locks held after the panic", l)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if ok, err := n.Advance(ctx, "alice", "n", 3, exp); !ok || err != nil {
+		t.Fatalf("the next Advance on the nonce = %v, %v", ok, err)
+	}
+}

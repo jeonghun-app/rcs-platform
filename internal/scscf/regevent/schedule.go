@@ -80,6 +80,11 @@ func (n *Notifier) enqueue(t *task) bool {
 				old.job.ends = merged
 				// A refresh only if both are.
 				old.job.refresh = old.job.refresh && t.job.refresh
+				// The newer record of the two, whichever change came
+				// first: two changes' fan-outs may queue in either order.
+				if a := t.job.after; a != nil && (old.job.after == nil || a.Version > old.job.after.Version) {
+					old.job.after = a
+				}
 				n.count("regevent.notify_merged")
 				finish(t)
 				return true
