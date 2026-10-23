@@ -196,3 +196,70 @@ func TestAChangesRecordThatWouldEndASubscriptionIsCheckedAsItIsNow(t *testing.T)
 		t.Errorf("subscriptions left %+v, want the one, not terminated", subs)
 	}
 }
+
+// numberedDuringRead is the memory store, whose next Registration read,
+// once armed, is followed by another instance's save of a newer record and
+// the numbering of its NOTIFY, before the read returns.
+type numberedDuringRead struct {
+	*state.Memory
+	reads atomic.Int64
+	armed atomic.Bool
+	sub   string
+	newer *state.Registration
+	err   error
+}
+
+func (s *numberedDuringRead) Registration(ctx context.Context, k state.SetKey) (*state.Registration, error) {
+	s.reads.Add(1)
+	r, err := s.Memory.Registration(ctx, k)
+	if s.armed.CompareAndSwap(true, false) {
+		saved, serr := s.Memory.SaveRegistration(ctx, s.newer)
+		if serr == nil {
+			_, _, serr = s.Memory.NextNotify(ctx, s.sub, saved.Version)
+		}
+		s.err = serr
+	}
+	return r, err
+}
+
+// TestALateChangeReadsTheRecordOnceThoughItIsStaleAgain (#492 QA): a late
+// change's NOTIFY, refused its number for the record it carries, reads the
+// record and is refused again, as a newer record's NOTIFY was numbered
+// meanwhile. It is not sent, and does not read the record again: the newer
+// record's NOTIFY tells what this one would.
+func TestALateChangeReadsTheRecordOnceThoughItIsStaleAgain(t *testing.T) {
+	e := newEnv(t)
+	v0 := e.registered(binding(1, time.Hour), binding(2, time.Hour))
+	st := &numberedDuringRead{Memory: e.store}
+	m := &counts{}
+	n := newNotifierWith(t, e, st, e.send, func(c *Config) { c.Metrics = m })
+	e.subscribed(n)
+	v1 := v0.Clone()
+	v1.Contacts = []state.Contact{binding(1, time.Hour)}
+	v1 = e.saved(v1)
+	v2 := v1.Clone()
+	v2.Contacts = []state.Contact{binding(1, 2*time.Hour)}
+	v2 = e.saved(v2)
+	n.Changed(bg, v1, v2, Registered)
+	n.Wait()
+	v3 := v2.Clone()
+	v3.Contacts = []state.Contact{binding(1, 3*time.Hour)}
+	st.sub, st.newer = e.subscriptions(impu1)[0].ID, v3
+	st.reads.Store(0)
+	st.armed.Store(true)
+	sent := len(e.send.notifies())
+	n.Changed(bg, v0, v1, Unregistered)
+	n.Wait()
+	if st.err != nil || st.armed.Load() {
+		t.Fatalf("the newer record's NOTIFY was not numbered during the read: %v", st.err)
+	}
+	if got := len(e.send.notifies()) - sent; got != 0 {
+		t.Errorf("%d NOTIFYs of the late change, want none: a newer one has its number", got)
+	}
+	if r := st.reads.Load(); r != 1 {
+		t.Errorf("%d reads of the record for the late change's NOTIFY, want 1", r)
+	}
+	if got := m.get("regevent.notify_superseded"); got != 1 {
+		t.Errorf("%d superseded, want 1", got)
+	}
+}

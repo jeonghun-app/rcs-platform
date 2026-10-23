@@ -311,8 +311,8 @@ identities costs I index queries (0.5 RRU each, keys only), S strongly
 consistent reads of the subscriptions the queries find (1 RRU each) and S
 `NextNotify` updates. An update costs the item's size in 1 KB units, and a
 subscription item is about 1 KB, over it with a typical route set (1.1 KB
-measured on #492), so 2 WRU. With S = 2 and I = 3 that is 2.5 RRU and 4 WRU
-the change, 1.25 RRU and 2 WRU a NOTIFY. Before #492 each NOTIFY also read
+measured on #492), so 2 WRU. With S = 2 and I = 3 that is 3.5 RRU and 4 WRU
+the change, 1.75 RRU and 2 WRU a NOTIFY. Before #492 each NOTIFY also read
 the set's record, 1 RRU more; now a subscription's first change's NOTIFY
 still does. The wait for the answer is not a
 worker's; it is bounded instead per set (`SetConcurrency`, 2) and per next
