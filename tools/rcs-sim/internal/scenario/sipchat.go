@@ -94,9 +94,43 @@ type peerCall struct {
 }
 
 // fromNetwork counts what the network sent the chat-invite client outside
-// the sessions it opened itself: chats it opened to it (invites), and
-// notifications in pager mode (pagers).
-type fromNetwork struct{ invites, pagers atomic.Int64 }
+// the chat it opened itself: the chats the network opened to it (invites),
+// and, by the IMDN Message-ID of the message they are about, what came on
+// those chats (onChats: notifications, or the message itself) and the
+// notifications in pager mode (pagers). One rcs-as task sends none of it
+// while it holds the client's chat (docs/rcs-as.md, Delivery), so each step
+// that waits on the client reports them (report), and a one-task stack
+// checks they are 0 (tools/rcs-sim/e2e; code review and QA on #654).
+type fromNetwork struct {
+	invites atomic.Int64
+
+	mu              sync.Mutex
+	onChats, pagers map[string]int64
+}
+
+// add counts one in m, made if nil, for id, under n.mu.
+func (n *fromNetwork) add(m *map[string]int64, id string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if *m == nil {
+		*m = map[string]int64{}
+	}
+	(*m)[id]++
+}
+
+// report puts in detail, for the step's message id, the chats opened to
+// the client since invites was read (client_invites), what came on any
+// chat the network opened to it (network_chat) and the notifications in
+// pager mode (pager_notifications). A step calls it once it has what it
+// waits for: each is counted before it is handed on, and an INVITE came
+// before what its chat carried.
+func (n *fromNetwork) report(detail map[string]int64, invites int64, id string) {
+	detail["client_invites"] = n.invites.Load() - invites
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	detail["network_chat"] = n.onChats[id]
+	detail["pager_notifications"] = n.pagers[id]
+}
 
 // chatInvite is the chat-invite scenario (#135 AC 4): the client sends an
 // INVITE for a 1-to-1 chat with an MSRP offer to the peer's IMPU, through
@@ -161,6 +195,9 @@ func chatInvite(r *run) error {
 		return err
 	}
 	aEnd := r.endpoint(r.cfg.Self, false)
+	// The chats the network opens to the client have an endpoint of their
+	// own, which hands what they carry to aEnd once it has counted it.
+	netEnd := r.endpoint(r.cfg.Self, false)
 	// The peer reads at once, so its display notifications go out without
 	// a step for them.
 	bEnd := r.endpoint(r.cfg.Peer, true)
@@ -171,8 +208,9 @@ func chatInvite(r *run) error {
 	answering.Go(func() { r.answerCalls(answerer, calls, bEnd, sessions, release) })
 	// The client's chats are not released at peer-offline: only the peer
 	// unregisters.
-	answering.Go(func() { r.answerCalls(answerer, clientCalls, aEnd, nil, nil) })
-	answering.Go(func() { pagerNotifications(answerer, a, aEnd, &taken.pagers) })
+	answering.Go(func() { r.answerCalls(answerer, clientCalls, netEnd, nil, nil) })
+	answering.Go(func() { networkChats(answerer, netEnd, aEnd, &taken) })
+	answering.Go(func() { pagerNotifications(answerer, a, aEnd, &taken) })
 	// The answerers end what they opened once stopped; the scenario's end
 	// waits for that.
 	r.onEnd(func() { stop(); answering.Wait() })
@@ -234,6 +272,7 @@ func chatInvite(r *run) error {
 	}
 	var peer peerSession
 	if err := r.step("client-to-peer", func(ctx context.Context) (map[string]int64, error) {
+		invites := taken.invites.Load()
 		text := []byte(sipChatText + " " + token)
 		sent, err := aEnd.Send(ctx, aConn.Session, bEnd.Self, "text/plain;charset=UTF-8", text, imdn.PositiveDelivery|imdn.Display)
 		if err != nil {
@@ -254,11 +293,14 @@ func chatInvite(r *run) error {
 		if peer, err = latestSession(ctx, sessions, peer); err != nil {
 			return detail, r.peerRefused(err)
 		}
-		return detail, awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
+		err = awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
+		taken.report(detail, invites, sent.IMDN)
+		return detail, r.peerRefused(err)
 	}); err != nil {
 		return err
 	}
 	if err := r.step("peer-to-client", func(ctx context.Context) (map[string]int64, error) {
+		invites := taken.invites.Load()
 		text := []byte(sipChatText + " back " + token)
 		sent, err := bEnd.Send(ctx, peer.client.Session, aEnd.Self, "text/plain;charset=UTF-8", text, imdn.PositiveDelivery|imdn.Display)
 		if err != nil {
@@ -269,8 +311,11 @@ func chatInvite(r *run) error {
 		}
 		got, skipped, err := awaitChat(ctx, aEnd, sent.IMDN, token)
 		detail := map[string]int64{"skipped": int64(skipped)}
+		// The message itself may come on a chat the network opened to the
+		// client: a task without the client's chat opens one for it.
+		taken.report(detail, invites, sent.IMDN)
 		if err != nil {
-			return detail, err
+			return detail, r.peerRefused(err)
 		}
 		if !bytes.Equal(got.Body, text) || got.From.URI != bEnd.Self.URI {
 			return detail, errors.New("the message arrived changed")
@@ -283,6 +328,7 @@ func chatInvite(r *run) error {
 		return err
 	}
 	if err := r.step("chunked-message", func(ctx context.Context) (map[string]int64, error) {
+		invites := taken.invites.Load()
 		// Large enough to travel in internal/msrp's 2 KiB chunks through
 		// the relay and rcs-as, as text, which rcs-as stores and sends on.
 		raw, err := r.content(largeMessage / 2)
@@ -306,7 +352,9 @@ func chatInvite(r *run) error {
 		if !bytes.Equal(got.Body, text) {
 			return detail, errors.New("the message arrived changed")
 		}
-		return detail, awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
+		err = awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
+		taken.report(detail, invites, sent.IMDN)
+		return detail, r.peerRefused(err)
 	}); err != nil {
 		return err
 	}
@@ -375,7 +423,7 @@ func chatInvite(r *run) error {
 		return err
 	}
 	return r.step("clean", func(context.Context) (map[string]int64, error) {
-		for _, e := range []*chat.Endpoint{aEnd, bEnd} {
+		for _, e := range []*chat.Endpoint{aEnd, netEnd, bEnd} {
 			e.Wait()
 			if n := e.Malformed.Load(); n > 0 {
 				return nil, fmt.Errorf("%d malformed messages received", n)
@@ -396,12 +444,12 @@ func chatInvite(r *run) error {
 // again the network opens a chat to it, and the message, its text and
 // Message-ID intact, arrives there, and its notifications come back to the
 // client (stored), on its chat, on one the network opens to it
-// (client_invites counts those), or in pager mode (pager_notifications):
-// rcs-as sends them so when the peer's registration lands on a task other
-// than the one with the client's chat (#647). One that accepts the chat and loses the message fails, and so
-// does one that sends it on a chat opened before the peer registered again,
-// whether the peer had it already or the network opened it to a binding it
-// kept (code review on #559).
+// (network_chat), or in pager mode (pager_notifications): rcs-as sends
+// them so when the peer's registration lands on a task other than the one
+// with the client's chat (#647). One that accepts the chat
+// and loses the message fails, and so does one that sends it on a chat
+// opened before the peer registered again, whether the peer had it already
+// or the network opened it to a binding it kept (code review on #559).
 func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd *chat.Endpoint, sessions <-chan peerSession, release chan<- chan struct{}, registration *atomic.Int64, taken *fromNetwork, token string) (map[string]int64, error) {
 	// A UE releases the dialogs on its flow before it de-registers (TS
 	// 24.229 §5.1.1.6.1): answerCalls ends every chat it opened to the
@@ -430,7 +478,7 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	if _, err := b.ua.Unregister(ctx); err != nil {
 		return nil, fmt.Errorf("peer: %w", sipError(err))
 	}
-	invites, pagers := taken.invites.Load(), taken.pagers.Load()
+	invites := taken.invites.Load()
 	local, err := chat.LocalURI(r.cfg.Rand)
 	if err != nil {
 		return nil, err
@@ -514,10 +562,7 @@ func (r *run) chatToOfflinePeer(ctx context.Context, b, a *sipClient, aEnd, bEnd
 	}
 	detail["new_session"] = 1
 	err = awaitNotifications(ctx, aEnd, sent.IMDN, bEnd.Self.URI)
-	// Read after the notifications: each is counted before it is passed
-	// on, and an INVITE that carried them came before them.
-	detail["client_invites"] = taken.invites.Load() - invites
-	detail["pager_notifications"] = taken.pagers.Load() - pagers
+	taken.report(detail, invites, sent.IMDN)
 	if err != nil {
 		return detail, r.peerRefused(err)
 	}
@@ -610,9 +655,10 @@ func (r *run) answerCalls(ctx context.Context, calls <-chan peerCall, end *chat.
 
 // pagerNotifications hands each IMDN notification the network sends c in
 // pager mode (RFC 5438 §12.1.3.1) to e, as if it had come in a session,
-// and counts it in n before it does. Other MESSAGEs are passed over: an
-// earlier run may have left some. It runs until ctx ends or c's flow goes.
-func pagerNotifications(ctx context.Context, c *sipClient, e *chat.Endpoint, n *atomic.Int64) {
+// and counts it in n by its message's Message-ID before it does. Other
+// MESSAGEs are passed over: an earlier run may have left some. It runs
+// until ctx ends or c's flow goes.
+func pagerNotifications(ctx context.Context, c *sipClient, e *chat.Endpoint, n *fromNetwork) {
 	for {
 		m, err := c.next(ctx)
 		if err != nil {
@@ -627,11 +673,38 @@ func pagerNotifications(ctx context.Context, c *sipClient, e *chat.Endpoint, n *
 			e.Malformed.Add(1)
 			continue
 		}
-		n.Add(1)
+		n.add(&n.pagers, note.MessageID)
 		select {
 		case e.Notifications <- note:
 		default:
 			e.Dropped.Add(1)
+		}
+	}
+}
+
+// networkChats hands what comes on the chats the network opened to the
+// client, from, to the client's own endpoint, to, as if it had come on the
+// client's chat, and counts it in n by its message's Message-ID before it
+// does. It runs until ctx ends.
+func networkChats(ctx context.Context, from, to *chat.Endpoint, n *fromNetwork) {
+	for {
+		select {
+		case note := <-from.Notifications:
+			n.add(&n.onChats, note.MessageID)
+			select {
+			case to.Notifications <- note:
+			default:
+				to.Dropped.Add(1)
+			}
+		case m := <-from.Messages:
+			n.add(&n.onChats, m.Request.MessageID)
+			select {
+			case to.Messages <- m:
+			default:
+				to.Dropped.Add(1)
+			}
+		case <-ctx.Done():
+			return
 		}
 	}
 }
