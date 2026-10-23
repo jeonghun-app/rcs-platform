@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 func lookupFor(password string) SecretLookup {
@@ -19,7 +21,7 @@ func lookupFor(password string) SecretLookup {
 
 func httpAnswer(t *testing.T, ch Challenge, method, uri string, nc uint32) string {
 	t.Helper()
-	c, err := Respond(ch, ClientParams{Username: "alice", Password: []byte(testPass), Method: method, URI: uri, CNonce: "http-cnonce", NC: nc})
+	c, err := Respond(ch, ClientParams{Username: "alice", Password: secret.NewKey([]byte(testPass)), Method: method, URI: uri, CNonce: "http-cnonce", NC: nc})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +139,7 @@ func TestHTTPRequestFailures(t *testing.T) {
 func TestHTTPUnknownUserFailsWithTheLookupError(t *testing.T) {
 	h := newHarness(t)
 	ch := h.challenge(t, SHA256)
-	c, err := Respond(ch, ClientParams{Username: "mallory", Password: []byte("x"), Method: "GET", URI: "/f", CNonce: "c", NC: 1})
+	c, err := Respond(ch, ClientParams{Username: "mallory", Password: secret.NewKey([]byte("x")), Method: "GET", URI: "/f", CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

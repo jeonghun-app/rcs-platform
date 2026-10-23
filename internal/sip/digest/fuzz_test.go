@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 func checkParseError(t *testing.T, err error) {
@@ -43,7 +45,7 @@ func FuzzParseChallenge(f *testing.F) {
 func FuzzParseCredentials(f *testing.F) {
 	h := newHarness(f)
 	ch, _ := h.server.Challenge(SHA256, false)
-	c, _ := Respond(ch, ClientParams{Username: testUser, Password: []byte(testPass), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	c, _ := Respond(ch, ClientParams{Username: testUser, Password: secret.NewKey([]byte(testPass)), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	f.Add(c.Header())
 	f.Add(rfc2617Authorization)
 	f.Add(rfc7616Authorization("MD5", "8ca523f5e9506fed4657c9700eebdbec"))

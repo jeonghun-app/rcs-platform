@@ -17,6 +17,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -193,7 +194,7 @@ func (u *user) sign(r *http.Request) *http.Request {
 	}
 	u.nc++
 	c, err := digest.Respond(u.ch, digest.ClientParams{
-		Username: u.name, Password: []byte(u.password), Method: r.Method,
+		Username: u.name, Password: secret.NewKey([]byte(u.password)), Method: r.Method,
 		URI: r.URL.RequestURI(), CNonce: fmt.Sprintf("cnonce-%d", u.nc), NC: u.nc,
 	})
 	if err != nil {
