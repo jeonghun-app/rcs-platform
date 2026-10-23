@@ -85,28 +85,30 @@ func TestAPanickingNOTIFYEndsThatNOTIFYOnly(t *testing.T) {
 	}
 }
 
-// readPanics is the memory store, whose next Registration read panics once
-// armed, as a bug in a store's decoding would.
-type readPanics struct {
+// numberingPanics is the memory store, whose next NextNotify panics once
+// armed, as a bug in a store's decoding would: the store call every
+// change's NOTIFY makes as it is prepared, whether it carries the change's
+// record or reads the set (#492).
+type numberingPanics struct {
 	*state.Memory
 	armed atomic.Bool
 }
 
-func (s *readPanics) Registration(ctx context.Context, k state.SetKey) (*state.Registration, error) {
+func (s *numberingPanics) NextNotify(ctx context.Context, id string, of int64) (uint32, uint32, error) {
 	if s.armed.CompareAndSwap(true, false) {
 		panic("regevent test panic")
 	}
-	return s.Memory.Registration(ctx, k)
+	return s.Memory.NextNotify(ctx, id, of)
 }
 
 // TestAPanicPreparingANOTIFYGivesItsWorkerBack (#527 code review): a
-// NOTIFY whose preparation on a worker panics, in the store's read of the
-// set, is recovered and counted, and gives back its worker, set and hop:
+// NOTIFY whose preparation on a worker panics, in the store's numbering of
+// it, is recovered and counted, and gives back its worker, set and hop:
 // with one of each, the next change's NOTIFY still goes, and Wait returns.
 func TestAPanicPreparingANOTIFYGivesItsWorkerBack(t *testing.T) {
 	e := newEnv(t)
 	before := e.registered(binding(1, time.Hour))
-	st := &readPanics{Memory: e.store}
+	st := &numberingPanics{Memory: e.store}
 	guard := panics.New(panics.Config{Metric: "background.panics", Message: "test", Log: slog.New(slog.DiscardHandler)})
 	u, err := sip.ParseURI("sip:scscf." + realm)
 	if err != nil {
