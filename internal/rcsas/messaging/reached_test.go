@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -332,9 +333,11 @@ func TestALiveChatIsNotReReadForAnotherTasksDelivery(t *testing.T) {
 }
 
 // Code review on #624, its M5: task-2 marked bob at 0 s; task-1 finds him
-// unreachable at 30 s; task-2 reaches him at 40 s again, and leaves the
-// mark out, within reachedEvery of the last. The mark of 0 s still counts
-// against task-1's hold of 30 s, which reachedSlack's minute is for.
+// unreachable at 30 s; task-2 reaches him at 40 s again, on a refresh, and
+// leaves the mark out, within reachedEvery of the last. The mark of 0 s
+// still counts against task-1's hold of 30 s, which reachedSlack's minute
+// is for. A refresh writes no mark of a registration, so the delivery mark
+// alone releases the hold (QA on #624).
 func TestAMarkLeftOutWithinAMinuteStillCounts(t *testing.T) {
 	r1, r2 := twoTasks(t, nil, nil)
 	online, got := reachable(r1, r2)
@@ -351,7 +354,7 @@ func TestAMarkLeftOutWithinAMinuteStillCounts(t *testing.T) {
 	waitFor(t, "task-1's failed try", func() bool { return r1.m.get("delivery.pager_failed") == 1 && r1.idle() })
 	r1.clock.Advance(10 * time.Second)
 	online.Store(true)
-	r2.e.UserRegistered(bob, true)
+	r2.e.UserRegistered(bob, false)
 	waitFor(t, "m1 delivered by task-2", func() bool { return got.Load() == 2 && r2.idle() })
 	if n := r2.m.get("delivery.reached_marked"); n != 1 {
 		t.Fatalf("task-2 stored %d marks of a delivery, want 1 (the second within reachedEvery)", n)
@@ -360,6 +363,32 @@ func TestAMarkLeftOutWithinAMinuteStillCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, "m2 delivered with task-1's retry timer 50 s away", func() bool { return got.Load() == 3 })
+	if d, f := r1.m.get("delivery.reached_elsewhere"), r1.m.get("delivery.registered_elsewhere"); d != 1 || f != 0 {
+		t.Errorf("task-1 acted on %d delivery marks and %d registration marks, want 1 and 0", d, f)
+	}
+}
+
+// QA on #624: bob is unreachable when task-1 tries him, then comes back by
+// a refresh that task-2 takes, which marks only the delivery. alice's next
+// message to task-1 goes out with task-1's retry timer still to come: the
+// clock does not move.
+func TestADeliveryMarkAloneReleasesAHold(t *testing.T) {
+	r1, r2 := twoTasks(t, nil, nil)
+	online, got := reachable(r1, r2)
+	if err := r1.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "one", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "task-1's failed try", func() bool { return r1.m.get("delivery.pager_failed") == 1 && r1.idle() })
+	online.Store(true)
+	r2.e.UserRegistered(bob, false)
+	waitFor(t, "m1 out by task-2", func() bool { return got.Load() == 1 && r2.m.get("delivery.reached_marked") == 1 && r2.idle() })
+	if err := r1.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m2", "two", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "m2 delivered with task-1's retry timer still to come", func() bool { return got.Load() == 2 })
+	if d, f := r1.m.get("delivery.reached_elsewhere"), r1.m.get("delivery.registered_elsewhere"); d != 1 || f != 0 {
+		t.Errorf("task-1 acted on %d delivery marks and %d registration marks, want 1 and 0", d, f)
+	}
 }
 
 // Code review on #624, its M6: the mark outlives the registration it came
@@ -562,5 +591,99 @@ func TestADeliveredSummaryMarksItsRecipient(t *testing.T) {
 	waitFor(t, "the summary expanded", func() bool { return r.m.get("group.summary.expanded") == 1 && r.idle() })
 	if n := r.m.get("delivery.reached_marked"); n != 1 {
 		t.Fatalf("%d marks after the summary went, want 1; metrics %v", n, r.m)
+	}
+}
+
+// Code review and QA on #624: task-1 invited bob for alice's chat (inv1);
+// bob then registered on a new flow with task-2, whose mark had task-1
+// invite him again (inv2). A late ErrNoSessions for inv1 is of the old
+// flow and is overtaken, as after a registration here; one for inv2 marks
+// bob pager-only. Otherwise his large messages would wait for a session
+// he never opens (#384, across tasks).
+func TestALateFailureBeforeARegistrationMarkedElsewhereIsOvertaken(t *testing.T) {
+	r1, r2 := twoTasks(t, nil, nil)
+	r1.d.onInvite(func(Invitation) error { return nil })
+	r2.d.onInvite(func(Invitation) error { return nil })
+	drainInvites(t, r2.d)
+	l1 := r1.listen(t)
+	_, a := r1.connect(t, l1, LegParams{User: alice, Peer: bob, Conversation: conv, Mode: store.Chat})
+	a.send(t, chat(t, "c1", "one", 0))
+	inv1 := r1.d.nextInvite(t)
+	waitFor(t, "task-1 idle", func() bool { return r1.m.get("message.accepted") == 1 && r1.idle() })
+	r2.e.UserRegistered(bob, true)
+	waitFor(t, "task-2's mark", func() bool { return r2.m.get("delivery.registered_marked") == 1 && r2.idle() })
+	a.send(t, chat(t, "c2", "two", 0))
+	inv2 := r1.d.nextInvite(t)
+	waitFor(t, "task-1's look", func() bool { return r1.m.get("delivery.registered_elsewhere") == 1 && r1.idle() })
+	r1.e.InviteFailed(inv1, ErrNoSessions)
+	if r1.m.get("invite.failed_overtaken") != 1 || r1.m.get("invite.no_sessions") != 0 {
+		t.Fatalf("old invitation's failure: metrics %v, want overtaken", r1.m)
+	}
+	r1.e.InviteFailed(inv2, ErrNoSessions)
+	if r1.m.get("invite.no_sessions") != 1 {
+		t.Fatalf("new invitation's failure: metrics %v, want no_sessions", r1.m)
+	}
+}
+
+// QA on #624: a registration on a new flow is marked by the pass it ran,
+// not by every full pass after it, each of which would count on the other
+// tasks as one more registration.
+func TestARegistrationIsMarkedOnce(t *testing.T) {
+	r := newRig(t, Config{})
+	r.d.onPager(func(Delivery) error { return ErrOffline })
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "one", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first try", func() bool { return r.m.get("delivery.pager_failed") == 1 && r.idle() })
+	r.e.UserRegistered(bob, true)
+	waitFor(t, "the registration's pass", func() bool { return r.m.get("delivery.pager_failed") == 2 && r.idle() })
+	waitFor(t, "the retry timer armed", func() bool { return r.clock.armed(DefaultRetryInterval) })
+	r.clock.Advance(DefaultRetryInterval)
+	waitFor(t, "the retry's pass", func() bool { return r.m.get("delivery.pager_failed") == 3 && r.idle() })
+	if n := r.m.get("delivery.registered_marked"); n != 1 {
+		t.Errorf("registered_marked = %d after one registration and a retry, want 1", n)
+	}
+}
+
+// QA on #624: a registration whose pass found nothing queued has nothing
+// for another task to release, and costs no write.
+func TestARegistrationWithNothingQueuedIsNotMarked(t *testing.T) {
+	st := &pendingCalls{Store: store.NewMemory()}
+	r := newRigWith(t, Config{}, st, newFakeClock())
+	r.e.UserRegistered(bob, true)
+	waitFor(t, "the registration's pass", func() bool { return st.n.Load() > 0 && r.idle() })
+	if n := r.m.get("delivery.registered_marked"); n != 0 {
+		t.Errorf("registered_marked = %d with an empty queue, want 0", n)
+	}
+}
+
+// failMarkOnce fails the first mark stored, as a throttled write would.
+type failMarkOnce struct {
+	store.Store
+	n atomic.Int32
+}
+
+func (s *failMarkOnce) MarkReached(ctx context.Context, recipient string, m store.Mark, expires time.Time) error {
+	if s.n.Add(1) == 1 {
+		return errors.New("throttled")
+	}
+	return s.Store.MarkReached(ctx, recipient, m, expires)
+}
+
+// QA on #624: a mark that failed to store is tried again with the next
+// delivery, not a minute later.
+func TestAFailedMarkIsTriedAgain(t *testing.T) {
+	st := &failMarkOnce{Store: store.NewMemory()}
+	r := newRigWith(t, Config{}, st, newFakeClock())
+	r.d.onPager(func(Delivery) error { return nil })
+	for i, id := range []string{"s1", "s2"} {
+		if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, id, "x", 0))); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "delivered", func() bool { return r.m.get("delivery.pager") == int64(i+1) && r.idle() })
+		r.clock.Advance(time.Second)
+	}
+	if n := r.m.get("delivery.reached_marked"); n != 1 {
+		t.Errorf("reached_marked = %d after a failed mark and a second delivery, want 1", n)
 	}
 }

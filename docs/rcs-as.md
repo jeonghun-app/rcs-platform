@@ -590,6 +590,16 @@ through the store:
     them.
 - **When a stale mark counts.** A mark from before the hold, inside that
   margin, costs one more attempt, once, as each mark counts once.
+- **A second hold within the minute.** Because each mark counts once, a mark
+  this task already acted on does not release a later hold. If the recipient
+  is lost again and this task holds the queue again, another task that
+  reaches the recipient within a minute of its last delivery mark writes no
+  new one. This task's next message then waits for its retry timer. The
+  counted mark reset that timer's backoff, so the wait is about
+  `RCSAS_RETRY_INTERVAL`, not up to `RCSAS_MAX_RETRY_INTERVAL`. The other
+  task's next delivery after that minute marks the recipient again. This is
+  the price of counting each mark once; otherwise one mark would release a
+  hold, and read the queue, for every new message.
 - **Cost.** A delivery costs no more than one write a minute per recipient
   and task, and a registration on a new flow with something queued one write.
   Each message to a held recipient costs one read. The queue is read once
@@ -1444,7 +1454,7 @@ identifier ever appears in a metric name.
 | `delivery.claimed_elsewhere` | A message another task held |
 | `delivery.reached_marked`, `delivery.registered_marked`, `delivery.reached_elsewhere`, `delivery.registered_elsewhere` | #605: marks of a delivery and of a registration on a new flow this task stored, and other tasks' marks of each kind it acted on |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
-| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, which leave no mark (the registration had the queue read already); a group's 482 is never one |
+| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, here or, as its mark told, on another task, which leave no mark (the registration had the queue read already); a group's 482 is never one |
 | `leg.opened`, `leg.unanswered` | MSRP legs, and offers that got no answer |
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
@@ -1511,8 +1521,9 @@ Signals to alarm on (Phase 7):
   as `imdn_unknown`.
 - **Per-task state.** The rate limit, the pager-only marker and the retry
   timers are per task. A sender spread over N tasks gets N times the rate. A
-  hold, the invitations a task asked for and its pager-only marker give way
-  when another task reaches the recipient (see
+  hold gives way when another task reaches the recipient. The invitations a
+  task asked for and its pager-only marker give way only when another task
+  takes a registration on a new flow whose pass finds something queued (see
   [A recipient reached on another task](#a-recipient-reached-on-another-task)).
 - **No processing notifications.** rcs-as does not send "stored" processing
   notifications on its own.
