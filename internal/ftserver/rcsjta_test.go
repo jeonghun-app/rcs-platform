@@ -151,8 +151,8 @@ func TestRCSJTABrokenUploadVerifiedAfterItsResumeStartsStillCounts(t *testing.T)
 	// server has read the POST. rcsjta's next request, get_upload_info, goes
 	// out without credentials and its 401 starts a fresh nonce, so the late
 	// POST's nonce-count competes with nothing and the POST keeps its whole
-	// parts. (A client that reused the POST's nonce would see the late POST
-	// refused as a replay; see #66.)
+	// parts. (A client that reuses the POST's nonce is covered by
+	// TestBrokenUploadVerifiedAfterTheNextRequestOnItsNonceIsKept.)
 	e := newEnv(t)
 	c := &rcsjta{t: t, e: e, user: alice, password: password}
 	c.readChallenge(e.do(httptest.NewRequest(http.MethodPost, "/ft", nil)).Header())
