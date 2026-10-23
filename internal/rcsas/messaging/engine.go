@@ -608,6 +608,9 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 		e.mu.Unlock()
 		return
 	}
+	// The pass looks out for a message another task's attempt holds, which
+	// it would otherwise leave to that task's retry timer (#632).
+	e.lookOut(user, 0)
 	e.mu.Unlock()
 	e.kickEvent(user)
 }

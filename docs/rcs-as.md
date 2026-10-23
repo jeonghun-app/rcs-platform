@@ -561,6 +561,21 @@ the claim, so a message goes out once. If a task loses its lease while
 delivering, the message may go out twice, and clients drop the duplicate by
 Message-ID.
 
+A registration can come in while another task's attempt holds a message, for
+example a pager request sent on the flow the client has just left (#632). The
+registration's pass does not see the claimed message, or loses the claim to
+the other task's retry. If that attempt then fails, the other task holds the
+queue until its retry timer, up to `RCSAS_MAX_RETRY_INTERVAL`, and nothing else
+reads it. So a pass a registration asked for that passed over a message
+another task held, or lost a claim, reads the queue again after a second. It
+reads again after 2, 4, 8 s and so on while such a message is still held,
+until a wait reaches the lease. By then any attempt begun before the
+registration is over, and one begun after it went to the new flow. The
+store's read tells of the held message at no extra cost (`PendingHeld`), so a
+registration with nothing held costs nothing more. A message that comes in
+on the holding task meanwhile is #605's case: a hold on one task after
+another task delivered.
+
 `Close` takes no new work, then lets the attempts in progress finish, for at
 most a delivery and two store calls, before it cancels the rest. The store
 calls that record an outcome survive the cancellation. A message delivered
@@ -1159,7 +1174,10 @@ The table's properties:
 - **Length prefix.** The identity's length goes in front, so that one identity
   can never be a prefix of another's key.
 - **Partitions.** A recipient's queue is one partition, read in sort-key
-  order, which is enqueue order.
+  order, which is enqueue order. The engine's read (`PendingHeld`) filters on
+  expiry only and tells free messages from claimed ones itself, so that it
+  can tell of a message another task holds (#632). A query is charged for
+  what it reads, whatever its filter returns.
 - **Bounds.** The queue's size item and the sender's share item count messages
   and bytes. Both are written in the same transaction as each enqueue and
   removal, and the enqueue is conditional on both bounds. A 1-to-1
@@ -1385,6 +1403,7 @@ identifier ever appears in a metric name.
 | `imdn.incomplete_request` | Messages asking for notifications without a Message-ID or DateTime; delivered without them |
 | `imdn.duplicate` | Notifications dropped as repeats |
 | `imdn.route_untrusted`, `imdn.route_dropped` | IMDN routes not followed: in a forwarded notification, and in a generated one's record route |
+| `delivery.held_elsewhere` | #632: reads of a queue set for a registration's pass that passed over a message another task held |
 | `delivery.msrp`, `delivery.pager`, `delivery.msrp_failed`, `delivery.pager_failed` | Delivery attempts |
 | `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
