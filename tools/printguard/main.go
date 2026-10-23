@@ -137,6 +137,10 @@ func run(dir string) ([]Finding, int, error) {
 			return nil, 0, fmt.Errorf("%s has no type %s", msgPkg, name)
 		}
 	}
+	ifaces, err := loadPrintInterfaces(imp)
+	if err != nil {
+		return nil, 0, err
+	}
 	root, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, 0, err
@@ -154,7 +158,7 @@ func run(dir string) ([]Finding, int, error) {
 			}
 			files = append(files, f)
 		}
-		got, err := checkPackage(fset, imp, msg, p.ImportPath, files)
+		got, err := checkPackage(fset, imp, msg, ifaces, p.ImportPath, files)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -169,8 +173,9 @@ func run(dir string) ([]Finding, int, error) {
 }
 
 // checkPackage type-checks files as the package path and returns its
-// findings; msg is msgPkg as imp loads it.
-func checkPackage(fset *token.FileSet, imp types.Importer, msg *types.Package, path string, files []*ast.File) ([]Finding, error) {
+// findings; msg is msgPkg and ifaces are fmt's and slog's interfaces, as imp
+// loads them.
+func checkPackage(fset *token.FileSet, imp types.Importer, msg *types.Package, ifaces printInterfaces, path string, files []*ast.File) ([]Finding, error) {
 	info := &types.Info{
 		Types: map[ast.Expr]types.TypeAndValue{},
 		Uses:  map[*ast.Ident]types.Object{},
@@ -181,7 +186,7 @@ func checkPackage(fset *token.FileSet, imp types.Importer, msg *types.Package, p
 	if err != nil {
 		return nil, fmt.Errorf("type-checking %s: %w", path, err)
 	}
-	c := &checker{msgPkg: msgPkg, msg: dependency(pkg, msgPkg), info: info, fset: fset}
+	c := &checker{msgPkg: msgPkg, msg: dependency(pkg, msgPkg), ifaces: ifaces, info: info, fset: fset}
 	if c.msg == nil {
 		c.msg = msg
 	}

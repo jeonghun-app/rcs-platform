@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"go/ast"
 	"go/constant"
 	"go/token"
@@ -28,10 +29,12 @@ type checker struct {
 	msgPkg string
 	// msg is msgPkg as the package being checked sees it, or as the
 	// importer loads it if the package does not depend on it.
-	msg   *types.Package
-	info  *types.Info
-	fset  *token.FileSet
-	found []Finding
+	msg *types.Package
+	// ifaces are fmt's and slog's interfaces, as the importer loads them.
+	ifaces printInterfaces
+	info   *types.Info
+	fset   *token.FileSet
+	found  []Finding
 }
 
 // dependency finds the package of path among pkg's imports, at any depth.
@@ -468,53 +471,70 @@ func (w *walk) reach(t types.Type, s state, path string) string {
 // methods reports what fmt does with t's own methods when it prints a
 // value of t with w's verb: handleMethods in fmt's print.go.
 func (w *walk) methods(t types.Type, s state) stops {
-	ms := types.NewMethodSet(t)
-	if w.slog && s.top && method(ms, "LogValue", 0, 1) {
+	is := func(i *types.Interface) bool { return types.Implements(t, i) }
+	ifs := w.c.ifaces
+	if w.slog && s.top && is(ifs.logValuer) {
 		// slog resolves a LogValuer before it prints.
 		return callsMethod
 	}
 	v := w.verb
 	if v.r == 'w' {
-		if !w.wrapErrs || !stringMethod(ms, "Error") {
+		if !w.wrapErrs || !is(ifs.err) {
 			return refusesVerb
 		}
 		v.r = 'v'
 	}
 	switch {
-	case method(ms, "Format", 2, 0):
+	case is(ifs.formatter):
 		return callsMethod
 	case v.sharp && v.r == 'v':
-		if stringMethod(ms, "GoString") {
+		if is(ifs.goStringer) {
 			return callsMethod
 		}
 	case strings.ContainsRune("vsxXq", v.r):
-		if stringMethod(ms, "Error") || stringMethod(ms, "String") {
+		if is(ifs.err) || is(ifs.stringer) {
 			return callsMethod
 		}
 	}
 	return printsFields
 }
 
-// method reports whether ms has a method name with params parameters and
-// results results.
-func method(ms *types.MethodSet, name string, params, results int) bool {
-	sel := ms.Lookup(nil, name)
-	if sel == nil {
-		return false
-	}
-	sig, ok := sel.Type().(*types.Signature)
-	return ok && sig.Params().Len() == params && sig.Results().Len() == results
+// printInterfaces are the interfaces whose methods fmt and slog call:
+// a method of the same name but another signature is not called.
+type printInterfaces struct {
+	formatter, stringer, goStringer, err, logValuer *types.Interface
 }
 
-// stringMethod reports whether ms has name() string, as fmt.Stringer,
-// fmt.GoStringer and error do.
-func stringMethod(ms *types.MethodSet, name string) bool {
-	if !method(ms, name, 0, 1) {
-		return false
+// loadPrintInterfaces reads them from fmt and log/slog as imp loads them,
+// so that a checked package's fmt.State is the same type.
+func loadPrintInterfaces(imp types.Importer) (printInterfaces, error) {
+	lookup := func(path, name string) (*types.Interface, error) {
+		pkg, err := imp.Import(path)
+		if err != nil {
+			return nil, err
+		}
+		if tn, ok := pkg.Scope().Lookup(name).(*types.TypeName); ok {
+			if i, ok := tn.Type().Underlying().(*types.Interface); ok {
+				return i, nil
+			}
+		}
+		return nil, fmt.Errorf("%s has no interface %s", path, name)
 	}
-	res := ms.Lookup(nil, name).Type().(*types.Signature).Results().At(0).Type()
-	b, ok := res.Underlying().(*types.Basic)
-	return ok && b.Kind() == types.String
+	var p printInterfaces
+	var err error
+	for _, x := range []struct {
+		dst        **types.Interface
+		path, name string
+	}{
+		{&p.formatter, "fmt", "Formatter"}, {&p.stringer, "fmt", "Stringer"},
+		{&p.goStringer, "fmt", "GoStringer"}, {&p.logValuer, "log/slog", "LogValuer"},
+	} {
+		if *x.dst, err = lookup(x.path, x.name); err != nil {
+			return printInterfaces{}, err
+		}
+	}
+	p.err = types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	return p, nil
 }
 
 // pointerLike reports whether %p prints a value of t as an address.

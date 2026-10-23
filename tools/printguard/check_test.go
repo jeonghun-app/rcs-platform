@@ -90,7 +90,11 @@ func TestTheShapesAreFound(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			c := &checker{msgPkg: "sip", msg: msg, info: info, fset: fset}
+			ifaces, err := loadPrintInterfaces(imp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &checker{msgPkg: "sip", msg: msg, ifaces: ifaces, info: info, fset: fset}
 			found := map[int]string{}
 			for _, f := range c.check(files) {
 				if prev, dup := found[f.Pos.Line]; dup {

@@ -81,6 +81,24 @@ type logHolder struct{ req *sip.Request }
 
 func (logHolder) LogValue() slog.Value { return slog.StringValue("holder") }
 
+// fmt and slog call a method only with their interface's signature.
+type wrongFormat struct{ req *sip.Request }
+
+func (wrongFormat) Format(a, b int) {}
+
+type myString string
+
+type wrongString struct{ req *sip.Request }
+
+func (wrongString) String() myString { return "wrong" }
+
+type wrongLogValue struct{ req *sip.Request }
+
+func (wrongLogValue) LogValue() string { return "wrong" }
+
+// slog calls LogValue on the argument only, not on a field of it.
+type nestedLog struct{ L logHolder }
+
 type exported struct {
 	R *sip.Request
 	V sip.Response
@@ -140,8 +158,14 @@ func refused(t testing.TB, tt *testing.T, format string, r *sip.Request) {
 	_ = fmt.Sprintf("%p", exportedBody{})      // want "sip.Body value with %p (B)"
 	_ = fmt.Sprintf("%d", exportedAny{})       // want "interface that may hold a sip.Request value with %d (V)"
 	var rec slog.Record
-	rec.Add("v", unexportedValue{}) // want "sip.Response in an unexported field (res)"
-	log.Fatal(unexportedValue{})    // want "sip.Response in an unexported field (res)"
+	rec.Add("v", unexportedValue{})           // want "sip.Response in an unexported field (res)"
+	_ = fmt.Sprint(wrongFormat{})             // want "*sip.Request in an unexported field (req)"
+	_ = fmt.Sprint(wrongString{})             // want "*sip.Request in an unexported field (req)"
+	slog.Info("m", "v", wrongLogValue{})      // want "*sip.Request in an unexported field (req)"
+	slog.Info("m", "v", nestedLog{})          // want "*sip.Request in an unexported field (L.req)"
+	_ = fmt.Sprintf("%w", &unexportedValue{}) // want "sip.Response in an unexported field (res)"
+	_ = fmt.Errorf("%#w", errHolder{})        // want "*sip.Request in an unexported field (req)"
+	log.Fatal(unexportedValue{})              // want "sip.Response in an unexported field (res)"
 }
 
 func allowed(format string) {
