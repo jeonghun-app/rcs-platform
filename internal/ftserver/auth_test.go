@@ -77,6 +77,11 @@ func TestEveryAuthenticationFailureLooksTheSame(t *testing.T) {
 			t.Errorf("%s: %s", name, got)
 		}
 	}
+	// Each upload sent with credentials that did not verify; not the one
+	// without credentials, nor the empty POST.
+	if got := e.metric("upload.failed.auth"); got != 4 {
+		t.Errorf("upload.failed.auth = %v, want 4", got)
+	}
 }
 
 func TestExpiredNonceGetsAStaleChallenge(t *testing.T) {

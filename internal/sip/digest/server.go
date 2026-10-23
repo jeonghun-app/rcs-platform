@@ -34,8 +34,9 @@ var (
 	ErrWrongResponse = errors.New("digest: response does not match")
 	// ErrStaleNonce means the response was right but the nonce has expired.
 	ErrStaleNonce = errors.New("digest: nonce has expired")
-	// ErrReplayed means the nonce-count is not greater than one already used
-	// with this nonce (RFC 7616 §5.5).
+	// ErrReplayed means the nonce-count has already been used with this
+	// nonce, or lies below the NonceCountWindow counts ending at the highest
+	// one used (RFC 7616 §3.4, §5.5).
 	ErrReplayed = errors.New("digest: nonce count already used")
 )
 
@@ -64,17 +65,20 @@ type SyncFailure struct {
 // Error implements error. It names no value: AUTS and RAND must not be logged.
 func (e *SyncFailure) Error() string { return "digest: AKA client reported a synchronisation failure" }
 
-// NonceCountStore records the highest nonce-count each user has used with
-// each nonce, the only state Digest needs. Counts are kept per (username,
-// nonce) because MD5 and SHA-256 nonces are not bound to a user: keyed by
-// nonce alone, one user could exhaust the count of a nonce issued to another.
+// NonceCountStore records the nonce-counts each user has used with each
+// nonce (UsedCounts), the only state Digest needs. Counts are kept per
+// (username, nonce) because MD5 and SHA-256 nonces are not bound to a user:
+// keyed by nonce alone, one user could exhaust the count of a nonce issued to
+// another.
 type NonceCountStore interface {
-	// Advance records nc for (username, nonce) and reports true if nc is
-	// greater than the nonce-count recorded so far (or none is); otherwise it
-	// changes nothing and reports false. The comparison and the write must be
-	// one atomic step across every instance sharing the store, for example a
-	// DynamoDB conditional update. The entry must be kept until expires and
-	// may be discarded after it: no credentials for the nonce verify later.
+	// Advance records nc for (username, nonce) and reports true if
+	// UsedCounts.Use accepts it after the counts recorded so far (none, when
+	// no entry is live): nc has not been used and is not below the window.
+	// Otherwise it changes nothing and reports false. The check and the
+	// write must be one atomic step across every instance sharing the store,
+	// for example a DynamoDB conditional write. The entry must be kept until
+	// expires and may be discarded after it: no credentials for the nonce
+	// verify later.
 	Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error)
 }
 

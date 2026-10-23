@@ -378,12 +378,12 @@ receives, as a B2BUA does.
 ## Findings
 
 - A client that breaks an upload and at once sends another request under the
-  same nonce can lose the whole upload. The transport gives up on the broken
+  same nonce could lose the whole upload. The transport gives up on the broken
   request as soon as its body fails, possibly before ft-server has read its
-  headers. If the next request, with a higher nonce-count, is verified first,
-  the broken one is refused as a replay (RFC 7616 §3.4) and stores nothing.
-  `get_upload_info` then answers 404, and the client starts over. rcsjta does
-  not hit this: it sends `get_upload_info` without credentials first and
-  answers the fresh nonce of that 401 with `nc` 1, so the broken POST's nonce
-  sees no later count. Only clients that keep the nonce across a break are
-  affected, so #66 is P2 hardening.
+  headers. If the next request, with a higher nonce-count, was verified first,
+  the broken one was refused as a replay and stored nothing; `get_upload_info`
+  then answered 404, and the client started over. rcsjta does not hit this: it
+  sends `get_upload_info` without credentials first and answers the fresh nonce
+  of that 401 with `nc` 1. Since #66 ft-server accepts a nonce-count that
+  arrives late, once, inside a window of 32, so such a broken upload keeps its
+  whole parts.
