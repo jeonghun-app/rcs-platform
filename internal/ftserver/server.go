@@ -321,7 +321,8 @@ var errLookupBusy = errors.New("ftserver: too many credential lookups in progres
 // 401 with a fresh challenge,
 // stale=true only for a correct response with an expired nonce, so a client
 // cannot learn which user names exist. A failure of the credential backend
-// itself, or a task at its lookup limit, gets 503 with Retry-After instead:
+// or of the nonce-count store, or a task at its lookup limit, gets 503 with
+// Retry-After instead:
 // it says nothing about the user, and RCS clients retry a 503 but give up
 // after a second 401.
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity, bool) {
@@ -364,6 +365,14 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 	case lookupErr != nil && !errors.Is(lookupErr, ErrUnknownUser):
 		s.metrics.Count("auth.backend_error", 1)
 		s.log.Warn("credential lookup failed", slog.String("error", pii.Redact(lookupErr.Error())))
+		serviceUnavailable(w, retryAfter)
+		return identity{}, false
+	case errors.Is(err, digest.ErrNonceCountStore):
+		// The credentials verified but could not be checked for a replay:
+		// the store's fault, not the client's, so the client retries
+		// rather than giving up on a second 401 (#621).
+		s.metrics.Count("auth.backend_error", 1)
+		s.log.Warn("nonce count store failed", slog.String("error", pii.Redact(err.Error())))
 		serviceUnavailable(w, retryAfter)
 		return identity{}, false
 	case errors.Is(err, digest.ErrNoCredentials):

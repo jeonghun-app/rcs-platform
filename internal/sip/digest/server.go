@@ -16,10 +16,11 @@ import (
 )
 
 // Verification outcomes. Callers answer ErrStaleNonce with a new challenge
-// carrying stale=true and a *SyncFailure as its documentation says. Every
-// other error, including a failed secret lookup, should get one and the same
-// answer (a fresh challenge, or a rejection by local policy), so that a client
-// cannot tell an unknown user from a wrong password.
+// carrying stale=true, a *SyncFailure as its documentation says, and
+// ErrNonceCountStore as a failure of their own backend. Every other error,
+// including a failed secret lookup, should get one and the same answer (a
+// fresh challenge, or a rejection by local policy), so that a client cannot
+// tell an unknown user from a wrong password.
 var (
 	// ErrRealmMismatch means the credentials name another realm.
 	ErrRealmMismatch = errors.New("digest: credentials are for another realm")
@@ -38,6 +39,12 @@ var (
 	// nonce, or lies below the NonceCountWindow counts ending at the highest
 	// one used (RFC 7616 §3.4, §5.5).
 	ErrReplayed = errors.New("digest: nonce count already used")
+	// ErrNonceCountStore wraps an error of the NonceCountStore: the
+	// response was right, but whether its nonce-count was used could not
+	// be told, so the credentials are neither accepted nor refused. It comes
+	// only after the response has verified, so answering it apart from the
+	// other errors tells a client nothing it did not know (#621).
+	ErrNonceCountStore = errors.New("digest: the nonce count store failed")
 )
 
 // SyncFailure is returned by VerifyAKA when an AKA client reported that the
@@ -392,7 +399,7 @@ func (s *Server) consume(ctx context.Context, c Credentials, deadline time.Time)
 	}
 	fresh, err := s.counts.Advance(ctx, c.Username, nonce, c.NC, deadline)
 	if err != nil {
-		return fmt.Errorf("digest: recording the nonce count: %w", err)
+		return fmt.Errorf("%w: %w", ErrNonceCountStore, err)
 	}
 	if !fresh {
 		return ErrReplayed

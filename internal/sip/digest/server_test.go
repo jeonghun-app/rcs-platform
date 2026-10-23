@@ -414,8 +414,11 @@ func TestNonceCountStoreFailureFailsVerification(t *testing.T) {
 	h.server.counts = failingCounts{}
 	c := answer(t, h.challenge(t, MD5), testPass, 1)
 	err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass)))
-	if err == nil || !strings.Contains(err.Error(), "table unavailable") {
-		t.Fatalf("err = %v, want the store's error", err)
+	if !errors.Is(err, ErrNonceCountStore) || !strings.Contains(err.Error(), "table unavailable") {
+		t.Fatalf("err = %v, want the store's error as ErrNonceCountStore", err)
+	}
+	if errors.Is(err, ErrReplayed) {
+		t.Fatal("a store failure looks like a replay")
 	}
 }
 

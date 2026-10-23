@@ -212,9 +212,13 @@ and answers it as MD5.
   such users apart. The operator gets `auth.bad_credential_record` and a log
   line without the user name.
 - **Backend failures get 503.** A transport error, a timeout, or an HSS status
-  other than `200` and `404` gets `503` with `Retry-After`. It is counted in
-  `auth.backend_error` and logged without the user name. It says nothing about
-  the user, and clients retry a 503 but give up after a second 401.
+  other than `200` and `404` gets `503` with `Retry-After`. So does a failure
+  of the nonce-count store, DynamoDB throttling say, or an update that lost
+  every conditional write to other requests on its nonce: the response was
+  right, but whether its nonce-count was used could not be told (#621). Each
+  is counted in `auth.backend_error` and logged without the user name. It says
+  nothing about the user, and clients retry a 503 but give up after a second
+  401.
 - **Lookups are bounded.** Each task runs at most `FT_MAX_CONCURRENT_LOOKUPS` at
   once and answers `503` beyond that (`auth.lookup_busy`). Anyone who has
   fetched a nonce can trigger a lookup with a made-up user name. The HSS client

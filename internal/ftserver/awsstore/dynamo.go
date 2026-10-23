@@ -346,13 +346,18 @@ var nonceCountAttrs = []struct{ name, attr string }{
 func (n *NonceCounts) Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
 	pk := nonceKey(username, nonce)
 	unlock, waited, err := n.locks.lock(ctx, pk)
+	if err != nil {
+		if waited {
+			n.countContention()
+		}
+		return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
+	}
+	// Before the callback, so that one that panics cannot leave the key
+	// held (code review on #610).
+	defer unlock()
 	if waited {
 		n.countContention()
 	}
-	if err != nil {
-		return false, fmt.Errorf("awsstore: advance nonce count: %w", err)
-	}
-	defer unlock()
 	sleep := n.sleep
 	if sleep == nil {
 		sleep = sleepCtx
