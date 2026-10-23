@@ -24,6 +24,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/registrar"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/proxy"
@@ -89,7 +90,7 @@ func answer(t *testing.T, res *sip.Response, card *milenage.Milenage) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	p := digest.ClientParams{Username: impi, Password: password, Method: "REGISTER", URI: "sip:" + realm, CNonce: "0a4f113b", NC: 1}
+	p := digest.ClientParams{Username: impi, Password: secret.NewKey(password), Method: "REGISTER", URI: "sip:" + realm, CNonce: "0a4f113b", NC: 1}
 	if card != nil {
 		if ch.Algorithm != digest.AKAv1MD5 {
 			t.Fatalf("challenged with %q, want AKAv1-MD5", ch.Algorithm)
@@ -102,7 +103,7 @@ func answer(t *testing.T, res *sip.Response, card *milenage.Milenage) string {
 			t.Fatalf("the card refused the network: %v", err)
 		}
 		r := card.F2(rnd)
-		p.Password = r[:]
+		p.Password = secret.NewKey(r[:])
 	}
 	creds, err := digest.Respond(ch, p)
 	if err != nil {
