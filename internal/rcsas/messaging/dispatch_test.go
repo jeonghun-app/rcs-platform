@@ -324,6 +324,66 @@ func TestARefreshKeepsTheInvitationsStillOut(t *testing.T) {
 	noInvite("a refresh after carol's failure")
 }
 
+// QA on #655: a refresh during a large-mode leg's attempt keeps the leg's
+// mark, so a pass that read the message before the leg claimed it asks
+// for no second session (#264).
+func TestARefreshDuringALargeModeAttemptAsksForNoSecondSession(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600, InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.UserRegistered(bob, true)
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("Pending = %+v, %v", ms, err)
+	}
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	r.e.UserRegistered(bob, false)
+	r.e.invite(t.Context(), ms[0])
+	select {
+	case again := <-r.d.invites:
+		t.Fatalf("a second session was asked for after a refresh: %+v", again)
+	default:
+	}
+}
+
+// QA on #655: bob's refresh leaves carol's failed mark alone.
+func TestARefreshClearsOnlyThatUsersFailedMarks(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.UserRegistered(bob, true)
+	r.e.UserRegistered(carol, true)
+	msg := func(id string) Origin {
+		return Origin{Sender: alice, Recipient: carol, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, id, "hi", 0))}
+	}
+	if err := r.e.Submit(t.Context(), msg("m1")); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	r.e.InviteFailed(inv, ErrOffline)
+	r.e.UserRegistered(bob, false)
+	if err := r.e.Submit(t.Context(), msg("m2")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	select {
+	case got := <-r.d.invites:
+		t.Fatalf("carol invited after bob's refresh: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 // Code review of #655: bob stays registered, refreshes every 30 min, and
 // every invitation to him fails. Each refresh finds a failed mark and has
 // the queue read, but leaves its retry timer as it is: the refresh says

@@ -1618,8 +1618,9 @@ Signals to alarm on (Phase 7):
 - **A failure after a refresh is marked.** An invitation still unanswered at a
   refresh that fails after it, a 480 that reaches rcs-as after the
   registration say, is marked as any failure is: what is queued behind it
-  waits for `RCSAS_INVITE_TIMEOUT` (2 min) or the queue's retry interval (1 min
-  and growing), not the next registration (#653).
+  waits for `RCSAS_INVITE_TIMEOUT` (2 min), the queue's retry interval (1 min
+  and growing) or the next registration, not the refresh the failure followed
+  (#653).
 - **Large messages from one sender go one session at a time.** The next one to
   the same recipient waits for the queue's next pass after the session ends.
 - **One user per registration.** `UserRegistered` gets the identity in the
