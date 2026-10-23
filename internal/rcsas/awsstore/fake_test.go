@@ -502,8 +502,10 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 	if bounded {
 		keyCond += " AND #sk > :after"
 	}
-	if aws.ToString(in.KeyConditionExpression) != keyCond || aws.ToString(in.FilterExpression) != freeAt+" AND #expires > :now" {
-		f.t.Errorf("Query %q filter %q", aws.ToString(in.KeyConditionExpression), aws.ToString(in.FilterExpression))
+	// Pending filters to free messages, PendingHeld on expiry only.
+	filter := aws.ToString(in.FilterExpression)
+	if aws.ToString(in.KeyConditionExpression) != keyCond || filter != freeAt+" AND #expires > :now" && filter != "#expires > :now" {
+		f.t.Errorf("Query %q filter %q", aws.ToString(in.KeyConditionExpression), filter)
 	}
 	var rows []map[string]dtypes.AttributeValue
 	for _, r := range f.rows {
@@ -512,7 +514,7 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		}
 	}
 	items, last := f.page(rows, rowKey, in.ExclusiveStartKey, func(r map[string]dtypes.AttributeValue) bool {
-		return free(r, vals[":now"]) && nOf(r[attrExpires]) > nOf(vals[":now"])
+		return (filter != freeAt+" AND #expires > :now" || free(r, vals[":now"])) && nOf(r[attrExpires]) > nOf(vals[":now"])
 	}, tableKey)
 	return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 }

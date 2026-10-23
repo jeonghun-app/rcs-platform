@@ -118,6 +118,34 @@ func (s *Memory) Pending(_ context.Context, recipient, after string, now time.Ti
 	return out[:min(len(out), max(limit, 0))], nil
 }
 
+// PendingHeld implements Store.
+func (s *Memory) PendingHeld(_ context.Context, recipient, after, owner string, now time.Time, limit int) ([]Message, bool, error) {
+	if limit <= 0 {
+		return nil, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Message
+	var held []string
+	for _, m := range s.queues[recipient] {
+		switch {
+		case m.ID <= after || !m.Expires.After(now):
+		case m.Free(now):
+			out = append(out, m.Clone())
+		case m.Owner != owner:
+			held = append(held, m.ID)
+		}
+	}
+	slices.SortFunc(out, func(a, b Message) int { return cmp.Compare(a.ID, b.ID) })
+	out = out[:min(len(out), limit)]
+	for _, id := range held {
+		if len(out) < limit || id < out[len(out)-1].ID {
+			return out, true, nil
+		}
+	}
+	return out, false, nil
+}
+
 // Claim implements Store.
 func (s *Memory) Claim(_ context.Context, recipient, id, owner string, now, until time.Time) (Message, error) {
 	s.mu.Lock()
