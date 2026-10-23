@@ -51,13 +51,18 @@ type countingGroups struct {
 	gets, owners atomic.Int64
 	failUpdates  atomic.Int64
 	failBeats    atomic.Bool
-	// getHook, when set, is called before each read.
-	getHook atomic.Pointer[func()]
+	// getHook, when set, is called before each read, and updateHook
+	// before each update.
+	getHook    atomic.Pointer[func()]
+	updateHook atomic.Pointer[func()]
 }
 
 var errFakeStore = errors.New("fake: the store failed")
 
 func (c *countingGroups) Update(ctx context.Context, g groupstore.Group, owner groupstore.Owner, token string) error {
+	if h := c.updateHook.Load(); h != nil {
+		(*h)()
+	}
 	if c.failUpdates.Add(-1) >= 0 {
 		return errFakeStore
 	}

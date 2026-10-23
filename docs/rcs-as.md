@@ -796,6 +796,30 @@ group's sessions and subscriptions is its conference URI.
   responses come back the same way. A task that does not know the group, or
   owns it, serves the request itself; one whose owner has stopped takes it over
   first.
+- **A takeover reads the queues.** The task that takes a group over has the
+  queues of its current participants (invited and joined) read at once
+  (`Engine.ReadQueues`). The copies the old owner queued and had not delivered
+  when it stopped are then delivered on a session open here, or invited for
+  as an owner does, rather than waiting for the next message written in the
+  group, the recipient's next registration on a new flow, or
+  `RCSAS_STORE_TTL` (#607): the old owner's retries ended with it. Each read
+  is a pass over the participant's whole queue, as a registration has: it
+  tries at once whatever else waits there, a 1-to-1 message on a long retry
+  wait say, and starts the queue's retry wait again at
+  `RCSAS_RETRY_INTERVAL`. A takeover costs one such pass per current
+  participant, at most `RCSAS_GROUP_MAX_PARTICIPANTS`, and a task that takes
+  many groups over at once, after a peer's crash, makes that many.
+- **No invitation to a participant joining.** While a task routes and serves
+  a participant's own `INVITE` to the conference URI, until its session's leg
+  is open or for `RCSAS_ANSWER_TIMEOUT` at most, the task does not invite that
+  participant to the group (`invite.held_for_join`): the queue passes the
+  routing's takeover starts, or a message written meanwhile, would otherwise
+  find its copies before the leg is open, and the focus's `INVITE` would ring
+  the client with a second session with the group, which rcsjta takes in
+  place of its own (code review on #628). The copies go on the session the
+  participant opens. A join that opens none has the queue read again as it
+  ends, so that they are invited for at once. Past 100 000 joins being served
+  at once a join holds nothing back (`invite.join_untracked`).
 - **No 404 for a group that exists.** A request that cannot reach the owner
   now is answered 500 with `Retry-After` (`group.forward_refused`): one
   forwarded here already, which is never forwarded again, so that two tasks
@@ -1455,6 +1479,7 @@ identifier ever appears in a metric name.
 | `delivery.reached_marked`, `delivery.registered_marked`, `delivery.reached_elsewhere`, `delivery.registered_elsewhere` | #605: marks of a delivery and of a registration on a new flow this task stored, and other tasks' marks of each kind it acted on |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
 | `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, here or, as its mark told, on another task, which leave no mark (the registration had the queue read already); a group's 482 is never one |
+| `invite.held_for_join`, `invite.join_untracked` | Group invitations not asked for because the participant's own `INVITE` to the group was being served, and joins past the bound that held nothing back |
 | `leg.opened`, `leg.unanswered` | MSRP legs, and offers that got no answer |
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |

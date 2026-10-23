@@ -108,6 +108,91 @@ func (e *Engine) Wake(user, group string, registered bool) {
 	e.kickEvent(user)
 }
 
+// ReadQueues has the queues of users read again at once, as a kick does:
+// for the group package, which takes a group over and must deliver, or
+// invite for, the copies its old owner queued and left (#607). Each read
+// is a pass over the whole queue, which also tries whatever else waits in
+// it and starts its retry wait again from RetryInterval.
+func (e *Engine) ReadQueues(users []string) {
+	for _, u := range users {
+		e.kickEvent(u)
+	}
+}
+
+// joinHold holds back the invitations of a participant to a group while
+// the participant's own INVITE to the group is served (Joining).
+type joinHold struct {
+	// n counts the INVITEs being served, and until is when the hold ends
+	// should their ends never come.
+	n     int
+	until time.Time
+	// held says that a queue pass asked for the session meanwhile.
+	held bool
+}
+
+// Joining holds back the engine's invitations of user to group while the
+// SIP layer serves user's own INVITE to the group, until done or for at
+// most AnswerTimeout. The hold starts before the request is routed, which
+// may take the group over and have the queues read (#607): a pass that
+// found user's copy then, before the INVITE's leg is open, would invite
+// user, ringing its client with a second session with the group, which
+// rcsjta takes in place of its own (code review on #628). The copy goes
+// on the INVITE's leg instead, whose opening reads the queue. done, for a
+// join that opened no leg, has the queue read again if a pass was held
+// back, so that its copies wait for no retry; calls after the first do
+// nothing. Past MaxTracked holds, the join holds nothing back.
+func (e *Engine) Joining(user, group string) (done func()) {
+	user, ok := UserOf(user, e.cfg.HomeDomain)
+	if !ok {
+		return func() {}
+	}
+	key := legKey{user, group}
+	now := e.clock.Now()
+	e.mu.Lock()
+	h := e.joins[key]
+	if h == nil {
+		if len(e.joins) >= e.cfg.MaxTracked {
+			for k, x := range e.joins {
+				if !now.Before(x.until) {
+					delete(e.joins, k)
+				}
+			}
+		}
+		if len(e.joins) >= e.cfg.MaxTracked {
+			e.mu.Unlock()
+			e.metrics.Count("invite.join_untracked", 1)
+			return func() {}
+		}
+		h = &joinHold{}
+		e.joins[key] = h
+	}
+	h.n++
+	h.until = now.Add(e.cfg.AnswerTimeout)
+	e.mu.Unlock()
+	ended := false
+	return func() {
+		e.mu.Lock()
+		if ended {
+			e.mu.Unlock()
+			return
+		}
+		ended = true
+		if h.n--; h.n > 0 {
+			// The other INVITE's end reads the queue.
+			e.mu.Unlock()
+			return
+		}
+		if e.joins[key] == h {
+			delete(e.joins, key)
+		}
+		read := h.held && e.chatLegLocked(user, group) == nil
+		e.mu.Unlock()
+		if read {
+			e.kickEvent(user)
+		}
+	}
+}
+
 // SetGroupHandler gives the engine the group package that runs the
 // groups. Without one, every group message is refused.
 func (e *Engine) SetGroupHandler(h GroupHandler) {

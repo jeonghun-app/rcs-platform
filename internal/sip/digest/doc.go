@@ -37,8 +37,9 @@
 // reading HA1 or the stored vector. Verify and VerifyAKA then compare the
 // response, apply expiry (ErrStaleNonce only for a correct response, RFC 7616
 // §3.3) and consume the nonce-count; VerifyAKA reports auts last. Answer
-// every error except ErrStaleNonce and *SyncFailure the same way, so that a
-// client learns nothing about which check failed or whether the user exists.
+// every error except ErrStaleNonce, *SyncFailure and ErrNonceCountStore the
+// same way, so that a client learns nothing about which check failed or
+// whether the user exists.
 //
 // # What is not supported
 //
