@@ -85,17 +85,16 @@ func TestAPanickingNOTIFYEndsThatNOTIFYOnly(t *testing.T) {
 	}
 }
 
-// readPanics is the memory store, whose next Registration read panics once
-// armed, as a bug in a store's decoding would.
-type readPanics struct {
+// numberingPanics is the memory store, whose next NextNotify panics once
+// armed, as a bug in a store's decoding would: the store call every
+// change's NOTIFY makes as it is prepared, whether it carries the change's
+// record or reads the set (#492).
+type numberingPanics struct {
 	*state.Memory
 	armed atomic.Bool
 }
 
-// NextNotify panics once armed: the store call a change's NOTIFY makes
-// as it is prepared, since it carries the change's record rather than
-// reading the set (#492).
-func (s *readPanics) NextNotify(ctx context.Context, id string, of int64) (uint32, uint32, error) {
+func (s *numberingPanics) NextNotify(ctx context.Context, id string, of int64) (uint32, uint32, error) {
 	if s.armed.CompareAndSwap(true, false) {
 		panic("regevent test panic")
 	}
@@ -109,7 +108,7 @@ func (s *readPanics) NextNotify(ctx context.Context, id string, of int64) (uint3
 func TestAPanicPreparingANOTIFYGivesItsWorkerBack(t *testing.T) {
 	e := newEnv(t)
 	before := e.registered(binding(1, time.Hour))
-	st := &readPanics{Memory: e.store}
+	st := &numberingPanics{Memory: e.store}
 	guard := panics.New(panics.Config{Metric: "background.panics", Message: "test", Log: slog.New(slog.DiscardHandler)})
 	u, err := sip.ParseURI("sip:scscf." + realm)
 	if err != nil {

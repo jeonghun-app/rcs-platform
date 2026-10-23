@@ -25,13 +25,22 @@ func (s *registrationReads) Registration(ctx context.Context, k state.SetKey) (*
 
 // TestAChangesNotifiesCarryItsRecordWithoutReadingItAgain: a refresh sends
 // each of the set's subscriptions its NOTIFY, with the refreshed expiry,
-// and reads the record for none of them: the change has it already.
+// and reads the record for none of them: the change has it already. The
+// subscriptions have numbered a NOTIFY first, as a subscription's first
+// change's NOTIFY reads the record (prepare).
 func TestAChangesNotifiesCarryItsRecordWithoutReadingItAgain(t *testing.T) {
 	e := newEnv(t)
-	before := e.registered(binding(1, time.Hour))
+	v0 := e.registered(binding(1, time.Hour))
 	e.subscribedMany(2)
 	st := &registrationReads{Store: e.store}
 	n := newNotifierWith(t, e, st, e.send)
+	before := e.touched(v0)
+	n.Changed(bg, v0, before, Registered)
+	n.Wait()
+	if r := st.n.Load(); r != 2 {
+		t.Fatalf("%d reads of the record for the first change's 2 NOTIFYs, want 2", r)
+	}
+	st.n.Store(0)
 	sent := len(e.send.notifies())
 	after := before.Clone()
 	after.Contacts[0].Expires = t0.Add(2 * time.Hour)
@@ -96,5 +105,75 @@ func TestAMergedNotifyCarriesTheNewerRecordWhicheverCameFirst(t *testing.T) {
 		if c.Active() && c.URI != binding(1, 0).URI {
 			t.Errorf("the merged NOTIFY has %s active, want binding 1 alone, as the newer record has it", c.URI)
 		}
+	}
+}
+
+// TestAChangeNumberedAfterTheFirstNotifyTellsNoOlderState (#492 code
+// review): the subscription is made at v0, and v1 and v2 each add a binding
+// before its first NOTIFY reads v2. The v0 to v1 change's NOTIFY, the first
+// NextNotify numbers, still has the three bindings: v1 lacks the third,
+// which a P-CSCF would take for its end, though v2's NOTIFY shows it again.
+func TestAChangeNumberedAfterTheFirstNotifyTellsNoOlderState(t *testing.T) {
+	e := newEnv(t)
+	v0 := e.registered(binding(1, time.Hour))
+	n := e.notifier(1)
+	res, first := n.Subscribe(bg, subscribe(t, impu1, pcscfPath, 600000))
+	wantStatus(t, res, 200)
+	v1 := v0.Clone()
+	v1.Contacts = append(v1.Contacts, binding(2, time.Hour))
+	v1 = e.saved(v1)
+	v2 := v1.Clone()
+	v2.Contacts = append(v2.Contacts, binding(3, time.Hour))
+	v2 = e.saved(v2)
+	first(bg)
+	n.Changed(bg, v0, v1, Registered)
+	n.Wait()
+	got := e.send.notifies()
+	if len(got) != 2 {
+		t.Fatalf("%d NOTIFYs, want the first and the change's", len(got))
+	}
+	for i, r := range got {
+		doc, _, _ := info(t, r)
+		if a := activeURIs(doc, impu1); doc.Version != uint32(i) || len(a) != 3 {
+			t.Errorf("NOTIFY of version %d has %v active, want version %d with the 3 bindings of v2", doc.Version, a, i)
+		}
+	}
+}
+
+// TestAChangesRecordThatWouldEndASubscriptionIsCheckedAsItIsNow (#492 code
+// review): binding 1, on the subscribed P-CSCF, goes in v1 and is back in
+// v2, and binding 9 on another P-CSCF stays. v2's NOTIFY is numbered first;
+// the v0 to v1 change's, run late, does not end the subscription by v1,
+// which has no binding on the P-CSCF: v2, the record now, has one.
+func TestAChangesRecordThatWouldEndASubscriptionIsCheckedAsItIsNow(t *testing.T) {
+	e := newEnv(t)
+	other := binding(9, time.Hour)
+	other.Path = []string{"<sip:term@pcscf2." + realm + ";lr>"}
+	v0 := e.registered(binding(1, time.Hour), other)
+	n := e.notifier(1)
+	e.subscribed(n)
+	v1 := v0.Clone()
+	v1.Contacts = []state.Contact{other}
+	v1 = e.saved(v1)
+	v2 := v1.Clone()
+	v2.Contacts = []state.Contact{binding(1, 2*time.Hour), other}
+	v2 = e.saved(v2)
+	n.Changed(bg, v1, v2, Registered)
+	n.Wait()
+	n.Changed(bg, v0, v1, Unregistered)
+	n.Wait()
+	got := e.send.notifies()
+	if len(got) != 3 {
+		t.Errorf("%d NOTIFYs, want the first and one for each change", len(got))
+	}
+	for _, r := range got {
+		// Read from the header: a NOTIFY that ended the subscription
+		// would have no body.
+		if ss, err := r.Header.SubscriptionState(); err != nil || ss.State != "active" {
+			t.Errorf("a NOTIFY says %s %v, want active: the P-CSCF is on a live binding of the record now", ss.State, ss.Params)
+		}
+	}
+	if subs := e.subscriptions(impu1); len(subs) != 1 || subs[0].Terminated {
+		t.Errorf("subscriptions left %+v, want the one, not terminated", subs)
 	}
 }

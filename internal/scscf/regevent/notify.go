@@ -43,7 +43,9 @@ type job struct {
 	// after is the set as the change saved it, which the NOTIFY carries
 	// rather than reading the record again (#492): nil for a NOTIFY that
 	// reads the set when it is sent, a first one, a sweep's, or one that
-	// only checks a subscription to another set.
+	// only checks a subscription to another set. A change's NOTIFY reads
+	// the set too to a subscription that has numbered none yet, or when it
+	// would end the subscription, or a later record was notified (prepare).
 	after *state.Registration
 	// ended says the registrar ended the set: the NOTIFY tells of before's
 	// end, whatever the store still has of a record being deleted.
@@ -317,9 +319,14 @@ func (n *Notifier) notifySub(ctx context.Context, sub *state.Subscription, j job
 // an older version than one already numbered is not sent (#256 QA and
 // code review). A change's NOTIFY carries the change's record, saved
 // before the change was told of, rather than reading it again (#492): a
-// newer save has NOTIFYs of its own, numbered after this one. One that a
-// newer record's NOTIFY was numbered before reads the record as it is now
-// instead, so that it still tells what its change ended (#516). A read
+// newer save has NOTIFYs of its own, numbered after this one. It reads the
+// record as it is now instead in three cases. To a subscription that has
+// numbered none yet: its first NOTIFY, not numbered by NextNotify, read
+// the record after the subscription was saved, maybe a newer one than the
+// change's (#492 code review). When the change's record would end the
+// subscription: a newer one may hold it, and an end is not taken back
+// (#492 code review). And when a newer record's NOTIFY was numbered
+// before, so that it still tells what its change ended (#516). A read
 // that fails sends nothing, rather than a document
 // without the set, which a subscriber takes for its end (#256 code review);
 // the next change or refresh brings the full state, and the next sweep an
@@ -337,7 +344,7 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 	var set *state.Registration
 	switch {
 	case j.ended:
-	case j.after != nil && j.after.Key == sub.Set:
+	case j.after != nil && j.after.Key == sub.Set && sub.ReginfoVersion != 0:
 		set = j.after
 	default:
 		var err error
@@ -358,6 +365,12 @@ func (n *Notifier) prepare(ctx context.Context, sub *state.Subscription, j job) 
 	why := lapsedSet
 	if set != nil {
 		why = n.check(sub, set, now)
+	}
+	if why != "" && !j.ended && j.after != nil && set == j.after {
+		// The change's record ends the subscription, but a newer one may
+		// hold it again: the end is judged by the record as it is now.
+		j.after = nil
+		return n.prepare(ctx, sub, j)
 	}
 	switch {
 	case j.ended:
