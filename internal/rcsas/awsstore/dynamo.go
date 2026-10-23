@@ -87,9 +87,11 @@ const (
 	sizeSK      = "n"
 	// reachedPrefix keys a recipient's reached marks (#605), in a
 	// partition of their own, so that neither the queue's reads nor its
-	// recounts meet them; reachedSK prefixes each task's.
+	// recounts meet them; reachedSK prefixes each task's mark of a
+	// delivery, and newFlowSK its mark of a registration on a new flow.
 	reachedPrefix = "r#"
 	reachedSK     = "t#"
+	newFlowSK     = "f#"
 	senderSK      = "s#"
 )
 
@@ -1118,12 +1120,16 @@ func getTime(item map[string]types.AttributeValue, name string, dst *time.Time) 
 	return nil
 }
 
-// MarkReached implements store.Store. A task's mark is an item of its
-// own, put over its last one.
-func (s *Store) MarkReached(ctx context.Context, recipient, task string, at, expires time.Time) error {
-	item := key(identityKey(reachedPrefix, recipient), identityKey(reachedSK, task))
-	item[attrTask] = str(task)
-	item[attrReached] = stamp(at)
+// MarkReached implements store.Store. A task's mark of each kind is an
+// item of its own, put over its last.
+func (s *Store) MarkReached(ctx context.Context, recipient string, m store.Mark, expires time.Time) error {
+	sk, ok := markSK(m.Kind)
+	if !ok {
+		return fmt.Errorf("awsstore: mark reached: kind %d", m.Kind)
+	}
+	item := key(identityKey(reachedPrefix, recipient), identityKey(sk, m.Task))
+	item[attrTask] = str(m.Task)
+	item[attrReached] = stamp(m.At)
 	item[attrExpires] = stamp(expires)
 	item[attrTTL] = ttlOf(expires)
 	if _, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(s.table), Item: item}); err != nil {
@@ -1132,10 +1138,22 @@ func (s *Store) MarkReached(ctx context.Context, recipient, task string, at, exp
 	return nil
 }
 
+// markSK is the sort key prefix of a mark of kind k.
+func markSK(k store.MarkKind) (string, bool) {
+	switch k {
+	case store.Delivered:
+		return reachedSK, true
+	case store.NewFlow:
+		return newFlowSK, true
+	}
+	return "", false
+}
+
 // Reached implements store.Store: a consistent query of the recipient's
-// marks, one item per task that delivered to it lately.
-func (s *Store) Reached(ctx context.Context, recipient string, now time.Time) (map[string]time.Time, error) {
-	out := map[string]time.Time{}
+// marks, one item per task and kind lately marked. An item of a kind this
+// version does not know is left out.
+func (s *Store) Reached(ctx context.Context, recipient string, now time.Time) ([]store.Mark, error) {
+	var out []store.Mark
 	in := &dynamodb.QueryInput{
 		TableName:                 aws.String(s.table),
 		KeyConditionExpression:    aws.String("#pk = :pk"),
@@ -1149,13 +1167,23 @@ func (s *Store) Reached(ctx context.Context, recipient string, now time.Time) (m
 			return nil, sanitize("query reached", err)
 		}
 		for _, item := range page.Items {
-			var task string
-			var at, expires time.Time
-			if err := errors.Join(getString(item, attrTask, &task, true), getTime(item, attrReached, &at), getTime(item, attrExpires, &expires)); err != nil {
+			var m store.Mark
+			var sk string
+			var expires time.Time
+			if err := errors.Join(getString(item, attrSK, &sk, true), getString(item, attrTask, &m.Task, true),
+				getTime(item, attrReached, &m.At), getTime(item, attrExpires, &expires)); err != nil {
 				return nil, fmt.Errorf("awsstore: query reached: %w", err)
 			}
+			switch {
+			case strings.HasPrefix(sk, reachedSK):
+				m.Kind = store.Delivered
+			case strings.HasPrefix(sk, newFlowSK):
+				m.Kind = store.NewFlow
+			default:
+				continue
+			}
 			if expires.After(now) {
-				out[task] = at
+				out = append(out, m)
 			}
 		}
 		if len(page.LastEvaluatedKey) == 0 {

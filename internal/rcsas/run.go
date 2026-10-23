@@ -128,6 +128,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	defer px.Close()
 	mc := cfg.Messaging
 	mc.Logger, mc.HomeDomain = rt.Logger, cfg.HomeDomain
+	// The margin for the tasks' clocks the groups' leases use is the one
+	// for another task's reached marks too (#605).
+	mc.ClockSkew = cfg.Group.TaskSkew
 	mc.MSRP.Panics = panics.New(panics.Config{
 		Metric: msrp.MetricCallbackPanics, Message: "rcs-as: an MSRP callback panicked", Log: rt.Logger, Metrics: rt.Metrics,
 	})

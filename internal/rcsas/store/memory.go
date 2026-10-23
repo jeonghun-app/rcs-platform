@@ -16,8 +16,8 @@ type Memory struct {
 	mu     sync.Mutex
 	queues map[string]map[string]Message
 	sent   map[sentKey]*sentRecord
-	// reached holds the marks of MarkReached by recipient and task.
-	reached map[string]map[string]reachedMark
+	// reached holds the marks of MarkReached by recipient, task and kind.
+	reached map[string]map[markKey]reachedMark
 	// fenced reports whether a Fence holds, from the groups store this
 	// one stands beside (SetFence); nil refuses every fenced enqueue.
 	fenced func(Fence) bool
@@ -42,13 +42,18 @@ type sentRecord struct {
 
 type mark struct{ token, status string }
 
+type markKey struct {
+	task string
+	kind MarkKind
+}
+
 type reachedMark struct{ at, expires time.Time }
 
 var _ Store = (*Memory)(nil)
 
 // NewMemory returns an empty Memory.
 func NewMemory() *Memory {
-	return &Memory{queues: map[string]map[string]Message{}, sent: map[sentKey]*sentRecord{}, reached: map[string]map[string]reachedMark{}}
+	return &Memory{queues: map[string]map[string]Message{}, sent: map[sentKey]*sentRecord{}, reached: map[string]map[markKey]reachedMark{}}
 }
 
 // Len reports how many messages recipient's queue holds, claimed, expired
@@ -295,27 +300,27 @@ func (s *Memory) UnmarkNotified(_ context.Context, sender, messageID, key, token
 }
 
 // MarkReached implements Store.
-func (s *Memory) MarkReached(_ context.Context, recipient, task string, at, expires time.Time) error {
+func (s *Memory) MarkReached(_ context.Context, recipient string, m Mark, expires time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.reached[recipient] == nil {
-		s.reached[recipient] = map[string]reachedMark{}
+		s.reached[recipient] = map[markKey]reachedMark{}
 	}
-	s.reached[recipient][task] = reachedMark{at: at, expires: expires}
+	s.reached[recipient][markKey{m.Task, m.Kind}] = reachedMark{at: m.At, expires: expires}
 	return nil
 }
 
 // Reached implements Store. Expired marks are deleted on the way.
-func (s *Memory) Reached(_ context.Context, recipient string, now time.Time) (map[string]time.Time, error) {
+func (s *Memory) Reached(_ context.Context, recipient string, now time.Time) ([]Mark, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := map[string]time.Time{}
-	for task, m := range s.reached[recipient] {
+	var out []Mark
+	for k, m := range s.reached[recipient] {
 		if !m.expires.After(now) {
-			delete(s.reached[recipient], task)
+			delete(s.reached[recipient], k)
 			continue
 		}
-		out[task] = m.at
+		out = append(out, Mark{Task: k.task, Kind: k.kind, At: m.at})
 	}
 	if len(s.reached[recipient]) == 0 {
 		delete(s.reached, recipient)

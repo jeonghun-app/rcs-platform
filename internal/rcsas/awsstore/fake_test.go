@@ -86,7 +86,7 @@ func (f *fakeDynamo) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...
 		}
 	case "":
 		// A task's heartbeat, or its reached mark of a recipient.
-		if sk := sOf(in.Item[attrSK]); sk != taskSK && !strings.HasPrefix(sk, reachedSK) {
+		if sk := sOf(in.Item[attrSK]); sk != taskSK && !strings.HasPrefix(sk, reachedSK) && !strings.HasPrefix(sk, newFlowSK) {
 			f.t.Errorf("PutItem without a condition of %v", in.Item[attrSK])
 		}
 	default:

@@ -62,7 +62,9 @@ const (
 	DefaultAnswerTimeout    = 32 * time.Second
 	DefaultRetryInterval    = time.Minute
 	DefaultMaxRetryInterval = time.Hour
-	DefaultStoreTimeout     = 5 * time.Second
+	// DefaultClockSkew is RCSAS_TASK_SKEW's default (group.DefaultTaskSkew).
+	DefaultClockSkew    = 2 * time.Second
+	DefaultStoreTimeout = 5 * time.Second
 	// DefaultFanoutTimeout leaves a group message's sender its answer well
 	// within the 30 s an MSRP client waits for one (rcsjta's transaction
 	// timeout).
@@ -159,6 +161,10 @@ type Config struct {
 	// memory: rate buckets, pager-only markers, pending invitations, marks
 	// of participants that left a group.
 	MaxTracked int
+	// ClockSkew is the margin for the tasks' clocks, RCSAS_TASK_SKEW: how
+	// far another task's reached mark may be off from this task's clock
+	// (#605).
+	ClockSkew time.Duration
 
 	// MSRP tunes the MSRP connections; its Clock and Rand are replaced by
 	// the Engine's, and its MaxMessageSize by MaxMessageSize.
@@ -242,8 +248,14 @@ type Engine struct {
 	// deliveries (sendSummary), up to MaxTracked.
 	summaries map[legKey]*summaryState
 	// reachedAt is when this task last marked each recipient reached
-	// (markReached), up to MaxTracked.
+	// (markReached), and marksSeen the newest of another task's marks of
+	// each kind this task acted on (markedElsewhere), so that it acts on
+	// each once; relayedAt numbers, from flowSeq, the latest registration
+	// on a new flow another task's mark told of (registeredElsewhere).
+	// Each up to MaxTracked.
 	reachedAt map[string]time.Time
+	marksSeen map[markSeen]time.Time
+	relayedAt map[string]uint64
 	lastID    int64
 	sweepAt   string
 }
@@ -286,6 +298,7 @@ func New(cfg Config, st store.Store, d Deliverer, metrics Counter) (*Engine, err
 		groupLegs: map[string]int{},
 		summaries: map[legKey]*summaryState{},
 		reachedAt: map[string]time.Time{},
+		marksSeen: map[markSeen]time.Time{}, relayedAt: map[string]uint64{},
 	}
 	e.wake = sync.NewCond(&e.mu)
 	if e.cfg.InstanceID == "" {
@@ -342,6 +355,7 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.Batch, DefaultBatch)
 	setDefault(&c.Workers, DefaultWorkers)
 	setDefault(&c.MaxTracked, DefaultMaxTracked)
+	setDefault(&c.ClockSkew, DefaultClockSkew)
 	c.MaxRetryInterval = max(c.MaxRetryInterval, c.RetryInterval)
 	if c.SenderRate == (Rate{}) {
 		c.SenderRate = DefaultSenderRate
@@ -595,6 +609,9 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 		}
 		e.flowSeq++
 		e.flows[user] = e.flowSeq
+		// The pass this registration has run marks it for the other
+		// tasks, if anything is queued (#605).
+		e.state(user).registered = true
 		delete(e.pagerOnly, user)
 		for k := range e.invites {
 			if k.user == user {
@@ -640,6 +657,13 @@ func (e *Engine) InviteFailed(inv Invitation, err error) {
 		// A wake told of the recipient's registration on another task
 		// after this group's session was asked for, and had its copies
 		// read again (Wake).
+		e.mu.Unlock()
+		e.metrics.Count("invite.failed_overtaken", 1)
+		return
+	}
+	if rel, ok := e.relayedAt[inv.Recipient]; ok && inv.asked < rel && !errors.Is(err, ErrLooped) {
+		// Another task took the recipient's registration on a new flow
+		// after the session was asked for, as its mark told (#605).
 		e.mu.Unlock()
 		e.metrics.Count("invite.failed_overtaken", 1)
 		return

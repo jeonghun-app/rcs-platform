@@ -197,9 +197,9 @@ func TestIntegrationAReachedMarkReleasesAnotherTasksHold(t *testing.T) {
 	if d := time.Since(start); d >= messaging.DefaultRetryInterval {
 		t.Fatalf("m2 took %v, as long as task-0's retry timer", d)
 	}
-	reached, err := s.Reached(t.Context(), bob, time.Now())
-	if err != nil || reached["task-1"].IsZero() {
-		t.Fatalf("Reached = %v, %v; want task-1's mark", reached, err)
+	marks, err := s.Reached(t.Context(), bob, time.Now())
+	if err != nil || !slices.ContainsFunc(marks, func(m store.Mark) bool { return m.Task == "task-1" && m.Kind == store.Delivered }) {
+		t.Fatalf("Reached = %v, %v; want task-1's mark of a delivery", marks, err)
 	}
 }
 
