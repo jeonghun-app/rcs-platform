@@ -2,7 +2,9 @@ package diameter
 
 import (
 	"context"
+	"sync"
 	"testing"
+	"time"
 )
 
 // blockingHandler holds every request until release is closed.
@@ -86,4 +88,36 @@ func TestDPRReceiverAnswersRequestsInProgressBeforeTheDPA(t *testing.T) {
 	if dpa := s.read(); dpa.Code != CodeDisconnectPeer || dpa.HopByHop != dpr.HopByHop {
 		t.Fatalf("expected the DPA, got %+v", dpa)
 	}
+}
+
+// TestAPeerIsAvailableOnlyOnceItsConnectionRuns (#587): between the
+// capabilities exchange and the start of run, the connection is not one a
+// Shutdown sends a DPR on, so its peer is not reported available either:
+// a caller that went by Available and stopped at once would close it
+// without a goodbye.
+func TestAPeerIsAvailableOnlyOnceItsConnectionRuns(t *testing.T) {
+	reached, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	hook := func(*conn) {
+		once.Do(func() {
+			close(reached)
+			<-release
+		})
+	}
+	testHookRun.Store(&hook)
+	t.Cleanup(func() { testHookRun.Store(nil) })
+	var released sync.Once
+	t.Cleanup(func() { released.Do(func() { close(release) }) })
+	_, peer, dialer, _ := startInitiator(t, nil)
+	acceptCER(t, dialer.next(t))
+	select {
+	case <-reached:
+	case <-time.After(realWait):
+		t.Fatal("the connection never started to run")
+	}
+	if peer.Available() {
+		t.Fatal("the peer is available before its connection runs")
+	}
+	released.Do(func() { close(release) })
+	waitFor(t, "the peer available once its connection runs", peer.Available)
 }

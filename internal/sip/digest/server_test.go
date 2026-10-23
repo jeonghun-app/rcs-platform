@@ -63,7 +63,7 @@ func (h *harness) challenge(t *testing.T, alg Algorithm) Challenge {
 func answer(t *testing.T, ch Challenge, password string, nc uint32) Credentials {
 	t.Helper()
 	c, err := Respond(ch, ClientParams{
-		Username: testUser, Password: []byte(password), Method: "REGISTER", URI: testURI,
+		Username: testUser, Password: secret.NewKey([]byte(password)), Method: "REGISTER", URI: testURI,
 		CNonce: "cnonce-1", NC: nc,
 	})
 	if err != nil {
@@ -533,7 +533,7 @@ func TestCustomNonceLifetimeIsHonoured(t *testing.T) {
 
 func TestRespondRefusesWhatItCannotAnswer(t *testing.T) {
 	ch := Challenge{Realm: "r", Nonce: "n", Algorithm: MD5, QOP: []string{"auth"}}
-	ok := ClientParams{Username: "u", Password: []byte("p"), Method: "REGISTER", URI: "sip:r", CNonce: "c", NC: 1}
+	ok := ClientParams{Username: "u", Password: secret.NewKey([]byte("p")), Method: "REGISTER", URI: "sip:r", CNonce: "c", NC: 1}
 	cases := []struct {
 		name   string
 		ch     func(*Challenge)
@@ -575,7 +575,7 @@ func TestRespondRefusesWhatItCannotAnswer(t *testing.T) {
 
 func TestRespondTreatsAMissingAlgorithmAsMD5(t *testing.T) {
 	ch := Challenge{Realm: "r", Nonce: "n", QOP: []string{"auth-int", "AUTH"}}
-	c, err := Respond(ch, ClientParams{Username: "u", Password: []byte("p"), Method: "M", URI: "u", CNonce: "c", NC: 1})
+	c, err := Respond(ch, ClientParams{Username: "u", Password: secret.NewKey([]byte("p")), Method: "M", URI: "u", CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -606,7 +606,7 @@ func TestOneUserCannotUseUpAnotherUsersNonceCount(t *testing.T) {
 	ch := h.challenge(t, SHA256)
 	ctx := context.Background()
 	other, err := Respond(ch, ClientParams{
-		Username: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org", Password: []byte("other"),
+		Username: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org", Password: secret.NewKey([]byte("other")),
 		Method: "REGISTER", URI: testURI, CNonce: "x", NC: 0xffffffff,
 	})
 	if err != nil {
@@ -639,7 +639,7 @@ func TestOpaqueIsBoundToAlgorithmAndRealm(t *testing.T) {
 	}
 	aka, _ := other.AKAChallenge(make([]byte, 16), make([]byte, 16), false)
 	aka.Realm = testRealm
-	c, err := Respond(aka, ClientParams{Username: testUser, Password: []byte("res"), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	c, err := Respond(aka, ClientParams{Username: testUser, Password: secret.NewKey([]byte("res")), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
