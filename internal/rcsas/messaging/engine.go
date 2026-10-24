@@ -595,8 +595,9 @@ func (e *Engine) countDeviations(d cpim.Deviation) {
 // a new flow may take terminating sessions again (ADR 0004): the
 // pager-only marker and pending invitations are cleared and every stored
 // message is tried at once. A refresh on the same flow changes nothing for
-// messages waiting for a session, so only a queue that found the user
-// unreachable is tried again.
+// messages waiting for a session: a queue that found the user unreachable
+// is tried again, retry timer and all, and one that waits for a session
+// is only read again, for what another task holds or left (#632).
 func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
 	if newFlow {
@@ -629,11 +630,24 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 			}
 		}
 	} else if r := e.recipients[user]; r != nil && r.hold == holdWaiting {
+		// The queue is still read, with the retry timer left as it is,
+		// for a message another task holds or left (#632): a client that
+		// moves to a new flow before its registration runs out refreshes
+		// (sipas), and the pass then finds what waits for a session still
+		// waiting, asking no invitation asked for within InviteTimeout.
+		e.registeredLook(user)
+		r.full = true
+		e.schedule(user, r)
 		e.mu.Unlock()
 		return
 	}
+	// The pass looks out for a message another task's attempt holds, which
+	// it would otherwise leave to that task's retry timer (#632). Both in
+	// one critical section, so that no pass ends in between and takes the
+	// recipient's state, look and all, with it.
+	e.registeredLook(user)
+	e.kickEventLocked(user)
 	e.mu.Unlock()
-	e.kickEvent(user)
 }
 
 // InviteFailed reports that the session Invite asked for did not come

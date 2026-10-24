@@ -30,6 +30,12 @@ func (s *readCounter) Pending(ctx context.Context, r, after string, now time.Tim
 	return ms, err
 }
 
+func (s *readCounter) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+	ms, held, err := s.Store.PendingHeld(ctx, r, after, owner, now, limit)
+	s.items.Add(int64(len(ms)))
+	return ms, held, err
+}
+
 // drainInvites has d keep no invitations, for a test that does not look
 // at them.
 func drainInvites(_ *testing.T, d *fakeDeliverer) { d.discardInvites.Store(true) }
@@ -654,8 +660,9 @@ func TestAReleasedLargeModeMessageIsTriedAgain(t *testing.T) {
 	}
 }
 
-// pendingGate is a store whose Pending, once armed, returns what it read
-// only when released: a pass that has read the queue and not finished.
+// pendingGate is a store whose PendingHeld, the engine's read of a queue,
+// once armed, returns what it read only when released: a pass that has
+// read the queue and not finished.
 type pendingGate struct {
 	store.Store
 	armed   atomic.Bool
@@ -663,13 +670,13 @@ type pendingGate struct {
 	release chan struct{}
 }
 
-func (s *pendingGate) Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]store.Message, error) {
-	ms, err := s.Store.Pending(ctx, recipient, after, now, limit)
+func (s *pendingGate) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+	ms, held, err := s.Store.PendingHeld(ctx, recipient, after, owner, now, limit)
 	if s.armed.CompareAndSwap(true, false) {
 		close(s.read)
 		<-s.release
 	}
-	return ms, err
+	return ms, held, err
 }
 
 // QA on #284: a large-mode attempt that releases its message while a pass

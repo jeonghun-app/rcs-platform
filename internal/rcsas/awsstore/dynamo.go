@@ -536,8 +536,23 @@ const freeAt = "(attribute_not_exists(#owner) OR #lease <= :now)"
 // Pending implements store.Store: the recipient's partition in sort-key
 // order, filtered to free, unexpired messages, page by page until limit.
 func (s *Store) Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]store.Message, error) {
+	ms, _, err := s.pending(ctx, recipient, after, "", now, limit, false)
+	return ms, err
+}
+
+// PendingHeld implements store.Store.
+func (s *Store) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+	return s.pending(ctx, recipient, after, owner, now, limit, true)
+}
+
+// pending is Pending, and with held PendingHeld. For PendingHeld the query
+// filters on expiry only, and messages are told free or held here. A query
+// is charged for what it reads, not for what its filter returns, so this
+// costs no more capacity; it also returns the claimed messages, of which a
+// queue has as many as attempts are under way.
+func (s *Store) pending(ctx context.Context, recipient, after, owner string, now time.Time, limit int, held bool) ([]store.Message, bool, error) {
 	if limit <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	in := &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
@@ -552,6 +567,12 @@ func (s *Store) Pending(ctx context.Context, recipient, after string, now time.T
 		},
 		ScanIndexForward: aws.Bool(true),
 	}
+	if held {
+		// DynamoDB refuses names an expression does not use.
+		in.FilterExpression = aws.String("#expires > :now")
+		delete(in.ExpressionAttributeNames, "#owner")
+		delete(in.ExpressionAttributeNames, "#lease")
+	}
 	if after != "" {
 		// A key condition, so DynamoDB starts reading after it rather than
 		// reading and filtering out the messages before it.
@@ -560,23 +581,28 @@ func (s *Store) Pending(ctx context.Context, recipient, after string, now time.T
 		in.ExpressionAttributeValues[":after"] = str(after)
 	}
 	var out []store.Message
+	passed := false
 	for {
 		page, err := s.api.Query(ctx, in)
 		if err != nil {
-			return nil, sanitize("query queue", err)
+			return nil, false, sanitize("query queue", err)
 		}
 		for _, item := range page.Items {
 			m, err := decodeMessage(item)
 			if err != nil {
-				return nil, err
+				return nil, false, err
+			}
+			if !m.Free(now) {
+				passed = passed || m.Owner != owner
+				continue
 			}
 			out = append(out, m)
 			if len(out) == limit {
-				return out, nil
+				return out, passed, nil
 			}
 		}
 		if len(page.LastEvaluatedKey) == 0 {
-			return out, nil
+			return out, passed, nil
 		}
 		in.ExclusiveStartKey = page.LastEvaluatedKey
 	}

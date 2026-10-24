@@ -300,6 +300,14 @@ type Store interface {
 	// after ("" for the start), so that a caller can page past messages it
 	// leaves queued.
 	Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]Message, error)
+	// PendingHeld is Pending that also reports whether it passed over a
+	// message someone other than owner holds at now, among those after
+	// after and, when limit messages are returned, before the last of
+	// them. A caller that has just learnt the recipient is back needs to
+	// know: the attempt holding that message may have been sent where the
+	// recipient no longer is, fail, and leave the message for the holder's
+	// retry timer (#632). It reads what Pending reads.
+	PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]Message, bool, error)
 	// Claim gives the message to owner until until, if it is free at now,
 	// and returns it whole. Exactly one of several concurrent callers
 	// succeeds; the others get ErrConflict. ErrNotFound if there is no

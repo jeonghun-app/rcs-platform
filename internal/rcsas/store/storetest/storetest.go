@@ -45,6 +45,7 @@ func message(recipient, id string, enqueued time.Time) store.Message {
 // empty store each time.
 func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("PendingListsFreeMessagesOldestFirst", func(t *testing.T) { pendingOrder(t, newStore(t)) })
+	t.Run("PendingHeldTellsOfMessagesAnotherOwnerHolds", func(t *testing.T) { pendingHeld(t, newStore(t)) })
 	t.Run("EnqueueRefusesADuplicateID", func(t *testing.T) { duplicate(t, newStore(t)) })
 	t.Run("GroupMessagesKeepTheirAuthor", func(t *testing.T) { groupMessage(t, newStore(t)) })
 	t.Run("OnlyOneOfConcurrentClaimsWins", func(t *testing.T) { concurrentClaims(t, newStore(t)) })
@@ -104,6 +105,57 @@ func pendingOrder(t *testing.T, s store.Store) {
 	}
 	if got, _ := s.Pending(ctx, bob, "", t0.Add(2*time.Hour), 10); len(got) != 0 {
 		t.Fatalf("Pending after expiry = %v", idsOf(got))
+	}
+}
+
+func pendingHeld(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	for i, id := range []string{"0001", "0002", "0003", "0004"} {
+		if err := s.Enqueue(ctx, message(bob, id, t0.Add(time.Duration(i)*time.Second)), none); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Enqueue(ctx, message(carol, "0000", t0), none); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Claim(ctx, carol, "0000", "task-a", t0, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got, held, err := s.PendingHeld(ctx, bob, "", "task-b", t0, 10); err != nil || held || fmt.Sprint(idsOf(got)) != "[0001 0002 0003 0004]" {
+		t.Fatalf("PendingHeld with nothing held = %v, %v, %v", idsOf(got), held, err)
+	}
+	if _, err := s.Claim(ctx, bob, "0002", "task-a", t0, t0.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		after, owner string
+		now          time.Time
+		limit        int
+		want         string
+		held         bool
+	}{
+		{"", "task-b", t0, 10, "[0001 0003 0004]", true},
+		// The holder's own claims are not told of.
+		{"", "task-a", t0, 10, "[0001 0003 0004]", false},
+		// Nor one whose lease is over: the message is pending again.
+		{"", "task-b", t0.Add(time.Minute), 10, "[0001 0002 0003 0004]", false},
+		// Nor one outside the range read: before after, or past the last
+		// message returned when limit were.
+		{"0002", "task-b", t0, 10, "[0003 0004]", false},
+		{"", "task-b", t0, 1, "[0001]", false},
+		{"", "task-b", t0, 2, "[0001 0003]", true},
+		{"", "task-b", t0, 0, "[]", false},
+		// Nor an expired one.
+		{"", "task-b", t0.Add(2 * time.Hour), 10, "[]", false},
+	} {
+		got, held, err := s.PendingHeld(ctx, bob, c.after, c.owner, c.now, c.limit)
+		if err != nil || held != c.held || fmt.Sprint(idsOf(got)) != c.want {
+			t.Errorf("PendingHeld(after %q, owner %q, %v, limit %d) = %v, %v, %v; want %s, %v",
+				c.after, c.owner, c.now.Sub(t0), c.limit, idsOf(got), held, err, c.want, c.held)
+		}
+		if p, err := s.Pending(ctx, bob, c.after, c.now, c.limit); err != nil || fmt.Sprint(idsOf(p)) != fmt.Sprint(idsOf(got)) {
+			t.Errorf("Pending(after %q, %v, limit %d) = %v, %v; PendingHeld read %v", c.after, c.now.Sub(t0), c.limit, idsOf(p), err, idsOf(got))
+		}
 	}
 }
 

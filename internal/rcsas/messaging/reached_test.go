@@ -549,9 +549,9 @@ type pendingCalls struct {
 	n atomic.Int64
 }
 
-func (s *pendingCalls) Pending(ctx context.Context, r, after string, now time.Time, limit int) ([]store.Message, error) {
+func (s *pendingCalls) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
 	s.n.Add(1)
-	return s.Store.Pending(ctx, r, after, now, limit)
+	return s.Store.PendingHeld(ctx, r, after, owner, now, limit)
 }
 
 // Code review on #624, its M10: a large-mode session delivers its message
