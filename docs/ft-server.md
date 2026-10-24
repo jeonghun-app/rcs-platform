@@ -218,11 +218,14 @@ and answers it as MD5.
   right, but whether its nonce-count was used could not be told (#621). Each
   is counted in `auth.backend_error` and logged without the user name. It says
   nothing about the user, and clients retry a 503 but give up after a second
-  401. A nonce-count item that cannot be decoded is the exception: it stays
-  bad until the nonce expires, so a 503 would bring the client back to it on
-  every retry. It gets 401 with `stale=true` instead, and the client moves to
-  a new nonce at once. It is counted in `auth.stale` and logged as "nonce
-  count record unusable", without the user name.
+  401. A lookup or update cut short because the client closed its connection
+  is no fault of either backend. It is counted in `auth.interrupted` instead
+  and not logged (#641). A nonce-count item that cannot be decoded is the
+  exception: it stays bad until the nonce expires, so a 503 would bring the
+  client back to it on every retry. It gets 401 with `stale=true` instead,
+  and the client moves to a new nonce at once. It is counted in
+  `auth.nonce_count_unusable`, not `auth.stale`, and logged as "nonce count
+  record unusable", without the user name.
 - **Lookups are bounded.** Each task runs at most `FT_MAX_CONCURRENT_LOOKUPS` at
   once and answers `503` beyond that (`auth.lookup_busy`). Anyone who has
   fetched a nonce can trigger a lookup with a made-up user name. The HSS client
@@ -442,6 +445,8 @@ identifier ever appears in a metric name:
 | `download.served`, `download.partial`, `download.bytes`, `download.not_found`, `download.unsatisfiable` | Downloads |
 | `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.uploader_busy`, `download.failed.missing_object` | Failed downloads |
 | `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.bad_credential_record`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
+| `auth.interrupted` | An HSS lookup or a nonce-count update cut short because the client closed its connection, answered `503` |
+| `auth.nonce_count_unusable` | A nonce-count item that cannot be decoded, answered `401` with `stale=true` |
 | `auth.nonce_contended` | DynamoDB store: a nonce-count update that waited for another on the same nonce in the task, or lost its conditional write to one on another task |
 | `sweep.expired`, `sweep.failed`, `sweep.duration` (ms) | Sweeper |
 
@@ -469,7 +474,7 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 
 | Signal | Meaning |
 |---|---|
-| `auth.backend_error` > 0 | The HSS lookup fails. Uploads get `503` |
+| `auth.backend_error` + `auth.nonce_count_unusable` > 0 | The HSS lookup or the DynamoDB nonce-count store fails, and uploads get `503`; or nonce-count items cannot be read, and requests get stale challenges ([runbook](runbook.md#ftauthbackenderror)) |
 | `auth.lookup_busy` sustained | Lookups pile up (slow HSS, or an unauthenticated flood). Check the WAF rule |
 | `auth.bad_credential_record` > 0 | A subscriber's FT credential record in the HSS is unusable. That user cannot upload |
 | `upload.failed.storage`, `download.failed.storage` > 0 | S3 or DynamoDB fails |

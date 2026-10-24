@@ -2389,11 +2389,16 @@ Resources:
             Condition:
               StringEquals: { 'aws:SourceAccount': !Ref AWS::AccountId }
 
+  # auth.backend_error counts HSS lookups and nonce-count updates that
+  # failed, not those a client's hang-up cut short (auth.interrupted, #641).
+  # auth.nonce_count_unusable is answered as a stale nonce, so that the
+  # client moves on, but a table whose items none can read leaves every
+  # request in that loop and shows nowhere else (#641).
   FtAuthBackendError:
     Type: AWS::CloudWatch::Alarm
     Properties:
       AlarmName: !Sub '${AWS::StackName}-FtAuthBackendError'
-      AlarmDescription: 'The HSS credential lookup fails; uploads get 503. See docs/runbook.md#ftauthbackenderror.'
+      AlarmDescription: 'The HSS credential lookup or the DynamoDB nonce-count store fails (uploads get 503), or stored nonce-counts cannot be read. See docs/runbook.md#ftauthbackenderror.'
       AlarmActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
       OKActions: [!If [CreateAlarmTopic, !Ref AlarmTopic, !Ref AlarmTopicArn]]
       ComparisonOperator: GreaterThanThreshold
@@ -2411,8 +2416,17 @@ Resources:
               Dimensions: [{ Name: Service, Value: ft-server }]
             Period: 300
             Stat: Sum
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: !Sub 'RCS/${AWS::StackName}'
+              MetricName: auth.nonce_count_unusable
+              Dimensions: [{ Name: Service, Value: ft-server }]
+            Period: 300
+            Stat: Sum
         - Id: total
-          Expression: 'FILL(m0, 0)'
+          Expression: 'FILL(m0, 0) + FILL(m1, 0)'
           Label: FtAuthBackendError
           ReturnData: true
   FtBadCredentialRecord:

@@ -160,7 +160,9 @@ func TestAnUnusableNonceCountRecordGetsANewNonceAtOnce(t *testing.T) {
 	// #621, QA on the first version: the record stays bad until the nonce
 	// expires, so a 503 brought the client back to it for five minutes. A
 	// stale challenge sends it to a new nonce, as before #621, without
-	// being counted as an auth failure.
+	// being counted as an auth failure. It is counted apart from expired
+	// nonces, so that FtAuthBackendError sees a table whose records cannot
+	// be read, after a rollback say (#641).
 	for name, counts := range map[string]func(o *Options) digest.NonceCountStore{
 		"malformed item": overTable(&badItemTable{}),
 		"unsanitised": func(o *Options) digest.NonceCountStore {
@@ -183,13 +185,19 @@ func TestAnUnusableNonceCountRecordGetsANewNonceAtOnce(t *testing.T) {
 			if rec := e.do(u.sign(uploadRequest())); rec.Code != http.StatusOK {
 				t.Fatalf("upload with the new nonce = %d", rec.Code)
 			}
-			for metric, want := range map[string]float64{"auth.stale": 1, "auth.backend_error": 0, "auth.failed": 0} {
+			for metric, want := range map[string]float64{"auth.nonce_count_unusable": 1, "auth.stale": 0, "auth.backend_error": 0, "auth.failed": 0} {
 				if got := e.metric(metric); got != want {
 					t.Errorf("%s = %v, want %v", metric, got, want)
 				}
 			}
-			if n := len(e.h.Logs("nonce count record unusable")); n != 1 {
+			logs := e.h.Logs("nonce count record unusable")
+			if n := len(logs); n != 1 {
 				t.Errorf("%d log lines for the unusable record, want 1", n)
+			}
+			for _, l := range logs {
+				if msg, _ := l["error"].(string); !strings.HasPrefix(msg, digest.ErrNonceCountUnusable.Error()) || strings.Contains(msg, "expired") {
+					t.Errorf("the unusable record logged as %q", msg)
+				}
 			}
 			if n := len(e.h.Logs("nonce count store failed")); n != 0 {
 				t.Errorf("an unusable record logged as a store failure %d times", n)

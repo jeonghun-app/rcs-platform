@@ -411,7 +411,7 @@ func (s *Server) consume(ctx context.Context, c Credentials, deadline time.Time)
 	}
 	fresh, err := s.counts.Advance(ctx, c.Username, nonce, c.NC, deadline)
 	if errors.Is(err, ErrNonceCountUnusable) {
-		return fmt.Errorf("%w: %w", ErrStaleNonce, err)
+		return unusableCount{err}
 	}
 	if err != nil {
 		return fmt.Errorf("%w: %w", ErrNonceCountStore, err)
@@ -421,6 +421,14 @@ func (s *Server) consume(ctx context.Context, c Credentials, deadline time.Time)
 	}
 	return nil
 }
+
+// unusableCount is the ErrStaleNonce of a nonce-count record the store
+// cannot use. Its message is the store's alone: callers log it, and one
+// that began with ErrStaleNonce's would read as an expired nonce (#641).
+type unusableCount struct{ err error }
+
+func (u unusableCount) Error() string   { return u.err.Error() }
+func (u unusableCount) Unwrap() []error { return []error{ErrStaleNonce, u.err} }
 
 const redactedServer = "digest.Server{redacted}"
 

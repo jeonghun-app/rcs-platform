@@ -324,7 +324,8 @@ var errLookupBusy = errors.New("ftserver: too many credential lookups in progres
 // exist. A failure of the credential backend or of the nonce-count store, or
 // a task at its lookup limit, gets 503 with Retry-After instead:
 // it says nothing about the user, and RCS clients retry a 503 but give up
-// after a second 401.
+// after a second 401. So does a lookup or update the client's hang-up cut
+// short, which is counted apart, being no fault of either backend.
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity, bool) {
 	var cred Credential
 	var lookupErr error
@@ -358,6 +359,12 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 		s.metrics.Count("auth.lookup_busy", 1)
 		serviceUnavailable(w, time.Second)
 		return identity{}, false
+	case hungUp(r, lookupErr), errors.Is(err, digest.ErrNonceCountStore) && hungUp(r, err):
+		// Not logged: clients on poor networks do this often, and it must
+		// not reach FtAuthBackendError, which pages (#641).
+		s.metrics.Count("auth.interrupted", 1)
+		serviceUnavailable(w, retryAfter)
+		return identity{}, false
 	case errors.Is(lookupErr, ErrBadCredentialRecord):
 		// Answered like an unknown user, below; only the operator learns.
 		s.metrics.Count("auth.bad_credential_record", 1)
@@ -381,8 +388,11 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 		// Answered as stale, below, so that the client moves to a new
 		// nonce at once; a 503 would bring it back to this record until
 		// the nonce expired (#621). Logged, because only a bug or a hand
-		// edit leaves a record unreadable.
-		s.metrics.Count("auth.stale", 1)
+		// edit leaves a record unreadable. Counted apart from expired
+		// nonces for FtAuthBackendError: a table none of whose records
+		// can be read, after a rollback say, would otherwise show only
+		// as many stale nonces (#641).
+		s.metrics.Count("auth.nonce_count_unusable", 1)
 		s.log.Warn("nonce count record unusable", slog.String("error", pii.Redact(err.Error())))
 	case stale:
 		s.metrics.Count("auth.stale", 1)
@@ -399,6 +409,13 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
 	return identity{}, false
+}
+
+// hungUp reports whether err is the cancellation of r's own context, which
+// net/http cancels when the client closes the connection. A cancellation
+// while r still runs is the backend's own failure.
+func hungUp(r *http.Request, err error) bool {
+	return errors.Is(err, context.Canceled) && r.Context().Err() != nil
 }
 
 // carriesContent reports whether r is an upload or a resume with a body,
