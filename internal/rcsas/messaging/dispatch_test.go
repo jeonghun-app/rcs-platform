@@ -30,6 +30,12 @@ func (s *readCounter) Pending(ctx context.Context, r, after string, now time.Tim
 	return ms, err
 }
 
+func (s *readCounter) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+	ms, held, err := s.Store.PendingHeld(ctx, r, after, owner, now, limit)
+	s.items.Add(int64(len(ms)))
+	return ms, held, err
+}
+
 // drainInvites has d keep no invitations, for a test that does not look
 // at them.
 func drainInvites(_ *testing.T, d *fakeDeliverer) { d.discardInvites.Store(true) }
@@ -205,6 +211,216 @@ func TestAnOvertakenGroupFailureGivesUpOnlyALoop(t *testing.T) {
 		if n := r.store.(*store.Memory).Len(bob); n != 1 || r.m.get("delivery.undeliverable") != 0 {
 			t.Fatalf("%v: %d copies, %d given up", tc.err, n, r.m.get("delivery.undeliverable"))
 		}
+	}
+}
+
+// #653: the core gave bob's de-registration to another task, so this task
+// takes his next registration for a refresh. Its invitation while he was
+// away failed (480), and that failure says nothing of him now: the
+// refresh has him invited at once, not InviteTimeout later. That holds
+// for a chat, a large-mode and a group invitation alike.
+func TestARefreshAfterAFailedInvitationInvitesAgainAtOnce(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		submit func(r *rig) error
+	}{
+		{"chat", func(r *rig) error {
+			return r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))})
+		}},
+		{"large mode", func(r *rig) error {
+			return r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))})
+		}},
+		{"group", func(r *rig) error {
+			r.e.SetGroupHandler(members{all: []string{alice, bob}})
+			return r.e.SubmitGroup(t.Context(), groupFrom(alice, chat(t, "g1", "hi", 0)))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour, PagerLimit: 600})
+			r.e.UserRegistered(bob, true) // before he left
+			if err := tc.submit(r); err != nil {
+				t.Fatal(err)
+			}
+			inv := r.d.nextInvite(t)
+			waitFor(t, "idle", r.idle)
+			r.e.InviteFailed(inv, ErrOffline) // the 480, bob being away
+			r.e.UserRegistered(bob, false)    // back, through this task
+			again := r.d.nextInvite(t)
+			if again.Recipient != bob || again.Peer != inv.Peer || again.Mode != inv.Mode || again.QueueID != inv.QueueID {
+				t.Fatalf("invitation %+v after %+v", again, inv)
+			}
+		})
+	}
+}
+
+// #653: a refresh clears a failed invitation's mark on a queue that found
+// bob unreachable too. There it reads the queue anyway, and the chat
+// message ahead of the failed pager request is invited for again.
+func TestARefreshAfterAFailedInvitationInvitesAgainOnABlockedQueue(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.UserRegistered(bob, true)
+	r.d.onPager(func(Delivery) error { return ErrOffline })
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	if err := r.e.Submit(t.Context(), standalone(carol, bob, chat(t, "m2", "hi", 0))); err != nil {
+		t.Fatal(err)
+	}
+	r.d.nextPager(t)
+	waitFor(t, "the queue blocked", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		x := r.e.recipients[bob]
+		return x != nil && x.hold == holdBlocked && x.run == runIdle
+	})
+	r.e.InviteFailed(inv, ErrOffline)
+	r.d.onPager(nil)
+	r.e.UserRegistered(bob, false)
+	if again := r.d.nextInvite(t); again.Peer != alice {
+		t.Fatalf("invitation %+v", again)
+	}
+	r.d.nextPager(t)
+}
+
+// #653: a refresh clears only the marks of invitations that failed. One
+// still waiting for its answer keeps its mark, so that the refresh does
+// not ring bob a second time for it: here alice's invitation is out and
+// carol's failed, and the refresh asks for carol's alone. With nothing
+// failed, a refresh asks for nothing.
+func TestARefreshKeepsTheInvitationsStillOut(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.UserRegistered(bob, true)
+	from := func(sender, id string) Origin {
+		return Origin{Sender: sender, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, id, "hi", 0))}
+	}
+	if err := r.e.Submit(t.Context(), from(alice, "m1")); err != nil {
+		t.Fatal(err)
+	}
+	if inv := r.d.nextInvite(t); inv.Peer != alice {
+		t.Fatalf("invitation %+v", inv)
+	}
+	waitFor(t, "idle", r.idle)
+	noInvite := func(what string) {
+		t.Helper()
+		waitFor(t, "idle", r.idle)
+		select {
+		case inv := <-r.d.invites:
+			t.Fatalf("%s: invited %+v", what, inv)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	r.e.UserRegistered(bob, false)
+	noInvite("a refresh with nothing failed")
+
+	if err := r.e.Submit(t.Context(), from(carol, "m2")); err != nil {
+		t.Fatal(err)
+	}
+	failed := r.d.nextInvite(t)
+	if failed.Peer != carol {
+		t.Fatalf("invitation %+v", failed)
+	}
+	waitFor(t, "idle", r.idle)
+	r.e.InviteFailed(failed, ErrOffline)
+	r.e.UserRegistered(bob, false)
+	if inv := r.d.nextInvite(t); inv.Peer != carol {
+		t.Fatalf("invitation %+v, want carol's again", inv)
+	}
+	noInvite("a refresh after carol's failure")
+}
+
+// QA on #655: a refresh during a large-mode leg's attempt keeps the leg's
+// mark, so a pass that read the message before the leg claimed it asks
+// for no second session (#264).
+func TestARefreshDuringALargeModeAttemptAsksForNoSecondSession(t *testing.T) {
+	r := newRig(t, Config{PagerLimit: 600, InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.UserRegistered(bob, true)
+	if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Standalone, CPIM: content.BodyOf(chat(t, "L1", strings.Repeat("L", 800), 0))}); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	ms, err := r.store.Pending(t.Context(), bob, "", r.clock.Now(), 10)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("Pending = %+v, %v", ms, err)
+	}
+	leg, err := r.e.Offer(LegParams{User: inv.Recipient, Peer: inv.Peer, Conversation: inv.Conversation,
+		Mode: store.Standalone, Direction: Terminating, QueueID: inv.QueueID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = leg.Close() })
+	if err := leg.Answer([]msrp.URI{clientURI()}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the leg to claim the message", func() bool { return r.queued(t, bob) == 0 })
+	r.e.UserRegistered(bob, false)
+	r.e.invite(t.Context(), ms[0])
+	select {
+	case again := <-r.d.invites:
+		t.Fatalf("a second session was asked for after a refresh: %+v", again)
+	default:
+	}
+}
+
+// QA on #655: bob's refresh leaves carol's failed mark alone.
+func TestARefreshClearsOnlyThatUsersFailedMarks(t *testing.T) {
+	r := newRig(t, Config{InviteTimeout: time.Hour, RetryInterval: time.Hour})
+	r.e.UserRegistered(bob, true)
+	r.e.UserRegistered(carol, true)
+	msg := func(id string) Origin {
+		return Origin{Sender: alice, Recipient: carol, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, id, "hi", 0))}
+	}
+	if err := r.e.Submit(t.Context(), msg("m1")); err != nil {
+		t.Fatal(err)
+	}
+	inv := r.d.nextInvite(t)
+	waitFor(t, "idle", r.idle)
+	r.e.InviteFailed(inv, ErrOffline)
+	r.e.UserRegistered(bob, false)
+	if err := r.e.Submit(t.Context(), msg("m2")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "idle", r.idle)
+	select {
+	case got := <-r.d.invites:
+		t.Fatalf("carol invited after bob's refresh: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// Code review of #655: bob stays registered, refreshes every 30 min, and
+// every invitation to him fails. Each refresh finds a failed mark and has
+// the queue read, but leaves its retry timer as it is: the refresh says
+// nothing of when to try next. So over 6 h the refreshes add at most one
+// invitation each to those the retry timer asks for on its own; restarting
+// the backoff at each refresh sent 49 instead of 21.
+func TestRefreshesAddOneInvitationEachToAFailingRecipient(t *testing.T) {
+	count := func(refresh bool) int64 {
+		r := newRig(t, Config{InviteTimeout: 2 * time.Minute, RetryInterval: time.Minute, MaxRetryInterval: time.Hour})
+		var invites atomic.Int64
+		r.d.discardInvites.Store(true)
+		r.d.onInvite(func(Invitation) error { invites.Add(1); return ErrOffline })
+		r.e.UserRegistered(bob, true)
+		if err := r.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "hi", 0))}); err != nil {
+			t.Fatal(err)
+		}
+		waitFor(t, "idle", r.idle)
+		for minute := 1; minute <= 6*60; minute++ {
+			r.clock.Advance(time.Minute)
+			waitFor(t, "idle", r.idle)
+			if refresh && minute%30 == 0 {
+				r.e.UserRegistered(bob, false)
+				waitFor(t, "idle", r.idle)
+			}
+		}
+		return invites.Load()
+	}
+	alone, refreshed := count(false), count(true)
+	t.Logf("%d invitations with refreshes, %d without", refreshed, alone)
+	if refreshes := int64(6 * 60 / 30); refreshed > alone+refreshes {
+		t.Fatalf("%d invitations with a refresh every 30 min, %d without: more than one per refresh", refreshed, alone)
 	}
 }
 
@@ -654,8 +870,9 @@ func TestAReleasedLargeModeMessageIsTriedAgain(t *testing.T) {
 	}
 }
 
-// pendingGate is a store whose Pending, once armed, returns what it read
-// only when released: a pass that has read the queue and not finished.
+// pendingGate is a store whose PendingHeld, the engine's read of a queue,
+// once armed, returns what it read only when released: a pass that has
+// read the queue and not finished.
 type pendingGate struct {
 	store.Store
 	armed   atomic.Bool
@@ -663,13 +880,13 @@ type pendingGate struct {
 	release chan struct{}
 }
 
-func (s *pendingGate) Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]store.Message, error) {
-	ms, err := s.Store.Pending(ctx, recipient, after, now, limit)
+func (s *pendingGate) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+	ms, held, err := s.Store.PendingHeld(ctx, recipient, after, owner, now, limit)
 	if s.armed.CompareAndSwap(true, false) {
 		close(s.read)
 		<-s.release
 	}
-	return ms, err
+	return ms, held, err
 }
 
 // QA on #284: a large-mode attempt that releases its message while a pass
