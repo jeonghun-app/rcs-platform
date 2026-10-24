@@ -274,12 +274,14 @@ func env(t *testing.T, name string) string {
 	return v
 }
 
-// rcsasTasks waits for the stack's rcs-as services and returns them:
-// rcs-as-a and, on two tasks, rcs-as-b, as make e2e-compose was told
-// (RCSAS_TASKS, here RCS_E2E_RCSAS_TASKS). The AS URI's shared alias must
-// then name as many tasks, or the test fails here: some checks hold on one
-// task only (#654) and the group chat needs two (#602), so a stack of
-// another size would fail them for a reason that is not theirs.
+// rcsasTasks returns the stack's rcs-as services, rcs-as-a and, on two
+// tasks, rcs-as-b, as make e2e-compose was told (RCSAS_TASKS, here
+// RCS_E2E_RCSAS_TASKS), once each is ready. The AS URI's shared alias must
+// name as many running tasks, or the test fails here: some checks hold on
+// one task only (#654) and the group chat needs two (#602), so a stack of
+// another size would fail them for a reason that is not theirs. It is
+// checked first, as a task that is not there would otherwise be waited
+// for until the test's deadline.
 func rcsasTasks(ctx context.Context, t *testing.T) []string {
 	t.Helper()
 	var tasks []string
@@ -291,16 +293,16 @@ func rcsasTasks(ctx context.Context, t *testing.T) []string {
 	default:
 		t.Fatalf("RCS_E2E_RCSAS_TASKS is %q, not 1 or 2: run the test through make e2e-compose", n)
 	}
-	for _, svc := range tasks {
-		waitReady(ctx, t, "http://"+svc+":8080/readyz")
-	}
 	addrs, err := net.DefaultResolver.LookupHost(ctx, "rcs-as.rcs.local")
 	if err != nil {
 		t.Fatalf("resolving rcs-as.rcs.local: %v", err)
 	}
 	if len(addrs) != len(tasks) {
-		t.Fatalf("rcs-as.rcs.local names %d rcs-as tasks, and make e2e-compose was given RCSAS_TASKS=%d: give make up the same RCSAS_TASKS",
+		t.Fatalf("rcs-as.rcs.local names %d running rcs-as tasks, and make e2e-compose was given RCSAS_TASKS=%d: give make up the same RCSAS_TASKS, or see why an earlier test left a task stopped",
 			len(addrs), len(tasks))
+	}
+	for _, svc := range tasks {
+		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
 	return tasks
 }

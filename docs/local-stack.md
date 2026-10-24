@@ -301,8 +301,9 @@ docker access. It:
 
 1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf`,
    `scscf`, `pcscf`, `rcs-as-a` (and `rcs-as-b` with `RCSAS_TASKS=2`) and
-   `acs`. `rcs-as.rcs.local` must then name as many tasks as `RCSAS_TASKS`
-   says, or the test fails at once: run `make up` with the same value;
+   `acs`. Before it waits for `rcs-as`, `rcs-as.rcs.local` must name as many
+   running tasks as `RCSAS_TASKS` says, or the test fails at once: run
+   `make up` with the same value;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
 4. runs `rcs-sim ft ft-resume`: the FT scenarios go to the `ftHTTPCSURI`
@@ -464,7 +465,7 @@ describe them. #56 provides the AWS values. Locally:
 | Another worktree's `make up` replaced this stack's containers, or `make e2e-compose` gets 401 from a stack it did not start | Both use the default `COMPOSE_PROJECT`. See [A second stack on the same host](#a-second-stack-on-the-same-host). |
 | `stack-tables` fails with "only some of the hss tables exist" (or the scscf tables) | A half-made stack. Run `make down` and `make up`. |
 | `make e2e-compose` fails with `REGISTER answered 500` right after another run | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics). `make e2e-compose` waits out the minute after its own last run (#648), but not after other REGISTERs of the test subscribers, such as an `rcs-sim` run by hand or a run from another worktree on the same stack, which keeps its own `tmp/`. Wait for the next minute and run it again. |
-| `make e2e-compose`: "rcs-as.rcs.local names 2 rcs-as tasks, and make e2e-compose was given RCSAS_TASKS=1" (or the other way) | The stack runs another number of `rcs-as` tasks than the test was told. Give `make up` and `make e2e-compose` the same `RCSAS_TASKS`. A task an interrupted run left stopped also counts: `make up` starts it again. |
+| `make e2e-compose`: "rcs-as.rcs.local names 2 running rcs-as tasks, and make e2e-compose was given RCSAS_TASKS=1" (or the other way) | The stack runs another number of `rcs-as` tasks than the test was told. Give `make up` and `make e2e-compose` the same `RCSAS_TASKS`. A task an interrupted run left stopped also counts: `make up` starts it again. |
 | `stack-seed` answers 401 | `deploy/compose.env` changed after the services started. Run `make up` again to recreate them, or `make down` and `make up`. |
 | `make e2e-compose`: "no local stack rcs-local is running: run make up first" | The stack's network does not exist, or `deploy/compose.env` is missing. Run `make up` first; the test does not start the stack. With another `COMPOSE_PROJECT`, pass the same name to both. |
 | `make e2e-compose`: "… is not ready: is the stack up" | The stack exists but a service is not ready within the test's wait. `make logs LOGS="<service>"`. |
