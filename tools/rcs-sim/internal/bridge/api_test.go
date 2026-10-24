@@ -146,6 +146,28 @@ func TestOfflineUnregistersAndKeepsTheSubscriberAndOnlineRegistersAgain(t *testi
 	}
 }
 
+// A path with a dot segment is answered 400 in JSON, not redirected by
+// ServeMux to a path the client did not ask for.
+func TestADotPathIsRefusedNotRedirected(t *testing.T) {
+	h := newHarness(t)
+	for _, path := range []string{"/v1/endpoints/.", "/v1/endpoints/..", "/v1/endpoints/./messages", "/v1/endpoints/a/../b"} {
+		req, _ := http.NewRequest(http.MethodPut, h.srv.URL, strings.NewReader(`{"online": true}`))
+		req.URL.Path = path
+		req.Header.Set("Authorization", "Bearer "+testToken)
+		res, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		if res.StatusCode != http.StatusBadRequest || res.Header.Get("Content-Type") != "application/json" {
+			t.Errorf("PUT %s answered %d %s, want 400 JSON", path, res.StatusCode, res.Header.Get("Content-Type"))
+		}
+	}
+	if h.hss.calls != nil {
+		t.Fatal("a dot path made an endpoint")
+	}
+}
+
 func TestDotNamesAreNotNames(t *testing.T) {
 	for _, n := range []string{".", ".."} {
 		if validName(n) {
@@ -183,9 +205,13 @@ func TestTheEndpointBoundCountsTheOnesOnline(t *testing.T) {
 	if h.net.registered(msisdnPrefix + "002") {
 		t.Fatal("the endpoint refused registered")
 	}
-	// Offline ones do not count: c may exist offline, and goes online
+	// Nor was it made (QA on #661): no subscriber was provisioned for it.
+	if e, _ := h.b.lookup("c"); e != nil || h.hss.calls["c"] != 0 {
+		t.Fatal("the PUT refused made the endpoint")
+	}
+	// Offline ones do not count: c may be made offline, and goes online
 	// once another has gone offline.
-	if status, out := h.call(http.MethodPut, "/v1/endpoints/c", map[string]bool{"online": false}); status != http.StatusOK || out["registered"] != false {
+	if status, out := h.call(http.MethodPut, "/v1/endpoints/c", map[string]bool{"online": false}); status != http.StatusCreated || out["registered"] != false {
 		t.Fatalf("c offline answered %d %v", status, out)
 	}
 	if status, _ := h.call(http.MethodPut, "/v1/endpoints/d", map[string]bool{"online": false}); status != http.StatusCreated {

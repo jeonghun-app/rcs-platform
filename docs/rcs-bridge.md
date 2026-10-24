@@ -137,7 +137,7 @@ they are refused with 400.
 
 1 to 64 bytes of letters, digits and combining marks in any script, and
 `.`, `_`, `~` and `-`, other than `.` and `..`, which a URL path resolves
-away. They are compared byte for byte, so `Car` and `car` are two
+away: a path with such a segment is answered 400. They are compared byte for byte, so `Car` and `car` are two
 endpoints. A name has no `:`, which is how `to` tells a name from a URI.
 
 ### PUT /v1/endpoints/{name}
@@ -160,7 +160,7 @@ removal) is done or has failed:
 | 201 | the endpoint was created |
 | 200 | it existed |
 | 400 | the name or the body is not valid |
-| 409 | `"online": true` would put one endpoint more online than `RCS_BRIDGE_MAX_ENDPOINTS`; nothing changes, and an endpoint just created stays offline. Or the bridge holds an endpoint for each of its 1000 slots |
+| 409 | `"online": true` would put one endpoint more online than `RCS_BRIDGE_MAX_ENDPOINTS`; nothing changes, and no new endpoint is made (two such PUTs at once may leave one made and offline). Or the bridge holds an endpoint for each of its 1000 slots |
 | 502 | `hss` refused the subscription or could not be reached; nothing was created |
 | 503 | the bridge is shutting down |
 
@@ -275,12 +275,16 @@ endpoint next registers, or when its retry timer runs (`RCSAS_RETRY_INTERVAL`,
 1 minute, doubling; [rcs-as](rcs-as.md#when-a-queue-is-read-again)). To have
 what was kept come at once, open a stream and put the endpoint offline and
 online again. Open the stream before putting endpoints online: what `rcs-as`
-kept for an endpoint comes as soon as it registers, and with no stream open
-it is refused and kept again, to come only at the next registration. A
-message refused so is not remembered, so a display notification about it is
-404 until it has come on a stream. A message it cannot read (not `message/cpim`, or a CPIM or IMDN
-header it cannot parse) is refused with 415 or 400, so that the network does
-not take it for delivered.
+kept for an endpoint comes as soon as it registers, and with no stream open it
+is refused and kept again, to come only at the next registration. A message
+refused so is not remembered, so a display notification about it is 404 until
+it has come on a stream. Until then `rcs-as` holds that endpoint's whole
+queue, so later messages to it wait too, up to the retry interval (as long as
+`RCSAS_MAX_RETRY_INTERVAL`, 1 hour, after repeated refusals); opening the
+stream first avoids it ([#664](https://github.com/jeonghun-app/rcs-
+platform/issues/664)). A message it cannot read (not `message/cpim`, or a CPIM
+or IMDN header it cannot parse) is refused with 415 or 400, so that the
+network does not take it for delivered.
 
 When the message asks for a delivery notification, the bridge sends it after
 the 200, once the event is queued: the bridge is the device (RFC 5438 §5.1).

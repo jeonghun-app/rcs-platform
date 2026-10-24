@@ -261,6 +261,27 @@ var (
 	errAllSlots = errors.New("bridge: the bridge holds an endpoint for each of its subscriber slots")
 )
 
+// onlineFull reports whether putting name online would pass MaxEndpoints:
+// one more online when it is not online already. It takes b.mu and e.mu
+// one after the other, never together: setOnline holds e.mu while it
+// counts under b.mu.
+func (b *Bridge) onlineFull(name string) bool {
+	b.mu.Lock()
+	e := b.endpoints[name]
+	b.mu.Unlock()
+	if e != nil {
+		e.mu.Lock()
+		online := e.online
+		e.mu.Unlock()
+		if online {
+			return false
+		}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.online >= b.cfg.MaxEndpoints
+}
+
 // countOnline counts an endpoint going online (up) or offline, and
 // reports false, counting nothing, when one more would be online than
 // MaxEndpoints allows.

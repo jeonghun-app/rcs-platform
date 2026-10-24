@@ -40,16 +40,32 @@ func (b *Bridge) routes() http.Handler {
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		// Every request needs the token, the event stream's handshake and
 		// unknown paths too, so that without it nothing is learnt.
-		if !b.authorized(r) {
+		switch {
+		case !b.authorized(r):
 			rec.Header().Set("WWW-Authenticate", `Bearer realm="rcs-bridge"`)
 			writeJSON(rec, http.StatusUnauthorized, errorBody{"a bearer token is needed"})
-		} else {
+		case hasDotSegment(r.URL.Path):
+			// ServeMux would redirect a path with "." or ".." (RFC 3986
+			// §5.2.4) to another, which a client might follow with its
+			// body; such a path names no endpoint (QA on #661).
+			writeJSON(rec, http.StatusBadRequest, errorBody{"the endpoint name is not 1 to 64 letters, digits, '.', '_', '~' or '-'"})
+		default:
 			mux.ServeHTTP(rec, r)
 		}
 		// The pattern, never the path: the path holds the endpoint's name.
 		b.log.Debug("request", slog.String("method", r.Method), slog.String("route", r.Pattern),
 			slog.Int("status", rec.status), slog.String("took", time.Since(start).String()))
 	})
+}
+
+// hasDotSegment reports whether path has a "." or ".." segment.
+func hasDotSegment(path string) bool {
+	for seg := range strings.SplitSeq(path, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // authorized reports whether r carries the token, compared in constant
@@ -128,6 +144,13 @@ func (b *Bridge) putEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	online := req.Online == nil || *req.Online
+	// Refused before a new endpoint is made, so that a PUT past the bound
+	// leaves nothing behind (QA on #661). setOnline counts again: two
+	// PUTs at once may both get past this.
+	if online && b.onlineFull(name) {
+		writeJSON(w, http.StatusConflict, errorBody{errFull.Error()})
+		return
+	}
 	ctx, cancel := b.opContext()
 	defer cancel()
 	e, created, err := b.endpoint(ctx, name)
