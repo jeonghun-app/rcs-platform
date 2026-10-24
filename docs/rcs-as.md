@@ -548,9 +548,9 @@ What the last pass over a queue found decides what reads it again:
 
 | Last pass | A new message | Reads the whole queue |
 |---|---|---|
-| Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg |
-| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark, a refresh (without restarting the retry timer; an invitation asked for more than `RCSAS_INVITE_TIMEOUT` ago is asked again, #632, and one that failed is asked again at once, #653) |
-| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark |
+| Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg, the end of a claim another task held that the last pass met (#651) |
+| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark, a refresh (without restarting the retry timer; an invitation asked for more than `RCSAS_INVITE_TIMEOUT` ago is asked again, #632, and one that failed is asked again at once, #653), the end of a claim another task held that the last pass met (#651) |
+| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark, a read an earlier pass set for the end of another task's claim (the pass that found the recipient unreachable sets none, #651) |
 
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
 `RCSAS_MAX_RETRY_INTERVAL` while the queue stays held. A recipient that never
@@ -657,10 +657,20 @@ claim it lost, a lease and `RCSAS_TASK_SKEW` after, as that claim was made
 no later by a clock at most that far ahead. A recipient has one such read
 waiting, the earliest, and the pass it makes sets the next if a message is
 still held. A pass that found the recipient unreachable sets none: the
-retry timer reads the queue, as for the rest. A live holder has delivered
-the message or put it back long before its lease ends, so for one the read
-costs a query that finds nothing more to do. Each pass that meets another
-task's attempt costs at most that read, and only one waits per recipient.
+retry timer reads the queue, as for the rest. A live holder's attempt is
+over long before its lease ends. If it delivered the message, the read
+costs a query that finds it gone. If the attempt failed and put the message
+back, the read tries it here as any pass would: should that find the
+recipient unreachable, this task holds the queue and starts its own retry
+timer, beside the holder's. Each pass that meets another task's attempt
+costs at most that read, and only one waits per recipient.
+
+This needs a pass on a surviving task to meet the claim during its lease.
+A group copy always has one, the takeover's read
+([Which task serves a group](#which-task-serves-a-group)). A 1-to-1 queue
+has no takeover: if no surviving task reads it during the lease, its
+message, like the free messages a crashed task was retrying, waits for the
+recipient's next event on a surviving task, or `RCSAS_STORE_TTL` (#663).
 
 `Close` takes no new work, then lets the attempts in progress finish, for at
 most a delivery and two store calls, before it cancels the rest. The store

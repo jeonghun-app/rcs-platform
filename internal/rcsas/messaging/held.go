@@ -106,11 +106,15 @@ func (e *Engine) lookAgain(user string, wait time.Duration) {
 // next message, registration or takeover (#651). So a pass that left a
 // message another task held has the queue read again once that claim is
 // over. The store tests a lease against the reader's clock, so for a
-// lease the read passed over that is the lease's own end. A live holder
-// has delivered the message or put it back long before, and the read costs
-// one query that finds nothing more to do. A recipient has one such read
-// waiting, the earliest asked for; its pass asks for the next if a message
-// is still held.
+// lease the read passed over that is the lease's own end. A live holder's
+// attempt is over long before. If it delivered the message, the read costs
+// one query that finds it gone. If the attempt failed and put the message
+// back, the read tries it as any pass would, and one that finds the
+// recipient unreachable holds the queue here with a retry timer of this
+// task's own, beside the holder's. A recipient has one such read waiting,
+// the earliest asked for; its pass asks for the next if a message is still
+// held. Only a pass meets the claim: a 1-to-1 queue no surviving task reads
+// during the lease still waits for the recipient's next event (#663).
 
 // lostClaimEnd is when a claim another task won from this one is over at
 // the latest: that claim was made no later than now by its holder's clock,

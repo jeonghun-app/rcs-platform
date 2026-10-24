@@ -36,6 +36,11 @@ import (
 // MaxRetryInterval while a queue stays held, so a recipient that never
 // comes back costs a read an hour, not one per message sent to it.
 //
+// Whatever the hold, the end of a claim another task held, which a pass
+// met, reads the whole queue: the holder may have died with it (#651,
+// leaseRead). A pass that found the recipient unreachable sets no such
+// read.
+//
 // A hold is this task's own: another task may take the recipient's
 // registration, or the session its invitation brought, and deliver the
 // queue meanwhile (#605). So each task marks a recipient in the store when
