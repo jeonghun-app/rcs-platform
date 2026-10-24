@@ -1032,9 +1032,9 @@ type pendingReads struct {
 	n atomic.Int64
 }
 
-func (p *pendingReads) Pending(ctx context.Context, r, after string, now time.Time, n int) ([]store.Message, error) {
+func (p *pendingReads) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, n int) ([]store.Message, bool, error) {
 	p.n.Add(1)
-	return p.Store.Pending(ctx, r, after, now, n)
+	return p.Store.PendingHeld(ctx, r, after, owner, now, n)
 }
 
 // Code review on #628: a join that opens no leg, refused say, has the

@@ -75,6 +75,13 @@ type recipient struct {
 	// last passes left waiting for a session: a new message from one of
 	// them must not go ahead of those, from anyone else it may.
 	waiting map[string]bool
+	// look has the next pass over the whole queue look out for messages
+	// another task holds, after a registration (lookAgain); lookWait is
+	// the wait that led to that look, zero for a registration's own.
+	// lookTimer is the one look waiting for its time.
+	look      bool
+	lookWait  time.Duration
+	lookTimer msrp.Timer
 	// arrived notes a message queued while a pass ran with the queue
 	// blocked (see hold).
 	arrived bool
@@ -132,6 +139,11 @@ func (e *Engine) schedule(user string, r *recipient) {
 func (e *Engine) kickEvent(user string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.kickEventLocked(user)
+}
+
+// kickEventLocked is kickEvent for a caller holding e.mu.
+func (e *Engine) kickEventLocked(user string) {
 	if e.closed {
 		return
 	}
@@ -422,7 +434,7 @@ func (e *Engine) work() {
 			}
 		}
 		r.run = runIdle
-		if r.hold == holdNone && r.retry == nil {
+		if r.hold == holdNone && r.retry == nil && r.lookTimer == nil {
 			delete(e.recipients, user)
 		}
 		e.mu.Unlock()
@@ -468,7 +480,7 @@ func (e *Engine) settle(user string, r *recipient, res passResult, full bool, st
 type outcome uint8
 
 const (
-	// done: delivered, given up on, or taken by another task.
+	// done: delivered or given up on.
 	done outcome = iota
 	// skip: m stays queued for a reason of its own (it waits for a
 	// session), which says nothing about the messages after it.
@@ -479,12 +491,17 @@ const (
 	// whole: m found a leg that older messages wait for, and was not
 	// sent ahead of them; the queue is to be read again, in order.
 	whole
+	// taken: as done, but m could not be claimed: another task held it,
+	// it was gone, or the store failed.
+	taken
 )
 
 // drain delivers recipient's queue, oldest first, until a message finds the
 // recipient unreachable or the engine closes.
 func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 	res := passResult{waited: map[string]bool{}}
+	look, wait := e.takeLook(recipient)
+	held := false
 	after := ""
 	// If the session the waited senders' messages wait for opens part-way
 	// through the pass, a later message from the same sender must not go
@@ -492,7 +509,7 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 	waited := res.waited
 	for ctx.Err() == nil && !e.isClosed() {
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
-		batch, err := e.store.Pending(sctx, recipient, after, e.clock.Now(), e.cfg.Batch)
+		batch, passed, err := e.store.PendingHeld(sctx, recipient, after, e.cfg.InstanceID, e.clock.Now(), e.cfg.Batch)
 		cancel()
 		if err != nil {
 			e.storeFailed("pending", recipient, err)
@@ -511,14 +528,26 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 				}
 			case whole:
 				res.again = true
+				if look {
+					// The queue is read again at once, and looks then.
+					e.mu.Lock()
+					e.lookOut(recipient, wait)
+					e.mu.Unlock()
+				}
 				return res
+			case taken:
+				held = true
 			}
 			after = m.ID
 			if e.isClosed() {
 				return res
 			}
 		}
+		held = held || passed
 		if len(batch) < e.cfg.Batch {
+			if look && held {
+				e.lookAgain(recipient, wait)
+			}
 			return res
 		}
 	}
@@ -789,9 +818,7 @@ func (e *Engine) claim(ctx context.Context, m store.Message) (store.Message, boo
 	now := e.clock.Now()
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 	defer cancel()
-	// The lease outlasts a whole attempt, so that it never runs out while
-	// the attempt is still going and another task delivers m a second time.
-	c, err := e.store.Claim(ctx, m.Recipient, m.ID, e.cfg.InstanceID, now, now.Add(3*e.cfg.DeliveryTimeout))
+	c, err := e.store.Claim(ctx, m.Recipient, m.ID, e.cfg.InstanceID, now, now.Add(e.lease()))
 	switch {
 	case err == nil:
 		return c, true
@@ -806,7 +833,7 @@ func (e *Engine) claim(ctx context.Context, m store.Message) (store.Message, boo
 func (e *Engine) viaLeg(ctx context.Context, l *Leg, m store.Message) outcome {
 	c, ok := e.claim(ctx, m)
 	if !ok {
-		return done
+		return taken
 	}
 	if c.Summary {
 		return e.sendSummary(ctx, l, c)
@@ -858,7 +885,7 @@ func permanent(code int) bool {
 func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 	m, ok := e.claim(ctx, m)
 	if !ok {
-		return done
+		return taken
 	}
 	d := Delivery{
 		Recipient: m.Recipient, Sender: m.Sender, Mode: m.Mode, Notification: m.Notification, CPIM: m.CPIM,
