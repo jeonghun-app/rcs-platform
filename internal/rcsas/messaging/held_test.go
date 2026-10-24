@@ -862,3 +862,45 @@ func TestAPassThatFindsTheRecipientAwayReadsNoSoonerForAHeldMessage(t *testing.T
 		t.Errorf("the queue was read %d more times within 10 min, its retry timer an hour", got)
 	}
 }
+
+// QA on #659: a read already waiting gives way to one for a claim that
+// ends sooner, whichever pass came first. task-2 first loses its claim to
+// m2, which sets a read for a lease and the skew after; a pass over the
+// whole queue then passes over m1, which a dead task holds for 30 s more.
+// The queue is read when m1's claim ends, not when m2's does.
+func TestAClaimEndingSoonerSeenAfterALostOneHasTheQueueReadSooner(t *testing.T) {
+	st := store.NewMemory()
+	clock := newFakeClock()
+	gate := &claimHold{Store: st, in: make(chan struct{}), gate: make(chan struct{})}
+	gate.release = sync.OnceFunc(func() { close(gate.gate) })
+	t.Cleanup(gate.release)
+	r := newRigWith(t, Config{InstanceID: "task-2", RetryInterval: time.Hour, InviteTimeout: time.Hour}, gate, clock)
+	drainInvites(t, r.d)
+	sent := pagerTimes(r)
+	lease := r.e.lease()
+	// carol's c1 waits for a session, so that m2 is tried on its own.
+	if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "c1", 0))}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "c1's invitation", func() bool { return r.m.get("invite.sent") == 1 && r.idle() })
+	gate.armed.Store(true)
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m2", "two", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, gate.in)
+	ms, err := st.Pending(t.Context(), bob, "", clock.Now(), 10)
+	if err != nil || len(ms) == 0 {
+		t.Fatal(ms, err)
+	}
+	if _, err := st.Claim(t.Context(), bob, ms[len(ms)-1].ID, "task-9", clock.Now(), clock.Now().Add(lease)); err != nil {
+		t.Fatal(err)
+	}
+	gate.release()
+	waitFor(t, "task-2's lost claim", func() bool { return r.m.get("delivery.claimed_elsewhere") == 1 && r.idle() })
+	queueHeld(t, st, "0001", "m1", clock.Now(), clock.Now().Add(30*time.Second))
+	r.e.ReadQueues([]string{bob})
+	waitFor(t, "the read that passes m1 over", r.idle)
+	if _, ok := stepUntil(t, clock, 10*time.Minute, r.idle, func() bool { return len(sent()) > 0 }); !ok || sent()[0] != 30*time.Second {
+		t.Fatalf("deliveries at %v; m1's claim ended at 30s, the one task-2 lost at %v", sent(), lease)
+	}
+}
