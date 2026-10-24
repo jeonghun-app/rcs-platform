@@ -352,6 +352,9 @@ services:
     build:
       context: ..
       dockerfile: deploy/rcs-bridge.Dockerfile
+      # make exports VERSION; its log lines carry it as the services' do.
+      args:
+        VERSION: ${VERSION:-dev}
     profiles: ["bridge"]
     restart: "no"
     # Above its own shutdown: 5 s for requests in flight, 15 s for the

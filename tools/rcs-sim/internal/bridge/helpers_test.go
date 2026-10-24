@@ -148,9 +148,10 @@ type fakeNet struct {
 	// hold, when set, holds each Send until it is closed.
 	hold chan struct{}
 	// deliverFirst has Register deliver what is stored before it
-	// returns, and return only once the receiver has sent something back
-	// on the new line (or 5 s have passed): the order a network may give
-	// a third-party REGISTER's deliveries and the UE's 200.
+	// returns, and, when the receiver took any of it, return only once it
+	// has sent something back on the new line (or 5 s have passed): the
+	// order a network may give a third-party REGISTER's deliveries and the
+	// UE's 200.
 	deliverFirst bool
 	// onSend, when set before the sends, sees each MESSAGE as it is sent.
 	onSend func(from string, body []byte)
@@ -176,12 +177,13 @@ func (n *fakeNet) Register(_ context.Context, s Subscriber, receive func(Incomin
 	if n.deliverFirst && len(stored) > 0 {
 		before := len(n.sent[number])
 		n.mu.Unlock()
+		taken := false
 		for _, in := range stored {
 			in.Line = l
-			l.receive(in)
+			taken = n.redeliver(number, in) || taken
 		}
 		deadline := time.Now().Add(5 * time.Second)
-		for len(n.sentBy(number)) == before && time.Now().Before(deadline) {
+		for taken && len(n.sentBy(number)) == before && time.Now().Before(deadline) {
 			time.Sleep(time.Millisecond)
 		}
 		n.mu.Lock()
@@ -192,11 +194,33 @@ func (n *fakeNet) Register(_ context.Context, s Subscriber, receive func(Incomin
 		go func() {
 			for _, in := range stored {
 				in.Line = l
-				l.receive(in)
+				n.redeliver(number, in)
 			}
 		}()
 	}
 	return l, n.expires, nil
+}
+
+// redeliver gives a stored message to number's line and reports whether
+// the line took it; one it answers 480 is stored again, as rcs-as keeps it
+// for the next registration.
+func (n *fakeNet) redeliver(number string, in Incoming) bool {
+	switch in.Line.(*fakeLine).receive(in) {
+	case 200:
+		return true
+	case 480:
+		n.mu.Lock()
+		n.stored[number] = append(n.stored[number], in)
+		n.mu.Unlock()
+	}
+	return false
+}
+
+// storedFor is how many messages wait for number.
+func (n *fakeNet) storedFor(number string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.stored[number])
 }
 
 func (n *fakeNet) registered(number string) bool {

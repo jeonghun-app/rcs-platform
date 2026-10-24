@@ -201,6 +201,9 @@ func (c *Client) write(op byte, p []byte) error {
 	return err
 }
 
+// Drop closes the connection without a Close, as a client that vanishes.
+func (c *Client) Drop() error { return c.nc.Close() }
+
 // Close sends a Close with code and closes the connection.
 func (c *Client) Close(code int) error {
 	_ = c.write(0x8, binary.BigEndian.AppendUint16(nil, uint16(code)))

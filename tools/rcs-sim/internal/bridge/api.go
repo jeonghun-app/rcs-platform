@@ -78,8 +78,12 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // decode reads r's JSON body into v. An empty body leaves v as it is.
-func decode(w http.ResponseWriter, r *http.Request, v any) error {
+// strict refuses a field v does not have.
+func decode(w http.ResponseWriter, r *http.Request, v any, strict bool) error {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody))
+	if strict {
+		dec.DisallowUnknownFields()
+	}
 	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
 		var tooBig *http.MaxBytesError
 		if errors.As(err, &tooBig) {
@@ -116,7 +120,10 @@ func (b *Bridge) putEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Online *bool `json:"online"`
 	}
-	if err := decode(w, r, &req); err != nil {
+	// Strict, unlike the other bodies: a mistyped "online" would
+	// otherwise be absent, which is true, and put online an endpoint
+	// meant to go offline (QA on #661).
+	if err := decode(w, r, &req, true); err != nil {
 		badBody(w, err)
 		return
 	}
@@ -167,7 +174,7 @@ func (b *Bridge) sendMessage(w http.ResponseWriter, r *http.Request) {
 		MessageID   string   `json:"message_id"`
 		IMDN        []string `json:"imdn"`
 	}
-	if err := decode(w, r, &req); err != nil {
+	if err := decode(w, r, &req, false); err != nil {
 		badBody(w, err)
 		return
 	}
@@ -241,7 +248,7 @@ func (b *Bridge) sendIMDN(w http.ResponseWriter, r *http.Request) {
 		MessageID string `json:"message_id"`
 		Status    string `json:"status"`
 	}
-	if err := decode(w, r, &req); err != nil {
+	if err := decode(w, r, &req, false); err != nil {
 		badBody(w, err)
 		return
 	}

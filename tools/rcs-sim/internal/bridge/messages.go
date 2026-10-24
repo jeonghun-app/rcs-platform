@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"mime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -67,14 +68,16 @@ func (e *endpoint) cpimMessage(m outgoing) ([]byte, error) {
 	return c.Marshal()
 }
 
-// validContentType reports whether v is a media type that can stand in a
-// CPIM Content-Type field.
+// validContentType reports whether v is a media type, type/subtype with
+// any parameters, that can stand in a CPIM Content-Type field (RFC 2045
+// §5.1: the subtype is required; mime.ParseMediaType takes a bare type).
 func validContentType(v string) bool {
 	if strings.ContainsAny(v, "\r\n") {
 		return false
 	}
-	_, _, err := mime.ParseMediaType(v)
-	return err == nil
+	mt, _, err := mime.ParseMediaType(v)
+	typ, sub, ok := strings.Cut(mt, "/")
+	return err == nil && ok && typ != "" && sub != ""
 }
 
 // validMessageID reports whether id can be an IMDN Message-ID.
@@ -148,7 +151,9 @@ func (e *endpoint) receive(in Incoming) int {
 
 // publish sends ib's event and returns how many streams took it. A
 // message is remembered first, for a display notification the application
-// may send as soon as it has the event.
+// may send as soon as it has the event, and forgotten again when no stream
+// took it: a message the application never saw cannot be displayed (QA on
+// #661).
 func (e *endpoint) publish(ib inbound) int {
 	from := e.b.nameOf(ib.from)
 	if n := ib.notification; n != nil {
@@ -158,14 +163,19 @@ func (e *endpoint) publish(ib inbound) int {
 	if t, err := ib.msg.DateTime(); err == nil {
 		at = t
 	}
+	undo := func() {}
 	if ib.request.MessageID != "" {
-		e.received.put(ib.request.MessageID, received{from: ib.from, msg: ib.msg, request: ib.request})
+		undo = e.received.put(ib.request.MessageID, received{from: ib.from, msg: ib.msg, request: ib.request})
 	}
-	return e.b.hub.publish(messageEvent{
+	n := e.b.hub.publish(messageEvent{
 		Type: "message", Endpoint: e.name, From: ib.from.String(), FromEndpoint: from,
 		MessageID: ib.request.MessageID, ContentType: ib.msg.ContentType(),
 		Body: string(ib.msg.Body.Bytes()), At: at.UTC().Format(time.RFC3339Nano),
 	})
+	if n == 0 {
+		undo()
+	}
+	return n
 }
 
 // work sends the delivery notifications of the messages published, in
@@ -250,16 +260,34 @@ type recent struct {
 
 func newRecent(n int) *recent { return &recent{max: n, byID: map[string]received{}} }
 
-func (r *recent) put(id string, m received) {
+// put remembers m as id and returns what puts back what id was before:
+// another message, or none.
+func (r *recent) put(id string, m received) (undo func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.byID[id]; !ok {
+	prev, had := r.byID[id]
+	if !had {
 		r.order = append(r.order, id)
 	}
 	r.byID[id] = m
 	for len(r.order) > r.max {
 		delete(r.byID, r.order[0])
 		r.order = r.order[1:]
+	}
+	return func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if _, still := r.byID[id]; !still {
+			return
+		}
+		if had {
+			r.byID[id] = prev
+			return
+		}
+		delete(r.byID, id)
+		if i := slices.Index(r.order, id); i >= 0 {
+			r.order = slices.Delete(r.order, i, i+1)
+		}
 	}
 }
 

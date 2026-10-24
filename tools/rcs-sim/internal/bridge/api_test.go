@@ -146,6 +146,19 @@ func TestOfflineUnregistersAndKeepsTheSubscriberAndOnlineRegistersAgain(t *testi
 	}
 }
 
+func TestDotNamesAreNotNames(t *testing.T) {
+	for _, n := range []string{".", ".."} {
+		if validName(n) {
+			t.Errorf("%q is a valid name", n)
+		}
+	}
+	for _, n := range []string{"...", ".a", "a.", "가\u0301"} {
+		if !validName(n) {
+			t.Errorf("%q is not a valid name", n)
+		}
+	}
+}
+
 func TestEndpointNamesAreChecked(t *testing.T) {
 	h := newHarness(t)
 	for _, name := range []string{"a%3Ab", "sip%3Aa", "a%2Fb", "a%20b", strings.Repeat("a", 65), "%E2%80%8B", "a%00"} {
@@ -215,7 +228,11 @@ func TestAMessageWithNoStreamOpenIs480AndComesWithItsNotificationLater(t *testin
 	if n := len(h.net.sentBy(msisdnPrefix + "001")); n != 0 {
 		t.Fatalf("the phone sent %d notifications for messages nobody has", n)
 	}
+	// Nobody saw it, so nobody can have displayed it (QA on #661).
 	ev := h.events()
+	if status, _ := h.call(http.MethodPost, "/v1/endpoints/phone/imdn", map[string]any{"to": "car", "message_id": "direct", "status": "displayed"}); status != http.StatusNotFound {
+		t.Fatalf("a display notification for a message never shown answered %d, want 404", status)
+	}
 	h.call(http.MethodPut, "/v1/endpoints/phone", map[string]bool{"online": false})
 	h.online("phone")
 	if m := ev.await("message", "phone"); m["message_id"] != "later-1" || m["body"] != "later" {
@@ -223,6 +240,66 @@ func TestAMessageWithNoStreamOpenIs480AndComesWithItsNotificationLater(t *testin
 	}
 	if d := ev.await("imdn", "car"); d["message_id"] != "later-1" || d["status"] != "delivered" {
 		t.Fatalf("imdn event %v", d)
+	}
+}
+
+// An application that puts its endpoint online before it opens its event
+// stream, as a gateway starting up would: what rcs-as kept while the
+// endpoint was offline comes at once, with no stream to take it, and must
+// still not be lost (QA on #661, reproduction B).
+func TestAMessageKeptWhileOfflineSurvivesOnlineBeforeTheStream(t *testing.T) {
+	h := newHarness(t)
+	h.online("car")
+	h.online("phone")
+	h.call(http.MethodPut, "/v1/endpoints/phone", map[string]bool{"online": false})
+	if status, out := h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "kept", "message_id": "kept-B", "imdn": []string{"delivery", "display"}}); status != http.StatusOK || out["sip_status"] != float64(202) {
+		t.Fatalf("send answered %d %v", status, out)
+	}
+	h.net.mu.Lock()
+	h.net.deliverFirst = true
+	h.net.mu.Unlock()
+	// Online first: the kept message comes before PUT returns, and is
+	// refused, so the network keeps it.
+	h.online("phone")
+	if n := h.net.storedFor(msisdnPrefix + "001"); n != 1 {
+		t.Fatalf("%d messages kept for the phone, want the one refused", n)
+	}
+	if n := len(h.net.sentBy(msisdnPrefix + "001")); n != 0 {
+		t.Fatalf("the phone sent %d notifications for a message nobody has", n)
+	}
+	if status, _ := h.call(http.MethodPost, "/v1/endpoints/phone/imdn", map[string]any{"to": "car", "message_id": "kept-B", "status": "displayed"}); status != http.StatusNotFound {
+		t.Fatalf("a display notification for a message never shown answered %d, want 404", status)
+	}
+	// Then the stream, and a registration: it comes, and is delivered.
+	ev := h.events()
+	h.call(http.MethodPut, "/v1/endpoints/phone", map[string]bool{"online": false})
+	h.online("phone")
+	if m := ev.await("message", "phone"); m["message_id"] != "kept-B" || m["body"] != "kept" {
+		t.Fatalf("message event %v", m)
+	}
+	if d := ev.await("imdn", "car"); d["message_id"] != "kept-B" || d["status"] != "delivered" {
+		t.Fatalf("imdn event %v", d)
+	}
+	if status, _ := h.call(http.MethodPost, "/v1/endpoints/phone/imdn", map[string]any{"to": "car", "message_id": "kept-B", "status": "displayed"}); status != http.StatusOK {
+		t.Fatalf("a display notification for the message shown answered %d", status)
+	}
+}
+
+// A message id the endpoint showed once stays displayable when a later
+// message with the same id is refused.
+func TestARefusedRepeatKeepsTheMessageShownBefore(t *testing.T) {
+	r := newRecent(4)
+	first := received{request: imdn.Request{MessageID: "m", Dispositions: imdn.Display}}
+	r.put("m", first)
+	undo := r.put("m", received{})
+	undo()
+	if got, ok := r.get("m"); !ok || got.request.Dispositions != imdn.Display {
+		t.Fatalf("got %v %v, want the first message back", got, ok)
+	}
+	undo = r.put("n", received{})
+	undo()
+	if _, ok := r.get("n"); ok || len(r.order) != 1 {
+		t.Fatalf("a refused message is still remembered (%d in order)", len(r.order))
 	}
 }
 
@@ -327,6 +404,9 @@ func TestBadRequestBodiesAre400(t *testing.T) {
 		{"/v1/endpoints/car", "{"},
 		{"/v1/endpoints/car", `{"online": "yes"}`},
 		{"/v1/endpoints/car", `{} {}`},
+		// Mistyped, which would otherwise be online.
+		{"/v1/endpoints/car", `{"onlin": false}`},
+		{"/v1/endpoints/car/messages", map[string]any{"to": "phone", "content_type": "text", "body": "x"}},
 		{"/v1/endpoints/car/messages", map[string]any{"body": "x"}},
 		{"/v1/endpoints/car/messages", map[string]any{"to": "nobody", "body": "x"}},
 		{"/v1/endpoints/car/messages", map[string]any{"to": "mailto:x@example.test", "body": "x"}},

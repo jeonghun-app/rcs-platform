@@ -180,6 +180,18 @@ up: image compose-env ## Start the local stack and wait until every service is h
 bridge-up: up ## Start the local stack and rcs-bridge, and wait until it is healthy
 	$(COMPOSE) --profile bridge up -d --build --wait --wait-timeout 120 rcs-bridge
 
+# The rcs-bridge test of make e2e-compose run against the compose service
+# make bridge-up started (RCS_BRIDGE_E2E_URL), so that its image, its
+# settings and its health check are checked too, not only the bridge the
+# test builds itself.
+.PHONY: e2e-bridge
+e2e-bridge: volumes ## End-to-end: the rcs-bridge test against the compose service
+	@$(DOCKER) network inspect $(COMPOSE_PROJECT)_default >/dev/null 2>&1 && [ -f $(COMPOSE_ENV) ] || \
+	  { echo "no local stack $(COMPOSE_PROJECT) is running: run make bridge-up first" >&2; exit 1; }
+	$(RUNGO) --network $(COMPOSE_PROJECT)_default --env-file $(COMPOSE_ENV) -e CGO_ENABLED=0 \
+	  -e RCS_BRIDGE_E2E_URL=http://rcs-bridge:8720 \
+	  $(GOIMAGE) go test -tags e2ecompose -count=1 -v -run '^TestE2EBridgeOnTheComposeStack$$' ./tools/rcs-sim/e2e/
+
 .PHONY: down
 down: compose-env ## Stop the local stack and remove its containers and data
 	$(COMPOSE) --profile seed --profile bridge down -v --remove-orphans

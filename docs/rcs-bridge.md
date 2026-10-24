@@ -129,14 +129,16 @@ token, the answer is 401 with `WWW-Authenticate: Bearer realm="rcs-bridge"`.
 The token is compared in constant time.
 
 Answers are JSON. Errors are `{"error": "..."}`. Request bodies are JSON
-objects of at most 64 KiB; fields the bridge does not know are ignored.
+objects of at most 64 KiB. Fields the bridge does not know are ignored, but
+for `PUT`, where a mistyped `online` would otherwise read as `true`: there
+they are refused with 400.
 
 ### Endpoint names
 
 1 to 64 bytes of letters, digits and combining marks in any script, and
-`.`, `_`, `~` and `-`. They are compared byte for byte, so `Car` and `car`
-are two endpoints. A name has no `:`, which is how `to` tells a name from a
-URI.
+`.`, `_`, `~` and `-`, other than `.` and `..`, which a URL path resolves
+away. They are compared byte for byte, so `Car` and `car` are two
+endpoints. A name has no `:`, which is how `to` tells a name from a URI.
 
 ### PUT /v1/endpoints/{name}
 
@@ -184,7 +186,7 @@ target, `DateTime`, the IMDN `Message-ID`, and the notifications asked for
 | Field | Meaning |
 |---|---|
 | `to` | an endpoint name of this bridge (its SIP identity is the target), or a `sip:`/`sips:` URI, or a global `tel:` URI, used as it is |
-| `content_type` | the content's media type; `text/plain;charset=utf-8` when absent |
+| `content_type` | the content's media type, `type/subtype` with any parameters; `text/plain;charset=utf-8` when absent |
 | `body` | the content |
 | `message_id` | the IMDN Message-ID: a CPIM token of at most 128 characters (`rcs-as`'s bound). The bridge makes one (128 random bits) when absent |
 | `imdn` | the notifications asked for: `"delivery"` (positive delivery) and `"display"`. None when absent |
@@ -272,7 +274,11 @@ and so is a notification: `rcs-as` then keeps it and sends it again when the
 endpoint next registers, or when its retry timer runs (`RCSAS_RETRY_INTERVAL`,
 1 minute, doubling; [rcs-as](rcs-as.md#when-a-queue-is-read-again)). To have
 what was kept come at once, open a stream and put the endpoint offline and
-online again. A message it cannot read (not `message/cpim`, or a CPIM or IMDN
+online again. Open the stream before putting endpoints online: what `rcs-as`
+kept for an endpoint comes as soon as it registers, and with no stream open
+it is refused and kept again, to come only at the next registration. A
+message refused so is not remembered, so a display notification about it is
+404 until it has come on a stream. A message it cannot read (not `message/cpim`, or a CPIM or IMDN
 header it cannot parse) is refused with 415 or 400, so that the network does
 not take it for delivered.
 
@@ -330,15 +336,19 @@ keys, the tokens and Message-IDs are never logged. A request line, at
 - `make e2e-compose` runs `TestE2EBridgeOnTheComposeStack`
   (`tools/rcs-sim/e2e/bridge_test.go`): it builds the bridge and runs it on
   the test container. Two endpoints register through the IMS core. A message
-  sent while no stream is open is refused with 480 and kept by `rcs-as`, and
-  comes, with its delivery notification, once a stream is open and the
-  receiver registers again. A message goes from one to the other through
+  sent while no stream is open is refused with 480 and kept by `rcs-as`; so
+  is one kept while the receiver was offline when the receiver is put online
+  before a stream is open. Both come, with their delivery notifications, once
+  a stream is open and the receiver registers again. A message goes from one to the other through
   `rcs-as` (202) with its delivery notification, a display notification goes
   back, and a message to the receiver offline arrives once it is online
   again. The bridge's log must hold no token, body or digit run of an
-  identity. With `RCS_BRIDGE_E2E_URL=http://rcs-bridge:8720` the same test
-  runs against the compose service instead; it then assumes no other client
-  has a stream open.
+  identity.
+- `make e2e-bridge` runs the same test against the compose service that
+  `make bridge-up` started (`RCS_BRIDGE_E2E_URL=http://rcs-bridge:8720`), so
+  that its image, its settings and its health check are tested too. It
+  assumes no other client has a stream open. The CI job "end to end (compose
+  stack)" runs `make bridge-up`, `make e2e-compose` and `make e2e-bridge`.
 
 ## Troubleshooting
 

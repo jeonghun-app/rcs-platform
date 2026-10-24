@@ -13,10 +13,12 @@ const maxNameLength = 64
 
 // validName reports whether name may name an endpoint: 1 to 64 bytes of
 // letters, digits, marks and ".", "_", "~", "-", in any script, compared
-// byte for byte. No ":" and no "/": a name stands in a URL path, and "to"
+// byte for byte, other than "." and "..". No ":" and no "/": a name stands in a URL path, and "to"
 // tells a name from a sip: or tel: URI by its ":".
 func validName(name string) bool {
-	if name == "" || len(name) > maxNameLength || !utf8.ValidString(name) {
+	// "." and ".." are path segments a URL resolves away (RFC 3986 §5.2.4),
+	// and ServeMux redirects them: they could never be used.
+	if name == "" || name == "." || name == ".." || len(name) > maxNameLength || !utf8.ValidString(name) {
 		return false
 	}
 	for _, r := range name {

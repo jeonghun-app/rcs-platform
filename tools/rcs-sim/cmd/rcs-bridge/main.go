@@ -204,8 +204,8 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	}
 	srv := &http.Server{
 		Handler: b.Handler(),
-		// The event stream outlives these: websocket.Upgrade clears the
-		// connection's deadlines once it has taken it over. They bound the
+		// The event stream outlives these: the connection's deadlines are
+		// cleared once websocket.Upgrade has taken it over. They bound the
 		// rest, so that a connection that sends nothing, or keeps an idle
 		// keep-alive after a 401, does not hold its descriptor for ever.
 		// The write timeout is above the bridge's own bound of a request's

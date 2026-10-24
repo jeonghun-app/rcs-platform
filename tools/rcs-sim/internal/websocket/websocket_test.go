@@ -439,3 +439,45 @@ func TestHandshakesThatAreNotVersion13WebSocketsAreRefused(t *testing.T) {
 		t.Fatalf("a POST handshake: %v %v", res, err)
 	}
 }
+
+// After its Close the server waits closeWait for the client's, and no
+// longer: a client that never answers does not hold the connection (QA on
+// #661).
+func TestAClientThatNeverAnswersTheCloseIsLetGo(t *testing.T) {
+	saved := closeWait
+	closeWait = 100 * time.Millisecond
+	defer func() { closeWait = saved }()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	nc, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	c := newConn(nc, nc, nc, Options{})
+	if err := c.Close(StatusGoingAway, "bye"); err != nil {
+		t.Fatal(err)
+	}
+	read := make(chan error, 1)
+	go func() {
+		_, _, err := c.Read()
+		read <- err
+	}()
+	select {
+	case err := <-read:
+		var ne net.Error
+		if !errors.As(err, &ne) || !ne.Timeout() {
+			t.Fatalf("Read = %v, want the close wait's timeout", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Read still waits for a Close that never comes")
+	}
+}

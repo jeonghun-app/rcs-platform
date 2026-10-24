@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,32 +27,24 @@ func TestEveryStreamGetsEveryEventInOrder(t *testing.T) {
 	}
 }
 
+// One stream reads, one does not: once the reader has emptied its queue,
+// the next event fills the other's and drops it, and the reader gets it.
+// In that order, on the test's goroutine, so that no scheduling can let the
+// reader's queue fill too (QA on #661: -cpu 1 failed every time).
 func TestAStreamThatFallsBehindIsDroppedWithoutHoldingTheOthers(t *testing.T) {
 	hb := newHub()
 	slow, _ := hb.subscribe()
 	fast, _ := hb.subscribe()
-	got := make(chan int)
-	go func() {
-		n := 0
-		for {
-			select {
-			case <-fast.events:
-				n++
-			case <-fast.gone:
-				got <- n
-				return
-			}
-			if n == subscriberQueue+10 {
-				got <- n
-				return
-			}
+	for i := range subscriberQueue {
+		if n := hb.publish(registrationEvent{Type: "registration", Endpoint: fmt.Sprint(i)}); n != 2 {
+			t.Fatalf("event %d went to %d streams, want both", i, n)
 		}
-	}()
-	for i := range subscriberQueue + 10 {
-		hb.publish(registrationEvent{Type: "registration", Endpoint: fmt.Sprint(i)})
 	}
-	if n := <-got; n != subscriberQueue+10 {
-		t.Fatalf("the reading stream got %d events", n)
+	for range subscriberQueue {
+		<-fast.events
+	}
+	if n := hb.publish(registrationEvent{Type: "registration", Endpoint: "one more"}); n != 1 {
+		t.Fatalf("the event past the slow stream's queue went to %d streams, want the reader's only", n)
 	}
 	select {
 	case <-slow.gone:
@@ -60,6 +53,14 @@ func TestAStreamThatFallsBehindIsDroppedWithoutHoldingTheOthers(t *testing.T) {
 	}
 	if slow.closing != closedBehind {
 		t.Fatalf("dropped for %v", slow.closing)
+	}
+	select {
+	case <-fast.gone:
+		t.Fatal("the reading stream was dropped")
+	case ev := <-fast.events:
+		if !strings.Contains(string(ev), "one more") {
+			t.Fatalf("the reader got %s", ev)
+		}
 	}
 }
 
@@ -118,6 +119,26 @@ func TestAStreamIsPingedAndClosedWhenAPingGoesUnanswered(t *testing.T) {
 		defer h.b.hub.mu.Unlock()
 		return len(h.b.hub.subs) == 0
 	})
+}
+
+// A client that vanishes without a Close gives its slot back once the
+// bridge reads the end of its connection, without waiting for the ping
+// timeout (QA on #661).
+func TestStreamsThatVanishGiveTheirSlotsBack(t *testing.T) {
+	h := newHarness(t)
+	var streams []*stream
+	for range maxSubscribers {
+		streams = append(streams, h.events())
+	}
+	for _, s := range streams {
+		s.c.Drop()
+	}
+	eventually(t, "the slots are free", func() bool {
+		h.b.hub.mu.Lock()
+		defer h.b.hub.mu.Unlock()
+		return len(h.b.hub.subs) == 0
+	})
+	h.events()
 }
 
 func TestStreamsBeyondTheBoundAreRefused(t *testing.T) {

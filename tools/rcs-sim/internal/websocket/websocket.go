@@ -54,11 +54,13 @@ const (
 	// DefaultWriteTimeout bounds one frame write, so that a client that
 	// stops reading cannot hold its writer for ever.
 	DefaultWriteTimeout = 10 * time.Second
-	// closeWait is how long the connection waits for the client's Close
-	// once it has sent its own (§7.1.1: the server closes the TCP
-	// connection first, once the handshake is done).
-	closeWait = 5 * time.Second
 )
+
+// closeWait is how long the connection waits for the client's Close once
+// it has sent its own (§7.1.1: the server closes the TCP connection first,
+// once the handshake is done). A variable for the test of a client that
+// never answers.
+var closeWait = 5 * time.Second
 
 // Options configures a connection.
 type Options struct {
@@ -153,7 +155,8 @@ func Upgrade(w http.ResponseWriter, r *http.Request, o Options) (*Conn, error) {
 		return nil, err
 	}
 	// The server's read and write timeouts, if any, were set for one HTTP
-	// exchange; the connection now lives as long as the stream.
+	// exchange; the connection now lives as long as the stream. net/http's
+	// Hijack clears them already; this keeps Upgrade from relying on it.
 	_ = nc.SetDeadline(time.Time{})
 	c := newConn(nc, brw.Reader, nc, o)
 	if _, err := io.WriteString(brw.Writer, "HTTP/1.1 101 Switching Protocols\r\n"+

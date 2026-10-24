@@ -34,10 +34,12 @@ const bridgeURLVar = "RCS_BRIDGE_E2E_URL"
 // The bridge's endpoints in this test. The names are fixed, so that a rerun
 // finds the subscriptions an earlier run made in hss (by name) instead of
 // taking two slots more each time; what an earlier run left in rcs-as's
-// queues is told apart by its Message-ID.
+// queues is told apart by its Message-ID. The compose service's are its
+// own: two bridges given one name re-key one subscription, and one whose
+// run stopped half way would keep a flow with keys hss no longer has.
 const (
-	bridgeCar   = "e2e-car"
-	bridgePhone = "e2e-phone"
+	bridgeCar, bridgePhone   = "e2e-car", "e2e-phone"
+	serviceCar, servicePhone = "e2e-svc-car", "e2e-svc-phone"
 )
 
 // TestE2EBridgeOnTheComposeStack (#658): two endpoints the bridge creates
@@ -58,7 +60,7 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 	br := startBridge(ctx, t)
 
 	// Without the token: 401, and no event stream.
-	if status, _ := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+bridgeCar, "", map[string]bool{"online": true}); status != http.StatusUnauthorized {
+	if status, _ := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+br.car, "", map[string]bool{"online": true}); status != http.StatusUnauthorized {
 		t.Fatalf("a PUT without the token answered %d, want 401", status)
 	}
 	if c, res, err := wstest.Dial(br.url+"/v1/events", nil); err == nil || res == nil || res.StatusCode != http.StatusUnauthorized {
@@ -68,7 +70,7 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 		t.Fatalf("the event stream without the token: %v %v, want 401", res, err)
 	}
 
-	for _, name := range []string{bridgeCar, bridgePhone} {
+	for _, name := range []string{br.car, br.phone} {
 		status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+name, br.token, map[string]bool{"online": true})
 		if status/100 != 2 || out["registered"] != true {
 			t.Fatalf("PUT %s online answered %d %v", name, status, out)
@@ -82,70 +84,86 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 	text := "rcs-bridge e2e " + run + " 한글 ✓"
 	id := "e2e-" + run
 
-	// No event stream is open yet, so nobody can take a message: the
-	// phone's bridge answers rcs-as 480, rcs-as keeps the message, and the
-	// car hears nothing. Once a stream is open and the phone registers
-	// again, rcs-as delivers it, and only then is it delivered (code
-	// review on #661). This assumes no other client holds a stream to the
-	// bridge, which is so for the one the test starts.
-	early := id + "-early"
-	if out := br.send(ctx, t, bridgeCar, map[string]any{"to": bridgePhone, "body": text + " early", "message_id": early, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
+	// No event stream is open yet, so nobody can take a message (code
+	// review and QA on #661). A: sent while the phone is online, the
+	// phone's bridge answers rcs-as 480; rcs-as keeps the message and the
+	// car hears nothing. B: sent while the phone is offline, kept by
+	// rcs-as, and the phone put online before a stream is open, as a
+	// gateway starting up would: rcs-as delivers what it kept on the
+	// registration, and it is refused again rather than lost. Once a
+	// stream is open and the phone registers again, both come, and only
+	// then are they delivered. This assumes no other client holds a
+	// stream to the bridge, which is so for the one the test starts.
+	const refused = `"msg":"message refused: no event stream is open"`
+	early, kept := id+"-early", id+"-kept"
+	if out := br.send(ctx, t, br.car, map[string]any{"to": br.phone, "body": text + " early", "message_id": early, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
 		t.Fatalf("the send with no stream open answered %v, want rcs-as's 202", out)
 	}
-	br.awaitLog(ctx, t, `"msg":"message refused: no event stream is open"`)
+	br.awaitLog(ctx, t, refused, 1)
+	br.setOnline(ctx, t, br.phone, false)
+	if out := br.send(ctx, t, br.car, map[string]any{"to": br.phone, "body": text + " kept", "message_id": kept, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
+		t.Fatalf("the send to the offline phone answered %v, want rcs-as's 202", out)
+	}
+	br.setOnline(ctx, t, br.phone, true)
+	br.awaitLog(ctx, t, refused, 2)
 	ev := br.events(t)
-	for _, online := range []bool{false, true} {
-		if status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+bridgePhone, br.token, map[string]bool{"online": online}); status != http.StatusOK || out["registered"] != online {
-			t.Fatalf("PUT %s online=%v answered %d %v", bridgePhone, online, status, out)
+	br.setOnline(ctx, t, br.phone, false)
+	br.setOnline(ctx, t, br.phone, true)
+	// The two messages and their notifications, in whatever order they
+	// interleave.
+	got := ev.awaitAll(t, []eventKey{
+		{"message", br.phone, early, ""}, {"message", br.phone, kept, ""},
+		{"imdn", br.car, early, "delivered"}, {"imdn", br.car, kept, "delivered"},
+	})
+	for k, e := range got {
+		switch {
+		case k.typ == "message" && (!strings.HasPrefix(str(e["body"]), text) || e["from_endpoint"] != br.car):
+			t.Fatalf("message event %v", e)
+		case k.typ == "imdn" && e["from_endpoint"] != br.phone:
+			t.Fatalf("delivery notification event %v", e)
 		}
-	}
-	if m := ev.await(t, "message", bridgePhone, early, ""); m["body"] != text+" early" || m["from_endpoint"] != bridgeCar {
-		t.Fatalf("message event %v", m)
-	}
-	if d := ev.await(t, "imdn", bridgeCar, early, "delivered"); d["from_endpoint"] != bridgePhone {
-		t.Fatalf("delivery notification event %v", d)
 	}
 
 	// rcs-as answers 202 to what it stores (docs/rcs-as.md, Answers); the
 	// phone's own 200 would mean the MESSAGE went past it.
-	if out := br.send(ctx, t, bridgeCar, map[string]any{"to": bridgePhone, "content_type": "text/plain;charset=utf-8", "body": text, "message_id": id, "imdn": []string{"delivery", "display"}}); out["sip_status"] != float64(202) || out["message_id"] != id {
+	if out := br.send(ctx, t, br.car, map[string]any{"to": br.phone, "content_type": "text/plain;charset=utf-8", "body": text, "message_id": id, "imdn": []string{"delivery", "display"}}); out["sip_status"] != float64(202) || out["message_id"] != id {
 		t.Fatalf("the send answered %v, want rcs-as's 202", out)
 	}
-	m := ev.await(t, "message", bridgePhone, id, "")
-	if m["body"] != text || m["content_type"] != "text/plain;charset=utf-8" || m["from_endpoint"] != bridgeCar || !strings.HasPrefix(str(m["from"]), "tel:+15550108") {
+	m := ev.await(t, "message", br.phone, id, "")
+	if m["body"] != text || m["content_type"] != "text/plain;charset=utf-8" || m["from_endpoint"] != br.car || !strings.HasPrefix(str(m["from"]), "tel:+15550108") {
 		t.Fatalf("message event %v", m)
 	}
-	if d := ev.await(t, "imdn", bridgeCar, id, "delivered"); d["from_endpoint"] != bridgePhone {
+	if d := ev.await(t, "imdn", br.car, id, "delivered"); d["from_endpoint"] != br.phone {
 		t.Fatalf("delivery notification event %v", d)
 	}
 
-	status, out := br.call(ctx, t, http.MethodPost, "/v1/endpoints/"+bridgePhone+"/imdn", br.token, map[string]any{"to": bridgeCar, "message_id": id, "status": "displayed"})
+	status, out := br.call(ctx, t, http.MethodPost, "/v1/endpoints/"+br.phone+"/imdn", br.token, map[string]any{"to": br.car, "message_id": id, "status": "displayed"})
 	if status != http.StatusOK || out["sip_status"] != float64(202) {
 		t.Fatalf("the display notification answered %d %v, want rcs-as's 202", status, out)
 	}
-	if d := ev.await(t, "imdn", bridgeCar, id, "displayed"); d["from_endpoint"] != bridgePhone {
+	if d := ev.await(t, "imdn", br.car, id, "displayed"); d["from_endpoint"] != br.phone {
 		t.Fatalf("display notification event %v", d)
 	}
 
 	// The phone goes offline: rcs-as keeps the message until it registers
 	// again.
-	if status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+bridgePhone, br.token, map[string]bool{"online": false}); status != http.StatusOK || out["registered"] != false {
+	if status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+br.phone, br.token, map[string]bool{"online": false}); status != http.StatusOK || out["registered"] != false {
 		t.Fatalf("PUT offline answered %d %v", status, out)
 	}
-	ev.awaitState(t, bridgePhone, "unregistered")
+	ev.awaitState(t, br.phone, "unregistered")
 	stored := id + "-stored"
-	if out := br.send(ctx, t, bridgeCar, map[string]any{"to": bridgePhone, "body": text + " stored", "message_id": stored, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
+	if out := br.send(ctx, t, br.car, map[string]any{"to": br.phone, "body": text + " stored", "message_id": stored, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
 		t.Fatalf("the send to the offline phone answered %v, want rcs-as's 202", out)
 	}
-	if status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+bridgePhone, br.token, map[string]bool{"online": true}); status != http.StatusOK || out["registered"] != true {
+	if status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+br.phone, br.token, map[string]bool{"online": true}); status != http.StatusOK || out["registered"] != true {
 		t.Fatalf("PUT online again answered %d %v", status, out)
 	}
-	if m := ev.await(t, "message", bridgePhone, stored, ""); m["body"] != text+" stored" || m["from_endpoint"] != bridgeCar {
+	if m := ev.await(t, "message", br.phone, stored, ""); m["body"] != text+" stored" || m["from_endpoint"] != br.car {
 		t.Fatalf("stored message event %v", m)
 	}
-	ev.await(t, "imdn", bridgeCar, stored, "delivered")
+	ev.await(t, "imdn", br.car, stored, "delivered")
 
-	for _, name := range []string{bridgeCar, bridgePhone} {
+	for _, name := range []string{br.car, br.phone} {
 		br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+name, br.token, map[string]bool{"online": false})
 	}
 	br.checkLogs(t, br.token, env(t, "HSS_ADMIN_TOKEN"), run)
@@ -154,6 +172,8 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 // bridgeUnderTest is the bridge the test talks to.
 type bridgeUnderTest struct {
 	url, token string
+	// car and phone are the endpoints' names.
+	car, phone string
 	// logs is the bridge's output when the test started it.
 	logs *lockedBuffer
 }
@@ -164,11 +184,11 @@ type bridgeUnderTest struct {
 func startBridge(ctx context.Context, t *testing.T) *bridgeUnderTest {
 	t.Helper()
 	if u := os.Getenv(bridgeURLVar); u != "" {
-		return &bridgeUnderTest{url: strings.TrimSuffix(u, "/"), token: env(t, "RCS_BRIDGE_TOKEN")}
+		return &bridgeUnderTest{url: strings.TrimSuffix(u, "/"), token: env(t, "RCS_BRIDGE_TOKEN"), car: serviceCar, phone: servicePhone}
 	}
 	bin := build(t, "./tools/rcs-sim/cmd/rcs-bridge")
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(simtest.FreePort(t)))
-	br := &bridgeUnderTest{url: "http://" + addr, token: randomHex(t) + randomHex(t), logs: &lockedBuffer{}}
+	br := &bridgeUnderTest{url: "http://" + addr, token: randomHex(t) + randomHex(t), logs: &lockedBuffer{}, car: bridgeCar, phone: bridgePhone}
 	cmd := exec.Command(filepath.Join(bin, "rcs-bridge"))
 	cmd.Env = []string{
 		"RCS_BRIDGE_TOKEN=" + br.token,
@@ -260,16 +280,25 @@ func (b *bridgeUnderTest) send(ctx context.Context, t *testing.T, endpoint strin
 	return out
 }
 
-// awaitLog waits until the bridge's log has line, when the test started
-// the bridge; for one it did not start, it waits a few seconds instead.
-func (b *bridgeUnderTest) awaitLog(ctx context.Context, t *testing.T, line string) {
+// setOnline puts endpoint online or offline and checks the answer.
+func (b *bridgeUnderTest) setOnline(ctx context.Context, t *testing.T, endpoint string, online bool) {
+	t.Helper()
+	if status, out := b.call(ctx, t, http.MethodPut, "/v1/endpoints/"+endpoint, b.token, map[string]bool{"online": online}); status != http.StatusOK || out["registered"] != online {
+		t.Fatalf("PUT %s online=%v answered %d %v", endpoint, online, status, out)
+	}
+}
+
+// awaitLog waits until the bridge's log has line n times, when the test
+// started the bridge; for one it did not start, it waits a few seconds
+// instead.
+func (b *bridgeUnderTest) awaitLog(ctx context.Context, t *testing.T, line string, n int) {
 	t.Helper()
 	if b.logs == nil {
 		time.Sleep(3 * time.Second)
 		return
 	}
 	deadline := time.Now().Add(30 * time.Second)
-	for !strings.Contains(b.logs.String(), line) {
+	for strings.Count(b.logs.String(), line) < n {
 		if time.Now().After(deadline) || ctx.Err() != nil {
 			t.Fatalf("the bridge never logged %s:\n%s", line, b.logs.String())
 		}
@@ -328,6 +357,32 @@ func (s *eventStream) await(t *testing.T, typ, endpoint, messageID, status strin
 	}
 	t.Fatalf("no %s event for %s about %s", typ, endpoint, messageID)
 	return nil
+}
+
+// eventKey names an event: its type, endpoint, Message-ID and status ("" for
+// any).
+type eventKey struct{ typ, endpoint, messageID, status string }
+
+// awaitAll returns the events of want, by key, in whatever order they come,
+// skipping the others.
+func (s *eventStream) awaitAll(t *testing.T, want []eventKey) map[eventKey]map[string]any {
+	t.Helper()
+	got := map[eventKey]map[string]any{}
+	deadline := time.Now().Add(time.Minute)
+	for len(got) < len(want) && time.Now().Before(deadline) {
+		ev := s.next(t, time.Until(deadline))
+		for _, k := range want {
+			if ev["type"] == k.typ && ev["endpoint"] == k.endpoint && ev["message_id"] == k.messageID && (k.status == "" || ev["status"] == k.status) {
+				got[k] = ev
+			}
+		}
+	}
+	for _, k := range want {
+		if got[k] == nil {
+			t.Fatalf("no %s event for %s about %s", k.typ, k.endpoint, k.messageID)
+		}
+	}
+	return got
 }
 
 func (s *eventStream) awaitState(t *testing.T, endpoint, state string) {

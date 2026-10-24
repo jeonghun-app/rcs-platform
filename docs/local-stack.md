@@ -29,6 +29,7 @@ contracts as in AWS (#56); [Local and AWS](#local-and-aws) lists what differs.
 make up            # build the image, start everything, wait until healthy, seed
 make e2e-compose   # rcs-sim and the acs checks against the running stack
 make bridge-up     # make up, then rcs-bridge (docs/rcs-bridge.md)
+make e2e-bridge    # the rcs-bridge test against that compose service
 make logs          # the last 200 lines of every service; make logs LOGS="-f hss"
 make down          # stop and remove the containers and all data
 ```
@@ -335,8 +336,9 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
    display notifications, and one to the receiver offline arrives once it is
    online again.
 
-The CI job "end to end (compose stack)" runs `make up`, `make e2e-compose`,
-`make logs` on failure, and `make down`.
+The CI job "end to end (compose stack)" runs `make bridge-up` (`make up` and
+[rcs-bridge](rcs-bridge.md)), `make e2e-compose`, `make e2e-bridge`, `make
+logs` on failure, and `make down`.
 
 ## Local and AWS
 
