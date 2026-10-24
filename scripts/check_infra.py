@@ -15,24 +15,37 @@ platform the ADRs describe:
   only, docs/ft-server.md);
 * every task definition has a read-only root file system, drops all Linux
   capabilities and is not privileged, and no service enables ECS Exec
-  (ADR 0007 §9);
+  (ADR 0007 §9); hss's health check outlasts HSS_START_TIMEOUT;
 * every DynamoDB table has point-in-time recovery (ADR 0003);
 * no task role can read a secret: secrets reach tasks through the execution
   role only (ADR 0007 §4);
-* tables holding capabilities are read only by their own service's task
-  role, and nothing may export them: msrp-bindings holds rcs-as session ids
-  (threat model T3, #54); a wildcard ARN, or one naming the table, counts;
+* tables holding capabilities or message content are read only by their own
+  service's task role, and nothing may export them: msrp-bindings holds
+  rcs-as session ids (threat model T3, #54), messages holds queued messages,
+  the S-CSCF tables hold IMPIs and device addresses, under their own key; a
+  wildcard ARN, or one naming the table, counts;
 * every task role is granted each action its service's code calls
-  (infra/task-role-actions.yaml).
+  (infra/task-role-actions.yaml);
+* alarms follow the EMF rules of docs/architecture.md §8: periods of 60 s or
+  more, N >= 2, explicit treatMissingData, no sampled timing statistics, and
+  at most 10 metrics each;
+* every VPC endpoint has a policy holding it to this account;
+* with the interface endpoints on, no group sends to an address range, and
+  ft-server's egress is only the HSS API, the S3 and DynamoDB prefix lists
+  and the endpoints (#105);
+* with --runbook, every alarm links the runbook section named after it, and
+  that section exists, so whoever is paged lands on what to do.
 
 Runs in the infra tools image (deploy/infra-tools.Dockerfile), which provides
-cfn-lint's CloudFormation YAML decoder. Usage: check_infra.py TEMPLATE...
+cfn-lint's CloudFormation YAML decoder. Usage:
+check_infra.py [--runbook docs/runbook.md] TEMPLATE...
 Exit status 1 lists every problem.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import importlib.util
 import pathlib
 import re
 import sys
@@ -54,6 +67,31 @@ EXPECTED_INGRESS: dict[tuple[str, int], set[str]] = {
     ("FtServerSecurityGroup", 8081): {"AlbSecurityGroup"},
     ("FtServerSecurityGroup", 8080): {"AlbSecurityGroup"},
     ("AcsSecurityGroup", 8080): {"AlbSecurityGroup"},
+    # The interface endpoints (with InterfaceEndpoints): private DNS sends
+    # every task's AWS API calls there.
+    ("EndpointSecurityGroup", 443): {
+        "PcscfSecurityGroup", "IcscfSecurityGroup", "ScscfSecurityGroup", "RcsAsSecurityGroup", "HssSecurityGroup",
+        "MsrpRelaySecurityGroup", "FtServerSecurityGroup", "AcsSecurityGroup", "OperatorSecurityGroup",
+    },
+}
+
+# Egress to the gateway endpoints' prefix lists: ft-server's only way to S3
+# and DynamoDB, held to them (#105).
+SERVICE_GROUPS_ALL = (
+    "PcscfSecurityGroup", "IcscfSecurityGroup", "ScscfSecurityGroup", "RcsAsSecurityGroup", "HssSecurityGroup",
+    "MsrpRelaySecurityGroup", "FtServerSecurityGroup", "AcsSecurityGroup", "OperatorSecurityGroup",
+)
+ALLOWED_PREFIX_EGRESS = {
+    (group, prefix, 443) for group in SERVICE_GROUPS_ALL for prefix in ("S3PrefixListId", "DynamoDbPrefixListId")
+}
+
+# Everything ft-server may send to with the interface endpoints on (#105):
+# (kind, peer, port), kind "sg" for a group, "pl" for a prefix list.
+FT_SERVER_EGRESS = {
+    ("sg", "HssSecurityGroup", 8081),
+    ("sg", "EndpointSecurityGroup", 443),
+    ("pl", "S3PrefixListId", 443),
+    ("pl", "DynamoDbPrefixListId", 443),
 }
 
 # Internet-facing groups and the TCP ports they may admit from an address
@@ -82,6 +120,7 @@ class Rule:
     peer_group: str | None
     cidr: str | None
     other: str | None  # prefix lists, IPv6 ranges: never expected
+    prefix: str | None = None  # the prefix list parameter, for DestinationPrefixListId
 
 
 def load(path: str) -> dict:
@@ -126,6 +165,7 @@ def _rule(group: str, props: dict, peer_key: str) -> Rule:
         peer_group=logical_id(props.get(peer_key)),
         cidr=cidr,
         other=other,
+        prefix=logical_id(props.get("DestinationPrefixListId")),
     )
 
 
@@ -196,6 +236,8 @@ def check_security_groups(template: dict) -> list[str]:
     seen_egress = set()
     for r in egress:
         where = f"{r.group} egress {r.protocol} {r.from_port}-{r.to_port}"
+        if r.other == "DestinationPrefixListId" and (r.group, r.prefix, r.from_port) in ALLOWED_PREFIX_EGRESS:
+            continue
         if r.other:
             problems.append(f"{where}: {r.other} egress is not expected")
         elif r.cidr is not None:
@@ -215,10 +257,129 @@ def check_security_groups(template: dict) -> list[str]:
     return problems
 
 
+def check_ft_server_egress(template: dict) -> list[str]:
+    """With the interface endpoints on, ft-server reaches only the HSS API,
+    S3 and DynamoDB through their gateway endpoints, and the endpoints (#105).
+
+    Rules that exist only without them (dev) are left out: that is the case
+    staging and prod run, which the Rules enforce.
+    """
+    group = "FtServerSecurityGroup"
+    found = set()
+    sg = resources(template, "AWS::EC2::SecurityGroup").get(group, {})
+    rules = [(p, c) for p, c in inline_rules(sg.get("Properties", {}).get("SecurityGroupEgress", []))]
+    for res in resources(template, "AWS::EC2::SecurityGroupEgress").values():
+        props = res.get("Properties", {})
+        if logical_id(props.get("GroupId")) == group:
+            rules.append((props, res.get("Condition")))
+    for props, condition in rules:
+        if condition == "NoInterfaceEndpoints":
+            continue
+        r = _rule(group, props, "DestinationSecurityGroupId")
+        if r.prefix:
+            found.add(("pl", r.prefix, r.from_port))
+        elif r.peer_group:
+            found.add(("sg", r.peer_group, r.from_port))
+        else:
+            found.add(("cidr", str(r.cidr), r.from_port))
+    problems = [f"{group}: may send to {kind} {peer} port {port}; with interface endpoints ft-server reaches only "
+                "the HSS API, S3, DynamoDB and the endpoints (#105)" for kind, peer, port in sorted(found - FT_SERVER_EGRESS)]
+    problems += [f"{group}: cannot reach {kind} {peer} port {port}" for kind, peer, port in sorted(FT_SERVER_EGRESS - found)]
+    return problems
+
+
+# The one statement not held to this account: image layers, which ECR
+# serves from a bucket of its own, on the S3 endpoint only.
+ECR_LAYER_BUCKET = {"Fn::Sub": "arn:${AWS::Partition}:s3:::prod-${AWS::Region}-starport-layer-bucket/*"}
+
+
+def check_endpoint_policies(template: dict) -> list[str]:
+    """Every VPC endpoint is held to this account: resources of the account
+    for the gateway endpoints, principals of the account for the interface
+    ones. The only exception is ECR's layer bucket on the S3 endpoint, which
+    image pulls need. Without it, the prefix-list egress would reach any
+    bucket or table in the region."""
+    problems = []
+    for name, ep in resources(template, "AWS::EC2::VPCEndpoint").items():
+        doc = ep.get("Properties", {}).get("PolicyDocument")
+        if not doc:
+            problems.append(f"{name}: no endpoint policy, so it reaches every account")
+            continue
+        for st in expand_statements(doc.get("Statement", [])):
+            if st.get("Effect") != "Allow":
+                continue
+            equals = st.get("Condition", {}).get("StringEquals", {})
+            account = equals.get("aws:ResourceAccount") or equals.get("aws:PrincipalAccount")
+            layer = (name == "S3Endpoint" and st.get("Resource") == ECR_LAYER_BUCKET
+                     and _actions(st) == ["s3:GetObject"] and "NotAction" not in st and "NotResource" not in st)
+            if logical_id(account) != "AWS::AccountId" and not layer:
+                problems.append(f"{name}: an endpoint policy statement not held to this account")
+    return problems
+
+
+def _refs(value) -> set[str]:
+    """Every resource a value names with Ref or GetAtt, at any depth."""
+    if isinstance(value, list):
+        return set().union(*(_refs(v) for v in value)) if value else set()
+    if isinstance(value, dict):
+        name = logical_id(value)
+        found = {name} if name else set()
+        return found.union(*(_refs(v) for v in value.values()))
+    return set()
+
+
+def check_endpoints_ready(template: dict) -> list[str]:
+    """Every ECS service waits for EndpointsReady, and EndpointsReady for
+    every VPC endpoint and every rule of the path to the endpoints' group
+    (both directions): a task started before them finds no image, secret or
+    log group."""
+    res = template.get("Resources", {})
+    ready = res.get("EndpointsReady")
+    if ready is None:
+        return ["EndpointsReady: missing, so services may start before the endpoints exist"]
+    listed = _refs(ready.get("Metadata", {}))
+    wanted = set(resources(template, "AWS::EC2::VPCEndpoint"))
+    for kind in ("AWS::EC2::SecurityGroupIngress", "AWS::EC2::SecurityGroupEgress"):
+        for name, rule in resources(template, kind).items():
+            props = rule.get("Properties", {})
+            peers = {logical_id(props.get(k)) for k in ("GroupId", "SourceSecurityGroupId", "DestinationSecurityGroupId")}
+            if "EndpointSecurityGroup" in peers:
+                wanted.add(name)
+    problems = [f"EndpointsReady: does not wait for {name}" for name in sorted(wanted - listed)]
+    for name, service in resources(template, "AWS::ECS::Service").items():
+        depends = service.get("DependsOn", [])
+        if "EndpointsReady" not in ([depends] if isinstance(depends, str) else depends):
+            problems.append(f"{name}: does not wait for EndpointsReady")
+    return problems
+
+
+def check_egress_with_endpoints(template: dict) -> list[str]:
+    """With the interface endpoints on, no group sends to an address range:
+    the AWS APIs go through the endpoints and the prefix lists, everything
+    else to the peers of the matrix (lead decision on #56)."""
+    problems = []
+    groups = resources(template, "AWS::EC2::SecurityGroup")
+    for name, sg in groups.items():
+        for props, condition in inline_rules(sg.get("Properties", {}).get("SecurityGroupEgress", [])):
+            if condition == "NoInterfaceEndpoints":
+                continue
+            r = _rule(name, props, "DestinationSecurityGroupId")
+            if r.cidr is not None and (r.protocol, r.cidr) != ("icmp", "127.0.0.1/32"):
+                problems.append(f"{name}: sends to {r.cidr} port {r.from_port} even with interface endpoints")
+    for res in resources(template, "AWS::EC2::SecurityGroupEgress").values():
+        props = res.get("Properties", {})
+        if res.get("Condition") != "NoInterfaceEndpoints" and "CidrIp" in props:
+            problems.append(f"{logical_id(props.get('GroupId'))}: sends to {props['CidrIp']} even with interface endpoints")
+    return problems
+
+
 def check_target_groups(template: dict) -> list[str]:
     problems = []
     for name, tg in resources(template, "AWS::ElasticLoadBalancingV2::TargetGroup").items():
         props = tg.get("Properties", {})
+        if not isinstance(props.get("Protocol", ""), str):
+            problems.append(f"{name}: Protocol written with a function, which the checks cannot read")
+            continue
         if props.get("Protocol") not in NETWORK_PROTOCOLS:
             continue
         attrs = {a.get("Key"): str(a.get("Value")).lower() for a in props.get("TargetGroupAttributes", [])}
@@ -289,6 +450,28 @@ def check_plain_listeners(template: dict) -> list[str]:
 LISTENER_PORTS = {"Nlb": {5060, 5061, 2855, 2856}, "Alb": {80, 443}}
 
 
+# Parameters that must be given together: a reused NLB allocation and its
+# address (an empty address would leave a hole in PCSCF_PUBLIC_ADDRS).
+PARAMETER_PAIRS = (("NlbAllocationIdA", "NlbReusedAddressA"), ("NlbAllocationIdB", "NlbReusedAddressB"))
+
+
+def check_parameter_pairs(template: dict) -> list[str]:
+    """A Rule asserts each pair is given together: both empty or both set."""
+    problems = []
+    for first, second in PARAMETER_PAIRS:
+        both_empty = {"Fn::And": [{"Fn::Equals": [{"Ref": first}, ""]}, {"Fn::Equals": [{"Ref": second}, ""]}]}
+        both_set = {"Fn::And": [{"Fn::Not": [{"Fn::Equals": [{"Ref": first}, ""]}]},
+                                {"Fn::Not": [{"Fn::Equals": [{"Ref": second}, ""]}]}]}
+        found = any(a.get("Assert") == {"Fn::Or": [both_empty, both_set]} and "RuleCondition" not in rule
+                    for rule in template.get("Rules", {}).values() for a in rule.get("Assertions", []))
+        if not found:
+            problems.append(f"Rules: nothing asserts {first} and {second} come together")
+    distinct = {"Fn::Not": [{"Fn::Equals": [{"Ref": "NlbAllocationIdA"}, {"Ref": "NlbAllocationIdB"}]}]}
+    if not any(a.get("Assert") == distinct for rule in template.get("Rules", {}).values() for a in rule.get("Assertions", [])):
+        problems.append("Rules: nothing asserts NlbAllocationIdA and NlbAllocationIdB differ")
+    return problems
+
+
 def check_load_balancers(template: dict) -> list[str]:
     """Only Nlb and Alb face the internet, on their listed ports only."""
     problems = []
@@ -356,7 +539,7 @@ def check_host_parameters(template: dict) -> list[str]:
         if not pattern:
             problems.append(f"parameter {name}: no AllowedPattern")
             continue
-        for bad in ("a b", "Ft.Example.com", "-x.example.com", "x"):
+        for bad in ("a b", "Ft.Example.com", "-x.example.com", "x", "a" * 64 + ".example.com"):
             if re.fullmatch(pattern, bad):
                 problems.append(f"parameter {name}: its pattern accepts {bad!r}")
         for good in ("", "ft.example.com"):
@@ -387,6 +570,104 @@ def check_tasks(template: dict) -> list[str]:
     for name, svc in resources(template, "AWS::ECS::Service").items():
         if is_true(svc.get("Properties", {}).get("EnableExecuteCommand")):
             problems.append(f"{name}: ECS Exec is enabled")
+    return problems
+
+
+# ECS allows a container health check StartPeriod of 300 s at most.
+MAX_START_TIMEOUT = 240
+
+
+def _seconds(value) -> float | None:
+    """A Go duration of whole units (60s, 4m, 1m30s), or None."""
+    if not isinstance(value, str):
+        return None
+    parts = re.findall(r"(\d+)(h|m|s)", value)
+    if not parts or "".join(n + u for n, u in parts) != value:
+        return None
+    return sum(int(n) * {"h": 3600, "m": 60, "s": 1}[u] for n, u in parts)
+
+
+def check_start_period(template: dict) -> list[str]:
+    """hss's container health check outlasts its start timeout.
+
+    hss exits once HSS_START_TIMEOUT passes without its store and keyring,
+    which the deployment circuit breaker sees. A health check that gave up
+    first would stop the task for a different reason, hiding that one.
+    """
+    problems = []
+    for name, td in resources(template, "AWS::ECS::TaskDefinition").items():
+        for c in td.get("Properties", {}).get("ContainerDefinitions", []):
+            env = {e.get("Name"): e.get("Value") for e in c.get("Environment", [])}
+            if "HSS_START_TIMEOUT" not in env:
+                continue
+            where = f"{name}/{c.get('Name', '?')}"
+            timeout = _seconds(env["HSS_START_TIMEOUT"])
+            check = c.get("HealthCheck", {})
+            if timeout is None:
+                problems.append(f"{where}: HSS_START_TIMEOUT is not a duration in h, m and s")
+                continue
+            if timeout > MAX_START_TIMEOUT:
+                problems.append(f"{where}: HSS_START_TIMEOUT is over {MAX_START_TIMEOUT} s")
+            grace = check.get("StartPeriod", 0) + check.get("Interval", 30) * check.get("Retries", 3)
+            if grace <= timeout:
+                problems.append(f"{where}: StartPeriod + Interval x Retries ({grace} s) must exceed HSS_START_TIMEOUT ({timeout:g} s)")
+    return problems
+
+
+def check_table_keys(template: dict) -> list[str]:
+    problems = []
+    tables = resources(template, "AWS::DynamoDB::Table")
+    for name in sorted(CMK_TABLES):
+        sse = tables.get(name, {}).get("Properties", {}).get("SSESpecification", {})
+        if sse.get("SSEType") != "KMS" or logical_id(sse.get("KMSMasterKeyId")) not in resources(template, "AWS::KMS::Key"):
+            problems.append(f"{name}: not encrypted with a customer-managed key of the stack")
+    return problems
+
+
+def _namespace(metric: dict) -> str:
+    ns = metric.get("Namespace", "")
+    return ns.get("Fn::Sub", "") if isinstance(ns, dict) else ns
+
+
+def check_alarm_rules(template: dict) -> list[str]:
+    """The alarm rules of docs/architecture.md §8 for EMF metrics.
+
+    A minute's EMF values arrive up to a minute late and a task's flushes are
+    not aligned, so every alarm uses periods of 60 s or more and N >= 2
+    evaluation periods, and states treatMissingData. On the services' own
+    metrics, counts (Sum) treat missing as not breaching, except an alarm
+    that fires on too few (missing then is the breach); gauges and latency
+    Maximums treat missing as missing or ignore; and no alarm uses a
+    statistic that describes a timing's sampled values (SampleCount, Average).
+    """
+    problems = []
+    for name, alarm in resources(template, "AWS::CloudWatch::Alarm").items():
+        props = alarm.get("Properties", {})
+        stats = [m["MetricStat"] for m in props.get("Metrics", []) if "MetricStat" in m]
+        if "MetricName" in props:
+            stats.append({"Metric": props, "Period": props.get("Period"), "Stat": props.get("Statistic")})
+        if len(stats) > 10:
+            problems.append(f"{name}: {len(stats)} metrics; a metric math alarm takes at most 10")
+        if not isinstance(props.get("EvaluationPeriods"), int) or props["EvaluationPeriods"] < 2:
+            problems.append(f"{name}: EvaluationPeriods must be 2 or more")
+        missing = props.get("TreatMissingData")
+        if missing is None:
+            problems.append(f"{name}: TreatMissingData is not set")
+        for stat in stats:
+            if not isinstance(stat.get("Period"), int) or stat["Period"] < 60:
+                problems.append(f"{name}: a period is under 60 s")
+            if not _namespace(stat.get("Metric", {})).startswith("RCS/"):
+                continue
+            kind = stat.get("Stat")
+            if kind == "Sum":
+                fewer = str(props.get("ComparisonOperator", "")).startswith("LessThan")
+                if missing != ("breaching" if fewer else "notBreaching"):
+                    problems.append(f"{name}: a count treats missing data as {missing}")
+            elif kind == "Maximum":
+                if missing not in ("missing", "ignore"):
+                    problems.append(f"{name}: a gauge or latency treats missing data as {missing}")
+            else:
+                problems.append(f"{name}: statistic {kind} on a service metric (use Sum or Maximum)")
     return problems
 
 
@@ -459,8 +740,21 @@ def expand_statements(statements) -> list[dict]:
     return found
 
 
+def _document_statements(document) -> list[dict]:
+    """A policy document's statements as expand_statements gives them; none
+    for a document or statement list written with a function, which
+    check_iam_shapes refuses (so no other check crashes on it)."""
+    if not isinstance(document, dict) or "Fn::If" in document:
+        return []
+    statements = document.get("Statement", [])
+    if isinstance(statements, dict) and "Fn::If" in statements and any(
+            isinstance(b, list) for b in statements["Fn::If"][1:]):
+        return []
+    return expand_statements(statements)
+
+
 def _reads_secrets(document: dict) -> bool:
-    for statement in expand_statements(document.get("Statement", [])):
+    for statement in _document_statements(document):
         if statement.get("Effect") != "Allow":
             continue
         if "NotAction" in statement or covers(_actions(statement), SECRET_ACTIONS):
@@ -471,7 +765,8 @@ def _reads_secrets(document: dict) -> bool:
 def _policies(role: dict) -> list[dict]:
     """A role's inline policies, both branches of an Fn::If included."""
     found = []
-    for policy in role.get("Properties", {}).get("Policies", []):
+    policies = role.get("Properties", {}).get("Policies", [])
+    for policy in policies if isinstance(policies, list) else []:
         if isinstance(policy, dict) and "Fn::If" in policy:
             found += [b for b in policy["Fn::If"][1:] if isinstance(b, dict) and "PolicyDocument" in b]
         elif isinstance(policy, dict):
@@ -538,7 +833,7 @@ def check_secret_access(template: dict) -> list[str]:
         allowed.setdefault(role, set()).update(refs - {None})
     for role, secrets in sorted(allowed.items()):
         for policy in _policies(roles.get(role, {})):
-            for st in policy.get("PolicyDocument", {}).get("Statement", []):
+            for st in _document_statements(policy.get("PolicyDocument")):
                 if st.get("Effect") == "Allow" and covers(_actions(st), SECRET_ACTIONS):
                     targets = _names(st.get("Resource"))
                     if "*" in targets or not targets <= secrets:
@@ -547,8 +842,20 @@ def check_secret_access(template: dict) -> list[str]:
     return problems
 
 
-# Tables whose items are capabilities, and the only roles that may read them.
-TABLE_READERS: dict[str, set[str]] = {"MsrpBindingsTable": {"MsrpRelayTaskRole"}}
+# Tables whose items are capabilities or message content, and the only roles
+# that may read them.
+TABLE_READERS: dict[str, set[str]] = {
+    "MsrpBindingsTable": {"MsrpRelayTaskRole"},
+    "MessagesTable": {"RcsAsTaskRole"},
+    "GroupChatsTable": {"RcsAsTaskRole"},
+    "RegistrationsTable": {"ScscfTaskRole"},
+    "AuthChallengesTable": {"ScscfTaskRole"},
+    "RegSubscriptionsTable": {"ScscfTaskRole"},
+}
+
+# Tables encrypted with a customer-managed key of the stack: their items
+# hold IMPIs, contact addresses and instance ids (docs/scscf-state.md).
+CMK_TABLES = {"RegistrationsTable", "AuthChallengesTable", "RegSubscriptionsTable"}
 
 READ_ACTIONS = {
     "dynamodb:getitem",
@@ -610,13 +917,13 @@ def _statements(template: dict):
     """(role or policy name, attached roles, statement) for every IAM statement."""
     for name, role in resources(template, "AWS::IAM::Role").items():
         for policy in _policies(role):
-            for st in expand_statements(policy.get("PolicyDocument", {}).get("Statement", [])):
+            for st in _document_statements(policy.get("PolicyDocument")):
                 yield name, {name}, st
     for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"):
         for name, policy in resources(template, kind).items():
             props = policy.get("Properties", {})
             attached = ({logical_id(r) for r in props.get("Roles", [])} | {logical_id(props.get("RoleName"))}) - {None}
-            for st in expand_statements(props.get("PolicyDocument", {}).get("Statement", [])):
+            for st in _document_statements(props.get("PolicyDocument")):
                 yield name, attached, st
 
 
@@ -640,6 +947,36 @@ def check_table_readers(template: dict) -> list[str]:
             if not attached <= readers:
                 problems.append(f"{name}: may read {table}; only {', '.join(sorted(readers))} may")
     return problems
+
+
+RUNBOOK_LINK = re.compile(r"docs/runbook\.md#([\w-]+)")
+
+
+def check_runbook(template: dict, anchors: set[str]) -> list[str]:
+    """Every alarm links exactly its own runbook section, which exists.
+
+    The section is named after the alarm's logical id (also its AlarmName
+    after the stack prefix), so the anchor is the id in lower case.
+    """
+    problems = []
+    for name, alarm in resources(template, "AWS::CloudWatch::Alarm").items():
+        anchor = name.lower()
+        description = alarm.get("Properties", {}).get("AlarmDescription")
+        links = RUNBOOK_LINK.findall(description) if isinstance(description, str) else []
+        if links != [anchor]:
+            problems.append(f"{name}: the description must link docs/runbook.md#{anchor} and nothing else")
+        elif anchor not in anchors:
+            problems.append(f"{name}: docs/runbook.md has no section {name}")
+    return problems
+
+
+def runbook_anchors(path: str) -> set[str]:
+    """Heading anchors of a Markdown file, as `make docs` computes them."""
+    source = pathlib.Path(__file__).resolve().parent / "check-links.py"
+    spec = importlib.util.spec_from_file_location("check_links", source)
+    links = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(links)
+    return links.anchors(pathlib.Path(path).read_text())
 
 
 REQUIRED_ACTIONS = pathlib.Path(__file__).resolve().parent.parent / "infra" / "task-role-actions.yaml"
@@ -740,9 +1077,181 @@ def check_iam_statements(template: dict) -> list[str]:
                 if not isinstance(action, str) or action.lower() not in STAR_ACTIONS:
                     problems.append(f"{name}: {action} on Resource '*'; name the resource")
             if covers(_actions(st), "sns:publish") and not any(
-                    covers(_actions(d), "sns:publish") and ":sns:*" in str(d.get("Resource")) for d in denies.get(name, [])):
+                    _actions(d) == ["sns:Publish"] and d.get("Resource") == SNS_EVERY_TOPIC for d in denies.get(name, [])):
                 problems.append(f"{name}: sns:Publish on '*' without a Deny on topics reaches every topic")
     return problems
+
+
+# Values the IAM checks can read: literals, Ref, GetAtt and Sub (whose
+# variables are literals or the same). The registry stack's repository ARNs
+# arrive by import, in execution roles only. Anything else (an If inside a
+# Resource, Join, a nested If around statements) could hide what is granted,
+# so the checks fail closed on it.
+ECR_IMPORTS = (
+    {"Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-PlatformRepositoryArn"}},
+    {"Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-AcsRepositoryArn"}},
+)
+
+
+def _readable(value, imports_allowed: bool) -> bool:
+    if isinstance(value, str):
+        return True
+    if isinstance(value, list):
+        return all(_readable(v, imports_allowed) for v in value)
+    if isinstance(value, dict):
+        if imports_allowed and value in ECR_IMPORTS:
+            return True
+        if set(value) == {"Ref"} and isinstance(value["Ref"], str):
+            return True
+        if set(value) == {"Fn::GetAtt"}:
+            return True
+        if set(value) == {"Fn::Sub"}:
+            sub = value["Fn::Sub"]
+            if isinstance(sub, str):
+                return True
+            return (isinstance(sub, list) and len(sub) == 2 and isinstance(sub[0], str)
+                    and all(_readable(v, imports_allowed) for v in sub[1].values()))
+    return False
+
+
+def _documents(template: dict):
+    """(owner, policy document, is an execution role) for every IAM policy,
+    as written: a policy-level If's branches, unexpanded statements."""
+    execution = {logical_id(td.get("Properties", {}).get("ExecutionRoleArn"))
+                 for td in resources(template, "AWS::ECS::TaskDefinition").values()}
+    for name, role in resources(template, "AWS::IAM::Role").items():
+        policies = role.get("Properties", {}).get("Policies", [])
+        if not isinstance(policies, list):
+            # The whole list in an If (or any function): no check could
+            # read a statement of it.
+            yield name, None, False
+            continue
+        for policy in policies:
+            branches = policy["Fn::If"][1:] if isinstance(policy, dict) and "Fn::If" in policy else [policy]
+            for branch in branches:
+                if isinstance(branch, dict) and "Fn::If" in branch:
+                    yield name, None, False
+                elif isinstance(branch, dict) and "PolicyDocument" in branch:
+                    yield name, branch["PolicyDocument"], name in execution
+    for kind in ("AWS::IAM::Policy", "AWS::IAM::ManagedPolicy", "AWS::IAM::RolePolicy"):
+        for name, policy in resources(template, kind).items():
+            yield name, policy.get("Properties", {}).get("PolicyDocument", {}), False
+
+
+def check_iam_shapes(template: dict) -> list[str]:
+    """Fail closed: every IAM statement is written so the other checks can
+    read it. A role's Policies, each PolicyDocument and its Statement are
+    written out, not produced by a function; Action and Resource are
+    literals, Ref, GetAtt or Sub; no statement or policy sits in an If
+    inside another If. No role has managed policies, whose statements no
+    check can see.
+
+    One exception, accepted on #126: an execution role may name the registry
+    stack's repository by its export (ECR_IMPORTS), since the platform stack
+    does not create the repositories. A task role may not import anything.
+    """
+    problems = []
+    for name, role in resources(template, "AWS::IAM::Role").items():
+        if "ManagedPolicyArns" in role.get("Properties", {}):
+            problems.append(f"{name}: managed policies, which the checks cannot see into; write the statements inline")
+    for name, document, imports_allowed in _documents(template):
+        if document is None:
+            problems.append(f"{name}: policies inside a nested or list-wide Fn::If, which the checks cannot read")
+            continue
+        if not isinstance(document, dict) or "Fn::If" in document:
+            problems.append(f"{name}: a PolicyDocument written with a function, which the checks cannot read")
+            continue
+        statements = document.get("Statement", [])
+        if isinstance(statements, dict) and "Fn::If" in statements and any(
+                isinstance(b, list) for b in statements["Fn::If"][1:]):
+            problems.append(f"{name}: a Statement list inside an Fn::If, which the checks cannot read")
+            continue
+        for st in statements if isinstance(statements, list) else [statements]:
+            if isinstance(st, dict) and "Fn::If" in st:
+                inner = [b for b in st["Fn::If"][1:] if isinstance(b, dict) and "Ref" not in b]
+                if any("Fn::If" in b for b in inner):
+                    problems.append(f"{name}: a statement inside a nested Fn::If, which the checks cannot read")
+                    continue
+                statements = inner
+            else:
+                statements = [st]
+            for s in statements:
+                for key in ("Action", "NotAction", "Resource", "NotResource"):
+                    if key in s and not _readable(s[key], imports_allowed):
+                        problems.append(f"{name}: {key} written with a function the checks cannot read (use Ref, GetAtt or Sub)")
+    return problems
+
+
+ECR_PULL = ("ecr:batchchecklayeravailability", "ecr:getdownloadurlforlayer", "ecr:batchgetimage")
+
+
+def _execution_key(value) -> str | None:
+    """A resource of an execution role's statement: "*", a logical id, or
+    the registry export it imports."""
+    if value == "*":
+        return "*"
+    if value in ECR_IMPORTS:
+        return "import " + value["Fn::ImportValue"]["Fn::Sub"]
+    return logical_id(value)
+
+
+def _repository_import(image) -> str | None:
+    """The registry export of the repository ARN a container image is pulled
+    from: its Sub's Repository is the repository URI's export."""
+    if not (isinstance(image, dict) and isinstance(image.get("Fn::Sub"), list) and len(image["Fn::Sub"]) == 2):
+        return None
+    uri = image["Fn::Sub"][1].get("Repository", {})
+    sub = uri.get("Fn::ImportValue", {}).get("Fn::Sub") if isinstance(uri, dict) else None
+    if not isinstance(sub, str) or not sub.endswith("RepositoryUri"):
+        return None
+    return "import " + sub[: -len("Uri")] + "Arn"
+
+
+def check_execution_roles(template: dict) -> list[str]:
+    """Each execution role grants exactly what starting its tasks needs
+    (ADR 0007 §4): the ECR token, pulling from the repository its images
+    come from, writing to its own log group, and reading the secrets its
+    task definition injects. Nothing more, and nothing of that missing."""
+    needs: dict[str, set[tuple[str, str]]] = {}
+    for name, td in resources(template, "AWS::ECS::TaskDefinition").items():
+        props = td.get("Properties", {})
+        role = logical_id(props.get("ExecutionRoleArn"))
+        if role is None:
+            continue
+        need = needs.setdefault(role, {("*", "ecr:getauthorizationtoken")})
+        for c in props.get("ContainerDefinitions", []):
+            repository = _repository_import(c.get("Image"))
+            if repository is not None:
+                need.update((repository, a) for a in ECR_PULL)
+            group = logical_id(c.get("LogConfiguration", {}).get("Options", {}).get("awslogs-group"))
+            if group is not None:
+                need.update({(group, "logs:createlogstream"), (group, "logs:putlogevents")})
+            for secret in c.get("Secrets", []):
+                ref = logical_id(secret.get("ValueFrom"))
+                if ref is not None:
+                    need.add((ref, "secretsmanager:getsecretvalue"))
+    problems = []
+    roles = resources(template, "AWS::IAM::Role")
+    for role, need in sorted(needs.items()):
+        if role not in roles:
+            continue  # not a role of this template
+        granted = set()
+        for _, attached, st in _statements(template):
+            if role not in attached or st.get("Effect") != "Allow":
+                continue
+            resources_ = st.get("Resource", [])
+            for value in resources_ if isinstance(resources_, list) else [resources_]:
+                key = _execution_key(value) or "?"
+                granted.update((key, a.lower()) for a in _actions(st) if isinstance(a, str))
+        for key, action in sorted(granted - need):
+            problems.append(f"{role}: grants {action} on {key}, which starting its tasks does not need")
+        for key, action in sorted(need - granted):
+            problems.append(f"{role}: lacks {action} on {key}, which starting its tasks needs")
+    return problems
+
+
+# The Deny that holds sns:Publish on '*' to phone numbers: every topic.
+SNS_EVERY_TOPIC = {"Fn::Sub": "arn:${AWS::Partition}:sns:*:*:*"}
 
 
 # Wildcards inside an ARN, only where the resource is a set by nature:
@@ -860,10 +1369,17 @@ def check_topics(template: dict) -> list[str]:
         key = logical_id(topic.get("Properties", {}).get("KmsMasterKeyId"))
         if key in keys:
             # Publishing to an encrypted topic needs the key too.
-            usable = set()
+            # SNS needs both: GenerateDataKey to encrypt a message, Decrypt to
+            # deliver it.
+            granted: dict[str, set[str]] = {}
             for st in keys[key].get("Properties", {}).get("KeyPolicy", {}).get("Statement", []):
-                if st.get("Effect") == "Allow" and covers(_actions(st), ("kms:generatedatakey", "kms:decrypt")):
-                    usable |= {s[len("service:"):] for s in _key_principals(st) if s.startswith("service:")}
+                if st.get("Effect") != "Allow":
+                    continue
+                for s in _key_principals(st):
+                    if s.startswith("service:"):
+                        granted.setdefault(s[len("service:"):], set()).update(
+                            a for a in ("kms:generatedatakey", "kms:decrypt") if covers(_actions(st), a))
+            usable = {s for s, actions in granted.items() if actions == {"kms:generatedatakey", "kms:decrypt"}}
             for service in sorted(publishers.get(name, set()) - usable):
                 problems.append(f"{name}: {service} publishes to it but cannot use its key {key}")
         for service in sorted(publishers.get(name, set()) - allowed.get(name, set())):
@@ -921,16 +1437,26 @@ def check_services(template: dict) -> list[str]:
 
 CHECKS = (
     check_security_groups,
+    check_ft_server_egress,
+    check_egress_with_endpoints,
+    check_endpoint_policies,
+    check_endpoints_ready,
     check_target_groups,
     check_plain_listeners,
     check_load_balancers,
+    check_parameter_pairs,
     check_waf,
     check_waf_logging,
     check_host_parameters,
     check_tasks,
+    check_start_period,
     check_tables,
     check_buckets,
+    check_table_keys,
+    check_alarm_rules,
     check_secret_access,
+    check_execution_roles,
+    check_iam_shapes,
     check_iam_statements,
     check_scans,
     check_key_policies,
@@ -949,10 +1475,17 @@ def problems(template: dict) -> list[str]:
     return found
 
 
-def main(paths: list[str]) -> int:
-    status = 0
+def main(args: list[str]) -> int:
+    anchors = None
+    if args[:1] == ["--runbook"]:
+        anchors, args = runbook_anchors(args[1]), args[2:]
+    paths, status = args, 0
     for path in paths:
-        for problem in problems(load(path)):
+        template = load(path)
+        found = problems(template)
+        if anchors is not None:
+            found += check_runbook(template, anchors)
+        for problem in found:
             print(f"{path}: {problem}")
             status = 1
     if status == 0:

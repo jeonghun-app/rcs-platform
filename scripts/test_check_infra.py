@@ -6,6 +6,7 @@ tools image (make infra-lint)."""
 from __future__ import annotations
 
 import copy
+import json
 import pathlib
 import re
 import unittest
@@ -264,6 +265,17 @@ class PlatformTemplate(TemplateCase):
         self.assertTrue(re.fullmatch(pattern, ""))
         self.assertFalse(re.fullmatch(pattern, "203.0.113.7"))
 
+    def test_an_nlb_allocation_without_its_address_is_refused(self):
+        t = copy.deepcopy(self.template)
+        del t["Rules"]["NlbAddressPairB"]
+        self.assertProblem(t, "Rules: nothing asserts NlbAllocationIdB and NlbReusedAddressB come together")
+        t = copy.deepcopy(self.template)
+        t["Rules"]["NlbAddressPairA"]["Assertions"][0]["Assert"]["Fn::Or"].pop()
+        self.assertProblem(t, "Rules: nothing asserts NlbAllocationIdA and NlbReusedAddressA come together")
+        t = copy.deepcopy(self.template)
+        del t["Rules"]["NlbAllocationsDistinct"]
+        self.assertProblem(t, "Rules: nothing asserts NlbAllocationIdA and NlbAllocationIdB differ")
+
     def test_an_alb_without_waf_is_refused(self):
         t = self.changed(WebAclAssociation=None)
         self.assertProblem(t, "Alb: internet-facing ALB without an AWS WAF web ACL")
@@ -345,6 +357,36 @@ class PlatformServices(TemplateCase):
         del t["Resources"]["SubscribersTable"]["Properties"]["PointInTimeRecoverySpecification"]
         self.assertProblem(t, "SubscribersTable: point-in-time recovery is off")
 
+    def test_only_rcs_as_reads_the_messages(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:Query",
+             "Resource": {"Fn::Sub": "${MessagesTable.Arn}/index/expiry"}})
+        self.assertProblem(t, "FtServerTaskRole: may read MessagesTable; only RcsAsTaskRole may")
+
+    def hss_container(self, t: dict) -> dict:
+        return t["Resources"]["HssTaskDefinition"]["Properties"]["ContainerDefinitions"][0]
+
+    def set_start_timeout(self, t: dict, value: str):
+        for e in self.hss_container(t)["Environment"]:
+            if e["Name"] == "HSS_START_TIMEOUT":
+                e["Value"] = value
+
+    def test_the_hss_health_check_outlasts_its_start_timeout(self):
+        t = copy.deepcopy(self.template)
+        self.set_start_timeout(t, "2m")
+        self.assertProblem(t, "StartPeriod + Interval x Retries (105 s) must exceed HSS_START_TIMEOUT (120 s)")
+
+    def test_the_hss_start_timeout_stays_within_what_ecs_can_wait(self):
+        t = copy.deepcopy(self.template)
+        self.set_start_timeout(t, "4m30s")
+        self.hss_container(t)["HealthCheck"]["StartPeriod"] = 300
+        self.assertProblem(t, "HSS_START_TIMEOUT is over 240 s")
+
+    def test_an_unreadable_start_timeout_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.set_start_timeout(t, "1.5m")
+        self.assertProblem(t, "HSS_START_TIMEOUT is not a duration")
     def test_an_arn_wildcard_reaches_the_bindings(self):
         t = copy.deepcopy(self.template)
         t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
@@ -424,6 +466,430 @@ class PlatformServices(TemplateCase):
 
 
 
+class Parameters(TemplateCase):
+    """Parameter constraints that save a deployment that would fail later."""
+
+    def vpc_cidr_allowed(self, value: str) -> bool:
+        # CloudFormation matches AllowedPattern as a Java regex; this pattern
+        # uses nothing Java and Python read differently.
+        return re.fullmatch(self.template["Parameters"]["VpcCidr"]["AllowedPattern"], value) is not None
+
+    def test_the_vpc_is_rfc_1918_space(self):
+        for value in ("10.30.0.0/16", "10.0.0.0/16", "10.255.0.0/16", "172.16.0.0/16", "172.31.0.0/16", "192.168.0.0/16"):
+            self.assertTrue(self.vpc_cidr_allowed(value), value)
+
+    def test_other_ranges_are_refused(self):
+        # 100.64.0.0/16 is shared address space (RFC 6598): the internal
+        # dialer refuses it, so every HSS lookup would fail (#112).
+        for value in ("100.64.0.0/16", "198.18.0.0/16", "8.8.0.0/16", "999.1.0.0/16", "172.32.0.0/16",
+                      "172.15.0.0/16", "10.256.0.0/16", "192.169.0.0/16", "10.30.1.0/16", "10.30.0.0/20"):
+            self.assertFalse(self.vpc_cidr_allowed(value), value)
+
+
+class AlarmRules(TemplateCase):
+    """docs/architecture.md §8: how alarms read aggregated EMF metrics."""
+
+    def alarm(self, t: dict, name: str) -> dict:
+        return t["Resources"][name]["Properties"]
+
+    def test_a_single_evaluation_period_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "FtAuthBackendError")["EvaluationPeriods"] = 1
+        self.assertProblem(t, "FtAuthBackendError: EvaluationPeriods must be 2 or more")
+
+    def test_a_period_under_a_minute_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "HssLockBusy")["Metrics"][0]["MetricStat"]["Period"] = 10
+        self.assertProblem(t, "HssLockBusy: a period is under 60 s")
+
+    def test_missing_data_must_be_stated(self):
+        t = copy.deepcopy(self.template)
+        del self.alarm(t, "AcsOtpVolume")["TreatMissingData"]
+        self.assertProblem(t, "AcsOtpVolume: TreatMissingData is not set")
+
+    def test_a_missing_count_is_zero(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "RelayStoreErrors")["TreatMissingData"] = "missing"
+        self.assertProblem(t, "RelayStoreErrors: a count treats missing data as missing")
+
+    def test_a_missing_gauge_is_not_zero(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t, "RelayConnectionsNearLimit")["TreatMissingData"] = "notBreaching"
+        self.assertProblem(t, "RelayConnectionsNearLimit: a gauge or latency treats missing data as notBreaching")
+
+    def test_a_timings_sample_count_is_refused(self):
+        t = copy.deepcopy(self.template)
+        stat = self.alarm(t, "FtSweepStalled")["Metrics"][0]["MetricStat"]
+        stat["Metric"]["MetricName"], stat["Stat"] = "sweep.duration", "SampleCount"
+        self.assertProblem(t, "FtSweepStalled: statistic SampleCount on a service metric")
+
+
+class TableKeys(TemplateCase):
+    def test_the_scscf_tables_use_the_stacks_key(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AuthChallengesTable"]["Properties"]["SSESpecification"] = {"SSEEnabled": True}
+        self.assertProblem(t, "AuthChallengesTable: not encrypted with a customer-managed key of the stack")
+
+    def test_only_scscf_reads_its_state(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:Scan", "Resource": {"Fn::GetAtt": ["RegistrationsTable", "Arn"]}})
+        self.assertProblem(t, "HssTaskRole: may read RegistrationsTable; only ScscfTaskRole may")
+
+
+class StackAdditions(TemplateCase):
+    """Bad copies of what #126 adds: endpoints, S-CSCF state, top-level alarms."""
+
+    def test_https_to_the_internet_with_endpoints_on_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssSecurityGroup"]["Properties"]["SecurityGroupEgress"].append(
+            {"IpProtocol": "tcp", "FromPort": 443, "ToPort": 443, "CidrIp": "0.0.0.0/0"})
+        self.assertProblem(t, "HssSecurityGroup: sends to 0.0.0.0/0 port 443 even with interface endpoints")
+
+    def test_ft_server_reaching_anything_else_is_refused(self):
+        t = self.changed(Extra={"Type": "AWS::EC2::SecurityGroupEgress", "Properties": {
+            "GroupId": {"Ref": "FtServerSecurityGroup"}, "DestinationSecurityGroupId": {"Ref": "AcsSecurityGroup"},
+            "IpProtocol": "tcp", "FromPort": 8080, "ToPort": 8080}})
+        self.assertProblem(t, "FtServerSecurityGroup: may send to sg AcsSecurityGroup port 8080")
+
+    def test_a_scan_on_the_scscf_tables_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["ScscfStatePolicy"]["Properties"]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:Scan", "Resource": {"Fn::GetAtt": ["RegistrationsTable", "Arn"]}})
+        self.assertProblem(t, "ScscfStatePolicy: may Scan RegistrationsTable")
+
+    def test_the_scscf_key_used_by_the_account_is_refused(self):
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["ScscfStateKey"]["Properties"]["KeyPolicy"]["Statement"]:
+            if st.get("Sid") == "DeployerCreatesTablesThroughDynamoDb":
+                del st["Condition"]["StringEquals"]["aws:PrincipalArn"]
+        self.assertProblem(t, "ScscfStateKey: root may use the key")
+
+    def test_an_scscf_table_under_another_key_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["RegistrationsTable"]["Properties"]["SSESpecification"]["KMSMasterKeyId"] = "alias/aws/dynamodb"
+        self.assertProblem(t, "RegistrationsTable: not encrypted with a customer-managed key of the stack")
+
+    def test_top_level_metric_alarms_follow_the_rules_too(self):
+        t = copy.deepcopy(self.template)
+        props = t["Resources"]["AcsOtpVolume"]["Properties"]
+        props["Period"], props["Statistic"] = 30, "Average"
+        self.assertProblem(t, "AcsOtpVolume: a period is under 60 s")
+        self.assertProblem(t, "AcsOtpVolume: statistic Average on a service metric")
+
+    def test_a_gauge_alarm_filling_missing_data_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["PcscfTransactionBytes"]["Properties"]["TreatMissingData"] = "notBreaching"
+        self.assertProblem(t, "PcscfTransactionBytes: a gauge or latency treats missing data as notBreaching")
+
+    def test_rcs_as_may_check_conditions_on_its_messages(self):
+        self.assertEqual(check_infra.check_required_actions(self.template), [])
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["RcsAsTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]:
+            if isinstance(st.get("Action"), list) and "dynamodb:ConditionCheckItem" in st["Action"] and \
+                    st["Resource"] == {"Fn::GetAtt": ["MessagesTable", "Arn"]}:
+                st["Action"].remove("dynamodb:ConditionCheckItem")
+        self.assertProblem(t, "RcsAsTaskRole: lacks dynamodb:ConditionCheckItem on MessagesTable")
+
+    def test_only_rcs_as_reads_the_groups(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["AcsTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": {"Fn::GetAtt": ["GroupChatsTable", "Arn"]}})
+        self.assertProblem(t, "AcsTaskRole: may read GroupChatsTable; only RcsAsTaskRole may")
+
+    def test_every_endpoint_is_held_to_this_account(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["DynamoDbEndpoint"]["Properties"]["PolicyDocument"]
+        self.assertProblem(t, "DynamoDbEndpoint: no endpoint policy")
+        t = copy.deepcopy(self.template)
+        st = t["Resources"]["LogsEndpoint"]["Properties"]["PolicyDocument"]["Statement"][0]
+        del st["Condition"]
+        self.assertProblem(t, "LogsEndpoint: an endpoint policy statement not held to this account")
+        t = copy.deepcopy(self.template)
+        t["Resources"]["S3Endpoint"]["Properties"]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::someone-else/*"})
+        self.assertProblem(t, "S3Endpoint: an endpoint policy statement not held to this account")
+
+    def test_services_wait_for_the_endpoints(self):
+        for name in ("HssService", "FtServerService", "RelayService", "AcsService"):
+            depends = self.template["Resources"][name]["DependsOn"]
+            self.assertIn("EndpointsReady", [depends] if isinstance(depends, str) else depends, name)
+
+    def test_without_nat_the_endpoints_are_required(self):
+        rule = self.template["Rules"]["NoNatNeedsEndpoints"]
+        self.assertEqual(rule["RuleCondition"], {"Fn::Equals": [{"Ref": "NatGateways"}, "none"]})
+        for name in ("NatGatewayA", "NatAddressA", "PrivateDefaultRouteA", "PrivateDefaultRouteB"):
+            self.assertEqual(self.template["Resources"][name].get("Condition"), "HasNat")
+
+    def test_ft_server_must_reach_the_hss(self):
+        t = self.changed(FtServerToHssApiOut=None)
+        self.assertProblem(t, "FtServerSecurityGroup: cannot reach sg HssSecurityGroup port 8081")
+
+    def test_a_separate_egress_to_the_internet_is_refused(self):
+        t = self.changed(Wide={"Type": "AWS::EC2::SecurityGroupEgress", "Properties": {
+            "GroupId": {"Ref": "AcsSecurityGroup"}, "CidrIp": "0.0.0.0/0", "IpProtocol": "tcp", "FromPort": 443, "ToPort": 443}})
+        self.assertProblem(t, "AcsSecurityGroup: sends to 0.0.0.0/0 even with interface endpoints")
+
+    def test_the_dashboard_shows_throttles_of_every_table_and_task_counts(self):
+        body = json.loads(self.template["Resources"]["Dashboard"]["Properties"]["DashboardBody"]["Fn::Sub"])
+        lines = [m for w in body["widgets"] for m in w["properties"]["metrics"]]
+        reads = {m[3] for m in lines if m[:3] == ["AWS/DynamoDB", "ReadThrottleEvents", "TableName"]}
+        tables = {"${%s}" % name for name, r in self.template["Resources"].items()
+                  if r["Type"] == "AWS::DynamoDB::Table"}
+        self.assertEqual(reads, tables)
+        writes = [i for i, m in enumerate(lines) if m[:2] == [".", "WriteThrottleEvents"]]
+        self.assertEqual(len(writes), len(tables))
+        for i in writes:
+            self.assertEqual(lines[i - 1][1], "ReadThrottleEvents")
+        tasks = {m[5] for m in lines if m[:2] == ["ECS/ContainerInsights", "RunningTaskCount"]}
+        self.assertIn("hss", tasks)
+
+    def test_registrations_expire_on_ttl_not_on_the_index_key(self):
+        spec = self.template["Resources"]["RegistrationsTable"]["Properties"]["TimeToLiveSpecification"]
+        self.assertEqual(spec, {"AttributeName": "ttl", "Enabled": True})
+
+
+
+class FailClosed(TemplateCase):
+    """The five bypass copies of the second reviews, and QA's minors."""
+
+    def statements(self, t: dict, role: str) -> list:
+        return t["Resources"][role]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+
+    def test_an_extra_action_on_a_resource_written_with_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "FtServerTaskRole").append({"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": {
+            "Fn::If": ["IsDev", {"Fn::Sub": "${FilesBucket.Arn}/*"}, {"Ref": "AWS::NoValue"}]}})
+        self.assertProblem(t, "FtServerTaskRole: Resource written with a function the checks cannot read")
+
+    def test_an_extra_action_on_a_resource_written_with_join_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "FtServerTaskRole").append({"Effect": "Allow", "Action": "s3:DeleteObject", "Resource": {
+            "Fn::Join": ["", [{"Fn::GetAtt": ["FilesBucket", "Arn"]}, "/*"]]}})
+        self.assertProblem(t, "FtServerTaskRole: Resource written with a function the checks cannot read")
+
+    def test_a_secret_read_inside_a_nested_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "HssTaskRole").append({"Fn::If": ["IsDev", {"Fn::If": ["IsProduction", {
+            "Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": {"Ref": "HssAdminToken"}},
+            {"Ref": "AWS::NoValue"}]}, {"Ref": "AWS::NoValue"}]})
+        self.assertProblem(t, "HssTaskRole: a statement inside a nested Fn::If")
+
+    def test_an_if_in_a_resource_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "MsrpRelayTaskRole")[0]["Resource"] = {
+            "Fn::If": ["IsDev", {"Fn::GetAtt": ["MsrpBindingsTable", "Arn"]}, "*"]}
+        self.assertProblem(t, "MsrpRelayTaskRole: Resource written with a function the checks cannot read")
+
+    def test_an_import_on_a_task_role_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "AcsTaskRole").append({"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": {
+            "Fn::ImportValue": "someone-elses-table-arn"}})
+        self.assertProblem(t, "AcsTaskRole: Resource written with a function the checks cannot read")
+
+    def test_the_registry_imports_stay_allowed_in_execution_roles(self):
+        self.assertEqual([p for p in check_infra.check_iam_shapes(self.template)], [])
+
+    def test_the_registry_import_is_refused_in_a_task_role(self):
+        t = copy.deepcopy(self.template)
+        self.statements(t, "HssTaskRole").append({"Effect": "Allow", "Action": "ecr:BatchGetImage", "Resource": {
+            "Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-PlatformRepositoryArn"}}})
+        self.assertProblem(t, "HssTaskRole: Resource written with a function the checks cannot read")
+
+    def test_the_sns_deny_must_cover_every_topic_exactly(self):
+        t = copy.deepcopy(self.template)
+        for p in t["Resources"]["AcsTaskRole"]["Properties"]["Policies"]:
+            if isinstance(p, dict) and "Fn::If" in p and p["Fn::If"][0] == "UseAcsSns":
+                p["Fn::If"][1]["PolicyDocument"]["Statement"][1]["Resource"] = {
+                    "Fn::Sub": "arn:${AWS::Partition}:sns:*:*:*-not-every-topic"}
+        self.assertProblem(t, "AcsTaskRole: sns:Publish on '*' without a Deny on topics")
+
+    def http_rules(self, t: dict):
+        return t["Resources"]["HttpListener"]["Properties"]["DefaultActions"][0]["Fn::If"]
+
+    def test_the_http_listener_condition_must_be_the_certificate(self):
+        t = copy.deepcopy(self.template)
+        self.http_rules(t)[0] = "IsDev"
+        self.assertProblem(t, "HttpListener: with a certificate the HTTP listener must redirect to HTTPS")
+        t = copy.deepcopy(self.template)
+        self.http_rules(t)[1] = {"Type": "forward", "TargetGroupArn": {"Ref": "AcsTargetGroup"}}
+        self.assertProblem(t, "HttpListener: with a certificate the HTTP listener must redirect to HTTPS")
+
+    def test_a_rule_whose_if_picks_the_http_listener_with_a_certificate_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerRule"]["Properties"]["ListenerArn"] = {
+            "Fn::If": ["HasAlbCertificate", {"Ref": "HttpListener"}, {"Ref": "HttpsListener"}]}
+        self.assertProblem(t, "FtServerRule: forwards on the HTTP listener even with a certificate")
+        t = copy.deepcopy(self.template)
+        t["Resources"]["FtServerRule"]["Properties"]["ListenerArn"] = {
+            "Fn::If": ["IsDev", {"Ref": "HttpsListener"}, {"Ref": "HttpListener"}]}
+        self.assertProblem(t, "FtServerRule: forwards on the HTTP listener even with a certificate")
+
+    def test_a_topic_key_needs_both_generate_and_decrypt(self):
+        t = copy.deepcopy(self.template)
+        for st in t["Resources"]["AlarmKey"]["Properties"]["KeyPolicy"]["Statement"]:
+            if st.get("Sid") == "PublishersEncrypt":
+                st["Action"] = ["kms:GenerateDataKey*"]
+        self.assertProblem(t, "AlarmTopic: cloudwatch.amazonaws.com publishes to it but cannot use its key AlarmKey")
+
+    def test_discover_instances_needs_both_halves_of_its_condition(self):
+        for half in ("servicediscovery:ServiceName", "servicediscovery:NamespaceName"):
+            with self.subTest(half=half):
+                t = copy.deepcopy(self.template)
+                st = [s for s in t["Resources"]["IcscfTaskRole"]["Properties"]["Policies"][0]["PolicyDocument"]["Statement"]
+                      if s.get("Action") == "servicediscovery:DiscoverInstances"][0]
+                del st["Condition"]["StringEquals"][half]
+                self.assertProblem(t, "IcscfTaskRole: DiscoverInstances without the condition")
+
+    def test_a_dns_label_over_63_characters_is_refused(self):
+        pattern = self.template["Parameters"]["FtHostName"]["AllowedPattern"]
+        self.assertTrue(re.fullmatch(pattern, "a" * 63 + ".example.com"))
+        self.assertFalse(re.fullmatch(pattern, "a" * 64 + ".example.com"))
+
+
+
+class FailClosedRound4(TemplateCase):
+    """Bad copies from the fourth reviews (#126 at 6c07ae0)."""
+
+    def role_policies(self, t: dict, role: str) -> list:
+        return t["Resources"][role]["Properties"]["Policies"]
+
+    def wide_secret_read(self) -> dict:
+        return {"Effect": "Allow", "Action": "secretsmanager:GetSecretValue", "Resource": "*"}
+
+    def test_a_policies_list_inside_an_if_is_refused(self):
+        # The code review's copy: the whole list in an If, one branch adding
+        # a read of every secret.
+        t = copy.deepcopy(self.template)
+        original = self.role_policies(t, "HssExecutionRole")
+        wider = copy.deepcopy(original)
+        wider[0]["PolicyDocument"]["Statement"].append(self.wide_secret_read())
+        t["Resources"]["HssExecutionRole"]["Properties"]["Policies"] = {"Fn::If": ["IsDev", wider, original]}
+        self.assertProblem(t, "HssExecutionRole: policies inside a nested or list-wide Fn::If")
+
+    def test_a_policy_document_inside_an_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        policy = self.role_policies(t, "FtServerTaskRole")[0]
+        document = policy["PolicyDocument"]
+        policy["PolicyDocument"] = {"Fn::If": ["IsDev", document, document]}
+        self.assertProblem(t, "FtServerTaskRole: a PolicyDocument written with a function")
+
+    def test_a_statement_list_inside_an_if_is_refused(self):
+        t = copy.deepcopy(self.template)
+        document = self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]
+        statements = document["Statement"]
+        document["Statement"] = {"Fn::If": ["IsDev", statements + [self.wide_secret_read()], statements]}
+        self.assertProblem(t, "HssExecutionRole: a Statement list inside an Fn::If")
+
+    def test_managed_policies_are_refused_on_every_role(self):
+        for role in ("HssExecutionRole", "HssTaskRole"):
+            with self.subTest(role=role):
+                t = copy.deepcopy(self.template)
+                t["Resources"][role]["Properties"]["ManagedPolicyArns"] = [
+                    "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"]
+                self.assertProblem(t, f"{role}: managed policies, which the checks cannot see into")
+
+    def test_an_execution_role_grants_only_what_starting_tasks_needs(self):
+        t = copy.deepcopy(self.template)
+        self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]["Statement"].append(
+            {"Effect": "Allow", "Action": "dynamodb:GetItem", "Resource": {"Fn::GetAtt": ["SubscribersTable", "Arn"]}})
+        self.assertProblem(t, "HssExecutionRole: grants dynamodb:getitem on SubscribersTable, which starting its tasks does not need")
+
+    def test_an_execution_role_pulls_only_from_its_images_repository(self):
+        t = copy.deepcopy(self.template)
+        for st in self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]["Statement"]:
+            if "ecr:BatchGetImage" in st["Action"]:
+                st["Resource"] = {"Fn::ImportValue": {"Fn::Sub": "${EcrStackName}-AcsRepositoryArn"}}
+        found = check_infra.problems(t)
+        self.assertIn("HssExecutionRole: grants ecr:batchgetimage on import ${EcrStackName}-AcsRepositoryArn, "
+                      "which starting its tasks does not need", found)
+        self.assertIn("HssExecutionRole: lacks ecr:batchgetimage on import ${EcrStackName}-PlatformRepositoryArn, "
+                      "which starting its tasks needs", found)
+
+    def test_an_execution_role_writes_only_its_own_log_group(self):
+        t = copy.deepcopy(self.template)
+        for st in self.role_policies(t, "HssExecutionRole")[0]["PolicyDocument"]["Statement"]:
+            if "logs:PutLogEvents" in st["Action"]:
+                st["Resource"] = {"Fn::GetAtt": ["FtServerLogGroup", "Arn"]}
+        self.assertProblem(t, "HssExecutionRole: grants logs:putlogevents on FtServerLogGroup")
+        self.assertProblem(t, "HssExecutionRole: lacks logs:putlogevents on HssLogGroup")
+
+    def test_an_execution_role_in_an_attached_policy_is_held_too(self):
+        t = self.changed(ExtraPolicy={"Type": "AWS::IAM::Policy", "Properties": {
+            "PolicyName": "extra", "Roles": [{"Ref": "AcsExecutionRole"}],
+            "PolicyDocument": {"Statement": [{"Effect": "Allow", "Action": "s3:GetObject",
+                                              "Resource": {"Fn::Sub": "${FilesBucket.Arn}/*"}}]}}})
+        self.assertProblem(t, "AcsExecutionRole: grants s3:getobject on ?, which starting its tasks does not need")
+
+    def test_the_layer_bucket_exception_matches_exactly(self):
+        def layer(t):
+            for st in t["Resources"]["S3Endpoint"]["Properties"]["PolicyDocument"]["Statement"]:
+                if "starport" in str(st.get("Resource")):
+                    return st
+        cases = {
+            "another arn beside it": lambda st: st.update(Resource=[st["Resource"], "arn:aws:s3:::someone-else/*"]),
+            "a wildcard bucket": lambda st: st.update(Resource={"Fn::Sub": "arn:${AWS::Partition}:s3:::*-starport-layer-bucket/*"}),
+            "another action": lambda st: st.update(Action=["s3:GetObject", "s3:PutObject"]),
+        }
+        for case, change in cases.items():
+            with self.subTest(case=case):
+                t = copy.deepcopy(self.template)
+                change(layer(t))
+                self.assertProblem(t, "S3Endpoint: an endpoint policy statement not held to this account")
+        t = copy.deepcopy(self.template)
+        t["Resources"]["LogsEndpoint"]["Properties"]["PolicyDocument"]["Statement"].append(copy.deepcopy(layer(t)))
+        self.assertProblem(t, "LogsEndpoint: an endpoint policy statement not held to this account")
+
+    def endpoints_listed(self, t: dict) -> list:
+        return t["Resources"]["EndpointsReady"]["Metadata"]["Endpoints"]["Fn::If"][1]
+
+    def test_endpoints_ready_waits_for_every_endpoint_and_rule(self):
+        for name in ("HssToEndpoints", "HssToEndpointsOut", "SmsVoiceEndpoint", "SnsEndpoint", "KmsEndpoint"):
+            with self.subTest(name=name):
+                t = copy.deepcopy(self.template)
+                listed = self.endpoints_listed(t)
+                listed[:] = [v for v in listed if name not in check_infra._refs(v)]
+                self.assertProblem(t, f"EndpointsReady: does not wait for {name}")
+
+    def test_every_service_waits_for_the_endpoints(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["AcsService"]["DependsOn"]
+        self.assertProblem(t, "AcsService: does not wait for EndpointsReady")
+
+    def test_a_target_group_protocol_in_an_if_is_reported(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["RelayMsrpTargetGroup"]["Properties"]["Protocol"] = {"Fn::If": ["IsDev", "TCP", "TLS"]}
+        self.assertProblem(t, "RelayMsrpTargetGroup: Protocol written with a function")
+
+
+RUNBOOK = TEMPLATE.parent.parent / "docs" / "runbook.md"
+
+
+class AlarmRunbook(TemplateCase):
+    """Every alarm sends whoever is paged to its own runbook section."""
+
+    def anchors(self) -> set[str]:
+        return check_infra.runbook_anchors(str(RUNBOOK))
+
+    def test_the_runbook_has_a_section_for_every_alarm(self):
+        self.assertEqual(check_infra.check_runbook(self.template, self.anchors()), [])
+
+    def test_an_alarm_without_a_link_is_refused(self):
+        t = copy.deepcopy(self.template)
+        del t["Resources"]["FtAuthBackendError"]["Properties"]["AlarmDescription"]
+        self.assertIn("FtAuthBackendError: the description must link docs/runbook.md#ftauthbackenderror",
+                      " ".join(check_infra.check_runbook(t, self.anchors())))
+
+    def test_a_link_to_another_alarms_section_is_refused(self):
+        t = copy.deepcopy(self.template)
+        t["Resources"]["HssLockBusy"]["Properties"]["AlarmDescription"] = "See docs/runbook.md#hsscxerrors."
+        self.assertIn("HssLockBusy: the description must link docs/runbook.md#hsslockbusy",
+                      " ".join(check_infra.check_runbook(t, self.anchors())))
+
+    def test_a_missing_section_is_refused(self):
+        anchors = self.anchors() - {"relaystoreerrors"}
+        self.assertEqual(check_infra.check_runbook(self.template, anchors),
+                         ["RelayStoreErrors: docs/runbook.md has no section RelayStoreErrors"])
 class SecurityChecklist(TemplateCase):
     """Bad copies of the template that the security review asked to fail."""
 

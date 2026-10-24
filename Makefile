@@ -8,6 +8,7 @@ IMAGE    ?= rcs-platform
 GOIMAGE  ?= rcs-platform-go:$(shell cat deploy/toolchain.Dockerfile 2>/dev/null | sha256sum | cut -c1-12)
 DOCKER   ?= docker
 ACTIONLINT_IMAGE ?= rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+SHELLCHECK_IMAGE ?= koalaman/shellcheck:v0.11.0@sha256:61862eba1fcf09a484ebcc6feea46f1782532571a34ed51fedf90dd25f925a8d
 # Stand-ins for S3 and DynamoDB in `make test-integration`, pinned like the
 # toolchain so a run tests the same server code every time.
 S3MOCK_IMAGE   ?= adobe/s3mock:5.2.3@sha256:ab01a6946750f451ca215a47e91030695b260e4003b8a5a6201d25029b8fca92
@@ -103,12 +104,13 @@ infra-tools:
 	  $(DOCKER) build -q -f deploy/infra-tools.Dockerfile -t $(INFRAIMAGE) deploy >/dev/null
 
 .PHONY: infra-lint
-infra-lint: infra-tools ## cfn-lint and the policy checks on infra/*.yaml (no AWS access)
+infra-lint: infra-tools ## cfn-lint, the policy checks and the deploy script tests (no AWS access)
+	$(DOCKER) run --rm -v $(CURDIR):/mnt:ro -w /mnt $(SHELLCHECK_IMAGE) scripts/deploy.sh scripts/teardown.sh scripts/rotate-token.sh
 	$(DOCKER) run --rm -u $(shell id -u):$(shell id -g) -v $(CURDIR):/src:ro -w /src \
 	  -e HOME=/tmp -e PYTHONDONTWRITEBYTECODE=1 $(INFRAIMAGE) sh -c '\
 	    set -e; cfn-lint infra/ecr.yaml infra/platform.yaml; \
-	    python3 -m unittest discover -s scripts -p "test_check_infra.py"; \
-	    python3 scripts/check_infra.py infra/platform.yaml'
+	    python3 -m unittest discover -s scripts -p "test_*.py"; \
+	    python3 scripts/check_infra.py --runbook docs/runbook.md infra/platform.yaml'
 
 # The storage backends against an S3-compatible container and DynamoDB Local
 # on a private network: ft-server's (internal/ftserver/awsstore), msrp-relay's
@@ -129,13 +131,13 @@ test-integration: volumes ## Storage backends against S3 and DynamoDB containers
 	$(RUNGO) --network "$$id" \
 	  -e FT_IT_S3_ENDPOINT="http://$$id-s3:9090" -e FT_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
 	  -e RELAY_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" -e HSS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
-	  -e SCSCF_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" -e RCSAS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
+	  -e RCSAS_IT_DYNAMODB_ENDPOINT="http://$$id-ddb:8000" \
 	  -e AWS_REGION=us-east-1 -e AWS_ACCESS_KEY_ID=local -e AWS_SECRET_ACCESS_KEY=local \
 	  $(GOIMAGE) sh -c 'for url in "$$FT_IT_S3_ENDPOINT" "$$FT_IT_DYNAMODB_ENDPOINT"; do \
 	      n=0; until wget -S -O /dev/null "$$url/" 2>&1 | grep -q "HTTP/"; do \
 	        n=$$((n + 1)); [ "$$n" -lt 120 ] || { echo "$$url did not start" >&2; exit 1; }; sleep 1; done; \
 	    done; \
-	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/... ./internal/hss/... ./internal/rcsas/... ./internal/scscf/... ./tools/stack-init/'
+	    go test -tags integration -count=1 -v -run Integration ./internal/ftserver/... ./internal/msrprelay/... ./internal/hss/... ./internal/rcsas/... ./tools/stack-init/'
 
 # rcs-sim against the built ft-server and msrp-relay binaries
 # (tools/rcs-sim/e2e). Not part of `check`: it builds and starts three

@@ -169,8 +169,12 @@ An IAM principal that can change security groups, read Secrets Manager or change
 task definitions can undo every control above.
 **Control:** a least-privilege deploy role and CloudTrail; each operator decides
 who may assume it.
-**Status:** planned (Phase 7), including alarms on security group and secret
-changes.
+**Status:** alerts implemented: the platform stack sends security group,
+secret, key policy, task definition and ECS service changes to the alarm
+topic, and IAM policy changes in a stack in us-east-1, where CloudTrail
+delivers them (docs/runbook.md#securitygroupchanges). The least-privilege
+deploy role and IAM alerts for stacks in other regions are planned (#229).
+Until then the deploying principal is the operator's own.
 
 ## T8 — Subscriber identifiers in logs and metrics
 
