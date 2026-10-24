@@ -46,12 +46,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 			return err
 		}
 	}
-	ds, err := digest.NewServer(digest.ServerConfig{
-		Realm: cfg.Realm, NonceKey: secretkey.NewKey(nonceKey), NonceCounts: stores.nonces,
-		// The rcsjta reference client signs only the path of get_upload_info
-		// and get_download_info (docs/ft-server.md, Authentication).
-		HTTPPathOnlyURI: true,
-	})
+	ds, err := newDigest(cfg, nonceKey, stores.nonces)
 	if err != nil {
 		return err
 	}
@@ -165,6 +160,36 @@ func sweep(ctx context.Context, srv *Server, tick <-chan time.Time, log *slog.Lo
 			log.Warn("sweep failed", slog.String("error", pii.Redact(err.Error())))
 		}
 	}
+}
+
+// newDigest is the Digest server Run gives the handler, keeping its
+// nonce-counts in nonces.
+func newDigest(cfg Config, nonceKey []byte, nonces digest.NonceCountStore) (*digest.Server, error) {
+	return digest.NewServer(digest.ServerConfig{
+		Realm: cfg.Realm, NonceKey: secretkey.NewKey(nonceKey),
+		NonceCounts: timedNonceCounts{store: nonces, timeout: cfg.HSSTimeout},
+		// The rcsjta reference client signs only the path of get_upload_info
+		// and get_download_info (docs/ft-server.md, Authentication).
+		HTTPPathOnlyURI: true,
+	})
+}
+
+// timedNonceCounts gives each update FT_HSS_TIMEOUT, the bound of the
+// lookup before it in the same request. Under the request's context alone,
+// a stalled table would hold the request until the client gave up, and
+// that is counted in auth.interrupted, which does not page; past the
+// timeout it is auth.backend_error (#641). FT_STORAGE_TIMEOUT is longer
+// than clients and the ALB wait.
+type timedNonceCounts struct {
+	store   digest.NonceCountStore
+	timeout time.Duration
+}
+
+// Advance implements digest.NonceCountStore.
+func (t timedNonceCounts) Advance(ctx context.Context, username, nonce string, nc uint32, expires time.Time) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	defer cancel()
+	return t.store.Advance(ctx, username, nonce, nc, expires)
 }
 
 type stores struct {

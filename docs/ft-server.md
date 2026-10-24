@@ -213,8 +213,9 @@ and answers it as MD5.
   line without the user name.
 - **Backend failures get 503.** A transport error, a timeout, or an HSS status
   other than `200` and `404` gets `503` with `Retry-After`. So does a failure
-  of the nonce-count store, DynamoDB throttling say, or an update that lost
-  every conditional write to other requests on its nonce: the response was
+  of the nonce-count store, DynamoDB throttling say, an update that lost
+  every conditional write to other requests on its nonce, or one that took
+  longer than `FT_HSS_TIMEOUT`: the response was
   right, but whether its nonce-count was used could not be told (#621). Each
   is counted in `auth.backend_error` and logged without the user name. It says
   nothing about the user, and clients retry a 503 but give up after a second
@@ -297,7 +298,7 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_NONCE_KEY` | random per start | At least 32 bytes, shared by every task. Required in staging and prod |
 | `FT_CREDENTIALS` | `hss` | `hss` or `static` (refused in staging and prod) |
 | `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base, such as `http://hss.rcs.local:8081` (the HSS API port, `HSS_API_ADDR`), and service bearer token. `https`, or `http` to a private host (see above). In staging and prod the token must be at least 43 characters: 256 random bits, such as 32 bytes in base64 (ADR 0007 §4) |
-| `FT_HSS_TIMEOUT` | `2s` | Per lookup |
+| `FT_HSS_TIMEOUT` | `2s` | Per credential lookup, and per nonce-count update in the files table, so that a stalled HSS or table fails the request before the client gives up on it (#641) |
 | `FT_MAX_CONCURRENT_LOOKUPS` | `16` | Credential lookups in progress per task, and HSS connections |
 | `FT_STATIC_USERS` | required with `static` | `user=password,...` |
 | `FT_STORE` | `aws` | `aws` or `memory` (refused in staging and prod) |
@@ -324,7 +325,7 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_DOWNLOAD_PRESSURE_PERCENT` | `75` | Share of `FT_MAX_CONCURRENT_DOWNLOADS` in use, from 1 to 100, above which the pressure floor applies |
 | `FT_IDLE_TIMEOUT` | `30s` | A transfer that moves no byte for this long is cut off |
 | `FT_UPLOAD_TIMEOUT` | `30m` | Longest upload request |
-| `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call |
+| `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call for a file's record or content: in uploads, downloads and the sweeper. Nonce-count updates have `FT_HSS_TIMEOUT` instead |
 | `FT_SWEEP_INTERVAL` | `1h` | How often expired records are marked |
 | `FT_DRAIN_TIMEOUT` | `10s` | At shutdown, how long running requests may finish before uploads are cut off. Keep it a few seconds below `RCS_SHUTDOWN_TIMEOUT` |
 

@@ -1,16 +1,20 @@
 package ftserver
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/smithy-go"
 
@@ -95,7 +99,16 @@ func TestAClientThatHangsUpIsNotABackendError(t *testing.T) {
 			}
 		},
 		"nonce count": func(t *testing.T, held chan struct{}) func(*Options) {
-			return withNonceCounts(t, overTable(heldTable{held: held}))
+			// As Run builds it, with the update's own timeout far off: the
+			// hang-up comes first.
+			return func(o *Options) {
+				ds, err := newDigest(Config{Realm: realm, HSSTimeout: time.Minute}, bytes.Repeat([]byte("k"), 32),
+					awsstore.NewWithClients(awsstore.Config{Table: "files"}, nil, heldTable{held: held}).NonceCounts)
+				if err != nil {
+					t.Fatal(err)
+				}
+				o.Digest = ds
+			}
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -162,6 +175,182 @@ func TestACancellationThatIsNotTheRequestsIsABackendError(t *testing.T) {
 			}
 			if strings.Contains(e.h.Output(), "001010000000001") {
 				t.Error("the user name reached the log")
+			}
+		})
+	}
+}
+
+// silentDynamo is a DynamoDB endpoint that takes connections and requests
+// and never answers. It closes them when the test ends.
+func silentDynamo(t *testing.T) string {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			go func() { _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	t.Cleanup(func() {
+		ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	return "http://" + ln.Addr().String()
+}
+
+// deadlineTable is the real SDK client, recording how long the context of
+// each read has left when the read starts.
+type deadlineTable struct {
+	*dynamodb.Client
+	left chan<- time.Duration
+}
+
+func (d deadlineTable) GetItem(ctx context.Context, in *dynamodb.GetItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	left := time.Duration(-1)
+	if deadline, ok := ctx.Deadline(); ok {
+		left = max(0, time.Until(deadline))
+	}
+	select {
+	case d.left <- left:
+	default:
+	}
+	return d.Client.GetItem(ctx, in, opts...)
+}
+
+func TestAStalledNonceCountStoreTimesOutAsABackendError(t *testing.T) {
+	// #641 reviews: under the request's context alone, a DynamoDB that
+	// does not answer held the request until the client gave up, and the
+	// hang-up was counted in auth.interrupted, which does not page and
+	// logs nothing. Under FT_HSS_TIMEOUT the update fails first, as a
+	// backend error. The real SDK client, as the QA probe ran it.
+	const timeout = 50 * time.Millisecond
+	if DefaultHSSTimeout <= timeout {
+		t.Fatalf("DefaultHSSTimeout %v is not above the %v this test uses", DefaultHSSTimeout, timeout)
+	}
+	left := make(chan time.Duration, 1)
+	client := dynamodb.New(dynamodb.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(silentDynamo(t)),
+		Credentials: aws.CredentialsProviderFunc(func(context.Context) (aws.Credentials, error) {
+			return aws.Credentials{AccessKeyID: "test", SecretAccessKey: "test"}, nil
+		}),
+	})
+	e := newEnv(t, func(o *Options) {
+		// As Run builds it, so that the setting is shown to reach the
+		// store rather than a default (QA on #138).
+		ds, err := newDigest(Config{Realm: realm, HSSTimeout: timeout}, bytes.Repeat([]byte("k"), 32),
+			awsstore.NewWithClients(awsstore.Config{Table: "files"}, nil, deadlineTable{Client: client, left: left}).NonceCounts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.Digest = ds
+	})
+	srv := e.serve()
+	u := e.user(alice)
+	u.challenge()
+	r, err := http.NewRequest(http.MethodPost, srv.URL+"/ft", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A client that waits 5 s, far beyond the timeout, then gives up.
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Do(u.sign(r))
+	if err != nil {
+		t.Fatalf("no answer before the client gave up: %v", err)
+	}
+	resp.Body.Close()
+	// Set before the read, so it can only have shrunk on the way: more
+	// than the setting left, or none, means another deadline.
+	if got := <-left; got < 0 || got > timeout {
+		t.Fatalf("the read had %v left on its context, want at most FT_HSS_TIMEOUT %v", got, timeout)
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Retry-After") == "" {
+		t.Fatalf("upload = %d, Retry-After %q; want 503 with Retry-After", resp.StatusCode, resp.Header.Get("Retry-After"))
+	}
+	for metric, want := range map[string]float64{"auth.backend_error": 1, "auth.interrupted": 0} {
+		if got := e.metric(metric); got != want {
+			t.Errorf("%s = %v, want %v", metric, got, want)
+		}
+	}
+	if n := len(e.h.Logs("nonce count store failed")); n != 1 {
+		t.Errorf("%d warnings for the stalled store, want 1", n)
+	}
+}
+
+// lateFailures fail a lookup or an update, with an error that is not a
+// cancellation, only once the request's context has ended: an answer that
+// came back as the client hung up. held says the call has started.
+type lateFailures struct {
+	held chan<- struct{}
+	err  error
+}
+
+func (f lateFailures) wait(ctx context.Context) {
+	f.held <- struct{}{}
+	<-ctx.Done()
+}
+
+func (f lateFailures) Lookup(ctx context.Context, _ string, _ digest.Algorithm) (Credential, error) {
+	f.wait(ctx)
+	return Credential{}, f.err
+}
+
+func (f lateFailures) Advance(ctx context.Context, _, _ string, _ uint32, _ time.Time) (bool, error) {
+	f.wait(ctx)
+	return false, f.err
+}
+
+func TestABackendFailureAfterTheClientHungUpIsStillCounted(t *testing.T) {
+	// #641 QA: a hang-up hides only the cancellation it causes. A failure
+	// the backend reported meanwhile is still the backend's, or the
+	// record's, and keeps its own count.
+	for name, c := range map[string]struct {
+		backend func(t *testing.T, f lateFailures) func(*Options)
+		err     error
+		metric  string
+	}{
+		"hss lookup fails": {
+			backend: func(_ *testing.T, f lateFailures) func(*Options) { return func(o *Options) { o.Credentials = f } },
+			err:     errors.New("ftserver: hss answered 500"), metric: "auth.backend_error",
+		},
+		"hss record unusable": {
+			backend: func(_ *testing.T, f lateFailures) func(*Options) { return func(o *Options) { o.Credentials = f } },
+			err:     fmt.Errorf("%w: hss response is not an ft-credential", ErrBadCredentialRecord), metric: "auth.bad_credential_record",
+		},
+		"nonce count fails": {
+			backend: func(t *testing.T, f lateFailures) func(*Options) {
+				return withNonceCounts(t, func(*Options) digest.NonceCountStore { return f })
+			},
+			err: errors.New("awsstore: advance nonce count: InternalServerError"), metric: "auth.backend_error",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			held := make(chan struct{}, 1)
+			e := newEnv(t, c.backend(t, lateFailures{held: held, err: c.err}))
+			u := e.user(alice)
+			u.challenge()
+			r, err := http.NewRequest(http.MethodPost, "http://ft/ft", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.hangUp(u.sign(r), held)
+			for metric, want := range map[string]float64{c.metric: 1, "auth.interrupted": 0} {
+				if got := e.metric(metric); got != want {
+					t.Errorf("%s = %v, want %v", metric, got, want)
+				}
 			}
 		})
 	}
