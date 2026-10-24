@@ -29,11 +29,18 @@ type Client struct {
 	// client that has gone away would.
 	NoPong bool
 	pings  atomic.Int64
+	pongs  atomic.Int64
 	wmu    sync.Mutex
 }
 
 // Pings is how many pings Next has read.
 func (c *Client) Pings() int64 { return c.pings.Load() }
+
+// Pongs is how many pongs Next has read.
+func (c *Client) Pongs() int64 { return c.pongs.Load() }
+
+// Ping sends a ping; Next counts its pong.
+func (c *Client) Ping() error { return c.write(0x9, []byte("wstest")) }
 
 // CloseError is the server's Close.
 type CloseError struct {
@@ -119,6 +126,8 @@ func (c *Client) Next(timeout time.Duration) ([]byte, error) {
 					return nil, err
 				}
 			}
+		case 0xA:
+			c.pongs.Add(1)
 		case 0x8:
 			ce := &CloseError{Code: 1005}
 			if len(p) >= 2 {

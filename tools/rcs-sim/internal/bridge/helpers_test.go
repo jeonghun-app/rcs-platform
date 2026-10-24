@@ -29,6 +29,12 @@ const (
 	testToken  = "test-token-0123456789abcdef0123456789abcdef"
 )
 
+// testIMPIKey keys the tests' IMPIs.
+var testIMPIKey = secret.NewString("impi-key-0123456789abcdef0123456789abcdef")
+
+// testIMPI is the IMPI of the endpoint called name under testIMPIKey.
+func testIMPI(name string) string { return impiOf(nameMAC(testIMPIKey, name), testDomain) }
+
 // fakeClock runs timers when the test says, never by itself.
 type fakeClock struct {
 	mu     sync.Mutex
@@ -111,7 +117,7 @@ func (h *fakeHSS) Provision(_ context.Context, name string) (Subscriber, error) 
 	h.calls[name]++
 	digits := fmt.Sprintf("%03d", h.next)
 	h.next++
-	impi := impiOf(name, testDomain)
+	impi := testIMPI(name)
 	creds, err := sipua.DigestCredentials(impi, []byte("password-"+digits))
 	if err != nil {
 		return Subscriber{}, err
@@ -146,6 +152,8 @@ type fakeNet struct {
 	// on the new line (or 5 s have passed): the order a network may give
 	// a third-party REGISTER's deliveries and the UE's 200.
 	deliverFirst bool
+	// onSend, when set before the sends, sees each MESSAGE as it is sent.
+	onSend func(from string, body []byte)
 }
 
 func newFakeNet() *fakeNet {
@@ -243,9 +251,12 @@ func (l *fakeLine) Refresh(context.Context) (time.Duration, error) {
 
 func (l *fakeLine) Send(ctx context.Context, target sip.URI, body []byte) (int, error) {
 	l.n.mu.Lock()
-	hold := l.n.hold
+	hold, onSend := l.n.hold, l.n.onSend
 	l.n.sent[l.number] = append(l.n.sent[l.number], slices.Clone(body))
 	l.n.mu.Unlock()
+	if onSend != nil {
+		onSend(l.number, body)
+	}
 	if hold != nil {
 		select {
 		case <-hold:
@@ -277,7 +288,15 @@ func (l *fakeLine) Send(ctx context.Context, target sip.URI, body []byte) (int, 
 	}
 	l.n.mu.Unlock()
 	in.Line = to
-	if code := to.receive(in); code != 200 {
+	switch code := to.receive(in); code {
+	case 200:
+	case 480:
+		// As rcs-as: the recipient is not reachable now, and the
+		// message waits for its next registration.
+		l.n.mu.Lock()
+		l.n.stored[number] = append(l.n.stored[number], in)
+		l.n.mu.Unlock()
+	default:
 		return code, nil
 	}
 	return 202, nil

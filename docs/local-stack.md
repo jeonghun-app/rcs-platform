@@ -330,9 +330,10 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
    in the output.
 8. in a test of its own, runs [rcs-bridge](rcs-bridge.md#tests) on the test
    container: two of its endpoints register through the IMS core, a message
-   goes from one to the other through `rcs-as` with its delivery and display
-   notifications, and one to the receiver offline arrives once it is online
-   again.
+   sent with no event stream open is kept by `rcs-as` until there is one, a
+   message goes from one to the other through `rcs-as` with its delivery and
+   display notifications, and one to the receiver offline arrives once it is
+   online again.
 
 The CI job "end to end (compose stack)" runs `make up`, `make e2e-compose`,
 `make logs` on failure, and `make down`.

@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
@@ -36,7 +37,7 @@ func newHSSStub(t *testing.T) (*hssStub, Provisioner) {
 	s := &hssStub{t: t, subs: map[string]subscription{}, owner: map[string]string{}, keys: map[string]map[string]string{}}
 	srv := httptest.NewServer(s)
 	t.Cleanup(srv.Close)
-	p, err := NewHSS(HSSConfig{URL: srv.URL + "/", Token: secret.NewString("hss-admin-token"), Domain: testDomain})
+	p, err := NewHSS(HSSConfig{URL: srv.URL + "/", Token: secret.NewString("hss-admin-token"), IMPIKey: testIMPIKey, Domain: testDomain})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,7 +125,7 @@ func TestAnEndpointGetsASubscriptionOfTheBridgesRangeWithFreshKeys(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(got.IMPI, impiPrefix) || !strings.HasSuffix(got.IMPI, "@"+testDomain) || got.IMPI != impiOf("car", testDomain) {
+	if !strings.HasPrefix(got.IMPI, impiPrefix) || !strings.HasSuffix(got.IMPI, "@"+testDomain) || got.IMPI != testIMPI("car") {
 		t.Fatalf("IMPI %s", got.IMPI)
 	}
 	sub := stub.subs[got.IMPI]
@@ -217,7 +218,7 @@ func TestHSSFailuresNameTheOperationAndStatusOnly(t *testing.T) {
 
 func TestASubscriptionThatIsNotASlotIsRefused(t *testing.T) {
 	stub, p := newHSSStub(t)
-	impi := impiOf("car", testDomain)
+	impi := testIMPI("car")
 	stub.subs[impi] = subscription{IMPI: impi, PublicIdentities: []identity{{IMPU: "sip:+15550100001@" + testDomain}, {IMPU: "tel:+15550100001"}}}
 	if _, err := p.Provision(context.Background(), "car"); err == nil {
 		t.Fatal("took a subscription outside the bridge's range")
@@ -226,10 +227,11 @@ func TestASubscriptionThatIsNotASlotIsRefused(t *testing.T) {
 
 func TestNewHSSChecksItsSettings(t *testing.T) {
 	for _, c := range []HSSConfig{
-		{URL: "hss:8081", Token: secret.NewString("t"), Domain: testDomain},
-		{URL: "ftp://hss", Token: secret.NewString("t"), Domain: testDomain},
-		{URL: "http://hss:8081", Domain: testDomain},
-		{URL: "http://hss:8081", Token: secret.NewString("t")},
+		{URL: "hss:8081", Token: secret.NewString("t"), IMPIKey: testIMPIKey, Domain: testDomain},
+		{URL: "ftp://hss", Token: secret.NewString("t"), IMPIKey: testIMPIKey, Domain: testDomain},
+		{URL: "http://hss:8081", IMPIKey: testIMPIKey, Domain: testDomain},
+		{URL: "http://hss:8081", Token: secret.NewString("t"), Domain: testDomain},
+		{URL: "http://hss:8081", Token: secret.NewString("t"), IMPIKey: testIMPIKey},
 	} {
 		if _, err := NewHSS(c); err == nil {
 			t.Errorf("NewHSS(%s) took it", c.URL)
@@ -238,10 +240,17 @@ func TestNewHSSChecksItsSettings(t *testing.T) {
 }
 
 func TestIMPIsAndInstancesAreStableAndApart(t *testing.T) {
-	if impiOf("car", testDomain) != impiOf("car", testDomain) || impiOf("car", testDomain) == impiOf("Car", testDomain) {
-		t.Fatal("impiOf is not a function of the exact name")
+	if testIMPI("car") != testIMPI("car") || testIMPI("car") == testIMPI("Car") {
+		t.Fatal("the IMPI is not a function of the exact name")
 	}
-	inst := instanceOf(impiOf("car", testDomain))
+	// Keyed: another key gives another IMPI, and the plain hash of the
+	// name, which anyone could compute from a guessed plate, is not it.
+	other := impiOf(nameMAC(secret.NewString("another-key-0123456789abcdef0123456789"), "car"), testDomain)
+	plain := sha256.Sum256([]byte("rcs-bridge endpoint\x00car"))
+	if other == testIMPI("car") || strings.Contains(testIMPI("car"), hex.EncodeToString(plain[:12])) {
+		t.Fatal("the IMPI does not depend on the key alone")
+	}
+	inst := instanceOf(testIMPI("car"))
 	// RFC 9562: version 8, variant 10.
 	if len(inst) != len("urn:uuid:")+36 || inst[len("urn:uuid:")+14] != '8' || !strings.ContainsRune("89ab", rune(inst[len("urn:uuid:")+19])) {
 		t.Fatalf("instance %s", inst)
@@ -284,7 +293,7 @@ func TestKAndOPcAlwaysDiffer(t *testing.T) {
 	stub, _ := newHSSStub(t)
 	srv := httptest.NewServer(stub)
 	defer srv.Close()
-	p, err := NewHSS(HSSConfig{URL: srv.URL, Token: secret.NewString("hss-admin-token"), Domain: testDomain, Rand: &repeating{}})
+	p, err := NewHSS(HSSConfig{URL: srv.URL, Token: secret.NewString("hss-admin-token"), IMPIKey: testIMPIKey, Domain: testDomain, Rand: &repeating{}})
 	if err != nil {
 		t.Fatal(err)
 	}

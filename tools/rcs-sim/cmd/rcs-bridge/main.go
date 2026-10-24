@@ -6,11 +6,12 @@
 // Settings come from the environment:
 //
 //	RCS_BRIDGE_TOKEN          the bearer token every request needs; required, 32 bytes or more
-//	RCS_BRIDGE_ADDR           listen address, :8720
+//	RCS_BRIDGE_ADDR           listen address, 127.0.0.1:8720 (the compose service sets :8720)
+//	RCS_BRIDGE_IMPI_KEY       keys the IMPIs made from endpoint names; required, 32 bytes or more
 //	RCS_BRIDGE_HSS_URL        hss's provisioning API, http://hss:8081
 //	RCS_BRIDGE_HSS_TOKEN      an operator token of hss (HSS_ADMIN_TOKEN); required
 //	RCS_BRIDGE_PCSCF          pcscf's client listener, pcscf:5060, plain TCP
-//	RCS_BRIDGE_MAX_ENDPOINTS  endpoints this process holds, 64
+//	RCS_BRIDGE_MAX_ENDPOINTS  endpoints online at once, 64
 //	RCS_IMS_DOMAIN            the home network domain; required
 //	RCS_PII_HMAC_KEY          keys the log hints of identifiers (internal/pii)
 //	RCS_LOG_LEVEL             debug, info, warn or error; info
@@ -19,8 +20,10 @@
 // RCS_BRIDGE_ADDR, with the token, and exits 0 if it answers 200: the
 // container's health check, the image having no shell or curl.
 //
-// It is a development tool for the local stack, not a platform service.
-// Nothing it logs carries a token, a key or a message body.
+// It is a development tool for the local stack, not a platform service. It
+// speaks plain HTTP and holds hss's operator token, so it must not be
+// reachable beyond the host's loopback, which is why it listens there by
+// default. Nothing it logs carries a token, a key or a message body.
 package main
 
 import (
@@ -57,6 +60,10 @@ const (
 // subscribers.
 const minTokenLength = 32
 
+// httpTimeouts are the HTTP server's; a variable for the test that a
+// connection without the token does not stay.
+var httpTimeouts = struct{ read, write, idle time.Duration }{10 * time.Second, 45 * time.Second, 60 * time.Second}
+
 // At exit, httpShutdownTimeout bounds the wait for requests in flight and
 // shutdownTimeout the unregistrations after it; both together stay under
 // compose's stop grace (25 s).
@@ -74,6 +81,7 @@ func main() {
 // config is the settings read from the environment.
 type config struct {
 	token, hssToken     secret.Key
+	impiKey             secret.Key
 	addr, hssURL, pcscf string
 	domain              string
 	maxEndpoints        int
@@ -89,7 +97,7 @@ func readConfig(lookup func(string) (string, bool)) (config, error) {
 		return def
 	}
 	c := config{
-		addr:   get("RCS_BRIDGE_ADDR", ":8720"),
+		addr:   get("RCS_BRIDGE_ADDR", "127.0.0.1:8720"),
 		hssURL: get("RCS_BRIDGE_HSS_URL", "http://hss:8081"),
 		pcscf:  get("RCS_BRIDGE_PCSCF", "pcscf:5060"),
 		domain: get("RCS_IMS_DOMAIN", ""),
@@ -108,6 +116,17 @@ func readConfig(lookup func(string) (string, bool)) (config, error) {
 		errs = append(errs, errors.New("RCS_BRIDGE_HSS_TOKEN is required"))
 	}
 	c.hssToken = secret.NewString(hssToken)
+	// Kept apart from the token: it must stay the same across restarts,
+	// so that a name finds its subscription again, while the token may
+	// change.
+	impiKey := get("RCS_BRIDGE_IMPI_KEY", "")
+	switch {
+	case impiKey == "":
+		errs = append(errs, errors.New("RCS_BRIDGE_IMPI_KEY is required"))
+	case len(impiKey) < minTokenLength:
+		errs = append(errs, fmt.Errorf("RCS_BRIDGE_IMPI_KEY is shorter than %d bytes", minTokenLength))
+	}
+	c.impiKey = secret.NewString(impiKey)
 	if c.domain == "" {
 		errs = append(errs, errors.New("RCS_IMS_DOMAIN is required"))
 	}
@@ -160,7 +179,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	if c.piiKey == nil {
 		log.Warn("RCS_PII_HMAC_KEY is unset: log hints would show the last two characters of each identifier")
 	}
-	hss, err := bridge.NewHSS(bridge.HSSConfig{URL: c.hssURL, Token: c.hssToken, Domain: c.domain})
+	hss, err := bridge.NewHSS(bridge.HSSConfig{URL: c.hssURL, Token: c.hssToken, IMPIKey: c.impiKey, Domain: c.domain})
 	if err != nil {
 		fmt.Fprintf(stderr, "rcs-bridge: %v\n", err)
 		return exitUsage
@@ -185,9 +204,16 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	}
 	srv := &http.Server{
 		Handler: b.Handler(),
-		// No read or write timeout: the event stream is long-lived. A
-		// request's body is bounded by size instead.
-		ReadHeaderTimeout: 10 * time.Second,
+		// The event stream outlives these: websocket.Upgrade clears the
+		// connection's deadlines once it has taken it over. They bound the
+		// rest, so that a connection that sends nothing, or keeps an idle
+		// keep-alive after a 401, does not hold its descriptor for ever.
+		// The write timeout is above the bridge's own bound of a request's
+		// SIP or hss work (bridge.DefaultOpTimeout, 30 s).
+		ReadHeaderTimeout: httpTimeouts.read,
+		ReadTimeout:       httpTimeouts.read,
+		WriteTimeout:      httpTimeouts.write,
+		IdleTimeout:       httpTimeouts.idle,
 		ErrorLog:          runtime.HTTPErrorLog(log),
 	}
 	served := make(chan error, 1)

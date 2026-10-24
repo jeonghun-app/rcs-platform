@@ -125,7 +125,7 @@ func (b *Bridge) putEndpoint(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	e, created, err := b.endpoint(ctx, name)
 	switch {
-	case errors.Is(err, errFull):
+	case errors.Is(err, errAllSlots):
 		writeJSON(w, http.StatusConflict, errorBody{err.Error()})
 		return
 	case errors.Is(err, ErrClosed):
@@ -137,7 +137,14 @@ func (b *Bridge) putEndpoint(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, errorBody{"provisioning the subscriber failed: " + reason})
 		return
 	}
-	e.setOnline(ctx, online)
+	switch err := e.setOnline(ctx, online); {
+	case errors.Is(err, errFull):
+		writeJSON(w, http.StatusConflict, errorBody{err.Error()})
+		return
+	case errors.Is(err, ErrClosed):
+		writeJSON(w, http.StatusServiceUnavailable, errorBody{"rcs-bridge is shutting down"})
+		return
+	}
 	status := http.StatusOK
 	if created {
 		status = http.StatusCreated

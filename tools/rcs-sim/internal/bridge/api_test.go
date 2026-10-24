@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/imdn"
@@ -159,16 +160,145 @@ func TestEndpointNamesAreChecked(t *testing.T) {
 	}
 }
 
-func TestAPutBeyondTheEndpointBoundIsRefused(t *testing.T) {
+func TestTheEndpointBoundCountsTheOnesOnline(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.MaxEndpoints = 2 })
 	h.online("a")
 	h.online("b")
 	if status, _ := h.call(http.MethodPut, "/v1/endpoints/c", nil); status != http.StatusConflict {
-		t.Fatalf("the third endpoint answered %d, want 409", status)
+		t.Fatalf("a third endpoint online answered %d, want 409", status)
 	}
-	// One the bridge holds is still answered.
+	if h.net.registered(msisdnPrefix + "002") {
+		t.Fatal("the endpoint refused registered")
+	}
+	// Offline ones do not count: c may exist offline, and goes online
+	// once another has gone offline.
+	if status, out := h.call(http.MethodPut, "/v1/endpoints/c", map[string]bool{"online": false}); status != http.StatusOK || out["registered"] != false {
+		t.Fatalf("c offline answered %d %v", status, out)
+	}
+	if status, _ := h.call(http.MethodPut, "/v1/endpoints/d", map[string]bool{"online": false}); status != http.StatusCreated {
+		t.Fatalf("a new endpoint offline answered %d, want 201", status)
+	}
+	// Online again is no second count.
 	if status, _ := h.call(http.MethodPut, "/v1/endpoints/a", nil); status != http.StatusOK {
-		t.Fatalf("an existing endpoint answered %d", status)
+		t.Fatalf("an endpoint online already answered %d", status)
+	}
+	h.call(http.MethodPut, "/v1/endpoints/a", map[string]bool{"online": false})
+	if status, out := h.call(http.MethodPut, "/v1/endpoints/c", nil); status != http.StatusOK || out["registered"] != true {
+		t.Fatalf("c online after a went offline answered %d %v", status, out)
+	}
+	if status, _ := h.call(http.MethodPut, "/v1/endpoints/a", nil); status != http.StatusConflict {
+		t.Fatalf("a online again past the bound answered %d, want 409", status)
+	}
+}
+
+// With no event stream open the bridge cannot hand a message on, so it
+// answers 480: rcs-as keeps it for the endpoint's next registration
+// instead of taking it for delivered, and the sender hears nothing yet
+// (code review on #661).
+func TestAMessageWithNoStreamOpenIs480AndComesWithItsNotificationLater(t *testing.T) {
+	h := newHarness(t)
+	h.online("car")
+	h.online("phone")
+	phone, _ := h.b.lookup("phone")
+	car, _ := h.b.lookup("car")
+	body, err := car.cpimMessage(outgoing{target: phone.sub.IMPU, contentType: "text/plain", body: "x", messageID: "direct", asked: imdn.PositiveDelivery})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := phone.receive(Incoming{From: car.sub.Tel, ContentType: cpim.ContentType, Body: body}); code != 480 {
+		t.Fatalf("a message with no stream open answered %d, want 480", code)
+	}
+	status, out := h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "later", "message_id": "later-1", "imdn": []string{"delivery"}})
+	if status != http.StatusOK || out["sip_status"] != float64(202) {
+		t.Fatalf("send answered %d %v", status, out)
+	}
+	if n := len(h.net.sentBy(msisdnPrefix + "001")); n != 0 {
+		t.Fatalf("the phone sent %d notifications for messages nobody has", n)
+	}
+	ev := h.events()
+	h.call(http.MethodPut, "/v1/endpoints/phone", map[string]bool{"online": false})
+	h.online("phone")
+	if m := ev.await("message", "phone"); m["message_id"] != "later-1" || m["body"] != "later" {
+		t.Fatalf("message event %v", m)
+	}
+	if d := ev.await("imdn", "car"); d["message_id"] != "later-1" || d["status"] != "delivered" {
+		t.Fatalf("imdn event %v", d)
+	}
+}
+
+// The delivery notification goes only once the message's event is in a
+// stream's queue.
+func TestTheDeliveryNotificationGoesAfterTheEventIsQueued(t *testing.T) {
+	h := newHarness(t)
+	h.online("car")
+	h.online("phone")
+	sub, _ := h.b.hub.subscribe()
+	queued := make(chan bool, 1)
+	h.net.mu.Lock()
+	h.net.onSend = func(from string, body []byte) {
+		if from != msisdnPrefix+"001" {
+			return
+		}
+		ok := false
+		select {
+		case ev := <-sub.events:
+			ok = strings.Contains(string(ev), `"type":"message"`) && strings.Contains(string(ev), `"message_id":"order-1"`)
+		default:
+		}
+		queued <- ok
+	}
+	h.net.mu.Unlock()
+	// The hub held while the message comes in: no notification may go
+	// before its event can be queued. The hold can only fail a bridge
+	// that sends too early; one that waits passes however long it is.
+	h.b.hub.mu.Lock()
+	sent := make(chan struct{})
+	go func() {
+		defer close(sent)
+		h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "x", "message_id": "order-1", "imdn": []string{"delivery"}})
+	}()
+	eventually(t, "the message is on its way", func() bool { return len(h.net.sentBy(msisdnPrefix+"000")) == 1 })
+	time.Sleep(200 * time.Millisecond)
+	early := len(h.net.sentBy(msisdnPrefix + "001"))
+	h.b.hub.mu.Unlock()
+	<-sent
+	if early != 0 {
+		t.Fatal("the delivery notification went while the event could not be queued")
+	}
+	select {
+	case ok := <-queued:
+		if !ok {
+			t.Fatal("the delivery notification went before the message's event was queued")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("no delivery notification")
+	}
+}
+
+// A stream that leaves the hub between two messages: the second, with no
+// stream left, is refused, and nothing tells its sender it was delivered.
+func TestAMessageAfterTheLastStreamClosedIsRefused(t *testing.T) {
+	h := newHarness(t)
+	h.online("car")
+	h.online("phone")
+	s := h.events()
+	h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "x", "message_id": "before", "imdn": []string{"delivery"}})
+	s.await("imdn", "car")
+	s.c.Close(1000)
+	eventually(t, "the stream is gone", func() bool {
+		h.b.hub.mu.Lock()
+		defer h.b.hub.mu.Unlock()
+		return len(h.b.hub.subs) == 0
+	})
+	before := len(h.net.sentBy(msisdnPrefix + "001"))
+	phone, _ := h.b.lookup("phone")
+	car, _ := h.b.lookup("car")
+	body, _ := car.cpimMessage(outgoing{target: phone.sub.IMPU, contentType: "text/plain", body: "x", messageID: "after", asked: imdn.PositiveDelivery})
+	if code := phone.receive(Incoming{From: car.sub.Tel, ContentType: cpim.ContentType, Body: body}); code != 480 {
+		t.Fatalf("answered %d, want 480", code)
+	}
+	if after := len(h.net.sentBy(msisdnPrefix + "001")); after != before {
+		t.Fatal("a notification went for a message nobody has")
 	}
 }
 
@@ -446,6 +576,7 @@ func TestAMessageTheEndpointCannotReadIsRefusedNotTakenForDelivered(t *testing.T
 
 func TestAFullInboxAnswers486SoThatTheNetworkTriesAgain(t *testing.T) {
 	h := newHarness(t)
+	h.events()
 	h.online("car")
 	h.online("phone")
 	e, _ := h.b.lookup("phone")

@@ -362,6 +362,9 @@ services:
       RCS_LOG_LEVEL: ${RCS_LOG_LEVEL:-info}
       RCS_PII_HMAC_KEY: ${RCS_PII_HMAC_KEY:?not in deploy/compose.env; make up adds new settings to it}
       RCS_BRIDGE_TOKEN: ${RCS_BRIDGE_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
+      RCS_BRIDGE_IMPI_KEY: ${RCS_BRIDGE_IMPI_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      # All interfaces inside the container, for the port published on
+      # the host's loopback only; the bridge's own default is 127.0.0.1.
       RCS_BRIDGE_ADDR: ":8720"
       # The operator's token: only it may create subscriptions and set
       # their keys (docs/api/hss-scopes.md). A local stack's, dev only.

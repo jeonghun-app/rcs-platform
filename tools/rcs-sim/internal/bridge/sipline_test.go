@@ -18,7 +18,7 @@ import (
 func coreHarness(t *testing.T, offline simtest.Offline) (*harness, *simtest.IMSCore) {
 	t.Helper()
 	core := simtest.StartIMSCore(t, testDomain, map[string]string{
-		impiOf("car", testDomain): "password-000", impiOf("phone", testDomain): "password-001",
+		testIMPI("car"): "password-000", testIMPI("phone"): "password-001",
 	})
 	core.Offline = offline
 	sipNet, err := NewSIP(SIPConfig{Proxy: core.Addr.String(), Domain: testDomain})

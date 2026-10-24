@@ -101,22 +101,26 @@ func (h *hub) dropLocked(s *subscriber, why closeReason) {
 	close(s.gone)
 }
 
-// publish sends ev to every stream. Events reach each stream in the order
-// they were published.
-func (h *hub) publish(ev any) {
+// publish sends ev to every stream and returns how many took it into
+// their queues: zero when none is open. Events reach each stream in the
+// order they were published.
+func (h *hub) publish(ev any) int {
 	b, err := json.Marshal(ev)
 	if err != nil {
-		return
+		return 0
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	n := 0
 	for s := range h.subs {
 		select {
 		case s.events <- b:
+			n++
 		default:
 			h.dropLocked(s, closedBehind)
 		}
 	}
+	return n
 }
 
 // close lets go of every stream and opens no other.

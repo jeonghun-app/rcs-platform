@@ -3,6 +3,7 @@ package bridge
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
@@ -34,10 +35,13 @@ const (
 	slots        = 1000
 )
 
-// impiPrefix starts every IMPI the bridge provisions. The rest is a hash
-// of the endpoint's name, so that the bridge finds an endpoint's
-// subscription again after a restart, by name, without keeping any state
-// of its own; and an IMPI says nothing of the name.
+// impiPrefix starts every IMPI the bridge provisions. The rest is an HMAC
+// of the endpoint's name under HSSConfig.IMPIKey, so that the bridge finds
+// an endpoint's subscription again after a restart, by name, without
+// keeping any state of its own. Keyed, because a name can be a car's plate
+// number, and a plain hash of one is reversed by trying every plate:
+// whoever sees an IMPI (hss's API, the REGISTERs on the compose network)
+// learns nothing of the name without the key.
 const impiPrefix = "rcs-bridge-"
 
 // HSSConfig configures NewHSS.
@@ -47,6 +51,9 @@ type HSSConfig struct {
 	// Token is a token of the operator, the caller that may create
 	// subscriptions and set their keys (docs/api/hss-scopes.md).
 	Token secret.Key
+	// IMPIKey keys the IMPIs made from endpoint names; it must stay the
+	// same across restarts, or every endpoint gets a new subscription.
+	IMPIKey secret.Key
 	// Domain is the home network domain, of the IMPIs and the SIP IMPUs.
 	Domain string
 	// Client is the HTTP client; nil is one with a 10 s timeout.
@@ -62,8 +69,8 @@ func NewHSS(c HSSConfig) (Provisioner, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, errors.New("bridge: the hss URL must be an http(s) URL")
 	}
-	if c.Token.IsZero() || c.Domain == "" {
-		return nil, errors.New("bridge: hss needs a token and the home domain")
+	if c.Token.IsZero() || c.IMPIKey.IsZero() || c.Domain == "" {
+		return nil, errors.New("bridge: hss needs a token, an IMPI key and the home domain")
 	}
 	if c.Client == nil {
 		c.Client = &http.Client{Timeout: 10 * time.Second, CheckRedirect: runtime.RefuseRedirects}
@@ -97,13 +104,14 @@ type identity struct {
 // the bridge, keeps its identities and its SQN and is given new keys: hss
 // never returns the old ones.
 func (h *hssProvisioner) Provision(ctx context.Context, name string) (Subscriber, error) {
-	impi := impiOf(name, h.cfg.Domain)
+	mac := nameMAC(h.cfg.IMPIKey, name)
+	impi := impiOf(mac, h.cfg.Domain)
 	sub, found, err := h.get(ctx, impi)
 	if err != nil {
 		return Subscriber{}, err
 	}
 	if !found {
-		if sub, err = h.create(ctx, name, impi); err != nil {
+		if sub, err = h.create(ctx, mac, impi); err != nil {
 			return Subscriber{}, err
 		}
 	}
@@ -135,13 +143,12 @@ func (h *hssProvisioner) Provision(ctx context.Context, name string) (Subscriber
 	return Subscriber{IMPI: impi, IMPU: impu, Tel: tel, Credentials: creds, InstanceID: instanceOf(impi)}, nil
 }
 
-// create makes the subscription in the first free slot from the one
-// name's hash picks. hss answers 409 for an IMPU another subscription
+// create makes the subscription in the first free slot from the one the
+// name's HMAC picks. hss answers 409 for an IMPU another subscription
 // has, which is a slot taken, or for the IMPI itself, which another
 // creation made meanwhile.
-func (h *hssProvisioner) create(ctx context.Context, name, impi string) (subscription, error) {
-	sum := sha256.Sum256([]byte(name))
-	start := int(binary.BigEndian.Uint32(sum[:4]) % slots)
+func (h *hssProvisioner) create(ctx context.Context, mac []byte, impi string) (subscription, error) {
+	start := int(binary.BigEndian.Uint32(mac[12:16]) % slots)
 	for i := range slots {
 		n := (start + i) % slots
 		digits := fmt.Sprintf("%03d", n)
@@ -253,12 +260,19 @@ func (h *hssProvisioner) call(ctx context.Context, method, path string, body, ou
 	return res.StatusCode, nil
 }
 
-// impiOf is the IMPI of the endpoint called name (TS 23.003 §13.3: an
-// ISIM's IMPI is any NAI in the home domain): impiPrefix and 96 bits of a
-// hash of the name, at the domain.
-func impiOf(name, domain string) string {
-	sum := sha256.Sum256([]byte("rcs-bridge endpoint\x00" + name))
-	return impiPrefix + hex.EncodeToString(sum[:12]) + "@" + domain
+// nameMAC is HMAC-SHA256 of an endpoint's name under key: its first 96
+// bits name the IMPI, the next 32 the first slot tried.
+func nameMAC(key secret.Key, name string) []byte {
+	m := hmac.New(sha256.New, key.Reveal())
+	m.Write([]byte("rcs-bridge endpoint\x00" + name))
+	return m.Sum(nil)
+}
+
+// impiOf is the IMPI of the endpoint whose name has mac (TS 23.003 §13.3:
+// an ISIM's IMPI is any NAI in the home domain): impiPrefix and 96 bits of
+// the HMAC, at the domain.
+func impiOf(mac []byte, domain string) string {
+	return impiPrefix + hex.EncodeToString(mac[:12]) + "@" + domain
 }
 
 // instanceOf is the +sip.instance of an IMPI's flows, the same for every

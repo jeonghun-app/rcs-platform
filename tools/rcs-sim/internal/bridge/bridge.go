@@ -38,7 +38,8 @@ import (
 // Defaults.
 const (
 	// DefaultMaxEndpoints is the demo's scale (#658): this many endpoints
-	// registered at once.
+	// online at once, registered or trying to register. Offline ones do
+	// not count.
 	DefaultMaxEndpoints = 64
 	// DefaultOpTimeout bounds each piece of SIP or hss work a request, a
 	// refresh or a retry does.
@@ -112,8 +113,9 @@ type Config struct {
 	SIP         SIP
 	// Token is the bearer token every request needs.
 	Token secret.Key
-	// MaxEndpoints bounds the endpoints of this process; zero is
-	// DefaultMaxEndpoints.
+	// MaxEndpoints bounds the endpoints online at once; zero is
+	// DefaultMaxEndpoints. However many are offline, a process holds at
+	// most as many endpoints as the bridge has subscriber slots.
 	MaxEndpoints int
 	// OpTimeout bounds each piece of SIP or hss work; zero is
 	// DefaultOpTimeout.
@@ -147,8 +149,10 @@ type Bridge struct {
 	// byNumber finds an endpoint by its MSISDN, "+" and digits, which is
 	// how the network names a sender: tel:+..., or sip:+...@domain.
 	byNumber map[string]*endpoint
-	closed   bool
-	wg       sync.WaitGroup
+	// online counts the endpoints wanted online (MaxEndpoints).
+	online int
+	closed bool
+	wg     sync.WaitGroup
 }
 
 // ErrClosed is returned once Close has been called.
@@ -226,10 +230,10 @@ func (b *Bridge) endpoint(ctx context.Context, name string) (e *endpoint, create
 		return e, false, err
 	}
 	b.mu.Lock()
-	full := len(b.endpoints) >= b.cfg.MaxEndpoints
+	full := len(b.endpoints) >= slots
 	b.mu.Unlock()
 	if full {
-		return nil, false, errFull
+		return nil, false, errAllSlots
 	}
 	sub, err := b.cfg.Provisioner.Provision(ctx, name)
 	if err != nil {
@@ -252,7 +256,27 @@ func (b *Bridge) endpoint(ctx context.Context, name string) (e *endpoint, create
 	return e, true, nil
 }
 
-var errFull = errors.New("bridge: the bridge holds as many endpoints as it may")
+var (
+	errFull     = errors.New("bridge: as many endpoints as the bridge allows are online; put one offline first")
+	errAllSlots = errors.New("bridge: the bridge holds an endpoint for each of its subscriber slots")
+)
+
+// countOnline counts an endpoint going online (up) or offline, and
+// reports false, counting nothing, when one more would be online than
+// MaxEndpoints allows.
+func (b *Bridge) countOnline(up bool) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !up {
+		b.online--
+		return true
+	}
+	if b.online >= b.cfg.MaxEndpoints {
+		return false
+	}
+	b.online++
+	return true
+}
 
 // lookup returns the endpoint called name, nil if there is none.
 func (b *Bridge) lookup(name string) (*endpoint, error) {

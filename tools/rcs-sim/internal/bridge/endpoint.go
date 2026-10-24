@@ -21,8 +21,9 @@ const (
 	maxRetry = 60 * time.Second
 )
 
-// inboxLength bounds the MESSAGEs an endpoint holds before their events go
-// out; beyond it a MESSAGE is answered 486 and the network tries again.
+// inboxLength bounds the delivery notifications an endpoint has yet to
+// send; a MESSAGE that asks for one beyond it is answered 486, and the
+// network tries again.
 const inboxLength = 64
 
 // Registration states, as events carry them.
@@ -97,14 +98,20 @@ func (e *endpoint) currentLine() Line {
 
 // setOnline registers the endpoint (online) or removes its registration,
 // and returns once that is done or has failed. A failure is in the
-// registration event; online, the endpoint keeps trying.
-func (e *endpoint) setOnline(ctx context.Context, online bool) {
+// registration event; online, the endpoint keeps trying. It returns
+// errFull, and changes nothing, when the endpoint would be one more online
+// than the bridge allows.
+func (e *endpoint) setOnline(ctx context.Context, online bool) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	e.mu.Lock()
 	if e.stopped {
 		e.mu.Unlock()
-		return
+		return ErrClosed
+	}
+	if online != e.online && !e.b.countOnline(online) {
+		e.mu.Unlock()
+		return errFull
 	}
 	e.online = online
 	line := e.line
@@ -119,6 +126,7 @@ func (e *endpoint) setOnline(ctx context.Context, online bool) {
 	case !online:
 		e.stopTimer()
 	}
+	return nil
 }
 
 // connectLocked registers on a new flow; opMu is held.

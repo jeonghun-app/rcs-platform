@@ -33,8 +33,14 @@ make down          # stops the bridge with the rest of the stack
   (`RCS_BRIDGE_HOST_PORT` in `deploy/compose.env`). On the compose network it
   is `http://rcs-bridge:8720`.
 - **Token.** `RCS_BRIDGE_TOKEN` in `deploy/compose.env`, 256 random bits that
-  `make up` generates (`scripts/compose-env.sh`). A file written before this
-  setting existed gets it at the next `make up`.
+  `make up` generates (`scripts/compose-env.sh`). So is `RCS_BRIDGE_IMPI_KEY`,
+  the key of the endpoints' IMPIs ([below](#endpoints-and-their-subscribers)).
+  A file written before these settings existed gets them at the next
+  `make up`.
+- **Loopback only.** The bridge speaks plain HTTP, with no TLS, and holds
+  `hss`'s operator token. Never make it reachable beyond the host's loopback:
+  compose publishes it on `127.0.0.1` only, and run by hand it listens on
+  `127.0.0.1:8720` unless `RCS_BRIDGE_ADDR` says otherwise.
 - **What it uses.** The bridge reaches `hss` at `http://hss:8081` with the
   operator token (`HSS_ADMIN_TOKEN`), the only caller that may create
   subscriptions and set their keys ([scopes](api/hss-scopes.md)). It reaches
@@ -63,11 +69,12 @@ The events come on `ws://127.0.0.1:8720/v1/events`, opened with the same
 | Variable | Default | Meaning |
 |---|---|---|
 | `RCS_BRIDGE_TOKEN` | required | The bearer token every request needs, at least 32 bytes |
-| `RCS_BRIDGE_ADDR` | `:8720` | Listen address |
+| `RCS_BRIDGE_ADDR` | `127.0.0.1:8720` | Listen address. The compose service sets `:8720` inside its container, published on the host's `127.0.0.1` only |
+| `RCS_BRIDGE_IMPI_KEY` | required | The key of the IMPIs made from endpoint names, at least 32 bytes. Kept apart from the token and never changed: a new key gives every endpoint a new subscription |
 | `RCS_BRIDGE_HSS_URL` | `http://hss:8081` | `hss`'s provisioning API |
 | `RCS_BRIDGE_HSS_TOKEN` | required | An operator token of `hss` |
 | `RCS_BRIDGE_PCSCF` | `pcscf:5060` | `pcscf`'s client listener, host:port, plain TCP. A name is looked up again for each registration |
-| `RCS_BRIDGE_MAX_ENDPOINTS` | `64` | Endpoints one bridge process holds, 1 to 1000 |
+| `RCS_BRIDGE_MAX_ENDPOINTS` | `64` | Endpoints online at once, registered or trying to register, 1 to 1000. Offline ones do not count |
 | `RCS_IMS_DOMAIN` | required | The home network domain |
 | `RCS_PII_HMAC_KEY` | none | Keys the log hints of identifiers (`internal/pii`), at least 32 bytes |
 | `RCS_LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error` |
@@ -86,10 +93,13 @@ network, on `.github/allowed-test-identifiers.txt`:
 
 They are apart from `stack-seed`'s two subscribers. Each endpoint gets:
 
-- the IMPI `rcs-bridge-<24 hex digits>@<domain>`, from a SHA-256 hash of its
-  name. An ISIM's IMPI is any NAI in the home domain (TS 23.003 §13.3). The
-  IMPI says nothing of the name.
-- the first free slot from one its name's hash picks, with
+- the IMPI `rcs-bridge-<24 hex digits>@<domain>`, the first 96 bits of an
+  HMAC-SHA256 of its name under `RCS_BRIDGE_IMPI_KEY`. An ISIM's IMPI is any
+  NAI in the home domain (TS 23.003 §13.3). Without the key, an IMPI says
+  nothing of the name, even when names are plate numbers, which could
+  otherwise be tried one by one against a plain hash. Whoever holds the key
+  (it is in `deploy/compose.env`) can still try names against an IMPI.
+- the first free slot from one the same HMAC picks, with
   `sip:<MSISDN>@<domain>` (the default identity) and `tel:<MSISDN>` in one
   implicit registration set, as `stack-seed` provisions its subscribers.
 - fresh random AKA keys, K and OPc, 128 bits each. They are sent once to
@@ -103,8 +113,11 @@ finds the endpoint's subscription again by its IMPI: the identities and the
 SQN stay, and the subscription gets new keys. So an endpoint keeps its number
 across restarts, and what `rcs-as` kept for it is still delivered to it.
 
-The demo's scale is 64 endpoints registered at once (`RCS_BRIDGE_MAX_ENDPOINTS`).
-Endpoints are never deleted. Their subscriptions stay in `hss` until
+The demo's scale is 64 endpoints online at once (`RCS_BRIDGE_MAX_ENDPOINTS`):
+registered, or wanted online and trying to register. Offline endpoints do not
+count, so a long-lived bridge serves any number of runs that each put their
+endpoints offline at the end. Endpoints are never deleted. A process holds at
+most 1000, one per slot, and their subscriptions stay in `hss` until
 `make down`. Run one bridge per stack: two bridges with the same endpoint
 names would give the subscription each other's keys.
 
@@ -145,7 +158,7 @@ removal) is done or has failed:
 | 201 | the endpoint was created |
 | 200 | it existed |
 | 400 | the name or the body is not valid |
-| 409 | the bridge holds `RCS_BRIDGE_MAX_ENDPOINTS` endpoints already |
+| 409 | `"online": true` would put one endpoint more online than `RCS_BRIDGE_MAX_ENDPOINTS`; nothing changes, and an endpoint just created stays offline. Or the bridge holds an endpoint for each of its 1000 slots |
 | 502 | `hss` refused the subscription or could not be reached; nothing was created |
 | 503 | the bridge is shutting down |
 
@@ -227,13 +240,15 @@ message's Message-ID:
 ### GET /v1/events
 
 A WebSocket (RFC 6455). Every event of every endpoint is a JSON text frame,
-from the moment the stream opens; what happens while no stream is open is not
-kept. The bridge pings every 30 s and closes a stream that has not answered
-the previous ping. A stream that falls 1024 events behind is closed with 1008,
-and at shutdown each is closed with 1001 once what was queued has gone. At
-most 16 streams are open at once; one more is answered 503. A request that is
-not a WebSocket handshake is answered 426, or 400 for a malformed one. What a client sends is read and
-ignored, but its pings are answered.
+from the moment the stream opens. The bridge keeps no backlog: while no stream
+is open, it refuses what it is sent (480, below), so that `rcs-as` keeps it,
+and `registration` events are not kept. The bridge pings every 30 s and closes
+a stream that has not answered the previous ping. A stream that falls 1024
+events behind is closed with 1008, and at shutdown each is closed with 1001
+once what was queued has gone. At most 16 streams are open at once; one more
+is answered 503. A request that is not a WebSocket handshake is answered 426,
+or 400 for a malformed one. What a client sends is read and ignored, but its
+pings are answered.
 
 **message**: an endpoint received a message.
 
@@ -251,12 +266,22 @@ ignored, but its pings are answered.
 | `content_type`, `body` | the CPIM content, the body as text (bytes that are not UTF-8 become U+FFFD) |
 | `at` | the message's CPIM `DateTime`, as the sender wrote it, in RFC 3339; the time the bridge received it when there is none |
 
-When the message asks for a delivery notification, the bridge sends it once
-the event has been published: the bridge is the device (RFC 5438 §5.1). A
-message is answered 200 once the endpoint holds it, before its event goes out;
-one it cannot read (not `message/cpim`, or a CPIM or IMDN header it cannot
-parse) is refused with 415 or 400, so that the network does not take it for
-delivered.
+A message is answered 200 only once its event is in the queue of at least one
+open stream. With no stream open it is answered 480 (Temporarily Unavailable),
+and so is a notification: `rcs-as` then keeps it and sends it again when the
+endpoint next registers, or when its retry timer runs (`RCSAS_RETRY_INTERVAL`,
+1 minute, doubling; [rcs-as](rcs-as.md#when-a-queue-is-read-again)). To have
+what was kept come at once, open a stream and put the endpoint offline and
+online again. A message it cannot read (not `message/cpim`, or a CPIM or IMDN
+header it cannot parse) is refused with 415 or 400, so that the network does
+not take it for delivered.
+
+When the message asks for a delivery notification, the bridge sends it after
+the 200, once the event is queued: the bridge is the device (RFC 5438 §5.1).
+A message the bridge answered 480 gets none, so the sender hears `delivered`
+only for a message a stream has taken. An event already queued for a stream
+that is then closed, because it fell behind or did not answer a ping, is lost
+with the queue.
 
 **imdn**: a notification about a message an endpoint sent.
 
@@ -295,7 +320,8 @@ keys, the tokens and Message-IDs are never logged. A request line, at
 ## Tests
 
 - `tools/rcs-sim/internal/bridge`: the API, the endpoints' lifecycle (refresh,
-  retry, lost flows, offline) and the event fan-out with the SIP and `hss`
+  retry, lost flows, offline), the 480 with no stream open and the delivery
+  notification only after the event is queued, and the event fan-out with the SIP and `hss`
   sides injected; the real SIP side against rcs-sim's in-process IMS core
   stand-in, with a network that stores (202) and one that refuses (480); the
   `hss` provisioning against a stub of its API.
@@ -303,13 +329,16 @@ keys, the tokens and Message-IDs are never logged. A request line, at
   not send, and the fuzz targets `FuzzRead` and `FuzzMessageRoundTrip`.
 - `make e2e-compose` runs `TestE2EBridgeOnTheComposeStack`
   (`tools/rcs-sim/e2e/bridge_test.go`): it builds the bridge and runs it on
-  the test container. Two endpoints register through the IMS core, a message
-  goes from one to the other through `rcs-as` (202) with its delivery
-  notification, a display notification goes back, and a message to the
-  receiver offline arrives once it is online again. The bridge's log must
-  hold no token, body or digit run of an identity. With
-  `RCS_BRIDGE_E2E_URL=http://rcs-bridge:8720` the same test runs against the
-  compose service instead.
+  the test container. Two endpoints register through the IMS core. A message
+  sent while no stream is open is refused with 480 and kept by `rcs-as`, and
+  comes, with its delivery notification, once a stream is open and the
+  receiver registers again. A message goes from one to the other through
+  `rcs-as` (202) with its delivery notification, a display notification goes
+  back, and a message to the receiver offline arrives once it is online
+  again. The bridge's log must hold no token, body or digit run of an
+  identity. With `RCS_BRIDGE_E2E_URL=http://rcs-bridge:8720` the same test
+  runs against the compose service instead; it then assumes no other client
+  has a stream open.
 
 ## Troubleshooting
 
@@ -319,5 +348,6 @@ keys, the tokens and Message-IDs are never logged. A request line, at
 | 401 with the token from `deploy/compose.env` | The file changed after the bridge started. `make bridge-up` recreates it. |
 | `PUT` answers 502 "provisioning the subscriber failed: hss: ... answered 401" | `HSS_ADMIN_TOKEN` changed after `hss` started. `make up` recreates the services. |
 | `"registered": false`, `reason` "REGISTER answered 500" after many runs | `scscf`'s challenge budget per IMPI. Wait a minute; the bridge tries again by itself. |
-| A message event never comes | No event stream was open when it arrived: events are not kept. A message stored by `rcs-as` comes when the receiver registers again. |
+| A message event never comes | No event stream was open when it arrived, so the bridge answered 480 and `rcs-as` kept it. With a stream open, it comes when the receiver registers again (put it offline and online) or at `rcs-as`'s next retry, a minute or more later. The sender has not been told it was delivered. |
+| `PUT` online answers 409 "as many endpoints as the bridge allows are online" | `RCS_BRIDGE_MAX_ENDPOINTS` endpoints are online. Put one offline first. |
 | `"sip_status": 413` | The CPIM body is over `rcs-as`'s pager limit, 1300 bytes. Large messages need MSRP, which the bridge does not do. |

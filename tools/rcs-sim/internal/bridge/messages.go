@@ -93,11 +93,17 @@ type inbound struct {
 	at           time.Time
 }
 
-// receive takes a MESSAGE on the line's reading goroutine: it checks and
-// parses it, queues it for the worker and returns the status to answer
-// with. 200 says the endpoint has it; a message the endpoint cannot read is
-// refused, as a device refuses it, so that the network does not take it
-// for delivered.
+// receive takes a MESSAGE on the line's reading goroutine and returns the
+// status to answer with. A message the endpoint cannot read is refused, as
+// a device refuses it, so that the network does not take it for delivered.
+//
+// 200 means the event is in the queue of at least one open event stream:
+// it is published here, before the answer. With no stream open the answer
+// is 480 (TS 24.229 §5.4.3.3, RFC 3261 §21.4.18), so rcs-as keeps the
+// message and tries again when the endpoint registers again or its retry
+// timer runs, rather than taking it for delivered and dropping its copy
+// (docs/rcs-as.md, Delivery). The delivery notification goes only after
+// that, from the worker.
 func (e *endpoint) receive(in Incoming) int {
 	if in.ContentType != cpim.ContentType {
 		return 415
@@ -116,33 +122,37 @@ func (e *endpoint) receive(in Incoming) int {
 	} else if ib.request, err = imdn.ParseRequest(m); err != nil {
 		return 400
 	}
-	select {
-	case e.inbox <- ib:
-		return 200
-	default:
+	notify := ib.notification == nil && ib.request.Dispositions.Wants(imdn.DeliveryNotification, imdn.Delivered)
+	// Checked before the event goes out: a message published and then
+	// refused would come again as a second event. Only this flow's
+	// reading goroutine fills the inbox, so the room stays.
+	if notify && len(e.inbox) == cap(e.inbox) {
 		// RFC 3261 §21.4.7: busy now; rcs-as tries again later.
 		return 486
 	}
-}
-
-// work turns what the endpoint received into events, in the order it came,
-// and sends the delivery notifications messages asked for.
-func (e *endpoint) work() {
-	for {
+	if e.publish(ib) == 0 {
+		e.b.log.Info("message refused: no event stream is open", pii.Identity("endpoint", e.name))
+		return 480
+	}
+	if notify {
 		select {
-		case ib := <-e.inbox:
-			e.handle(ib)
-		case <-e.done:
-			return
+		case e.inbox <- ib:
+		default:
+			// Another flow of the endpoint took the room meanwhile: the
+			// application has the message, the sender hears nothing.
+			e.b.log.Warn("delivery notification not sent: busy", pii.Identity("endpoint", e.name))
 		}
 	}
+	return 200
 }
 
-func (e *endpoint) handle(ib inbound) {
+// publish sends ib's event and returns how many streams took it. A
+// message is remembered first, for a display notification the application
+// may send as soon as it has the event.
+func (e *endpoint) publish(ib inbound) int {
 	from := e.b.nameOf(ib.from)
 	if n := ib.notification; n != nil {
-		e.b.hub.publish(imdnEvent{Type: "imdn", Endpoint: e.name, FromEndpoint: from, MessageID: n.MessageID, Status: string(n.Status)})
-		return
+		return e.b.hub.publish(imdnEvent{Type: "imdn", Endpoint: e.name, FromEndpoint: from, MessageID: n.MessageID, Status: string(n.Status)})
 	}
 	at := ib.at
 	if t, err := ib.msg.DateTime(); err == nil {
@@ -151,23 +161,36 @@ func (e *endpoint) handle(ib inbound) {
 	if ib.request.MessageID != "" {
 		e.received.put(ib.request.MessageID, received{from: ib.from, msg: ib.msg, request: ib.request})
 	}
-	e.b.hub.publish(messageEvent{
+	return e.b.hub.publish(messageEvent{
 		Type: "message", Endpoint: e.name, From: ib.from.String(), FromEndpoint: from,
 		MessageID: ib.request.MessageID, ContentType: ib.msg.ContentType(),
 		Body: string(ib.msg.Body.Bytes()), At: at.UTC().Format(time.RFC3339Nano),
 	})
-	// The bridge is the device: it says the message was delivered once it
-	// is on its way to the application (RFC 5438 §5.1).
-	if ib.request.Dispositions.Wants(imdn.DeliveryNotification, imdn.Delivered) {
-		ctx, cancel := e.b.opContext()
-		defer cancel()
-		status, err := e.notify(ctx, ib.line, received{from: ib.from, msg: ib.msg, request: ib.request}, imdn.DeliveryNotification, imdn.Delivered)
-		switch {
-		case err != nil:
-			e.b.log.Warn("delivery notification not sent", pii.Identity("endpoint", e.name), slog.String("reason", safeerr.Reason(err).Error()))
-		case status >= 300:
-			e.b.log.Warn("delivery notification refused", pii.Identity("endpoint", e.name), slog.Int("sip_status", status))
+}
+
+// work sends the delivery notifications of the messages published, in
+// the order they came: the bridge is the device, and it says a message was
+// delivered once it is on its way to the application (RFC 5438 §5.1).
+func (e *endpoint) work() {
+	for {
+		select {
+		case ib := <-e.inbox:
+			e.notifyDelivered(ib)
+		case <-e.done:
+			return
 		}
+	}
+}
+
+func (e *endpoint) notifyDelivered(ib inbound) {
+	ctx, cancel := e.b.opContext()
+	defer cancel()
+	status, err := e.notify(ctx, ib.line, received{from: ib.from, msg: ib.msg, request: ib.request}, imdn.DeliveryNotification, imdn.Delivered)
+	switch {
+	case err != nil:
+		e.b.log.Warn("delivery notification not sent", pii.Identity("endpoint", e.name), slog.String("reason", safeerr.Reason(err).Error()))
+	case status >= 300:
+		e.b.log.Warn("delivery notification refused", pii.Identity("endpoint", e.name), slog.Int("sip_status", status))
 	}
 }
 

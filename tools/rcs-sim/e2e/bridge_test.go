@@ -41,7 +41,9 @@ const (
 )
 
 // TestE2EBridgeOnTheComposeStack (#658): two endpoints the bridge creates
-// register with IMS AKA through pcscf, icscf and scscf; a message from one
+// register with IMS AKA through pcscf, icscf and scscf; a message sent
+// while no event stream is open is kept by rcs-as and comes once one is
+// open and the receiver registers again; a message from one
 // to the other goes through rcs-as and arrives as an event with its body
 // and content type, and the sender hears it was delivered; a display
 // notification sent through the API reaches the sender; and a message to
@@ -66,7 +68,6 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 		t.Fatalf("the event stream without the token: %v %v, want 401", res, err)
 	}
 
-	ev := br.events(t)
 	for _, name := range []string{bridgeCar, bridgePhone} {
 		status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+name, br.token, map[string]bool{"online": true})
 		if status/100 != 2 || out["registered"] != true {
@@ -80,6 +81,31 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 	run := randomHex(t)
 	text := "rcs-bridge e2e " + run + " 한글 ✓"
 	id := "e2e-" + run
+
+	// No event stream is open yet, so nobody can take a message: the
+	// phone's bridge answers rcs-as 480, rcs-as keeps the message, and the
+	// car hears nothing. Once a stream is open and the phone registers
+	// again, rcs-as delivers it, and only then is it delivered (code
+	// review on #661). This assumes no other client holds a stream to the
+	// bridge, which is so for the one the test starts.
+	early := id + "-early"
+	if out := br.send(ctx, t, bridgeCar, map[string]any{"to": bridgePhone, "body": text + " early", "message_id": early, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
+		t.Fatalf("the send with no stream open answered %v, want rcs-as's 202", out)
+	}
+	br.awaitLog(ctx, t, `"msg":"message refused: no event stream is open"`)
+	ev := br.events(t)
+	for _, online := range []bool{false, true} {
+		if status, out := br.call(ctx, t, http.MethodPut, "/v1/endpoints/"+bridgePhone, br.token, map[string]bool{"online": online}); status != http.StatusOK || out["registered"] != online {
+			t.Fatalf("PUT %s online=%v answered %d %v", bridgePhone, online, status, out)
+		}
+	}
+	if m := ev.await(t, "message", bridgePhone, early, ""); m["body"] != text+" early" || m["from_endpoint"] != bridgeCar {
+		t.Fatalf("message event %v", m)
+	}
+	if d := ev.await(t, "imdn", bridgeCar, early, "delivered"); d["from_endpoint"] != bridgePhone {
+		t.Fatalf("delivery notification event %v", d)
+	}
+
 	// rcs-as answers 202 to what it stores (docs/rcs-as.md, Answers); the
 	// phone's own 200 would mean the MESSAGE went past it.
 	if out := br.send(ctx, t, bridgeCar, map[string]any{"to": bridgePhone, "content_type": "text/plain;charset=utf-8", "body": text, "message_id": id, "imdn": []string{"delivery", "display"}}); out["sip_status"] != float64(202) || out["message_id"] != id {
@@ -149,6 +175,9 @@ func startBridge(ctx context.Context, t *testing.T) *bridgeUnderTest {
 		"RCS_BRIDGE_ADDR=" + addr,
 		"RCS_BRIDGE_HSS_URL=" + hssAPI,
 		"RCS_BRIDGE_HSS_TOKEN=" + env(t, "HSS_ADMIN_TOKEN"),
+		// The compose service's key, so that both find the same
+		// subscriptions by name.
+		"RCS_BRIDGE_IMPI_KEY=" + env(t, "RCS_BRIDGE_IMPI_KEY"),
 		"RCS_BRIDGE_PCSCF=" + net.JoinHostPort(env(t, "PCSCF_PUBLIC_HOST"), "5060"),
 		"RCS_IMS_DOMAIN=" + composeDomain,
 		"RCS_PII_HMAC_KEY=" + env(t, "RCS_PII_HMAC_KEY"),
@@ -229,6 +258,23 @@ func (b *bridgeUnderTest) send(ctx context.Context, t *testing.T, endpoint strin
 		t.Fatalf("the send from %s answered %d %v", endpoint, status, out)
 	}
 	return out
+}
+
+// awaitLog waits until the bridge's log has line, when the test started
+// the bridge; for one it did not start, it waits a few seconds instead.
+func (b *bridgeUnderTest) awaitLog(ctx context.Context, t *testing.T, line string) {
+	t.Helper()
+	if b.logs == nil {
+		time.Sleep(3 * time.Second)
+		return
+	}
+	deadline := time.Now().Add(30 * time.Second)
+	for !strings.Contains(b.logs.String(), line) {
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			t.Fatalf("the bridge never logged %s:\n%s", line, b.logs.String())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // checkLogs fails if the bridge's log shows any of secrets, the message
