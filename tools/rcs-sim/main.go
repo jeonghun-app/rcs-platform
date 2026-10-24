@@ -41,6 +41,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/secret"
+	"github.com/jeonghun-app/rcs-platform/internal/sip"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/ft"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/scenario"
@@ -95,6 +96,9 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 		peer          = fs.String("peer", defaultPeer, "the far end's address")
 		stepTimeout   = fs.Duration("step-timeout", 30*time.Second, "bound on each step")
 		requireAll    = fs.Bool("require-all", false, "fail a step that would be skipped for want of something the stack does not offer yet")
+		groupRejoins  = fs.Int("group-rejoins", 1, "how many times group-chat's client rejoins before the owner stops")
+		ownerStopDir  = fs.String("group-owner-stop-dir", "", "handshake directory through which group-chat has its group's owner stopped (scripts/e2e-compose.sh); without it the owner steps are skipped")
+		ownerCrash    = fs.Bool("group-owner-crash", false, "group-chat's owner is killed, not stopped cleanly: no BYE or end of the roster subscription is expected")
 		sf            sipFlags
 	)
 	fs.StringVar(&sf.proxy, "sip-proxy", "", "pcscf's host:port; enables the SIP client")
@@ -105,6 +109,7 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	fs.StringVar(&sf.impi, "sip-impi", "", "private user identity (default: "+envIMPI+")")
 	fs.StringVar(&sf.auth, "sip-auth", "aka", "aka (RCS_SIM_AKA_K, RCS_SIM_AKA_OPC) or digest (RCS_SIM_SIP_PASSWORD)")
 	fs.StringVar(&sf.instance, "sip-instance", "", "+sip.instance URN (default: a new urn:uuid)")
+	fs.StringVar(&sf.factory, "sip-conference-factory", "", "the conference factory URI group-chat makes its group at (ConfFctyURI)")
 	fs.StringVar(&sf.peerIMPI, "sip-peer-impi", "", "the far end's private user identity, for pager-message, options and chat-invite (default: "+envPeerIMPI+"); its credentials are "+sipua.EnvPeerAKAK+", "+sipua.EnvPeerAKAOPc+" or "+sipua.EnvPeerSIPPassword)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -157,6 +162,14 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	if *uploadSettle <= 0 {
 		return usage("-upload-settle must be positive")
 	}
+	if *groupRejoins < 1 {
+		return usage("-group-rejoins must be at least 1")
+	}
+	cfg.GroupRejoins = *groupRejoins
+	cfg.OwnerCrash = *ownerCrash
+	if *ownerStopDir != "" {
+		cfg.StopOwner = ownerStopper(*ownerStopDir)
+	}
 	if *idleWait > 0 && *stepTimeout <= *idleWait {
 		return usage("-step-timeout must be longer than -idle-wait: the keep-alive step waits -idle-wait within it")
 	}
@@ -206,6 +219,11 @@ func run(ctx context.Context, args []string, lookup func(string) (string, bool),
 	if sf.proxy != "" {
 		if cfg.SIP, err = sipConfig(ctx, sf, *self, lookup); err != nil {
 			return usage(err.Error())
+		}
+		if sf.factory != "" {
+			if cfg.ConferenceFactory, err = sip.ParseURI(sf.factory); err != nil || cfg.ConferenceFactory.Scheme != "sip" {
+				return usage("-sip-conference-factory is not a SIP URI")
+			}
 		}
 		if sf.peerIMPI == "" {
 			sf.peerIMPI = envOr(lookup, envPeerIMPI, "")

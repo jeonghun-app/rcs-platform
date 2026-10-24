@@ -15,6 +15,10 @@
 001010000000001
 001010000000002
 001010000000003
+# rcs-bridge's subscriber slots (docs/rcs-bridge.md), the first and the last:
+# 001010000872000 to 001010000872999, made at run time from a prefix.
+001010000872000
+001010000872999
 
 # --- Phone numbers (E.164) ---------------------------------------------------
 # Use only these. +1 555 0100-0199 is reserved for fictional use in North America,
@@ -24,3 +28,8 @@
 +15550100003
 +15550100004
 +15550100005
+# rcs-bridge's subscriber slots (docs/rcs-bridge.md), the first and the last:
+# +1 555 010 8000 to 8999. NANP central office codes never start with 0, so
+# none of them can be dialled either.
++15550108000
++15550108999

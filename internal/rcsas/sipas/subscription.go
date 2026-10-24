@@ -55,7 +55,9 @@ const (
 
 // subscription is a participant's subscription to its group's conference
 // event package (RFC 4575), which rcs-as, the focus, notifies. Its state is
-// in this task's memory only: until #121 a group lives on one task. The
+// in this task's memory only, on the task that owns the group (#121): a
+// task that loses the group ends it (deactivated) for the client to
+// subscribe again through the owner. The
 // fields below mu are guarded by it; holding it while a NOTIFY is built and
 // handed to the transaction layer keeps each subscription's NOTIFYs in the
 // order of their versions.

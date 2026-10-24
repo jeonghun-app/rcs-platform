@@ -28,9 +28,25 @@ contracts as in AWS (#56); [Local and AWS](#local-and-aws) lists what differs.
 ```bash
 make up            # build the image, start everything, wait until healthy, seed
 make e2e-compose   # rcs-sim and the acs checks against the running stack
+make bridge-up     # make up, then rcs-bridge (docs/rcs-bridge.md)
+make e2e-bridge    # the rcs-bridge test against that compose service
 make logs          # the last 200 lines of every service; make logs LOGS="-f hss"
 make down          # stop and remove the containers and all data
 ```
+
+The stack runs one `rcs-as` task. `RCSAS_TASKS=2` adds a second, `rcs-as-b`
+(the compose profile `rcs-as-b`), as a deployment runs at least two. Give the
+same value to `make up`, `make e2e-compose` and `make logs`:
+
+```bash
+make up RCSAS_TASKS=2            # two rcs-as tasks
+make e2e-compose RCSAS_TASKS=2   # adds the group chat across them
+```
+
+`make up` without it removes an `rcs-as-b` that an earlier
+`make up RCSAS_TASKS=2` started. Some of
+the test's checks hold on one task only and the group chat needs two
+([make e2e-compose](#make-e2e-compose)), so CI runs both.
 
 `make up` can be run again on a running stack. It builds the platform and
 bootstrap images again and runs the bootstrap again, which leaves existing
@@ -80,9 +96,10 @@ DynamoDB Local or S3Mock.
 | `icscf` | platform image | I-CSCF; finds `hss` as `hss.rcs.local` by DNS ([icscf](icscf.md#settings)), SIP on 5060 | `icscf -healthcheck` |
 | `scscf` | platform image | S-CSCF; its state in DynamoDB Local, `hss` by DNS as `icscf` finds it ([scscf](scscf.md)), SIP on 5060 | `scscf -healthcheck` |
 | `pcscf` | platform image | P-CSCF; clients' SIP on plain TCP 5060, the core listener on 5070 (`RCS_PCSCF_CORE_PORT`, [pcscf](pcscf.md)) | `pcscf -healthcheck` |
-| `rcs-as-a` | platform image | rcs-as, the default profile's application server: chat, pager messages, group chat (off); its queue and groups in DynamoDB Local ([rcs-as](rcs-as.md)), SIP on 5060, MSRP on 2855 | `rcs-as -healthcheck` |
+| `rcs-as-a`, `rcs-as-b` | platform image | rcs-as, the default profile's application server: chat, pager messages, group chat; its queue and groups in DynamoDB Local ([rcs-as](rcs-as.md)), SIP on 5060, MSRP on 2855. `rcs-as-b` only with `RCSAS_TASKS=2` | `rcs-as -healthcheck` |
 | `acs` | `ACS_IMAGE` (Makefile) | auto-configuration, memory store, mock SMS | the image's own `/healthz` check |
 | `stack-seed` | `deploy/stack-init.Dockerfile` | one-shot, after the services are healthy: the test subscriber ([Bootstrap](#bootstrap)) | exits 0 |
+| `rcs-bridge` | `deploy/rcs-bridge.Dockerfile` | profile `bridge`, started by `make bridge-up` only: the HTTP and WebSocket bridge of [rcs-bridge](rcs-bridge.md) | `rcs-bridge -healthcheck` |
 
 `-healthcheck` asks the process's own `/healthz` on `RCS_ADMIN_ADDR` (port
 8080), as the ECS container health check does. The distroless image has no
@@ -92,8 +109,10 @@ stores.
 
 ### rcs-as
 
-`rcs-as` runs as one task, `rcs-as-a`, addressed as the D4 design on #121 sets
-out, so that a second task can join it with the same settings:
+`rcs-as` runs as one task, `rcs-as-a`, or with `RCSAS_TASKS=2` as two,
+`rcs-as-a` and `rcs-as-b`, as a deployment runs at least two. They are
+addressed as the D4 design on #121 sets out, with the same settings (the
+`x-rcs-as` anchor) but each its own MSRP host:
 
 - **Names.** Every task has two network aliases:
   - `rcs-as.rcs.local`, the host of the AS URI `hss` gives `scscf` in the
@@ -109,13 +128,17 @@ out, so that a second task can join it with the same settings:
     `RCSAS_SIP_HOST` is unset, so each task finds the one private IPv4 address
     of its container, as staging and prod with group chat require.
   - MSRP: each task names itself by an alias only it has, `rcs-as-a.rcs.local`
-    (`RCSAS_MSRP_HOST`). `msrp-relay` has the namespace
+    or `rcs-as-b.rcs.local` (`RCSAS_MSRP_HOST`). `msrp-relay` has the namespace
     (`RCS_SERVICE_NAMESPACE`), so it accepts that name in a `core_path`, and it
     connects on `RELAY_CORE_PORTS` (2855).
 - **What it sends** goes to `scscf.rcs.local` (`RCSAS_CORE_URI`'s default in
   the namespace).
-- **Group chat** is off (`RCSAS_GROUP_CHAT_ENABLED`): the factory and
-  conference URIs are answered 404.
+- **Group chat** is on (`RCSAS_GROUP_CHAT_ENABLED`), here only: its default
+  is off, and a deployment turns it on by choice (#121). Each group is served
+  by the task that owns it, and the other task forwards the group's requests
+  there ([Which task serves a group](rcs-as.md#which-task-serves-a-group)).
+  With two tasks the core gives each request to either, so a group's
+  requests go both ways.
 
 The default profile's criteria send each REGISTER's third-party REGISTER, a
 capability query's OPTIONS, a chat INVITE, a MESSAGE and a group chat's roster
@@ -135,6 +158,7 @@ Published on `127.0.0.1` only. The defaults are in `deploy/compose.env`.
 | 18000 (`DYNAMODB_HOST_PORT`) | `dynamodb` | DynamoDB API (any credentials) |
 | 15060 (`PCSCF_SIP_HOST_PORT`) | `pcscf` | SIP for a client on the host, plain TCP |
 | 19090 (`S3_HOST_PORT`) | `s3` | S3 API |
+| 8720 (`RCS_BRIDGE_HOST_PORT`) | `rcs-bridge` | its API and event stream ([rcs-bridge](rcs-bridge.md)), with `make bridge-up` |
 
 The admin ports (8080) and Diameter (3868) are reachable on the compose network
 only. On the network every service has its compose name: `hss:8081`,
@@ -275,10 +299,15 @@ Both keys were checked by hand against the v1.4.0 catalogue.
 
 The test (`tools/rcs-sim/e2e`, build tag `e2ecompose`) runs in the toolchain
 container on the stack's network (`<COMPOSE_PROJECT>_default`), with
-`deploy/compose.env` as its environment. It:
+`deploy/compose.env` as its environment. `scripts/e2e-compose.sh` runs it, and
+beside it does what the test asks of the host: the test container has no
+docker access. It:
 
 1. waits for the `/readyz` of `hss`, `ft-server`, `msrp-relay`, `icscf`,
-   `scscf`, `pcscf`, `rcs-as-a` and `acs`;
+   `scscf`, `pcscf`, `rcs-as-a` (and `rcs-as-b` with `RCSAS_TASKS=2`) and
+   `acs`. Before it waits for `rcs-as`, `rcs-as.rcs.local` must name as many
+   running tasks as `RCSAS_TASKS` says, or the test fails at once: run
+   `make up` with the same value;
 2. checks `acs`'s configuration document, as above;
 3. issues the test subscriber's FT password through the `hss` API;
 4. runs `rcs-sim ft ft-resume`: the FT scenarios go to the `ftHTTPCSURI`
@@ -313,7 +342,14 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
      and keeps the message, and once the peer registers again it opens a
      chat of its own to the peer and delivers the message there. The test
      checks the 200, that the message came on that new chat, and that it
-     came whole.
+     came whole. In the steps on the client's open chat (client-to-peer,
+     peer-to-client, chunked-message) it also checks that nothing for the
+     client came another way: no chat the network opened to it and no
+     notification in pager mode, as the task that holds its chat sends all
+     of it ([rcs-as](rcs-as.md#delivery), rule 1). On one task it checks
+     the same of peer-offline. With two, the peer's new registration can
+     reach the task without the client's chat, which then rightly sends the
+     notifications another way (#647).
 6. runs `rcs-sim options` once more, with the client's OPTIONS in the
    originating session case sent through two more application servers:
    stubs on the test container, which act as proxies and send them back to
@@ -322,12 +358,70 @@ container on the stack's network (`<COMPOSE_PROJECT>_default`), with
    with those criteria first, `SESSION_TERMINATED`, and puts the default
    back at the end (as `stack-seed` does at every `make up`). Each stub must
    have taken both OPTIONS, the second after the first.
-7. checks the results of every run by the same rules as `make e2e`: every
+7. with two tasks, runs `rcs-sim group-chat` over SIP (#121 D4); with one,
+   its two tests are skipped and say so. The client makes a group
+   with the peer at the conference factory, the focus invites the peer, and
+   a message goes through the group with its notifications. The client
+   subscribes to the roster, and rejoins five times: the core gives each
+   request to either `rcs-as` task, and the one that does not own the group
+   forwards it to the owner. Then the group's owner is stopped:
+   - `rcs-sim` writes the conference URI to `tmp/e2e-compose/conference`;
+   - the test reads the group's owner from the `groupchats` table and writes
+     its address to `tmp/e2e-compose/stop`;
+   - the host stops the `rcs-as` container of this stack with that address
+     (`docker stop`, a clean stop) and writes `stopped`.
+
+   Both sessions get the owner's BYE and the roster subscription ends. The
+   client rejoins, answered 500 with `Retry-After` until the other task has
+   taken the group over, then 200; its roster is back, and its next message
+   reaches the peer, whom the new owner invites again, once. No step may see
+   the network invite the peer while its session is open, the fault #121
+   fixed. A second run, `TestE2EComposeGroupChatOwnerCrash`, kills the owner
+   instead (`tmp/e2e-compose/kill`, `docker kill`), as a crash: nothing ends,
+   the client gives its own session up, and its rejoin is answered 500 with
+   `Retry-After`, never 404, until the other task takes the group over once
+   the owner's lease has run out, `RCSAS_TASK_LEASE` and `RCSAS_TASK_SKEW`
+   (22 s) after its last beat; the test checks that it had to wait at least
+   once. The crash run adds about 50 s to `make e2e-compose`. In both
+   runs the test checks that
+   the group's owner item names the other task, one epoch up, and that the
+   `rcs-as` logs count a forwarded request (`group.forwarded`) and the
+   takeover (`group.owner_takeover`) in this run. For that the host restarts
+   both `rcs-as` tasks before the scenario, so that they start with no
+   counters, and after it, so that each writes its counters as it stops
+   (they are written once a minute otherwise); it then writes their logs
+   since the first restart to `tmp/e2e-compose/logs`.
+
+   The host records each container before it stops or kills one. Whatever
+   the outcome, it starts every one recorded again, each whatever became of
+   the others, and waits until it is healthy before `make e2e-compose`
+   returns. Every docker call in the handshake is bounded (60 s), and each
+   wait for a healthy container is bounded in wall time (120 s). The docker
+   socket is never given to the test.
+8. checks the results of every run by the same rules as `make e2e`: every
    step, the resume bounds, no busy retries, nothing secret or identifying
    in the output.
+8. in a test of its own, runs [rcs-bridge](rcs-bridge.md#tests) on the test
+   container: two of its endpoints register through the IMS core, a message
+   sent with no event stream open is kept by `rcs-as` until there is one, a
+   message goes from one to the other through `rcs-as` with its delivery and
+   display notifications, and one to the receiver offline arrives once it is
+   online again.
 
-The CI job "end to end (compose stack)" runs `make up`, `make e2e-compose`,
-`make logs` on failure, and `make down`.
+The CI job "end to end (compose stack)" runs `make bridge-up` (`make up` and
+[rcs-bridge](rcs-bridge.md)), `make e2e-compose`, `make e2e-bridge`, `make
+logs` on failure, and `make down`, with one task. "end to end (compose
+stack, two rcs-as tasks)" runs `make up`, `make e2e-compose`, `make logs` and
+`make down` with `RCSAS_TASKS=2`, on a runner and a stack of its own.
+
+`scscf` allows each IMPI 10 challenges in each minute of the clock
+(`registrar.challenge_limited` in its metrics, #201), and a run registers each
+test subscriber several times. Two runs within one minute's window can use it
+up, and a REGISTER then gets 500 (#648). So `scripts/e2e-compose.sh` keeps
+when the last run of the project ended, in
+`tmp/e2e-compose-<COMPOSE_PROJECT>.ended`, and a run that starts in the same
+minute first waits for the next one, at most 60 s, and says so. `make down`
+removes the file, as the budget is in DynamoDB Local's memory.
 
 ## Local and AWS
 
@@ -381,7 +475,8 @@ describe them. #56 provides the AWS values. Locally:
 | "run make up, which …" for an image variable | The compose file was used without make. Use the make targets, which set the image variables. |
 | Another worktree's `make up` replaced this stack's containers, or `make e2e-compose` gets 401 from a stack it did not start | Both use the default `COMPOSE_PROJECT`. See [A second stack on the same host](#a-second-stack-on-the-same-host). |
 | `stack-tables` fails with "only some of the hss tables exist" (or the scscf tables) | A half-made stack. Run `make down` and `make up`. |
-| `make e2e-compose` fails with `REGISTER answered 500` right after several runs | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics): each run registers the client afresh five times. Wait a minute and run it again. |
+| `make e2e-compose` fails with `REGISTER answered 500` right after another run | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics). `make e2e-compose` waits out the minute after its own last run (#648), but not after other REGISTERs of the test subscribers, such as an `rcs-sim` run by hand or a run from another worktree on the same stack, which keeps its own `tmp/`. Wait for the next minute and run it again. |
+| `make e2e-compose`: "rcs-as.rcs.local names 2 running rcs-as tasks, and make e2e-compose was given RCSAS_TASKS=1" (or the other way) | The stack runs another number of `rcs-as` tasks than the test was told. Give `make up` and `make e2e-compose` the same `RCSAS_TASKS`. A task an interrupted run left stopped also counts: `make up` starts it again. |
 | `stack-seed` answers 401 | `deploy/compose.env` changed after the services started. Run `make up` again to recreate them, or `make down` and `make up`. |
 | `make e2e-compose`: "no local stack rcs-local is running: run make up first" | The stack's network does not exist, or `deploy/compose.env` is missing. Run `make up` first; the test does not start the stack. With another `COMPOSE_PROJECT`, pass the same name to both. |
 | `make e2e-compose`: "… is not ready: is the stack up" | The stack exists but a service is not ready within the test's wait. `make logs LOGS="<service>"`. |

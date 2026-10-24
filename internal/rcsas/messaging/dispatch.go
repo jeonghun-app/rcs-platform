@@ -36,6 +36,11 @@ import (
 // MaxRetryInterval while a queue stays held, so a recipient that never
 // comes back costs a read an hour, not one per message sent to it.
 //
+// Whatever the hold, the end of a claim another task held, which a pass
+// met, reads the whole queue: the holder may have died with it (#651,
+// leaseRead). A pass that found the recipient unreachable sets no such
+// read.
+//
 // A hold is this task's own: another task may take the recipient's
 // registration, or the session its invitation brought, and deliver the
 // queue meanwhile (#605). So each task marks a recipient in the store when
@@ -82,6 +87,10 @@ type recipient struct {
 	look      bool
 	lookWait  time.Duration
 	lookTimer msrp.Timer
+	// leaseTimer is the one read waiting for a lease another task holds a
+	// message under to end, at leaseAt (leaseRead).
+	leaseTimer msrp.Timer
+	leaseAt    time.Time
 	// arrived notes a message queued while a pass ran with the queue
 	// blocked (see hold).
 	arrived bool
@@ -405,6 +414,11 @@ func (e *Engine) work() {
 				}
 			}
 			e.settle(user, r, res, full, started)
+			if !res.stopped && !res.heldUntil.IsZero() {
+				// A pass that found the recipient unreachable leaves the
+				// held message to the retry timer, as the rest.
+				e.leaseRead(user, r, res.heldUntil)
+			}
 			if r.reread {
 				r.reread = false
 				if !res.stopped {
@@ -434,7 +448,7 @@ func (e *Engine) work() {
 			}
 		}
 		r.run = runIdle
-		if r.hold == holdNone && r.retry == nil && r.lookTimer == nil {
+		if r.hold == holdNone && r.retry == nil && r.lookTimer == nil && r.leaseTimer == nil {
 			delete(e.recipients, user)
 		}
 		e.mu.Unlock()
@@ -449,6 +463,16 @@ type passResult struct {
 	waited                  map[string]bool
 	// saw says the pass found anything queued.
 	saw bool
+	// heldUntil is when the first of the claims another task held, that
+	// the pass passed over or lost to, is sure to be over; zero for none.
+	heldUntil time.Time
+}
+
+// heldTill notes a claim the pass left that is over by until.
+func (r *passResult) heldTill(until time.Time) {
+	if !until.IsZero() && (r.heldUntil.IsZero() || until.Before(r.heldUntil)) {
+		r.heldUntil = until
+	}
 }
 
 // settle needs e.mu. It records what a pass that began at started found
@@ -509,13 +533,15 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 	waited := res.waited
 	for ctx.Err() == nil && !e.isClosed() {
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
-		batch, passed, err := e.store.PendingHeld(sctx, recipient, after, e.cfg.InstanceID, e.clock.Now(), e.cfg.Batch)
+		batch, until, err := e.store.PendingHeld(sctx, recipient, after, e.cfg.InstanceID, e.clock.Now(), e.cfg.Batch)
 		cancel()
 		if err != nil {
 			e.storeFailed("pending", recipient, err)
 			return passResult{stopped: true}
 		}
 		res.saw = res.saw || len(batch) > 0
+		held = held || !until.IsZero()
+		res.heldTill(until)
 		for _, m := range batch {
 			switch e.deliver(ctx, m, waited[m.Sender]) {
 			case stop:
@@ -537,13 +563,13 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 				return res
 			case taken:
 				held = true
+				res.heldTill(e.lostClaimEnd())
 			}
 			after = m.ID
 			if e.isClosed() {
 				return res
 			}
 		}
-		held = held || passed
 		if len(batch) < e.cfg.Batch {
 			if look && held {
 				e.lookAgain(recipient, wait)
@@ -573,6 +599,8 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message, waiting map
 			if sessionBound(m) {
 				res.waited[m.Sender] = true
 			}
+		case taken:
+			res.heldTill(e.lostClaimEnd())
 		}
 	}
 	return res

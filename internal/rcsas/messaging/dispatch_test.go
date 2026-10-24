@@ -30,10 +30,10 @@ func (s *readCounter) Pending(ctx context.Context, r, after string, now time.Tim
 	return ms, err
 }
 
-func (s *readCounter) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
-	ms, held, err := s.Store.PendingHeld(ctx, r, after, owner, now, limit)
+func (s *readCounter) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, time.Time, error) {
+	ms, until, err := s.Store.PendingHeld(ctx, r, after, owner, now, limit)
 	s.items.Add(int64(len(ms)))
-	return ms, held, err
+	return ms, until, err
 }
 
 // drainInvites has d keep no invitations, for a test that does not look
@@ -880,13 +880,13 @@ type pendingGate struct {
 	release chan struct{}
 }
 
-func (s *pendingGate) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
-	ms, held, err := s.Store.PendingHeld(ctx, recipient, after, owner, now, limit)
+func (s *pendingGate) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, time.Time, error) {
+	ms, until, err := s.Store.PendingHeld(ctx, recipient, after, owner, now, limit)
 	if s.armed.CompareAndSwap(true, false) {
 		close(s.read)
 		<-s.release
 	}
-	return ms, held, err
+	return ms, until, err
 }
 
 // QA on #284: a large-mode attempt that releases its message while a pass

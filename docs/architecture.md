@@ -87,11 +87,14 @@ internal/
                             contract
   msrprelay/dynamostore/    msrp-relay DynamoDB backend (`msrp-bindings`)
 deploy/                     Dockerfile (service image), toolchain.Dockerfile,
-                            docker-compose.yml (the local stack, docs/local-stack.md)
-                            and stack-init.Dockerfile (its bootstrap)
+                            docker-compose.yml (the local stack, docs/local-stack.md),
+                            stack-init.Dockerfile (its bootstrap) and
+                            rcs-bridge.Dockerfile (docs/rcs-bridge.md)
 infra/                      CloudFormation (empty until Phase 7)
 scripts/                    fuzz, privacy and docs-link checks, compose-env.sh
-tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests
+tools/rcs-sim/              Go client simulator used by end-to-end tests and smoke tests,
+                            and rcs-bridge (cmd/rcs-bridge), its SIP client behind an
+                            HTTP and WebSocket API
 tools/stack-init/           creates the local stack's tables and seeds its test subscriber
 docs/                       this file, ADRs, threat model, service docs
                             (ft-server.md, msrp-relay.md, pcscf.md), api/ (OpenAPI)

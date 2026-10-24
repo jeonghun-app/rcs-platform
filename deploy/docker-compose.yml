@@ -6,7 +6,9 @@
 # writes deploy/compose.env with fresh secrets:
 #
 #   make up             build, start, wait until every service is healthy
+#                       (RCSAS_TASKS=2 for a second rcs-as task)
 #   make e2e-compose    rcs-sim against the running stack
+#   make bridge-up      the stack and rcs-bridge (docs/rcs-bridge.md)
 #   make logs           the services' logs
 #   make down           stop and remove everything, data included
 #
@@ -61,6 +63,10 @@ x-rcs-as: &rcs-as
   # Not RCS_IMS_DOMAIN, which rcs-as refuses. A compose-only name: a
   # deployment sets its own.
   RCSAS_CONFERENCE_HOST: conf.rcs.local
+  # On here only: its default stays off, and turning it on in a deployment
+  # is the operator's choice (#121). Each group is served by the task that
+  # owns it, and the others forward its requests there.
+  RCSAS_GROUP_CHAT_ENABLED: "true"
 
 # What the platform services share: the image, and starting once their
 # tables exist. Each one's health check runs its own binary with
@@ -321,8 +327,12 @@ services:
   # rcs-as, the application server: chat, pager messages and
   # conferences, its queue and groups in DynamoDB Local (docs/rcs-as.md).
   # scscf reaches it as the default profile's AS, and msrp-relay connects
-  # to it on RELAY_CORE_PORTS (2855). One task, rcs-as-a; a second one
-  # takes the same settings and aliases with an MSRP host of its own (#121).
+  # to it on RELAY_CORE_PORTS (2855). One task, rcs-as-a, and with the
+  # profile rcs-as-b (make up RCSAS_TASKS=2) a second, as a deployment runs
+  # at least two: the same settings and shared aliases, each with an MSRP
+  # host of its own, so that a group's requests reach either task and are
+  # served on its owner (#121). Both stacks run in CI: some checks hold on
+  # one task only (#654), and the group chat needs two (#602).
   rcs-as-a:
     <<: *platform
     command: ["rcs-as"]
@@ -336,6 +346,76 @@ services:
         aliases: ["rcs-as.rcs.local", "conf.rcs.local", "rcs-as-a.rcs.local"]
     healthcheck:
       test: ["CMD", "/usr/local/bin/rcs-as", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  rcs-as-b:
+    <<: *platform
+    profiles: ["rcs-as-b"]
+    command: ["rcs-as"]
+    environment:
+      <<: *rcs-as
+      RCSAS_MSRP_HOST: rcs-as-b.rcs.local
+    networks:
+      default:
+        aliases: ["rcs-as.rcs.local", "conf.rcs.local", "rcs-as-b.rcs.local"]
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/rcs-as", "-healthcheck"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # ---- rcs-bridge (docs/rcs-bridge.md) ---------------------------------
+  # The HTTP and WebSocket bridge an application sends and receives
+  # standalone messages through, each endpoint a test subscriber it
+  # provisions in hss and registers through pcscf. Off by default: make
+  # bridge-up starts it (profile bridge). Built from deploy/rcs-bridge.Dockerfile,
+  # a development tool like stack-init, not in the platform image.
+  rcs-bridge:
+    image: ${RCS_BRIDGE_IMAGE:?run make bridge-up, which names the rcs-bridge image after the stack}
+    build:
+      context: ..
+      dockerfile: deploy/rcs-bridge.Dockerfile
+      # make exports VERSION; its log lines carry it as the services' do.
+      args:
+        VERSION: ${VERSION:-dev}
+    profiles: ["bridge"]
+    restart: "no"
+    # Above its own shutdown: 5 s for requests in flight, 15 s for the
+    # unregistrations.
+    stop_grace_period: 25s
+    environment:
+      RCS_IMS_DOMAIN: ims.mnc001.mcc001.3gppnetwork.org
+      RCS_LOG_LEVEL: ${RCS_LOG_LEVEL:-info}
+      RCS_PII_HMAC_KEY: ${RCS_PII_HMAC_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      RCS_BRIDGE_TOKEN: ${RCS_BRIDGE_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
+      RCS_BRIDGE_IMPI_KEY: ${RCS_BRIDGE_IMPI_KEY:?not in deploy/compose.env; make up adds new settings to it}
+      # All interfaces inside the container, for the port published on
+      # the host's loopback only; the bridge's own default is 127.0.0.1.
+      RCS_BRIDGE_ADDR: ":8720"
+      # The operator's token: only it may create subscriptions and set
+      # their keys (docs/api/hss-scopes.md). A local stack's, dev only.
+      RCS_BRIDGE_HSS_URL: http://hss:8081
+      RCS_BRIDGE_HSS_TOKEN: ${HSS_ADMIN_TOKEN:?not in deploy/compose.env; make up adds new settings to it}
+      # The client listener, plain TCP, as rcs-sim reaches it.
+      RCS_BRIDGE_PCSCF: ${PCSCF_PUBLIC_HOST:-pcscf}:5060
+    ports: ["127.0.0.1:${RCS_BRIDGE_HOST_PORT:-8720}:8720"]
+    depends_on:
+      hss:
+        condition: service_healthy
+      pcscf:
+        condition: service_healthy
+      icscf:
+        condition: service_healthy
+      scscf:
+        condition: service_healthy
+      rcs-as-a:
+        condition: service_healthy
+    healthcheck:
+      # Its own /healthz, with the token, as the platform services' checks
+      # do: the image has no shell or curl.
+      test: ["CMD", "/usr/local/bin/rcs-bridge", "-healthcheck"]
       interval: 2s
       timeout: 5s
       retries: 60

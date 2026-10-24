@@ -31,6 +31,9 @@ I-CSCF, S-CSCF, HSS), RCS 메시징 애플리케이션 서버, MSRP 릴레이, H
   `msrp-relay`와 `rcs-as`를 거쳐 다른 단말과 MSRP로 채팅합니다. `rcs-as`를 거쳐
   다른 단말에 pager 메시지도 보내고, 등록되지 않은 단말에게 보낸 메시지는
   `rcs-as`가 저장해 두었다가 전달합니다.
+  `rcs-bridge`([문서](docs/rcs-bridge.md))는 애플리케이션이 로컬 스택을 거쳐
+  단독 메시지를 주고받는 HTTP·WebSocket API입니다. 엔드포인트마다 브리지가
+  테스트 가입자를 만들어 직접 등록합니다.
 - **결정 기록**: ADR 0001–0007과 [위협 모델](docs/threat-model.md).
 
 아직 릴리스는 없습니다.
@@ -69,6 +72,8 @@ Local, S3Mock, 고정된 `acs` 릴리스가 함께 뜹니다.
 ```bash
 make up            # 로컬 스택을 띄우고 모두 정상이 될 때까지 기다림
 make e2e-compose   # 클라이언트 시뮬레이터를 스택에 실행
+# 둘 다 RCSAS_TASKS=2를 주면 rcs-as task 두 개로 띄우고 그 사이의 그룹 채팅도 실행
+make bridge-up     # 스택과 rcs-bridge를 127.0.0.1:8720에 띄움(docs/rcs-bridge.md)
 make down          # 스택을 멈추고 데이터를 지움
 ```
 

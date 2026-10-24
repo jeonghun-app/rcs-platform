@@ -1032,7 +1032,7 @@ type pendingReads struct {
 	n atomic.Int64
 }
 
-func (p *pendingReads) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, n int) ([]store.Message, bool, error) {
+func (p *pendingReads) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, n int) ([]store.Message, time.Time, error) {
 	p.n.Add(1)
 	return p.Store.PendingHeld(ctx, r, after, owner, now, n)
 }

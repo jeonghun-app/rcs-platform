@@ -121,40 +121,58 @@ func pendingHeld(t *testing.T, s store.Store) {
 	if _, err := s.Claim(ctx, carol, "0000", "task-a", t0, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	if got, held, err := s.PendingHeld(ctx, bob, "", "task-b", t0, 10); err != nil || held || fmt.Sprint(idsOf(got)) != "[0001 0002 0003 0004]" {
-		t.Fatalf("PendingHeld with nothing held = %v, %v, %v", idsOf(got), held, err)
+	if got, until, err := s.PendingHeld(ctx, bob, "", "task-b", t0, 10); err != nil || !until.IsZero() || fmt.Sprint(idsOf(got)) != "[0001 0002 0003 0004]" {
+		t.Fatalf("PendingHeld with nothing held = %v, %v, %v", idsOf(got), until, err)
 	}
 	if _, err := s.Claim(ctx, bob, "0002", "task-a", t0, t0.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
+	lease := t0.Add(time.Minute)
 	for _, c := range []struct {
 		after, owner string
 		now          time.Time
 		limit        int
 		want         string
-		held         bool
+		until        time.Time
 	}{
-		{"", "task-b", t0, 10, "[0001 0003 0004]", true},
+		{"", "task-b", t0, 10, "[0001 0003 0004]", lease},
 		// The holder's own claims are not told of.
-		{"", "task-a", t0, 10, "[0001 0003 0004]", false},
+		{"", "task-a", t0, 10, "[0001 0003 0004]", time.Time{}},
 		// Nor one whose lease is over: the message is pending again.
-		{"", "task-b", t0.Add(time.Minute), 10, "[0001 0002 0003 0004]", false},
+		{"", "task-b", t0.Add(time.Minute), 10, "[0001 0002 0003 0004]", time.Time{}},
 		// Nor one outside the range read: before after, or past the last
 		// message returned when limit were.
-		{"0002", "task-b", t0, 10, "[0003 0004]", false},
-		{"", "task-b", t0, 1, "[0001]", false},
-		{"", "task-b", t0, 2, "[0001 0003]", true},
-		{"", "task-b", t0, 0, "[]", false},
+		{"0002", "task-b", t0, 10, "[0003 0004]", time.Time{}},
+		{"", "task-b", t0, 1, "[0001]", time.Time{}},
+		{"", "task-b", t0, 2, "[0001 0003]", lease},
+		{"", "task-b", t0, 0, "[]", time.Time{}},
 		// Nor an expired one.
-		{"", "task-b", t0.Add(2 * time.Hour), 10, "[]", false},
+		{"", "task-b", t0.Add(2 * time.Hour), 10, "[]", time.Time{}},
 	} {
-		got, held, err := s.PendingHeld(ctx, bob, c.after, c.owner, c.now, c.limit)
-		if err != nil || held != c.held || fmt.Sprint(idsOf(got)) != c.want {
+		got, until, err := s.PendingHeld(ctx, bob, c.after, c.owner, c.now, c.limit)
+		if err != nil || !until.Equal(c.until) || fmt.Sprint(idsOf(got)) != c.want {
 			t.Errorf("PendingHeld(after %q, owner %q, %v, limit %d) = %v, %v, %v; want %s, %v",
-				c.after, c.owner, c.now.Sub(t0), c.limit, idsOf(got), held, err, c.want, c.held)
+				c.after, c.owner, c.now.Sub(t0), c.limit, idsOf(got), until, err, c.want, c.until)
 		}
 		if p, err := s.Pending(ctx, bob, c.after, c.now, c.limit); err != nil || fmt.Sprint(idsOf(p)) != fmt.Sprint(idsOf(got)) {
 			t.Errorf("Pending(after %q, %v, limit %d) = %v, %v; PendingHeld read %v", c.after, c.now.Sub(t0), c.limit, idsOf(p), err, idsOf(got))
+		}
+	}
+	// Of several held, the lease that ends first is told of, whichever
+	// message comes first (#651): the queue is to be read again then.
+	if _, err := s.Claim(ctx, bob, "0004", "task-c", t0, t0.Add(30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		owner string
+		until time.Time
+	}{
+		{"task-b", t0.Add(30 * time.Second)},
+		{"task-c", lease},
+		{"task-a", t0.Add(30 * time.Second)},
+	} {
+		if got, until, err := s.PendingHeld(ctx, bob, "", c.owner, t0, 10); err != nil || !until.Equal(c.until) || fmt.Sprint(idsOf(got)) != "[0001 0003]" {
+			t.Errorf("PendingHeld(owner %q) with two held = %v, %v, %v; want [0001 0003], %v", c.owner, idsOf(got), until, err, c.until)
 		}
 	}
 }

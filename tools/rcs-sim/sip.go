@@ -22,6 +22,8 @@ type sipFlags struct {
 	// peerIMPI is the far end's private identity, for the scenarios with
 	// two clients; without it they fail at their first step.
 	peerIMPI string
+	// factory is the conference factory URI, for group-chat.
+	factory string
 	// credEnv names the variables the credentials come from: the
 	// client's, or for the peer its own (sipua.PeerEnv).
 	credEnv sipua.CredentialEnv

@@ -31,6 +31,9 @@ Built and merged on `main` (details in [CHANGELOG.md](CHANGELOG.md)):
   event), reaches another client with OPTIONS, chats with it over MSRP
   through `msrp-relay` and `rcs-as`, and sends it pager messages through
   `rcs-as`, which stores one for a client that is not registered.
+  `rcs-bridge` ([docs](docs/rcs-bridge.md)) gives an application an HTTP and
+  WebSocket API for standalone messages through the local stack, each
+  endpoint a test subscriber it registers itself.
 - **Decisions**: ADRs 0001–0007 and the [threat model](docs/threat-model.md).
 
 There is no release yet.
@@ -70,6 +73,8 @@ Local, S3Mock and the pinned `acs` release. See
 ```bash
 make up            # start the local stack and wait until it is healthy
 make e2e-compose   # the client simulator against it
+# RCSAS_TASKS=2 on both: two rcs-as tasks, and the group chat across them
+make bridge-up     # the stack and rcs-bridge on 127.0.0.1:8720 (docs/rcs-bridge.md)
 make down          # stop it and remove its data
 ```
 

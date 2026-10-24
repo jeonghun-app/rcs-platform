@@ -541,7 +541,7 @@ func (s *Store) Pending(ctx context.Context, recipient, after string, now time.T
 }
 
 // PendingHeld implements store.Store.
-func (s *Store) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+func (s *Store) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, time.Time, error) {
 	return s.pending(ctx, recipient, after, owner, now, limit, true)
 }
 
@@ -550,9 +550,9 @@ func (s *Store) PendingHeld(ctx context.Context, recipient, after, owner string,
 // is charged for what it reads, not for what its filter returns, so this
 // costs no more capacity; it also returns the claimed messages, of which a
 // queue has as many as attempts are under way.
-func (s *Store) pending(ctx context.Context, recipient, after, owner string, now time.Time, limit int, held bool) ([]store.Message, bool, error) {
+func (s *Store) pending(ctx context.Context, recipient, after, owner string, now time.Time, limit int, held bool) ([]store.Message, time.Time, error) {
 	if limit <= 0 {
-		return nil, false, nil
+		return nil, time.Time{}, nil
 	}
 	in := &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
@@ -581,28 +581,30 @@ func (s *Store) pending(ctx context.Context, recipient, after, owner string, now
 		in.ExpressionAttributeValues[":after"] = str(after)
 	}
 	var out []store.Message
-	passed := false
+	var until time.Time
 	for {
 		page, err := s.api.Query(ctx, in)
 		if err != nil {
-			return nil, false, sanitize("query queue", err)
+			return nil, time.Time{}, sanitize("query queue", err)
 		}
 		for _, item := range page.Items {
 			m, err := decodeMessage(item)
 			if err != nil {
-				return nil, false, err
+				return nil, time.Time{}, err
 			}
 			if !m.Free(now) {
-				passed = passed || m.Owner != owner
+				if m.Owner != owner && (until.IsZero() || m.LeaseUntil.Before(until)) {
+					until = m.LeaseUntil
+				}
 				continue
 			}
 			out = append(out, m)
 			if len(out) == limit {
-				return out, passed, nil
+				return out, until, nil
 			}
 		}
 		if len(page.LastEvaluatedKey) == 0 {
-			return out, passed, nil
+			return out, until, nil
 		}
 		in.ExclusiveStartKey = page.LastEvaluatedKey
 	}
