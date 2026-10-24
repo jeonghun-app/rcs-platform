@@ -105,9 +105,10 @@ jobs:
 
   # The whole platform with docker compose (make up): the platform image on
   # DynamoDB Local and S3Mock, and the pinned acs release; then rcs-sim and
-  # the acs checks against it (make e2e-compose). The stack is removed
-  # however the job ends. Its name is stable so it can be made a required
-  # check.
+  # the acs checks against it (make e2e-compose). One rcs-as task, on which
+  # the test also checks what holds for one task only (#654). The stack is
+  # removed however the job ends. Its name is stable so it can be made a
+  # required check.
   compose:
     name: end to end (compose stack)
     runs-on: ubuntu-latest
@@ -121,6 +122,27 @@ jobs:
       - name: stack logs
         if: failure()
         run: make logs LOGS="--no-color --tail=500"
+      - name: remove the stack
+        if: always()
+        run: make down
+
+  # The same stack with two rcs-as tasks (RCSAS_TASKS=2), as a deployment
+  # runs: the same test, and the group chat across the tasks with its owner
+  # stopped and killed (#121). A job of its own, on its own runner and
+  # stack, so the two runs never share scscf's challenge budget (#648).
+  compose-two-tasks:
+    name: end to end (compose stack, two rcs-as tasks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: make up RCSAS_TASKS=2
+      - run: make e2e-compose RCSAS_TASKS=2
+      - name: stack logs
+        if: failure()
+        run: make logs RCSAS_TASKS=2 LOGS="--no-color --tail=500"
       - name: remove the stack
         if: always()
         run: make down
