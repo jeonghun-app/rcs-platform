@@ -3,6 +3,7 @@ package messaging
 import (
 	"bytes"
 	"context"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -176,14 +177,24 @@ func TestAMessageHeldElsewhereIsLookedForAFewTimesOnly(t *testing.T) {
 	if got := r.m.get("delivery.held_elsewhere"); got != 8 {
 		t.Errorf("the queue was read again %d times for the held message, want 8", got)
 	}
-	// Code review on #646: once the looks have run out, nothing keeps
+	// Code review on #646: once the looks have run out, no look keeps
 	// bob's state; a look that fired and stayed recorded would keep it
-	// for the task's life.
+	// for the task's life. The read for the end of task-9's claim keeps
+	// it until then (#651), and then nothing does.
 	r.e.mu.Lock()
 	x := r.e.recipients[bob]
 	r.e.mu.Unlock()
+	if x == nil || x.lookTimer != nil || x.leaseTimer == nil {
+		t.Fatalf("after the looks ran out, bob's state: kept %v, look waiting %v, read for the lease's end waiting %v",
+			x != nil, x != nil && x.lookTimer != nil, x != nil && x.leaseTimer != nil)
+	}
+	r.clock.Advance(12 * time.Hour)
+	waitFor(t, "m1 once task-9's claim was over", func() bool { return r.m.get("delivery.pager") == 1 && r.idle() })
+	r.e.mu.Lock()
+	x = r.e.recipients[bob]
+	r.e.mu.Unlock()
 	if x != nil {
-		t.Errorf("bob's state kept after the looks ran out (look waiting: %v)", x.lookTimer != nil)
+		t.Errorf("bob's state kept once m1 went (look waiting: %v, read waiting: %v)", x.lookTimer != nil, x.leaseTimer != nil)
 	}
 }
 
@@ -411,7 +422,7 @@ type heldReadCounter struct {
 	n atomic.Int64
 }
 
-func (s *heldReadCounter) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+func (s *heldReadCounter) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, time.Time, error) {
 	s.n.Add(1)
 	return s.Store.PendingHeld(ctx, r, after, owner, now, limit)
 }
@@ -660,4 +671,194 @@ func TestARefreshOnATaskWithAStaleWaitInvitesForAMessageQueuedElsewhere(t *testi
 	waitFor(t, "task-x's failed invitation", func() bool { return x.m.get("invite.failed") == 1 && x.idle() })
 	y.e.UserRegistered(bob, false)
 	waitFor(t, "task-y's invitation for m1", func() bool { return asked.Load() == 1 && x.idle() && y.idle() })
+}
+
+// queueHeld queues a standalone message from alice for bob under id, and
+// has task-9 claim it at now until until, as an attempt a task makes
+// before it dies does.
+func queueHeld(t *testing.T, st store.Store, id, text string, now, until time.Time) {
+	t.Helper()
+	if err := st.Enqueue(t.Context(), store.Message{Recipient: bob, ID: id, Sender: alice, Mode: store.Standalone,
+		CPIM: standalone(alice, bob, chat(t, id, text, 0)).CPIM, Enqueued: now, Expires: now.Add(24 * time.Hour)}, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Claim(t.Context(), bob, id, "task-9", now, until); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// pagerTimes has r's pager deliver, and returns when each delivery came,
+// counted from now.
+func pagerTimes(r *rig) func() []time.Duration {
+	var mu sync.Mutex
+	var at []time.Duration
+	t0 := r.clock.Now()
+	r.d.onPager(func(Delivery) error {
+		mu.Lock()
+		defer mu.Unlock()
+		at = append(at, r.clock.Now().Sub(t0))
+		return nil
+	})
+	return func() []time.Duration {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(at)
+	}
+}
+
+// #651: a task that dies while its attempts hold messages leaves their
+// claims for the rest of their leases. The read a takeover asks for passes
+// them over, and nothing else reads the queue: once each lease is over,
+// the queue is read again, with no other event, and the message goes. No
+// read is made before.
+func TestMessagesACrashedTaskHeldGoWhenTheirLeasesEnd(t *testing.T) {
+	st := &heldReadCounter{Store: store.NewMemory()}
+	clock := newFakeClock()
+	r := newRigWith(t, Config{InstanceID: "task-2", RetryInterval: time.Hour}, st, clock)
+	sent := pagerTimes(r)
+	lease := r.e.lease()
+	queueHeld(t, st, "0001", "m1", clock.Now(), clock.Now().Add(lease))
+	clock.Advance(30 * time.Second)
+	queueHeld(t, st, "0002", "m2", clock.Now(), clock.Now().Add(lease))
+	clock.Advance(10 * time.Second)
+	r.e.ReadQueues([]string{bob})
+	waitFor(t, "the takeover's read", func() bool { return st.n.Load() > 0 && r.idle() })
+	reads := st.n.Load()
+	stepUntil(t, clock, lease-41*time.Second, r.idle, func() bool { return false })
+	if got := st.n.Load() - reads; got != 0 || len(sent()) != 0 {
+		t.Fatalf("before m1's lease ended: %d more reads, deliveries at %v", got, sent())
+	}
+	if _, ok := stepUntil(t, clock, 10*time.Minute, r.idle, func() bool { return len(sent()) == 2 }); !ok {
+		t.Fatalf("deliveries at %v; m1's lease ended at %v, m2's at %v", sent(), lease, 30*time.Second+lease)
+	}
+	for i, end := range []time.Duration{lease, 30*time.Second + lease} {
+		if at := sent()[i]; at < end || at > end+time.Second {
+			t.Errorf("m%d delivered %v after it was claimed, its lease %v", i+1, at-end+lease, lease)
+		}
+	}
+	if n := r.queued(t, bob); n != 0 {
+		t.Errorf("%d messages still queued", n)
+	}
+	r.e.mu.Lock()
+	x := r.e.recipients[bob]
+	r.e.mu.Unlock()
+	if x != nil {
+		t.Error("bob's state kept once nothing was held")
+	}
+}
+
+// #651, a claim lost rather than read: task-2's pass reads m1 free, and
+// task-9 claims it first and then dies. That claim was made no later than
+// the lost one, by a clock up to the skew ahead, as task-9's is here: the
+// queue is read again a lease and the skew after, once.
+func TestAPassThatLosesAClaimToATaskThatDiesDeliversOnceTheLeaseEnds(t *testing.T) {
+	for _, waiting := range []bool{false, true} {
+		t.Run(map[bool]string{false: "pass over the queue", true: "pass of a new message"}[waiting], func(t *testing.T) {
+			st := store.NewMemory()
+			clock := newFakeClock()
+			gate := &claimHold{Store: st, in: make(chan struct{}), gate: make(chan struct{})}
+			gate.release = sync.OnceFunc(func() { close(gate.gate) })
+			t.Cleanup(gate.release)
+			r := newRigWith(t, Config{InstanceID: "task-2", RetryInterval: time.Hour, InviteTimeout: time.Hour}, gate, clock)
+			drainInvites(t, r.d)
+			if waiting {
+				// carol's c1 waits for a session, so that m1 is tried on
+				// its own (trySingles).
+				if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "c1", 0))}); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, "c1's invitation", func() bool { return r.m.get("invite.sent") == 1 && r.idle() })
+			}
+			gate.armed.Store(true)
+			if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "one", 0))); err != nil {
+				t.Fatal(err)
+			}
+			waitDone(t, gate.in)
+			ms, err := st.Pending(t.Context(), bob, "", clock.Now(), 10)
+			if err != nil || len(ms) == 0 {
+				t.Fatal(ms, err)
+			}
+			m1 := ms[len(ms)-1]
+			ahead := clock.Now().Add(DefaultClockSkew)
+			if _, err := st.Claim(t.Context(), bob, m1.ID, "task-9", ahead, ahead.Add(r.e.lease())); err != nil {
+				t.Fatal(err)
+			}
+			gate.release()
+			waitFor(t, "task-2's lost claim", func() bool { return r.m.get("delivery.claimed_elsewhere") == 1 && r.idle() })
+			moved, ok := stepUntil(t, clock, 10*time.Minute, r.idle, func() bool { return r.m.get("delivery.pager") == 1 })
+			if end := r.e.lease() + DefaultClockSkew; !ok || moved != end {
+				t.Fatalf("m1 delivered %v, %v after task-2 lost its claim; task-9's lease ended after %v", ok, moved, end)
+			}
+			if got := r.m.get("delivery.lease_read"); got != 1 {
+				t.Errorf("%d reads set for the end of task-9's lease, want 1", got)
+			}
+		})
+	}
+}
+
+// #651: of the claims passes leave, the read waits for the first to end,
+// whether one pass left them all or each came from a pass of its own: m1's
+// claim, which the first read passed over, ends before the one task-2
+// loses on m2 after it.
+func TestTheReadWaitsForTheFirstLeaseToEnd(t *testing.T) {
+	for _, apart := range []bool{false, true} {
+		t.Run(map[bool]string{false: "one pass", true: "passes apart"}[apart], func(t *testing.T) {
+			st := store.NewMemory()
+			clock := newFakeClock()
+			gate := &claimHold{Store: st, in: make(chan struct{}), gate: make(chan struct{})}
+			gate.release = sync.OnceFunc(func() { close(gate.gate) })
+			t.Cleanup(gate.release)
+			r := newRigWith(t, Config{InstanceID: "task-2", RetryInterval: time.Hour, InviteTimeout: time.Hour}, gate, clock)
+			drainInvites(t, r.d)
+			sent := pagerTimes(r)
+			lease := r.e.lease()
+			queueHeld(t, st, "0001", "m1", clock.Now(), clock.Now().Add(lease))
+			if apart {
+				// carol's c1 waits for a session: a read finds m1 held, and
+				// m2 is then tried on its own, with no read of the queue.
+				if err := r.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c1", "c1", 0))}); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, "c1's invitation", func() bool { return r.m.get("invite.sent") == 1 && r.idle() })
+			}
+			clock.Advance(40 * time.Second)
+			gate.armed.Store(true)
+			if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m2", "two", 0))); err != nil {
+				t.Fatal(err)
+			}
+			waitDone(t, gate.in)
+			ms, err := st.Pending(t.Context(), bob, "", clock.Now(), 10)
+			if err != nil || len(ms) == 0 {
+				t.Fatal(ms, err)
+			}
+			if _, err := st.Claim(t.Context(), bob, ms[len(ms)-1].ID, "task-9", clock.Now(), clock.Now().Add(lease)); err != nil {
+				t.Fatal(err)
+			}
+			gate.release()
+			waitFor(t, "task-2's lost claim", func() bool { return r.m.get("delivery.claimed_elsewhere") == 1 && r.idle() })
+			if _, ok := stepUntil(t, clock, 10*time.Minute, r.idle, func() bool { return len(sent()) > 0 }); !ok || sent()[0] != lease {
+				t.Fatalf("deliveries at %v; m1's lease ended at %v", sent(), lease)
+			}
+		})
+	}
+}
+
+// A pass that found bob unreachable reads the queue for a message held
+// elsewhere no sooner than for the rest: that one would find bob
+// unreachable too. The retry timer, an hour here, reads it.
+func TestAPassThatFindsTheRecipientAwayReadsNoSoonerForAHeldMessage(t *testing.T) {
+	st := &heldReadCounter{Store: store.NewMemory()}
+	clock := newFakeClock()
+	r := newRigWith(t, Config{InstanceID: "task-2", RetryInterval: time.Hour}, st, clock)
+	r.d.onPager(func(Delivery) error { return ErrOffline })
+	queueHeld(t, st, "0001", "m1", clock.Now(), clock.Now().Add(r.e.lease()))
+	if err := r.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m2", "two", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "m2's failed attempt", func() bool { return r.m.get("delivery.pager_failed") == 1 && r.idle() })
+	reads := st.n.Load()
+	stepUntil(t, clock, 10*time.Minute, r.idle, func() bool { return false })
+	if got := st.n.Load() - reads; got != 0 {
+		t.Errorf("the queue was read %d more times within 10 min, its retry timer an hour", got)
+	}
 }

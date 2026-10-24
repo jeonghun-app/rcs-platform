@@ -98,3 +98,49 @@ func (e *Engine) lookAgain(user string, wait time.Duration) {
 	})
 	r.lookTimer = t
 }
+
+// A task can die while its attempt holds a message. The claim outlives it
+// for the rest of its lease, and every pass meanwhile passes the message
+// over (store.Store.PendingHeld) or loses its claim to it. The dead task's
+// retry timer died with it, and nothing else reads the queue until the
+// next message, registration or takeover (#651). So a pass that left a
+// message another task held has the queue read again once that claim is
+// over. The store tests a lease against the reader's clock, so for a
+// lease the read passed over that is the lease's own end. A live holder
+// has delivered the message or put it back long before, and the read costs
+// one query that finds nothing more to do. A recipient has one such read
+// waiting, the earliest asked for; its pass asks for the next if a message
+// is still held.
+
+// lostClaimEnd is when a claim another task won from this one is over at
+// the latest: that claim was made no later than now by its holder's clock,
+// which may be ClockSkew ahead of this one's.
+func (e *Engine) lostClaimEnd() time.Time {
+	return e.clock.Now().Add(e.lease() + e.cfg.ClockSkew)
+}
+
+// leaseRead has user's whole queue read at until, when a claim a pass left
+// is over, unless a read is set for no later. It needs e.mu.
+func (e *Engine) leaseRead(user string, r *recipient, until time.Time) {
+	if e.closed || r.leaseTimer != nil && !until.Before(r.leaseAt) {
+		return
+	}
+	if r.leaseTimer != nil {
+		r.leaseTimer.Stop()
+	}
+	e.metrics.Count("delivery.lease_read", 1)
+	var t msrp.Timer
+	t = e.clock.AfterFunc(until.Sub(e.clock.Now()), func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		r := e.recipients[user]
+		// As for a look: only the read waiting now counts.
+		if e.closed || r == nil || r.leaseTimer != t {
+			return
+		}
+		r.leaseTimer = nil
+		r.full = true
+		e.schedule(user, r)
+	})
+	r.leaseTimer, r.leaseAt = t, until
+}
