@@ -597,7 +597,9 @@ func (e *Engine) countDeviations(d cpim.Deviation) {
 // message is tried at once. A refresh on the same flow changes nothing for
 // messages waiting for a session: a queue that found the user unreachable
 // is tried again, retry timer and all, and one that waits for a session
-// is only read again, for what another task holds or left (#632).
+// is only read again, for what another task holds or left (#632), or for
+// an invitation that failed, whose mark a refresh clears (#653); the marks
+// of those still out stay.
 func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()
 	if newFlow {
@@ -629,17 +631,26 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 				delete(e.woken, k)
 			}
 		}
-	} else if r := e.recipients[user]; r != nil && r.hold == holdWaiting {
-		// The queue is still read, with the retry timer left as it is,
-		// for a message another task holds or left (#632): a client that
-		// moves to a new flow before its registration runs out refreshes
-		// (sipas), and the pass then finds what waits for a session still
-		// waiting, asking no invitation asked for within InviteTimeout.
-		e.registeredLook(user)
-		r.full = true
-		e.schedule(user, r)
-		e.mu.Unlock()
-		return
+	} else {
+		// Whatever the hold: a queue that found the user unreachable
+		// may also keep a message whose invitation failed.
+		e.dropFailedInvites(user)
+		if r := e.recipients[user]; r != nil && r.hold == holdWaiting {
+			// The queue is still read, with the retry timer left as it is,
+			// for a message another task holds or left (#632), and for the
+			// invitations whose failed marks were just cleared (#653): a
+			// client that moves to a new flow before its registration runs
+			// out refreshes (sipas), and the pass then finds what waits for
+			// a session still waiting, asking no invitation asked for within
+			// InviteTimeout that is still out. Restarting the backoff here
+			// would give a recipient whose invitations keep failing several
+			// more per refresh (code review of #655).
+			e.registeredLook(user)
+			r.full = true
+			e.schedule(user, r)
+			e.mu.Unlock()
+			return
+		}
 	}
 	// The pass looks out for a message another task's attempt holds, which
 	// it would otherwise leave to that task's retry timer (#632). Both in
@@ -650,14 +661,31 @@ func (e *Engine) UserRegistered(user string, newFlow bool) {
 	e.mu.Unlock()
 }
 
+// dropFailedInvites clears the marks of user's invitations that failed.
+// It needs e.mu.
+//
+// A refresh can be a registration after a de-registration another task
+// took, which this task never heard of (sipas): the core gives each
+// third-party REGISTER to any task. An invitation that failed while the
+// user was away, a 480 say, would hold the queue for InviteTimeout though
+// the user is back (#653). One still out keeps its mark, so that the user
+// is not invited twice for it.
+func (e *Engine) dropFailedInvites(user string) {
+	for k, mark := range e.invites {
+		if k.user == user && mark.failed {
+			delete(e.invites, k)
+		}
+	}
+}
+
 // InviteFailed reports that the session Invite asked for did not come
 // about. ErrNoSessions marks the recipient as reachable by pager mode only
 // until it registers on a new flow, and sends it what fits; for any other
 // error the next invitation waits for InviteTimeout or the next
-// registration on a new flow. ErrUndeliverable for a group gives up what
-// is queued for the recipient from the group, unless it opens a session
-// with the group itself or is added again: the invitation will never
-// reach it.
+// registration, a refresh too (#653). ErrUndeliverable for a group gives
+// up what is queued for the recipient from the group, unless it opens a
+// session with the group itself or is added again: the invitation will
+// never reach it.
 //
 // A failure of an invitation asked for before the recipient's latest
 // registration on a new flow is of the old flow, and is not marked: the
@@ -701,7 +729,7 @@ func (e *Engine) InviteFailed(inv Invitation, err error) {
 		e.kickEvent(inv.Recipient)
 		return
 	}
-	e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout)}
+	e.invites[key] = inviteMark{until: e.clock.Now().Add(e.cfg.InviteTimeout), failed: true}
 	unreachable := inv.Mode == store.Group && errors.Is(err, ErrUndeliverable)
 	if unreachable {
 		e.mark(e.unreachable, legKey{inv.Recipient, inv.Peer})

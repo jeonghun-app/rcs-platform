@@ -24,7 +24,8 @@ import (
 //     queue again would find them waiting still, so a new message is tried
 //     on its own. The whole queue is read on what can let them go: a leg
 //     opening, a registration on a new flow, a failed invitation that makes
-//     pager mode the way, or the retry timer.
+//     pager mode the way, a refresh after an invitation failed (which
+//     leaves the retry timer as it is), or the retry timer.
 //   - The recipient could not be reached (holdBlocked): a new message
 //     waits too. Any registration, a leg, or the retry timer reads the
 //     queue. A message that comes in while such a pass runs is noted:
@@ -919,10 +920,14 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 // inviteMark is an invitation asked for, waited for until until. by is
 // the terminating large-mode leg that marked it while it makes its attempt
 // (activate), so that it deletes its own mark and never a newer one;
-// nil for the invitations invite asks for.
+// nil for the invitations invite asks for. failed marks one that failed
+// (InviteFailed): it tells only that the recipient could not be reached
+// when it was asked, so any registration since clears it, a refresh too
+// (UserRegistered).
 type inviteMark struct {
-	until time.Time
-	by    *Leg
+	until  time.Time
+	by     *Leg
+	failed bool
 }
 
 // invitation is the session m waits for, and its key in e.invites.

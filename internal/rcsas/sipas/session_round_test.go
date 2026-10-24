@@ -337,6 +337,58 @@ func TestAMessageWaitsUntilTheRecipientRegisters(t *testing.T) {
 	}
 }
 
+// #653, the order the captures on #602's two-task stack show: bob
+// registered through task y, his de-registration went to task x, y's
+// invitation for alice's message got 480, and his next registration came
+// to y, which had not seen him leave and took it for a refresh. The
+// refresh has y invite him at once, not RCSAS_INVITE_TIMEOUT later.
+func TestARegistrationTakenForARefreshInvitesAfterA480(t *testing.T) {
+	st := store.NewMemory()
+	x := newChatRigStore(t, messaging.Config{InstanceID: "task-x"}, Config{}, transport.Config{}, st)
+	y := newChatRigStore(t, messaging.Config{InstanceID: "task-y"}, Config{}, transport.Config{}, st)
+	toBob := relayPath()
+	var invites atomic.Int32
+	y.core.setReply(func(req *sip.Request) []*sip.Response {
+		if req.Method == "INVITE" {
+			if invites.Add(1) == 1 {
+				res, _ := sip.NewResponse(req, 480, "", "bob1")
+				return []*sip.Response{res}
+			}
+			return []*sip.Response{y.answerInvite(t, req, toBob, "active")}
+		}
+		res, _ := sip.NewResponse(req, 200, "", "core1")
+		return []*sip.Response{res}
+	})
+	register := func(r *chatRig, expires string) {
+		t.Helper()
+		reg := msg{method: "REGISTER", uri: "sip:rcs-as." + domain, from: "<sip:scscf." + domain + ">;tag=s1",
+			to: "<" + bob + ">", fields: []string{"Expires: " + expires}}
+		if res := r.a.dial(t).send(reg); res.StatusCode != 200 {
+			t.Fatalf("REGISTER answered %d", res.StatusCode)
+		}
+	}
+	register(y, "600")
+	register(x, "0")
+	p := y.a.dial(t)
+	fromAlice := relayPath()
+	s := answeredBy(t, p.send(y.chatInvite(offerSDP(fromAlice, "active"))))
+	p.ack(s)
+	if code := y.connect(t, fromAlice, s.path).send(t, chatCPIM("sf1", "stored for bob")); code != 200 {
+		t.Fatalf("report %d", code)
+	}
+	y.core.nextOf(t, "INVITE")
+	if err := y.e.nextFailure(t); !errors.Is(err, messaging.ErrOffline) {
+		t.Fatalf("failure %v", err)
+	}
+	register(y, "600")
+	inv := y.core.nextOf(t, "INVITE")
+	toLeg, _ := offered(t, inv)
+	y.core.nextOf(t, "ACK")
+	if m := y.connect(t, toBob, toLeg).next(t); !strings.Contains(string(m.Body.Bytes()), "stored for bob") {
+		t.Fatalf("bob got %q", m.Body.Bytes())
+	}
+}
+
 // QA's minor 2 on #252, AC 7 again: the first chunk of a 20 KB message is
 // refused while the send window is one. That outcome is a report about
 // the leg's own send, which Send waits on; a HandleReport that waited on
