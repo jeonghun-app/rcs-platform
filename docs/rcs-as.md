@@ -548,9 +548,9 @@ What the last pass over a queue found decides what reads it again:
 
 | Last pass | A new message | Reads the whole queue |
 |---|---|---|
-| Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg |
-| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark, a refresh (without restarting the retry timer; an invitation asked for more than `RCSAS_INVITE_TIMEOUT` ago is asked again, #632, and one that failed is asked again at once, #653) |
-| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark |
+| Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg, the end of a claim another task held that the last pass met (#651) |
+| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark, a refresh (without restarting the retry timer; an invitation asked for more than `RCSAS_INVITE_TIMEOUT` ago is asked again, #632, and one that failed is asked again at once, #653), the end of a claim another task held that the last pass met (#651) |
+| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark, a read an earlier pass set for the end of another task's claim (the pass that found the recipient unreachable sets none, #651) |
 
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
 `RCSAS_MAX_RETRY_INTERVAL` while the queue stays held. A recipient that never
@@ -646,6 +646,31 @@ store's read tells of the held message at no extra cost (`PendingHeld`), so a
 registration with nothing held costs nothing more. A message that comes in
 on the holding task meanwhile goes once the delivery here stores its reached
 mark ([A recipient reached on another task](#a-recipient-reached-on-another-task)).
+
+A task can also die while its attempt holds a message, as on a crash. Its
+claim outlives it for the rest of the lease, so every pass meanwhile passes
+the message over, or loses its claim to it, and the dead task's retry timer
+is gone (#651). So a pass that left a message another task held reads the
+queue again once that claim is over: at the end of the first lease its read
+passed over, which the store compares with the reader's clock, or, for a
+claim it lost, a lease and `RCSAS_TASK_SKEW` after, as that claim was made
+no later by a clock at most that far ahead. A recipient has one such read
+waiting, the earliest, and the pass it makes sets the next if a message is
+still held. A pass that found the recipient unreachable sets none: the
+retry timer reads the queue, as for the rest. A live holder's attempt is
+over long before its lease ends. If it delivered the message, the read
+costs a query that finds it gone. If the attempt failed and put the message
+back, the read tries it here as any pass would: should that find the
+recipient unreachable, this task holds the queue and starts its own retry
+timer, beside the holder's. Each pass that meets another task's attempt
+costs at most that read, and only one waits per recipient.
+
+This needs a pass on a surviving task to meet the claim during its lease.
+A group copy always has one, the takeover's read
+([Which task serves a group](#which-task-serves-a-group)). A 1-to-1 queue
+has no takeover: if no surviving task reads it during the lease, its
+message, like the free messages a crashed task was retrying, waits for the
+recipient's next event on a surviving task, or `RCSAS_STORE_TTL` (#663).
 
 `Close` takes no new work, then lets the attempts in progress finish, for at
 most a delivery and two store calls, before it cancels the rest. The store
@@ -834,7 +859,12 @@ group's sessions and subscriptions is its conference URI.
   when it stopped are then delivered on a session open here, or invited for
   as an owner does, rather than waiting for the next message written in the
   group, the recipient's next registration on a new flow, or
-  `RCSAS_STORE_TTL` (#607): the old owner's retries ended with it. Each read
+  `RCSAS_STORE_TTL` (#607): the old owner's retries ended with it. A copy
+  whose delivery was under way when an owner crashed is still claimed then,
+  for up to 3 × `RCSAS_DELIVERY_TIMEOUT` (90 s by default) from when the
+  attempt began. The read passes it over, and the queue is read again when
+  that claim ends, as for any message another task held
+  ([Claims and shutdown](#claims-and-shutdown), #651). Each read
   is a pass over the participant's whole queue, as a registration has: it
   tries at once whatever else waits there, a 1-to-1 message on a long retry
   wait say, and starts the queue's retry wait again at
@@ -1272,7 +1302,8 @@ The table's properties:
 - **Partitions.** A recipient's queue is one partition, read in sort-key
   order, which is enqueue order. The engine's read (`PendingHeld`) filters on
   expiry only and tells free messages from claimed ones itself, so that it
-  can tell of a message another task holds (#632). A query is charged for
+  can tell of a message another task holds (#632), and when the first such
+  claim ends (#651). A query is charged for
   what it reads, whatever its filter returns.
 - **Bounds.** The queue's size item and the sender's share item count messages
   and bytes. Both are written in the same transaction as each enqueue and
@@ -1512,6 +1543,7 @@ identifier ever appears in a metric name.
 | `delivery.msrp`, `delivery.pager`, `delivery.msrp_failed`, `delivery.pager_failed` | Delivery attempts |
 | `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
+| `delivery.lease_read` | #651: reads of a queue set for when the claim of a message another task held ends |
 | `delivery.reached_marked`, `delivery.registered_marked`, `delivery.reached_elsewhere`, `delivery.registered_elsewhere` | #605: marks of a delivery and of a registration on a new flow this task stored, and other tasks' marks of each kind it acted on |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
 | `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, here or, as its mark told, on another task, which leave no mark (the registration had the queue read already); a group's 482 is never one |

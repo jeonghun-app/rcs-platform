@@ -549,7 +549,7 @@ type pendingCalls struct {
 	n atomic.Int64
 }
 
-func (s *pendingCalls) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+func (s *pendingCalls) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, limit int) ([]store.Message, time.Time, error) {
 	s.n.Add(1)
 	return s.Store.PendingHeld(ctx, r, after, owner, now, limit)
 }

@@ -386,6 +386,43 @@ func TestATakeoverInvitesForTheCopiesTheOldOwnerQueued(t *testing.T) {
 	}
 }
 
+// #651: a copy whose delivery was under way when its owner crashed is still
+// claimed when the group is taken over, for the rest of the claim's lease
+// (3 × DeliveryTimeout), so the takeover's read passes it over. The new
+// owner invites for it once that lease is over, with no other message
+// written in the group. (QA's probe on #628, which waited 10 minutes.)
+func TestATakeoverInvitesForACopyTheCrashedOwnerHeldOnceItsLeaseEnds(t *testing.T) {
+	a, b, sa, _ := sharedTasks(t)
+	g := a.create(bob, carol)
+	if err := a.write(t, g.URI, alice, "m1"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "a's invitations", func() bool { return a.invitesOf(g, bob) > 0 && a.invitesOf(g, carol) > 0 })
+	claimed := b.clock.Now()
+	lease := 3 * messaging.DefaultDeliveryTimeout
+	pending, err := b.queues.Pending(t.Context(), bob, "", claimed, 10)
+	if err != nil || len(pending) != 1 {
+		t.Fatal(pending, err)
+	}
+	// a's attempt at bob's copy is under way when it crashes.
+	if _, err := b.queues.Claim(t.Context(), bob, pending[0].ID, "dead-instance", claimed, claimed.Add(lease)); err != nil {
+		t.Fatal(err)
+	}
+	sa.failBeats.Store(true)
+	b.pass(t, DefaultTaskLease+DefaultTaskSkew)
+	if owns, err := b.s.Owns(t.Context(), g.URI); err != nil || !owns {
+		t.Fatalf("b's Owns = %v, %v", owns, err)
+	}
+	waitFor(t, "b's invitation of carol", func() bool { return b.invitesOf(g, carol) > 0 })
+	b.pass(t, claimed.Add(lease-time.Second).Sub(b.clock.Now()))
+	time.Sleep(100 * time.Millisecond)
+	if n := b.invitesOf(g, bob); n != 0 {
+		t.Fatalf("b invited bob %d times while his copy was still claimed", n)
+	}
+	b.pass(t, time.Second)
+	waitFor(t, "b's invitation of bob once his copy's lease ended", func() bool { return b.invitesOf(g, bob) > 0 })
+}
+
 // #121 D2: whether this task owns a group is remembered for a heartbeat
 // when another task does, so that a queue of the group's copies costs no
 // read of the store each.
