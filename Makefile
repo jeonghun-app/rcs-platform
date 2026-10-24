@@ -158,7 +158,7 @@ COMPOSE_PROJECT ?= rcs-local
 COMPOSE_ENV     ?= deploy/compose.env
 COMPOSE = RCS_IMAGE="$(IMAGE):$$(printf %s "$$VERSION" | tr + _)" \
 	DDBLOCAL_IMAGE="$(DDBLOCAL_IMAGE)" S3MOCK_IMAGE="$(S3MOCK_IMAGE)" ACS_IMAGE="$(ACS_IMAGE)" \
-	STACK_INIT_IMAGE="$(COMPOSE_PROJECT)-stack-init" \
+	STACK_INIT_IMAGE="$(COMPOSE_PROJECT)-stack-init" RCS_BRIDGE_IMAGE="$(COMPOSE_PROJECT)-rcs-bridge" \
 	$(DOCKER) compose -p $(COMPOSE_PROJECT) -f deploy/docker-compose.yml --env-file $(COMPOSE_ENV)
 # Passed to `docker compose logs`, e.g. make logs LOGS="-f hss".
 LOGS ?= --tail=200
@@ -172,13 +172,21 @@ up: image compose-env ## Start the local stack and wait until every service is h
 	$(COMPOSE) up -d --build --wait --wait-timeout 300
 	$(COMPOSE) run --rm stack-seed
 
+# rcs-bridge (docs/rcs-bridge.md) on the stack make up starts, in the
+# compose profile bridge: built from deploy/rcs-bridge.Dockerfile, published
+# on 127.0.0.1:RCS_BRIDGE_HOST_PORT (8720), with the token RCS_BRIDGE_TOKEN
+# of deploy/compose.env.
+.PHONY: bridge-up
+bridge-up: up ## Start the local stack and rcs-bridge, and wait until it is healthy
+	$(COMPOSE) --profile bridge up -d --build --wait --wait-timeout 120 rcs-bridge
+
 .PHONY: down
 down: compose-env ## Stop the local stack and remove its containers and data
-	$(COMPOSE) --profile seed down -v --remove-orphans
+	$(COMPOSE) --profile seed --profile bridge down -v --remove-orphans
 
 .PHONY: logs
 logs: compose-env ## Logs of the local stack (LOGS="-f hss" to follow one service)
-	$(COMPOSE) logs $(LOGS)
+	$(COMPOSE) --profile bridge logs $(LOGS)
 
 # rcs-sim and acs checks against the stack `make up` started
 # (tools/rcs-sim/e2e, build tag e2ecompose), from the toolchain container on
