@@ -402,6 +402,15 @@ The CI job "end to end (compose stack)" runs `make up`, `make e2e-compose`,
 stack, two rcs-as tasks)" runs the same with `RCSAS_TASKS=2`, on a runner and
 a stack of its own.
 
+`scscf` allows each IMPI 10 challenges in each minute of the clock
+(`registrar.challenge_limited` in its metrics, #201), and a run registers each
+test subscriber several times. Two runs within one minute's window can use it
+up, and a REGISTER then gets 500 (#648). So `scripts/e2e-compose.sh` keeps
+when the last run of the project ended, in
+`tmp/e2e-compose-<COMPOSE_PROJECT>.ended`, and a run that starts in the same
+minute first waits for the next one, at most 60 s, and says so. `make down`
+removes the file, as the budget is in DynamoDB Local's memory.
+
 ## Local and AWS
 
 The services read the same variables in both places, as their documents
@@ -454,7 +463,7 @@ describe them. #56 provides the AWS values. Locally:
 | "run make up, which …" for an image variable | The compose file was used without make. Use the make targets, which set the image variables. |
 | Another worktree's `make up` replaced this stack's containers, or `make e2e-compose` gets 401 from a stack it did not start | Both use the default `COMPOSE_PROJECT`. See [A second stack on the same host](#a-second-stack-on-the-same-host). |
 | `stack-tables` fails with "only some of the hss tables exist" (or the scscf tables) | A half-made stack. Run `make down` and `make up`. |
-| `make e2e-compose` fails with `REGISTER answered 500` right after another run | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics): each run registers the client afresh seven times, five in `TestE2EComposeStack` and one in each group test, so a second run within a minute hits the budget. Wait 65 s between runs. |
+| `make e2e-compose` fails with `REGISTER answered 500` right after another run | `scscf`'s challenge budget per IMPI, 10 a minute (`registrar.challenge_limited` in its metrics). `make e2e-compose` waits out the minute after its own last run (#648), but not after other REGISTERs of the test subscribers, such as an `rcs-sim` run by hand or a run from another worktree on the same stack, which keeps its own `tmp/`. Wait for the next minute and run it again. |
 | `make e2e-compose`: "rcs-as.rcs.local names 2 rcs-as tasks, and make e2e-compose was given RCSAS_TASKS=1" (or the other way) | The stack runs another number of `rcs-as` tasks than the test was told. Give `make up` and `make e2e-compose` the same `RCSAS_TASKS`. A task an interrupted run left stopped also counts: `make up` starts it again. |
 | `stack-seed` answers 401 | `deploy/compose.env` changed after the services started. Run `make up` again to recreate them, or `make down` and `make up`. |
 | `make e2e-compose`: "no local stack rcs-local is running: run make up first" | The stack's network does not exist, or `deploy/compose.env` is missing. Run `make up` first; the test does not start the stack. With another `COMPOSE_PROJECT`, pass the same name to both. |

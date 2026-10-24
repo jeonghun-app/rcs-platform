@@ -26,6 +26,14 @@
 # from starting; the exit status is the test's, or 1 if a container did not
 # come back.
 #
+# A run starts in a later minute than the last run of this project ended
+# in: scscf counts each IMPI's challenges in fixed one-minute windows, 10 at
+# most (internal/scscf/registrar), and one run registers each test
+# subscriber several times, so two runs in one window can use up the
+# budget and fail a REGISTER with 500 (#648). The time the last run ended
+# is kept beside the handshake directory, in <handshake dir>-<project>.ended,
+# which make down removes with the budget.
+#
 # usage: scripts/e2e-compose.sh <project> <handshake dir> <container> command...
 #   project    the compose project (COMPOSE_PROJECT): its network is
 #              <project>_default, and only its rcs-as containers are touched
@@ -61,9 +69,32 @@ bounded() {
 	return "$rc"
 }
 
+# wait_challenge_window sleeps until the minute after the one the last run
+# of this project ended in, if it is still that minute.
+challenge_window=60
+ended="${dir%/}-$project.ended"
+wait_challenge_window() {
+	last=$(cat "$ended" 2>/dev/null) || return 0
+	case "$last" in
+	*[!0-9]* | "") return 0 ;;
+	esac
+	next=$(((last / challenge_window + 1) * challenge_window))
+	now=$(date +%s)
+	if [ "$now" -lt "$next" ]; then
+		echo "e2e-compose: the last run ended in this minute; waiting $((next - now)) s for scscf's next challenge window (#648)" >&2
+		sleep $((next - now))
+	fi
+}
+
+# mark_ended records when this run ended.
+mark_ended() {
+	date +%s >"$ended"
+}
+
 rm -rf "$dir"
 mkdir -p "$dir" || exit 1
 stopped=""
+wait_challenge_window
 
 # rcsas_container prints the name of the rcs-as container of this project
 # with the IPv4 address $1 on its network, if there is one.
@@ -215,7 +246,7 @@ restart_all() {
 "$@" &
 test_pid=$!
 # Interrupted, the test container goes too, and what was stopped comes back.
-trap 'kill "$test_pid" 2>/dev/null; bounded "$docker_timeout" docker rm -f "$container" >/dev/null 2>&1; restart_stopped; exit 130' INT TERM
+trap 'kill "$test_pid" 2>/dev/null; bounded "$docker_timeout" docker rm -f "$container" >/dev/null 2>&1; mark_ended; restart_stopped; exit 130' INT TERM
 
 while kill -0 "$test_pid" 2>/dev/null; do
 	[ -f "$dir/stop" ] && stop_owner stop
@@ -226,6 +257,7 @@ while kill -0 "$test_pid" 2>/dev/null; do
 done
 wait "$test_pid"
 status=$?
+mark_ended
 trap - INT TERM
 restart_stopped || status=1
 exit "$status"

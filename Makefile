@@ -186,9 +186,12 @@ up: image compose-env ## Start the local stack and wait until every service is h
 	$(if $(RCSAS_PROFILE),,$(COMPOSE) --profile rcs-as-b rm -fsv rcs-as-b)
 	$(COMPOSE) run --rm stack-seed
 
+# down also forgets when the last e2e-compose run ended: the challenge budget
+# it waits for (#648, scripts/e2e-compose.sh) is in DynamoDB Local's memory.
 .PHONY: down
 down: compose-env ## Stop the local stack and remove its containers and data
 	$(COMPOSE) --profile seed --profile rcs-as-b down -v --remove-orphans
+	rm -f $(E2E_HANDSHAKE)-$(COMPOSE_PROJECT).ended
 
 .PHONY: logs
 logs: compose-env ## Logs of the local stack (LOGS="-f hss" to follow one service)
