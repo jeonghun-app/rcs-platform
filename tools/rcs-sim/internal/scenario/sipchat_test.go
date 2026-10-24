@@ -7,6 +7,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/sdp"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/transaction"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/transport"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/anchor"
 	"github.com/jeonghun-app/rcs-platform/tools/rcs-sim/internal/chat"
@@ -60,6 +62,25 @@ type chatAnchor struct {
 	// #559).
 	offlineOnFirst bool
 	offlineOnLater chan struct{} // closed once that chat is open
+	// clientChat, if set, has the peer's notifications on a chat the third
+	// subscriber opened to it go on a chat the third opens to the client,
+	// once the channel is closed, as a network that has no session with
+	// the client might ask for one; rcs-as asks so for a chat message
+	// (docs/rcs-as.md, Delivery; #647). pager, if set instead, is given
+	// each of those notifications to send the client in pager mode, as
+	// rcs-as sends one.
+	clientChat chan struct{}
+	pager      func(cpim []byte)
+	// pagerOwn has pager take the peer's notifications on the client's own
+	// chat too, as an rcs-as that missed the client's open leg would send
+	// them, against docs/rcs-as.md Delivery rule 1 (code review on #654).
+	// clientMessages, if set, is where the peer's messages on the client's
+	// own chat go instead of it: the leg it returns, or nowhere for nil.
+	// ownOnClientChat has everything from the peer on the client's own
+	// chat go on the latest chat to the client instead, once clientChat is
+	// closed (QA on #654).
+	pagerOwn, ownOnClientChat bool
+	clientMessages            func() *msrp.Session
 	// toPeer and toClient are what the forwarders do wrong on the way to
 	// the peer and to the client.
 	toPeer, toClient faults
@@ -67,8 +88,9 @@ type chatAnchor struct {
 	mu    sync.Mutex
 	calls map[string]*anchoredCall // by Call-ID
 	// toPeerLegs are the core legs toward the peer, a chat's each, oldest
-	// first.
-	toPeerLegs []*msrp.Session
+	// first, and toClientLeg the one of the latest chat to the client.
+	toPeerLegs  []*msrp.Session
+	toClientLeg *msrp.Session
 }
 
 // faults are what a forwarder does wrong with what it sends on: it loses
@@ -220,6 +242,20 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 			return
 		}
 		in, out := &forwarder{f: &a.toPeer}, &forwarder{f: &a.toClient}
+		from, _ := req.Header.From()
+		third, own := from.URI.String() == thirdIMPU && to.URI.String() == peer.URI, from.URI.String() == self.URI
+		switch {
+		case a.pager != nil && (third || own && a.pagerOwn):
+			out.pager = a.pager
+		case a.clientChat != nil && third:
+			out.later = a.clientLeg
+		}
+		if own {
+			out.chatLater = a.clientMessages
+			if a.ownOnClientChat {
+				out.later = a.clientLeg
+			}
+		}
 		inbound, err := a.core.Expect(callerCore, caller.CoreLocal, in)
 		if err != nil {
 			a.t.Error(err)
@@ -232,7 +268,11 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 		}
 		in.to, out.to = outbound, inbound
 		a.mu.Lock()
-		a.toPeerLegs = append(a.toPeerLegs, outbound)
+		if to.URI.String() == self.URI {
+			a.toClientLeg = outbound
+		} else {
+			a.toPeerLegs = append(a.toPeerLegs, outbound)
+		}
 		a.mu.Unlock()
 		if err := a.ctrl.Complete(ctx, caller.ID, anchor.Paths{Core: callerCore}, 0); err != nil {
 			a.t.Error(err)
@@ -266,6 +306,19 @@ func (a *chatAnchor) forwarding(req *sip.Request) {
 			_ = a.ctrl.Release(ctx, c.callee.ID)
 		}
 	}
+}
+
+// clientLeg is the core's leg toward the client on the latest chat to it,
+// once clientChat is closed; nil if there is none by then.
+func (a *chatAnchor) clientLeg() *msrp.Session {
+	select {
+	case <-a.clientChat:
+	case <-time.After(10 * time.Second):
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.toClientLeg
 }
 
 // answered gives the caller the relay's client_path in the callee's 2xx,
@@ -320,10 +373,14 @@ func (a *chatAnchor) answered(req *sip.Request, res *sip.Response) {
 // the other leg, to, once that is bound, and acknowledged here, as rcs-as
 // takes a message and delivers it in a session of its own. With later set,
 // the other leg is not known yet: it is what later returns once it does.
+// With pager set, a notification goes to pager instead, and with chatLater
+// set, anything else goes on the leg chatLater returns, or nowhere for nil.
 type forwarder struct {
-	f     *faults
-	to    *msrp.Session
-	later func() *msrp.Session
+	f         *faults
+	to        *msrp.Session
+	later     func() *msrp.Session
+	pager     func(cpim []byte)
+	chatLater func() *msrp.Session
 
 	mu       sync.Mutex
 	leftOver bool // the leftover has gone
@@ -360,6 +417,10 @@ func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 	if f.f.recipient != "" && notification {
 		body = recipientRe.ReplaceAll(body, []byte("<recipient-uri>"+f.f.recipient+"</recipient-uri>"))
 	}
+	if f.pager != nil && notification {
+		go f.pager(body)
+		return reportErr
+	}
 	var first []byte
 	if !notification {
 		if f.f.from != "" {
@@ -391,6 +452,11 @@ func (f *forwarder) HandleMessage(_ *msrp.Session, m *msrp.Message) error {
 		to := f.to
 		if f.later != nil {
 			if to = f.later(); to == nil {
+				return
+			}
+		}
+		if f.chatLater != nil && !notification {
+			if to = f.chatLater(); to == nil {
 				return
 			}
 		}
@@ -480,8 +546,180 @@ func TestAChatOverSIPCarriesAMessageEachWayAndItsBYEReleasesIt(t *testing.T) {
 	if d := steps["peer-offline"].Detail; d["status"] != 480 || d["stored"] != 0 {
 		t.Fatalf("peer-offline %+v", steps["peer-offline"])
 	}
+	// Everything for the client came on its own chat.
+	if outside := outsideOwnChat(steps); len(outside) > 0 {
+		t.Fatalf("outside the client's own chat: %v", outside)
+	}
 	if core.Registered(self.URI) || core.Registered(peer.URI) {
 		t.Fatal("a binding outlived the scenario")
+	}
+}
+
+// outsideCounts are the counts each chat-invite step that waits on the
+// client reports of what came outside the client's own chat, as
+// tools/rcs-sim/e2e checks them on its one-task stack.
+var outsideCounts = map[string][]string{
+	"client-to-peer":  {"client_invites", "network_chat", "pager_notifications"},
+	"peer-to-client":  {"client_invites", "network_chat", "pager_notifications"},
+	"chunked-message": {"client_invites", "network_chat", "pager_notifications"},
+}
+
+// outsideOwnChat lists the counts of outsideCounts that are missing or not
+// 0 in steps, as step/count.
+func outsideOwnChat(steps map[string]scenario.Result) []string {
+	var outside []string
+	for step, counts := range outsideCounts {
+		for _, c := range counts {
+			if v, ok := steps[step].Detail[c]; !ok || v != 0 {
+				outside = append(outside, fmt.Sprintf("%s/%s=%d", step, c, v))
+			}
+		}
+	}
+	slices.Sort(outside)
+	return outside
+}
+
+func TestAChatWhoseNotificationsComeInPagerModeOnItsOwnChatShowsIt(t *testing.T) {
+	// Code review on #654: the peer's notifications about the client's
+	// messages come in pager mode though the client's chat is open, as an
+	// rcs-as whose leg lookup missed it would send them (docs/rcs-as.md,
+	// Delivery rule 1). The client takes them, and the steps that waited
+	// for them say they came so, which a one-task stack fails
+	// (tools/rcs-sim/e2e). On main the steps failed instead.
+	cfg, core := sipStack(t)
+	a := anchorChats(t, cfg, core)
+	third := thirdClient(t, core)
+	a.pagerOwn = true
+	a.pager = func(body []byte) {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		su, _ := sip.ParseURI(self.URI)
+		req, err := third.NewMessage(su, cpim.ContentType, body)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if res, err := third.Send(ctx, req); err != nil || res.StatusCode != 200 {
+			t.Errorf("a notification in pager mode: %v, %v", res, err)
+		}
+	}
+	ok, results := runAll(t, cfg, "chat-invite")
+	if !ok {
+		t.Fatalf("results %+v", results)
+	}
+	outside := outsideOwnChat(byStep(results))
+	if want := []string{"chunked-message/pager_notifications=2", "client-to-peer/pager_notifications=2"}; !slices.Equal(outside, want) {
+		t.Fatalf("outside the client's own chat: %v, want %v (results %+v)", outside, want, results)
+	}
+}
+
+// passiveToClient has core offer a=setup:passive in each INVITE to the
+// client, after a's anchoring, so that the client refuses it.
+func passiveToClient(a *chatAnchor, core *simtest.IMSCore) {
+	core.Forwarding = func(req *sip.Request) {
+		a.forwarding(req)
+		to, err := req.Header.To()
+		if req.Method != "INVITE" || err != nil || to.URI.String() != self.URI {
+			return
+		}
+		s, m, err := msrpMedia(req.Body)
+		if err == nil && m.SetSetup(sdp.SetupPassive) == nil {
+			req.Body, _ = s.Marshal()
+		}
+	}
+}
+
+const passiveRefusal = "the network's offer to the client has a=setup:passive, not actpass (RFC 6135 §4.2.2)"
+
+func TestAChatToTheClientRefusedFailsPeerToClientWithWhy(t *testing.T) {
+	// Code review on #654: the peer's message comes, as from a task
+	// without the client's chat, on a chat the network opens to the client
+	// (docs/rcs-as.md, Delivery rule 3); the client refuses its passive
+	// offer, and the step says why rather than that the message did not
+	// arrive.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	a := anchorChats(t, cfg, core)
+	third := thirdClient(t, core)
+	passiveToClient(a, core)
+	a.clientMessages = func() *msrp.Session {
+		if err := openChatsTo(third, self.URI, 1); err == nil {
+			t.Error("the client took a passive offer")
+		}
+		return nil
+	}
+	ok, results := runAll(t, cfg, "chat-invite")
+	last := results[len(results)-1]
+	if ok || last.Step != "peer-to-client" || last.Error != passiveRefusal || last.Detail["client_invites"] != 1 {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestARefusalStandsOnlyForTheStepItCameIn(t *testing.T) {
+	// Code review on #654: the client refuses a chat between client-to-peer
+	// and peer-to-client, and chunked-message then loses its notifications:
+	// its failure is that, not the earlier refusal.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	a := anchorChats(t, cfg, core)
+	a.toClient.dropNotificationsAfter = 2
+	third := thirdClient(t, core)
+	passiveToClient(a, core)
+	var results []scenario.Result
+	ok, err := scenario.Run(context.Background(), cfg, []string{"chat-invite"}, func(r scenario.Result) {
+		results = append(results, r)
+		if r.Step == "client-to-peer" && r.OK {
+			if err := openChatsTo(third, self.URI, 1); err == nil {
+				t.Error("the client took a passive offer")
+			}
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	last := results[len(results)-1]
+	if ok || last.Step != "chunked-message" || last.Error != "2 notifications did not arrive" {
+		t.Fatalf("results %+v", results)
+	}
+	// The INVITE came before peer-to-client: no later step counts it.
+	steps := byStep(results)
+	if steps["peer-to-client"].Detail["client_invites"] != 0 || steps["chunked-message"].Detail["client_invites"] != 0 {
+		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestAChatWhosePeerTrafficComesOnASecondChatToTheClientShowsIt(t *testing.T) {
+	// QA on #654: the network opens a second chat to the client before
+	// client-to-peer, and sends everything from the peer on it rather than
+	// on the client's open chat, against docs/rcs-as.md Delivery rule 1.
+	// The client takes it, and the steps say it came so (network_chat),
+	// which a one-task stack fails (tools/rcs-sim/e2e). The client's own
+	// delivery notification goes back on that chat, which leads nowhere
+	// here, so peer-to-client then fails. On main client-to-peer failed.
+	cfg, core := sipStack(t)
+	cfg.StepTimeout = 3 * time.Second
+	a := anchorChats(t, cfg, core)
+	a.ownOnClientChat, a.clientChat = true, make(chan struct{})
+	third := thirdClient(t, core)
+	var results []scenario.Result
+	_, err := scenario.Run(context.Background(), cfg, []string{"chat-invite"}, func(r scenario.Result) {
+		results = append(results, r)
+		if r.Step == "connect" && r.OK {
+			if err := openChatsTo(third, self.URI, 1); err != nil {
+				t.Error(err)
+			}
+			close(a.clientChat)
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	steps := byStep(results)
+	if d := steps["client-to-peer"].Detail; !steps["client-to-peer"].OK || d["network_chat"] != 2 || d["client_invites"] != 0 {
+		t.Fatalf("results %+v", results)
+	}
+	if d := steps["peer-to-client"].Detail; d["network_chat"] != 1 {
+		t.Fatalf("results %+v", results)
 	}
 }
 
@@ -700,6 +938,12 @@ func TestAChatsOfflineStepEndsEveryChatThePeerHad(t *testing.T) {
 // thirdClient registers the third subscriber with core.
 func thirdClient(t *testing.T, core *simtest.IMSCore) *sipua.UA {
 	t.Helper()
+	return thirdClientWith(t, core, nil)
+}
+
+// thirdClientWith is thirdClient with onRequest as its Config.OnRequest.
+func thirdClientWith(t *testing.T, core *simtest.IMSCore, onRequest func(*transaction.ServerTransaction)) *sipua.UA {
+	t.Helper()
 	u, _ := sip.ParseURI(thirdIMPU)
 	creds, err := sipua.DigestCredentials(thirdIMPI, []byte(thirdToken))
 	if err != nil {
@@ -708,7 +952,7 @@ func thirdClient(t *testing.T, core *simtest.IMSCore) *sipua.UA {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	third, err := sipua.Dial(ctx, sipua.Config{Network: transport.TCP, Proxy: core.Addr, Domain: imsDomain, IMPU: u,
-		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000003", Credentials: creds})
+		InstanceID: "urn:uuid:00000000-0000-4000-8000-000000000003", Credentials: creds, OnRequest: onRequest})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -729,7 +973,12 @@ func chatToPeer(t *testing.T, from *sipua.UA, n int) {
 }
 
 func openChats(from *sipua.UA, n int) error {
-	pu, _ := sip.ParseURI(peer.URI)
+	return openChatsTo(from, peer.URI, n)
+}
+
+// openChatsTo is openChats to the IMPU to.
+func openChatsTo(from *sipua.UA, to string, n int) error {
+	pu, _ := sip.ParseURI(to)
 	offer := "v=0\r\no=- 1 1 IN IP4 192.0.2.3\r\ns=-\r\nc=IN IP4 192.0.2.3\r\nt=0 0\r\nm=message 9 TCP/MSRP *\r\n" +
 		"a=accept-types:message/cpim\r\na=path:msrp://192.0.2.3:9/third;tcp\r\na=setup:active\r\na=sendrecv\r\n"
 	for i := range n {
@@ -742,7 +991,7 @@ func openChats(from *sipua.UA, n int) error {
 		_, res, err := from.Invite(ctx, req, nil)
 		cancel()
 		if err != nil || res.StatusCode/100 != 2 {
-			return fmt.Errorf("chat %d to the peer: %v, %v", i, res, err)
+			return fmt.Errorf("chat %d to %s: %v, %v", i, to, res, err)
 		}
 	}
 	return nil
@@ -787,5 +1036,140 @@ func TestAChatStoredThenSentBeforeThePeersRegistrationIsAnsweredFails(t *testing
 	last := results[len(results)-1]
 	if ok || last.Step != "peer-offline" || last.Error != "the stored message came on a chat the network opened before the peer registered again" {
 		t.Fatalf("results %+v", results)
+	}
+}
+
+func TestAChatsStoredMessageIsNotifiedOutsideTheClientsOwnChat(t *testing.T) {
+	// #647, rcs-as with two tasks: the client's chat to the unregistered
+	// peer and its stored message are on one task, and the peer registers
+	// again on the other. That task opens a chat to the peer for the
+	// message, and has no session with the client for the peer's
+	// notifications: it sends them in pager mode (docs/rcs-as.md,
+	// Delivery). A network could open a chat to the client for them too.
+	// Here the third subscriber does what that task does, through the core,
+	// once the peer's REGISTER has been answered: the reg event's NOTIFY
+	// says so, and it goes only after the 200 (simtest.IMSCore), which the
+	// peer's flow then carries ahead of the INVITE. The client takes either,
+	// and refuses an offer it cannot take, saying why.
+	for name, tc := range map[string]struct {
+		pager   bool // the notifications come in pager mode
+		passive bool // the chat offered to the client is a=setup:passive
+		invites int64
+		err     string
+	}{
+		"in pager mode":                             {pager: true},
+		"on a chat to the client":                   {invites: 1},
+		"on a passive offer to the client, refused": {passive: true, err: passiveRefusal},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, core := sipStack(t)
+			if tc.err != "" {
+				cfg.StepTimeout = 3 * time.Second
+			}
+			a := anchorChats(t, cfg, core)
+			a.answerOffline, a.offlineOnLater = true, make(chan struct{})
+			// Set before the subscription that brings the NOTIFYs.
+			var third *sipua.UA
+			if tc.pager {
+				a.pager = func(body []byte) {
+					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+					defer cancel()
+					su, _ := sip.ParseURI(self.URI)
+					req, err := third.NewMessage(su, cpim.ContentType, body)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					if res, err := third.Send(ctx, req); err != nil || res.StatusCode != 200 {
+						t.Errorf("a notification in pager mode: %v, %v", res, err)
+					}
+				}
+			} else {
+				a.clientChat = make(chan struct{})
+			}
+			if tc.passive {
+				passiveToClient(a, core)
+			}
+			var registered atomic.Bool
+			opened := make(chan struct{})
+			third = thirdClientWith(t, core, func(tx *transaction.ServerTransaction) {
+				req := tx.Request()
+				if res, err := sip.NewResponse(req, 200, "", "third"); err == nil {
+					_ = tx.Respond(res)
+				}
+				// The first with the peer's contact active is its
+				// registration again: the subscription is made while it is
+				// unregistered.
+				if req.Method != "NOTIFY" || !bytes.Contains(req.Body, []byte(`state="active" event="registered"`)) || !registered.CompareAndSwap(false, true) {
+					return
+				}
+				go func() {
+					defer close(opened)
+					if err := openChatsTo(third, peer.URI, 1); err != nil {
+						t.Error(err)
+						return
+					}
+					close(a.offlineOnLater)
+					if a.clientChat == nil {
+						return
+					}
+					// Not checked here: a client that does not take the
+					// chat fails the step, which says so.
+					if err := openChatsTo(third, self.URI, 1); err != nil {
+						t.Log(err)
+					}
+					close(a.clientChat)
+				}()
+			})
+			offline := core.AnswerOffline
+			core.AnswerOffline = func(req *sip.Request) []byte {
+				body := offline(req)
+				if body == nil {
+					return nil
+				}
+				// Before the client has the answer, so before the peer
+				// registers again.
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				pu, _ := sip.ParseURI(peer.URI)
+				sub, err := third.NewRequest("SUBSCRIBE", pu)
+				if err != nil {
+					t.Error(err)
+					return nil
+				}
+				for _, f := range [][2]string{{"Contact", "<" + third.ContactURI().String() + ">"}, {"Event", "reg"}, {"Accept", "application/reginfo+xml"}} {
+					if err := sub.Header.Add(f[0], f[1]); err != nil {
+						t.Error(err)
+						return nil
+					}
+				}
+				if res, err := third.Send(ctx, sub); err != nil || res.StatusCode != 200 {
+					t.Errorf("subscribing to the peer's reg event: %v, %v", res, err)
+					return nil
+				}
+				return body
+			}
+			ok, results := runAll(t, cfg, "chat-invite")
+			if registered.Load() {
+				<-opened
+			}
+			last := results[len(results)-1]
+			if tc.err != "" {
+				if ok || last.Step != "peer-offline" || last.Error != tc.err {
+					t.Fatalf("results %+v", results)
+				}
+				return
+			}
+			if !ok {
+				t.Fatalf("results %+v", results)
+			}
+			pagers, onChat := int64(0), int64(2)
+			if tc.pager {
+				pagers, onChat = 2, 0
+			}
+			if d := byStep(results)["peer-offline"].Detail; d["stored"] != 1 || d["new_session"] != 1 || d["client_invites"] != tc.invites || d["network_chat"] != onChat || d["pager_notifications"] != pagers {
+				t.Fatalf("peer-offline %+v", byStep(results)["peer-offline"])
+			}
+		})
 	}
 }
