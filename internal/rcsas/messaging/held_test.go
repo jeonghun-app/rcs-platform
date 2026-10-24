@@ -586,3 +586,78 @@ func TestARefreshOfAWaitingQueueAsksAnInvitationPastItsTimeout(t *testing.T) {
 		t.Error("the refreshes stopped the retry timer")
 	}
 }
+
+// QA on #646: a client that moves to a new flow before its registration
+// runs out reaches rcs-as as a refresh (sipas register.go), most often on
+// a task that has no state for it. So a refresh on task-2 during task-1's
+// attempt has the queue read again too.
+func TestARefreshElsewhereDuringAnAttemptDeliversOnceTheAttemptFails(t *testing.T) {
+	st := store.NewMemory()
+	clock := newFakeClock()
+	r1 := newRigWith(t, Config{InstanceID: "task-1", RetryInterval: time.Hour}, st, clock)
+	r2 := newRigWith(t, Config{InstanceID: "task-2", Rand: seeded(2), RetryInterval: time.Hour}, st, clock)
+	h := newHeldAttempt(t)
+	r1.d.onPager(h.pager)
+	r2.d.onPager(h.pager)
+	if err := r1.e.Submit(t.Context(), standalone(alice, bob, chat(t, "m1", "one", 0))); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, h.in)
+	r2.e.UserRegistered(bob, false)
+	waitFor(t, "task-2's refresh pass", r2.idle)
+	h.release()
+	waitFor(t, "task-1's failed attempt", func() bool { return r1.m.get("delivery.pager_failed") == 1 && r1.idle() })
+	idle := func() bool { return r1.idle() && r2.idle() }
+	moved, ok := stepUntil(t, clock, 10*time.Minute, idle, func() bool { return h.delivered.Load() == 1 })
+	if !ok || moved > 5*time.Second {
+		t.Fatalf("m1 delivered %v, %v after task-1's attempt failed, with bob refreshed on task-2 (task-1's retry timer: 1 h)", ok, moved)
+	}
+}
+
+// QA on #646, what failed #602's compose run ("message never arrived"):
+// task-y keeps a stale wait for bob, from a pass whose chat message then
+// went another way. task-x queues m1, and its invitation finds bob away.
+// bob's REGISTER lands on task-y as a refresh, as task-y never had his
+// de-registration. That refresh used to return at the stale wait, and m1
+// waited for the next event; now its read invites bob for m1 at once.
+func TestARefreshOnATaskWithAStaleWaitInvitesForAMessageQueuedElsewhere(t *testing.T) {
+	st := store.NewMemory()
+	clock := newFakeClock()
+	x := newRigWith(t, Config{InstanceID: "task-x"}, st, clock)
+	y := newRigWith(t, Config{InstanceID: "task-y", Rand: seeded(2)}, st, clock)
+	drainInvites(t, x.d)
+	drainInvites(t, y.d)
+	x.d.onInvite(func(Invitation) error { return ErrOffline })
+	var asked atomic.Int64
+	y.d.onInvite(func(inv Invitation) error {
+		if inv.Peer == alice {
+			asked.Add(1)
+		}
+		return nil
+	})
+	y.e.UserRegistered(bob, true)
+	waitFor(t, "idle", y.idle)
+	if err := y.e.Submit(t.Context(), Origin{Sender: carol, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "c0", "c0", 0))}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "task-y's wait for a session", func() bool { return y.m.get("invite.sent") == 1 && y.idle() })
+	// c0 goes another way, delivered by task-z.
+	ms, err := st.Pending(t.Context(), bob, "", clock.Now(), 10)
+	if err != nil || len(ms) != 1 {
+		t.Fatal(ms, err)
+	}
+	c, err := st.Claim(t.Context(), bob, ms[0].ID, "task-z", clock.Now(), clock.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Remove(t.Context(), c, "task-z"); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(10 * time.Second)
+	if err := x.e.Submit(t.Context(), Origin{Sender: alice, Recipient: bob, Conversation: conv, Mode: store.Chat, CPIM: content.BodyOf(chat(t, "m1", "m1", 0))}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "task-x's failed invitation", func() bool { return x.m.get("invite.failed") == 1 && x.idle() })
+	y.e.UserRegistered(bob, false)
+	waitFor(t, "task-y's invitation for m1", func() bool { return asked.Load() == 1 && x.idle() && y.idle() })
+}
