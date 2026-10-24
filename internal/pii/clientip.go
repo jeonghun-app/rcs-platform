@@ -140,6 +140,19 @@ func parseDottedQuad(s string) (netip.Addr, bool) {
 // read as a token of its own, so its network may start with digits that
 // look like a port ("[::1]:0:1::" is written "[::/48]:1::/48").
 //
+// Some addresses that net/http does not write, and so its one caller does
+// not see, are truncated less than TruncateIP would truncate them (#500):
+//   - one right after a word's dot, after a "/" that follows a digit, or
+//     after a dotted number, whose start is refused, is read from a later
+//     colon, so that its first groups stay as written;
+//   - one followed by a second "::", which makes the token no address, is
+//     read from its last part;
+//   - one whose first group follows a network's length is read with that
+//     length;
+//   - one followed by ":." or "::." is left whole.
+//
+// A new caller that may pass such text needs these cases handled first.
+//
 // Some text that is no address reads as one and is rewritten: a four-part
 // number such as a version or an OID part (1.2.3.4), an EUI-64
 // (00:11:22:ff:fe:33:44:55), a hex word with "::" (dead::beef), a lone

@@ -300,6 +300,14 @@ type Store interface {
 	// after ("" for the start), so that a caller can page past messages it
 	// leaves queued.
 	Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]Message, error)
+	// PendingHeld is Pending that also reports whether it passed over a
+	// message someone other than owner holds at now, among those after
+	// after and, when limit messages are returned, before the last of
+	// them. A caller that has just learnt the recipient is back needs to
+	// know: the attempt holding that message may have been sent where the
+	// recipient no longer is, fail, and leave the message for the holder's
+	// retry timer (#632). It reads what Pending reads.
+	PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]Message, bool, error)
 	// Claim gives the message to owner until until, if it is free at now,
 	// and returns it whole. Exactly one of several concurrent callers
 	// succeeds; the others get ErrConflict. ErrNotFound if there is no
@@ -340,4 +348,32 @@ type Store interface {
 	// mark stood for could not be done. Without such a mark it does
 	// nothing.
 	UnmarkNotified(ctx context.Context, sender, messageID, key, token string) error
+
+	// MarkReached records m, a mark of recipient, kept until expires:
+	// what tells the other tasks that a queue they hold has a recipient
+	// that was reached since, or registered on a new flow (#605). Each task
+	// has one mark of each kind, which this replaces, so that no task's
+	// mark hides another's.
+	MarkReached(ctx context.Context, recipient string, m Mark, expires time.Time) error
+	// Reached returns recipient's marks that have not expired at now, in
+	// no particular order.
+	Reached(ctx context.Context, recipient string, now time.Time) ([]Mark, error)
+}
+
+// MarkKind is what a reached mark says (Store.MarkReached).
+type MarkKind uint8
+
+const (
+	// Delivered says a delivery by the task got through.
+	Delivered MarkKind = iota + 1
+	// NewFlow says the task took a registration of the recipient on a new
+	// flow while something was queued for it.
+	NewFlow
+)
+
+// Mark is one task's mark of a recipient: of kind Kind, at At.
+type Mark struct {
+	Task string
+	Kind MarkKind
+	At   time.Time
 }

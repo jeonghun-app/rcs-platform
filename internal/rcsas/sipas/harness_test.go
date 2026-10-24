@@ -502,6 +502,7 @@ func (e *fakeEngine) Offer(messaging.LegParams) (*messaging.Leg, error)   { retu
 func (e *fakeEngine) InviteFailed(messaging.Invitation, error)            {}
 func (e *fakeEngine) Invite(context.Context, messaging.Invitation)        {}
 func (e *fakeEngine) Wake(string, string, bool)                           {}
+func (e *fakeEngine) Joining(string, string) func()                       { return func() {} }
 
 func (e *fakeEngine) UserRegistered(user string, newFlow bool) {
 	e.mu.Lock()

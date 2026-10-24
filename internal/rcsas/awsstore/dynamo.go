@@ -69,6 +69,7 @@ const (
 	attrSize       = "size"
 	attrRecounted  = "recounted_at"
 	attrBytes      = "bytes"
+	attrReached    = "reached_at"
 )
 
 // MaxCPIMSize is the largest message body the table takes. A DynamoDB item
@@ -84,7 +85,14 @@ const (
 	sizePrefix  = "c#"
 	sentPrefix  = "s#"
 	sizeSK      = "n"
-	senderSK    = "s#"
+	// reachedPrefix keys a recipient's reached marks (#605), in a
+	// partition of their own, so that neither the queue's reads nor its
+	// recounts meet them; reachedSK prefixes each task's mark of a
+	// delivery, and newFlowSK its mark of a registration on a new flow.
+	reachedPrefix = "r#"
+	reachedSK     = "t#"
+	newFlowSK     = "f#"
+	senderSK      = "s#"
 )
 
 const conditionFailed = "ConditionalCheckFailedException"
@@ -528,8 +536,23 @@ const freeAt = "(attribute_not_exists(#owner) OR #lease <= :now)"
 // Pending implements store.Store: the recipient's partition in sort-key
 // order, filtered to free, unexpired messages, page by page until limit.
 func (s *Store) Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]store.Message, error) {
+	ms, _, err := s.pending(ctx, recipient, after, "", now, limit, false)
+	return ms, err
+}
+
+// PendingHeld implements store.Store.
+func (s *Store) PendingHeld(ctx context.Context, recipient, after, owner string, now time.Time, limit int) ([]store.Message, bool, error) {
+	return s.pending(ctx, recipient, after, owner, now, limit, true)
+}
+
+// pending is Pending, and with held PendingHeld. For PendingHeld the query
+// filters on expiry only, and messages are told free or held here. A query
+// is charged for what it reads, not for what its filter returns, so this
+// costs no more capacity; it also returns the claimed messages, of which a
+// queue has as many as attempts are under way.
+func (s *Store) pending(ctx context.Context, recipient, after, owner string, now time.Time, limit int, held bool) ([]store.Message, bool, error) {
 	if limit <= 0 {
-		return nil, nil
+		return nil, false, nil
 	}
 	in := &dynamodb.QueryInput{
 		TableName:              aws.String(s.table),
@@ -544,6 +567,12 @@ func (s *Store) Pending(ctx context.Context, recipient, after string, now time.T
 		},
 		ScanIndexForward: aws.Bool(true),
 	}
+	if held {
+		// DynamoDB refuses names an expression does not use.
+		in.FilterExpression = aws.String("#expires > :now")
+		delete(in.ExpressionAttributeNames, "#owner")
+		delete(in.ExpressionAttributeNames, "#lease")
+	}
 	if after != "" {
 		// A key condition, so DynamoDB starts reading after it rather than
 		// reading and filtering out the messages before it.
@@ -552,23 +581,28 @@ func (s *Store) Pending(ctx context.Context, recipient, after string, now time.T
 		in.ExpressionAttributeValues[":after"] = str(after)
 	}
 	var out []store.Message
+	passed := false
 	for {
 		page, err := s.api.Query(ctx, in)
 		if err != nil {
-			return nil, sanitize("query queue", err)
+			return nil, false, sanitize("query queue", err)
 		}
 		for _, item := range page.Items {
 			m, err := decodeMessage(item)
 			if err != nil {
-				return nil, err
+				return nil, false, err
+			}
+			if !m.Free(now) {
+				passed = passed || m.Owner != owner
+				continue
 			}
 			out = append(out, m)
 			if len(out) == limit {
-				return out, nil
+				return out, passed, nil
 			}
 		}
 		if len(page.LastEvaluatedKey) == 0 {
-			return out, nil
+			return out, passed, nil
 		}
 		in.ExclusiveStartKey = page.LastEvaluatedKey
 	}
@@ -1110,4 +1144,77 @@ func getTime(item map[string]types.AttributeValue, name string, dst *time.Time) 
 	}
 	*dst = time.Unix(0, n).UTC()
 	return nil
+}
+
+// MarkReached implements store.Store. A task's mark of each kind is an
+// item of its own, put over its last.
+func (s *Store) MarkReached(ctx context.Context, recipient string, m store.Mark, expires time.Time) error {
+	sk, ok := markSK(m.Kind)
+	if !ok {
+		return fmt.Errorf("awsstore: mark reached: kind %d", m.Kind)
+	}
+	item := key(identityKey(reachedPrefix, recipient), identityKey(sk, m.Task))
+	item[attrTask] = str(m.Task)
+	item[attrReached] = stamp(m.At)
+	item[attrExpires] = stamp(expires)
+	item[attrTTL] = ttlOf(expires)
+	if _, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(s.table), Item: item}); err != nil {
+		return sanitize("mark reached", err)
+	}
+	return nil
+}
+
+// markSK is the sort key prefix of a mark of kind k.
+func markSK(k store.MarkKind) (string, bool) {
+	switch k {
+	case store.Delivered:
+		return reachedSK, true
+	case store.NewFlow:
+		return newFlowSK, true
+	}
+	return "", false
+}
+
+// Reached implements store.Store: a consistent query of the recipient's
+// marks, one item per task and kind lately marked. An item of a kind this
+// version does not know is left out.
+func (s *Store) Reached(ctx context.Context, recipient string, now time.Time) ([]store.Mark, error) {
+	var out []store.Mark
+	in := &dynamodb.QueryInput{
+		TableName:                 aws.String(s.table),
+		KeyConditionExpression:    aws.String("#pk = :pk"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(identityKey(reachedPrefix, recipient))},
+		ConsistentRead:            aws.Bool(true),
+	}
+	for {
+		page, err := s.api.Query(ctx, in)
+		if err != nil {
+			return nil, sanitize("query reached", err)
+		}
+		for _, item := range page.Items {
+			var m store.Mark
+			var sk string
+			var expires time.Time
+			if err := errors.Join(getString(item, attrSK, &sk, true), getString(item, attrTask, &m.Task, true),
+				getTime(item, attrReached, &m.At), getTime(item, attrExpires, &expires)); err != nil {
+				return nil, fmt.Errorf("awsstore: query reached: %w", err)
+			}
+			switch {
+			case strings.HasPrefix(sk, reachedSK):
+				m.Kind = store.Delivered
+			case strings.HasPrefix(sk, newFlowSK):
+				m.Kind = store.NewFlow
+			default:
+				continue
+			}
+			if expires.After(now) {
+				out = append(out, m)
+			}
+		}
+		if len(page.LastEvaluatedKey) == 0 {
+			return out, nil
+		}
+		in.ExclusiveStartKey = page.LastEvaluatedKey
+	}
 }

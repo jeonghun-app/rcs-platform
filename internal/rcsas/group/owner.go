@@ -123,6 +123,19 @@ func (s *Service) ownerOrOther(ctx context.Context, g groupstore.Group, maxAge t
 	}
 	s.metrics.Count("group.owner_takeover", 1)
 	s.own(g.URI, next, now)
+	// The copies the old owner queued and had not delivered wait in the
+	// participants' queues, its retries gone with it: they are read at
+	// once, so that each is invited for as an owner does, rather than at
+	// the next message written in the group or the recipient's next
+	// registration (#607; #121 D4 design, §4). After own, so that the
+	// queue passes find this task the owner.
+	var users []string
+	for _, p := range g.Participants {
+		if p.State.Active() {
+			users = append(users, p.Identity)
+		}
+	}
+	s.engine.ReadQueues(users)
 	return next, groupstore.Owner{}, nil
 }
 

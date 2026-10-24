@@ -205,8 +205,9 @@ type run struct {
 	failed   bool
 	cleanups []func()
 
-	// refusal is why the peer last refused an offer the network sent it
-	// (answerCalls), which a step that then waits in vain reports.
+	// refusal is why the peer or the client last refused an offer the
+	// network sent it (answerCalls) in the step under way, which the step,
+	// waiting in vain, reports.
 	refusalMu sync.Mutex
 	refusal   string
 }
@@ -223,6 +224,12 @@ func (r *run) step(name string, f func(ctx context.Context) (map[string]int64, e
 
 // stepWithin is step with its own timeout.
 func (r *run) stepWithin(name string, timeout time.Duration, f func(ctx context.Context) (map[string]int64, error)) error {
+	// A refusal names what failed only in the step it happened in: one
+	// kept from an earlier step would stand for another failure here
+	// (code review on #654).
+	r.refusalMu.Lock()
+	r.refusal = ""
+	r.refusalMu.Unlock()
 	ctx, cancel := context.WithTimeout(r.ctx, timeout)
 	defer cancel()
 	start := time.Now()

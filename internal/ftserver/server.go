@@ -319,9 +319,10 @@ var errLookupBusy = errors.New("ftserver: too many credential lookups in progres
 // Every credential failure (no credentials, an unknown user, an unusable
 // credential record, a wrong password, a replay, a wrong uri) gets the same
 // 401 with a fresh challenge,
-// stale=true only for a correct response with an expired nonce, so a client
-// cannot learn which user names exist. A failure of the credential backend
-// itself, or a task at its lookup limit, gets 503 with Retry-After instead:
+// stale=true only for a correct response with an expired nonce or one whose
+// nonce-count record is unusable, so a client cannot learn which user names
+// exist. A failure of the credential backend or of the nonce-count store, or
+// a task at its lookup limit, gets 503 with Retry-After instead:
 // it says nothing about the user, and RCS clients retry a 503 but give up
 // after a second 401.
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity, bool) {
@@ -366,18 +367,44 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (identity,
 		s.log.Warn("credential lookup failed", slog.String("error", pii.Redact(lookupErr.Error())))
 		serviceUnavailable(w, retryAfter)
 		return identity{}, false
+	case errors.Is(err, digest.ErrNonceCountStore):
+		// The credentials verified but could not be checked for a replay:
+		// the store's fault, not the client's, so the client retries
+		// rather than giving up on a second 401 (#621).
+		s.metrics.Count("auth.backend_error", 1)
+		s.log.Warn("nonce count store failed", slog.String("error", pii.Redact(err.Error())))
+		serviceUnavailable(w, retryAfter)
+		return identity{}, false
 	case errors.Is(err, digest.ErrNoCredentials):
 		s.metrics.Count("auth.challenged", 1)
+	case errors.Is(err, digest.ErrNonceCountUnusable):
+		// Answered as stale, below, so that the client moves to a new
+		// nonce at once; a 503 would bring it back to this record until
+		// the nonce expired (#621). Logged, because only a bug or a hand
+		// edit leaves a record unreadable.
+		s.metrics.Count("auth.stale", 1)
+		s.log.Warn("nonce count record unusable", slog.String("error", pii.Redact(err.Error())))
 	case stale:
 		s.metrics.Count("auth.stale", 1)
 	default:
 		s.metrics.Count("auth.failed", 1)
+	}
+	if !errors.Is(err, digest.ErrNoCredentials) && carriesContent(r) {
+		// Content sent under credentials that did not verify, so none of
+		// it is kept: a broken upload refused this way is lost (#66).
+		s.metrics.Count("upload.failed.auth", 1)
 	}
 	if err := s.o.Digest.ChallengeHTTP(w, stale); err != nil {
 		s.log.Error("cannot issue a digest challenge", slog.String("error", err.Error()))
 		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
 	}
 	return identity{}, false
+}
+
+// carriesContent reports whether r is an upload or a resume with a body,
+// not the empty pre-check POST.
+func carriesContent(r *http.Request) bool {
+	return (r.Method == http.MethodPost || r.Method == http.MethodPut) && r.ContentLength != 0
 }
 
 // serviceUnavailable answers 503 with Retry-After, which RCS clients honour

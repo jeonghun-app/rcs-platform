@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
 // errReader fails every read, like a connection that broke.
@@ -25,13 +26,7 @@ func (r errReader) Read([]byte) (int, error) { return 0, r.err }
 // declares its length, as RCS clients do.
 func breakUpload(t *testing.T, e *env, u *user, tid, data string, n int) {
 	t.Helper()
-	p := filePart("a.bin", "application/octet-stream", data)
-	p.header += "Content-Length: " + strconv.Itoa(len(data)) + "\r\n"
-	body := multipartBody(tidPart(tid), p)
-	cut := strings.Index(body, data) + n
-	r := httptest.NewRequest(http.MethodPost, "/ft", io.MultiReader(strings.NewReader(body[:cut]), errReader{io.ErrUnexpectedEOF}))
-	r.Header.Set("Content-Type", formType)
-	if rec := e.do(u.sign(r)); rec.Code != http.StatusBadRequest {
+	if rec := e.do(signedBrokenUpload(u, tid, data, n)); rec.Code != http.StatusBadRequest {
 		t.Fatalf("broken upload = %d %s, want 400", rec.Code, rec.Body)
 	}
 }
@@ -80,6 +75,90 @@ func TestBrokenUploadResumesFromTheLastStoredPart(t *testing.T) {
 	}
 	if e.metric("upload.resumed") != 1 {
 		t.Fatal("resume not counted")
+	}
+}
+
+// signedBrokenUpload signs a POST of data under tid broken off after n bytes
+// of file content, for a test to serve whenever the server would get to it.
+func signedBrokenUpload(u *user, tid, data string, n int) *http.Request {
+	p := filePart("a.bin", "application/octet-stream", data)
+	p.header += "Content-Length: " + strconv.Itoa(len(data)) + "\r\n"
+	body := multipartBody(tidPart(tid), p)
+	cut := strings.Index(body, data) + n
+	r := httptest.NewRequest(http.MethodPost, "/ft", io.MultiReader(strings.NewReader(body[:cut]), errReader{io.ErrUnexpectedEOF}))
+	r.Header.Set("Content-Type", formType)
+	return u.sign(r)
+}
+
+func TestBrokenUploadVerifiedAfterTheNextRequestOnItsNonceIsKept(t *testing.T) {
+	// #66: the client gives up on the POST as soon as its body fails and
+	// sends get_upload_info at once, under the same nonce with the next
+	// count. The server verifies that request first, then gets to the POST.
+	e := newEnv(t)
+	u := e.user(alice)
+	data := pattern(3*testPart + 7)
+	late := signedBrokenUpload(u, "late", data, 2*testPart+100)
+	if early := u.get("/ft?tid=late&get_upload_info"); early.Code != http.StatusNotFound {
+		t.Fatalf("get_upload_info before the POST is read = %d, want 404", early.Code)
+	}
+	if rec := e.do(late); rec.Code != http.StatusBadRequest {
+		t.Fatalf("late broken upload = %d %s, want 400 (accepted, then broken)", rec.Code, rec.Body)
+	}
+	info := u.get("/ft?tid=late&get_upload_info")
+	if info.Code != http.StatusOK {
+		t.Fatalf("get_upload_info = %d", info.Code)
+	}
+	if end, _ := strconv.Atoi(parseResumeDocument(t, info.Body.Bytes()).Range.End); end+1 != 2*testPart {
+		t.Fatalf("held %d bytes, want the two whole parts", end+1)
+	}
+	if got := e.metric("upload.failed.auth"); got != 0 {
+		t.Fatalf("upload.failed.auth = %v", got)
+	}
+}
+
+func TestReplayedOrTooLateUploadIsRefusedAndCounted(t *testing.T) {
+	e := newEnv(t)
+	u := e.user(alice)
+	upload := func(tid string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/ft", strings.NewReader(multipartBody(tidPart(tid), filePart("a.bin", "text/plain", "x"))))
+		r.Header.Set("Content-Type", formType)
+		return u.sign(r)
+	}
+	below, edge := upload("below"), upload("edge") // nc 1 and 2
+	sent := upload("sent")
+	replay := httptest.NewRequest(http.MethodPost, "/ft", strings.NewReader(multipartBody(tidPart("sent"), filePart("a.bin", "text/plain", "x"))))
+	replay.Header = sent.Header.Clone()
+	if rec := e.do(sent); rec.Code != http.StatusOK {
+		t.Fatalf("upload = %d", rec.Code)
+	}
+	if rec := e.do(replay); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("the same upload with the same nonce-count again = %d, want 401", rec.Code)
+	}
+	// Up to nc 33: the window now starts at edge's 2, past below's 1.
+	for u.nc < 1+digest.NonceCountWindow {
+		if rec := u.get("/ft?tid=sent&get_download_info"); rec.Code != http.StatusOK {
+			t.Fatalf("get_download_info = %d", rec.Code)
+		}
+	}
+	if rec := e.do(edge); rec.Code != http.StatusOK {
+		t.Fatalf("upload at the window's lowest count = %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do(below); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("upload below the window = %d, want 401", rec.Code)
+	}
+	// A resume is an upload too.
+	put := u.sign(httptest.NewRequest(http.MethodPut, "/ft/sent", strings.NewReader("x")))
+	put.Header.Set("Content-Range", rangeHeader(0, 1))
+	again := httptest.NewRequest(http.MethodPut, "/ft/sent", strings.NewReader("x"))
+	again.Header = put.Header.Clone()
+	if rec := e.do(put); rec.Code == http.StatusUnauthorized {
+		t.Fatal("resume refused by authentication")
+	}
+	if rec := e.do(again); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("the same resume with the same nonce-count again = %d, want 401", rec.Code)
+	}
+	if got := e.metric("upload.failed.auth"); got != 3 {
+		t.Fatalf("upload.failed.auth = %v, want 3", got)
 	}
 }
 

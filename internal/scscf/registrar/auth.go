@@ -69,6 +69,10 @@ func (g *Registrar) authenticate(ctx context.Context, r *register, known bool) *
 		return nil
 	case errors.Is(err, digest.ErrStaleNonce):
 		return g.challenge(ctx, r, true)
+	case errors.Is(err, digest.ErrNonceCountStore):
+		// Not the UE's failure: answered as the other store failures here
+		// are, not as a wrong response (#621).
+		return g.internal("recording the nonce count", err)
 	}
 	g.count("registrar.auth_failed")
 	return refuse(403, "Authentication failed")

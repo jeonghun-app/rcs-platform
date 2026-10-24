@@ -29,14 +29,17 @@ type SecretLookup func(ctx context.Context, username string, alg Algorithm) (Sec
 // lookup runs only after the nonce and opaque have verified, so a forged
 // nonce costs no lookup. A genuine nonce is free to obtain, though, so lookup
 // can still run for any username a client sends, and its error comes back
-// wrapped. Callers must answer every error except ErrStaleNonce (and, if they
-// wish, ErrURIMismatch) with the same 401 from ChallengeHTTP, with no
+// wrapped. Callers must answer every error except ErrStaleNonce,
+// ErrNonceCountStore (a failure of their backend, such as 503) and, if they
+// wish, ErrURIMismatch with the same 401 from ChallengeHTTP, with no
 // difference in body or timing they can avoid, so that a client cannot tell
 // which usernames exist.
 //
-// A client that reuses a nonce must send its requests in nonce-count order;
-// counts must strictly increase, so a request overtaken by a later one fails
-// with ErrReplayed and the client is re-challenged. Digest AKA is refused:
+// A client that reuses a nonce may have its requests verified out of
+// nonce-count order: each count is accepted once inside NonceCountWindow
+// (UsedCounts), so a request overtaken by a later one still verifies. A count
+// already used, or one below the window, fails with ErrReplayed and the
+// client is re-challenged. Digest AKA is refused:
 // over HTTP it belongs to GBA, which this package does not implement.
 func (s *Server) VerifyHTTP(r *http.Request, lookup SecretLookup) (Credentials, error) {
 	var values []string

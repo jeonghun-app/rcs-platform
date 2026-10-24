@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	secretkey "github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
@@ -77,6 +78,11 @@ func TestEveryAuthenticationFailureLooksTheSame(t *testing.T) {
 			t.Errorf("%s: %s", name, got)
 		}
 	}
+	// Each upload sent with credentials that did not verify; not the one
+	// without credentials, nor the empty POST.
+	if got := e.metric("upload.failed.auth"); got != 4 {
+		t.Errorf("upload.failed.auth = %v, want 4", got)
+	}
 }
 
 func TestExpiredNonceGetsAStaleChallenge(t *testing.T) {
@@ -112,7 +118,7 @@ func TestMD5CredentialsAreAccepted(t *testing.T) {
 			ch = c
 		}
 	}
-	c, err := digest.Respond(ch, digest.ClientParams{Username: alice, Password: []byte(password), Method: "POST", URI: "/ft", CNonce: "c", NC: 1})
+	c, err := digest.Respond(ch, digest.ClientParams{Username: alice, Password: secret.NewKey([]byte(password)), Method: "POST", URI: "/ft", CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

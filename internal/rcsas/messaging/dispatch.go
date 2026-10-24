@@ -24,7 +24,8 @@ import (
 //     queue again would find them waiting still, so a new message is tried
 //     on its own. The whole queue is read on what can let them go: a leg
 //     opening, a registration on a new flow, a failed invitation that makes
-//     pager mode the way, or the retry timer.
+//     pager mode the way, a refresh after an invitation failed (which
+//     leaves the retry timer as it is), or the retry timer.
 //   - The recipient could not be reached (holdBlocked): a new message
 //     waits too. Any registration, a leg, or the retry timer reads the
 //     queue. A message that comes in while such a pass runs is noted:
@@ -34,6 +35,17 @@ import (
 // The retry timer starts at RetryInterval and doubles up to
 // MaxRetryInterval while a queue stays held, so a recipient that never
 // comes back costs a read an hour, not one per message sent to it.
+//
+// A hold is this task's own: another task may take the recipient's
+// registration, or the session its invitation brought, and deliver the
+// queue meanwhile (#605). So each task marks a recipient in the store when
+// a delivery to it gets through, and when it takes its registration on a
+// new flow while something is queued (markReached); a task holding the
+// queue reads the other tasks' marks when a new message comes in (probe).
+// It acts on each mark once, if the mark is not older than the hold:
+// a delivery elsewhere releases the hold, as a refresh here would; only a
+// registration on a new flow elsewhere also clears the invitations asked
+// for and the pager-only marker, as one here does.
 type hold uint8
 
 const (
@@ -63,9 +75,44 @@ type recipient struct {
 	// last passes left waiting for a session: a new message from one of
 	// them must not go ahead of those, from anyone else it may.
 	waiting map[string]bool
+	// look has the next pass over the whole queue look out for messages
+	// another task holds, after a registration (lookAgain); lookWait is
+	// the wait that led to that look, zero for a registration's own.
+	// lookTimer is the one look waiting for its time.
+	look      bool
+	lookWait  time.Duration
+	lookTimer msrp.Timer
 	// arrived notes a message queued while a pass ran with the queue
 	// blocked (see hold).
 	arrived bool
+	// probe asks for the store's reached mark to be read before the next
+	// pass, for a message that came in while the queue was held, and
+	// heldSince is when the last pass that left it held began.
+	probe     bool
+	heldSince time.Time
+	// reread asks for the queue to be read again once the running pass
+	// ends, unless the recipient could not be reached in it (markReached).
+	reread bool
+	// registered says a registration on a new flow here asked for the
+	// pass, which marks it if it finds anything queued.
+	registered bool
+}
+
+// reachedEvery spaces one task's marks of deliveries to one recipient, so
+// that a conversation costs a write a minute, not one per message.
+const reachedEvery = time.Minute
+
+// reachedSlack is how long before a hold's pass a mark still counts
+// against it: a mark left out within reachedEvery leaves the stored one up
+// to that much older than the delivery it stands for, and the tasks'
+// clocks may differ by ClockSkew. A mark that counts when it need not
+// costs one more attempt, once.
+func (e *Engine) reachedSlack() time.Duration { return reachedEvery + e.cfg.ClockSkew }
+
+// markSeen keys Engine.marksSeen.
+type markSeen struct {
+	user string
+	kind store.MarkKind
 }
 
 // state needs e.mu.
@@ -92,6 +139,11 @@ func (e *Engine) schedule(user string, r *recipient) {
 func (e *Engine) kickEvent(user string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.kickEventLocked(user)
+}
+
+// kickEventLocked is kickEvent for a caller holding e.mu.
+func (e *Engine) kickEventLocked(user string) {
 	if e.closed {
 		return
 	}
@@ -113,6 +165,9 @@ func (e *Engine) kickNew(m store.Message) {
 		return
 	}
 	r := e.state(m.Recipient)
+	if r.hold != holdNone {
+		r.probe = true
+	}
 	switch r.hold {
 	case holdNone:
 		r.full = true
@@ -130,12 +185,138 @@ func (e *Engine) kickNew(m store.Message) {
 			r.waiting[m.Sender] = true
 		}
 	case holdBlocked:
+		// It waits, unless the probe finds the recipient reached
+		// elsewhere.
 		if r.run == running {
 			r.arrived = true
 		}
-		return
 	}
 	e.schedule(m.Recipient, r)
+}
+
+// markReached records in the store that a delivery reached user, at most
+// once every reachedEvery from this task, for the tasks that hold user's
+// queue (see hold).
+func (e *Engine) markReached(user string) {
+	now := e.clock.Now()
+	e.mu.Lock()
+	if last, ok := e.reachedAt[user]; e.closed || ok && now.Sub(last) < reachedEvery {
+		e.mu.Unlock()
+		return
+	}
+	if len(e.reachedAt) >= e.cfg.MaxTracked {
+		clear(e.reachedAt)
+	}
+	e.reachedAt[user] = now
+	e.mu.Unlock()
+	if !e.storeMark(user, store.Delivered, now) {
+		e.mu.Lock()
+		// The next delivery tries again.
+		delete(e.reachedAt, user)
+		e.mu.Unlock()
+	}
+}
+
+// storeMark stores this task's mark of kind of user at now, and reports
+// whether it did. Once a mark of a delivery is stored the whole queue is
+// read once more, after the pass it came from: another task may have
+// queued a message this task's pass did not read, a pass of single
+// messages or one that had read past where it sorts, and looked for a
+// mark just before this one, so that it left the message to this task,
+// blocked (#605). A pass that then found the recipient unreachable has no
+// reason to read it again. A mark of a registration is written after the
+// pass that read the whole queue, and has it read no more: a message
+// another task queued meanwhile and holds for a session waits at most for
+// that task's next probe or its own timers, which a registration there
+// would have spared it, but is not blocked.
+func (e *Engine) storeMark(user string, kind store.MarkKind, now time.Time) bool {
+	ctx, cancel := e.recordCtx()
+	// A hold that began within reachedSlack of the mark is probed until
+	// its retry timer fires, MaxRetryInterval after it at most.
+	err := e.store.MarkReached(ctx, user, store.Mark{Task: e.cfg.InstanceID, Kind: kind, At: now}, now.Add(e.reachedSlack()+e.cfg.MaxRetryInterval))
+	cancel()
+	if err != nil {
+		e.storeFailed("mark reached", user, err)
+		return false
+	}
+	if kind == store.Delivered {
+		e.metrics.Count("delivery.reached_marked", 1)
+	} else {
+		e.metrics.Count("delivery.registered_marked", 1)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.closed || kind != store.Delivered {
+		return true
+	}
+	r := e.state(user)
+	if r.run == running {
+		r.reread = true
+		return true
+	}
+	r.full = true
+	e.schedule(user, r)
+	return true
+}
+
+// markedElsewhere reads user's marks and reports which kinds, of another
+// task, count against a hold whose pass began at since: newer than the
+// newest of its kind this task acted on, and not older than the hold by
+// more than reachedSlack. This task's own marks do not count, as it knows
+// what its deliveries did, nor do marks it cannot read. Each mark that
+// counts counts once.
+func (e *Engine) markedElsewhere(user string, since time.Time) (delivered, newFlow bool) {
+	ctx, cancel := e.withTimeout(e.ctx, e.cfg.StoreTimeout)
+	marks, err := e.store.Reached(ctx, user, e.clock.Now())
+	cancel()
+	if err != nil {
+		if e.ctx.Err() == nil {
+			e.storeFailed("reached", user, err)
+		}
+		return false, false
+	}
+	floor := since.Add(-e.reachedSlack())
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, m := range marks {
+		k := markSeen{user, m.Kind}
+		if m.Task == e.cfg.InstanceID || !m.At.After(floor) || !m.At.After(e.marksSeen[k]) {
+			continue
+		}
+		if _, ok := e.marksSeen[k]; !ok && len(e.marksSeen) >= e.cfg.MaxTracked {
+			clear(e.marksSeen)
+		}
+		e.marksSeen[k] = m.At
+		switch m.Kind {
+		case store.Delivered:
+			delivered = true
+		case store.NewFlow:
+			newFlow = true
+		}
+	}
+	return delivered, newFlow
+}
+
+// registeredElsewhere does for a registration on a new flow another task
+// took what one here does to the invitations asked for and the pager-only
+// marker: they are cleared, and a failure of an invitation asked before it
+// is not marked (InviteFailed). The registration is not this task's own,
+// so the owners of the user's groups are not told of it (wakeOwner): the
+// task that took it tells them.
+func (e *Engine) registeredElsewhere(user string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.pagerOnly, user)
+	for k := range e.invites {
+		if k.user == user {
+			delete(e.invites, k)
+		}
+	}
+	if _, ok := e.relayedAt[user]; !ok && len(e.relayedAt) >= e.cfg.MaxTracked {
+		clear(e.relayedAt)
+	}
+	e.flowSeq++
+	e.relayedAt[user] = e.flowSeq
 }
 
 // kickRetry is the retry timer.
@@ -168,15 +349,45 @@ func (e *Engine) work() {
 		e.queue = e.queue[1:]
 		r := e.recipients[user]
 		r.run = running
-		for r.full || len(r.single) > 0 {
+		for r.full || len(r.single) > 0 || r.probe {
+			if r.probe && !r.full {
+				// A pass over the whole queue reads it anyway.
+				r.probe = false
+				since := r.heldSince
+				e.mu.Unlock()
+				delivered, newFlow := e.markedElsewhere(user, since)
+				if newFlow {
+					e.metrics.Count("delivery.registered_elsewhere", 1)
+					e.registeredElsewhere(user)
+				}
+				if delivered {
+					e.metrics.Count("delivery.reached_elsewhere", 1)
+				}
+				if delivered || newFlow {
+					// The hold is released, as a registration here
+					// would release it, and the queue read.
+					e.kickEvent(user)
+				}
+				e.mu.Lock()
+				continue
+			}
+			r.probe = false
 			full, single, waiting := r.full, r.single, maps.Clone(r.waiting)
 			r.full, r.single = false, nil
+			registered := full && r.registered
+			if full {
+				r.registered = false
+			}
+			started := e.clock.Now()
 			e.mu.Unlock()
 			var res passResult
 			if full {
 				res = e.drain(e.ctx, user)
 			} else {
 				res = e.trySingles(e.ctx, single, waiting)
+			}
+			if registered && res.saw {
+				e.storeMark(user, store.NewFlow, started)
 			}
 			e.mu.Lock()
 			if res.again {
@@ -193,7 +404,13 @@ func (e *Engine) work() {
 					r.waiting[s] = true
 				}
 			}
-			e.settle(user, r, res, full)
+			e.settle(user, r, res, full, started)
+			if r.reread {
+				r.reread = false
+				if !res.stopped {
+					r.full = true
+				}
+			}
 			if r.arrived {
 				// A pass that stopped leaves it to wait like the rest. One
 				// that got through, full or of single messages, has the
@@ -217,7 +434,7 @@ func (e *Engine) work() {
 			}
 		}
 		r.run = runIdle
-		if r.hold == holdNone && r.retry == nil {
+		if r.hold == holdNone && r.retry == nil && r.lookTimer == nil {
 			delete(e.recipients, user)
 		}
 		e.mu.Unlock()
@@ -230,16 +447,18 @@ func (e *Engine) work() {
 type passResult struct {
 	stopped, skipped, again bool
 	waited                  map[string]bool
+	// saw says the pass found anything queued.
+	saw bool
 }
 
-// settle needs e.mu. It records what a pass found and arms the retry timer
-// of a queue left held.
-func (e *Engine) settle(user string, r *recipient, res passResult, full bool) {
+// settle needs e.mu. It records what a pass that began at started found
+// and arms the retry timer of a queue left held.
+func (e *Engine) settle(user string, r *recipient, res passResult, full bool, started time.Time) {
 	switch {
 	case res.stopped:
-		r.hold = holdBlocked
+		r.hold, r.heldSince = holdBlocked, started
 	case res.skipped:
-		r.hold = holdWaiting
+		r.hold, r.heldSince = holdWaiting, started
 	case full:
 		// The whole queue went: nothing is held.
 		r.hold = holdNone
@@ -261,7 +480,7 @@ func (e *Engine) settle(user string, r *recipient, res passResult, full bool) {
 type outcome uint8
 
 const (
-	// done: delivered, given up on, or taken by another task.
+	// done: delivered or given up on.
 	done outcome = iota
 	// skip: m stays queued for a reason of its own (it waits for a
 	// session), which says nothing about the messages after it.
@@ -272,12 +491,17 @@ const (
 	// whole: m found a leg that older messages wait for, and was not
 	// sent ahead of them; the queue is to be read again, in order.
 	whole
+	// taken: as done, but m could not be claimed: another task held it,
+	// it was gone, or the store failed.
+	taken
 )
 
 // drain delivers recipient's queue, oldest first, until a message finds the
 // recipient unreachable or the engine closes.
 func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 	res := passResult{waited: map[string]bool{}}
+	look, wait := e.takeLook(recipient)
+	held := false
 	after := ""
 	// If the session the waited senders' messages wait for opens part-way
 	// through the pass, a later message from the same sender must not go
@@ -285,12 +509,13 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 	waited := res.waited
 	for ctx.Err() == nil && !e.isClosed() {
 		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
-		batch, err := e.store.Pending(sctx, recipient, after, e.clock.Now(), e.cfg.Batch)
+		batch, passed, err := e.store.PendingHeld(sctx, recipient, after, e.cfg.InstanceID, e.clock.Now(), e.cfg.Batch)
 		cancel()
 		if err != nil {
 			e.storeFailed("pending", recipient, err)
 			return passResult{stopped: true}
 		}
+		res.saw = res.saw || len(batch) > 0
 		for _, m := range batch {
 			switch e.deliver(ctx, m, waited[m.Sender]) {
 			case stop:
@@ -303,14 +528,26 @@ func (e *Engine) drain(ctx context.Context, recipient string) passResult {
 				}
 			case whole:
 				res.again = true
+				if look {
+					// The queue is read again at once, and looks then.
+					e.mu.Lock()
+					e.lookOut(recipient, wait)
+					e.mu.Unlock()
+				}
 				return res
+			case taken:
+				held = true
 			}
 			after = m.ID
 			if e.isClosed() {
 				return res
 			}
 		}
+		held = held || passed
 		if len(batch) < e.cfg.Batch {
+			if look && held {
+				e.lookAgain(recipient, wait)
+			}
 			return res
 		}
 	}
@@ -581,9 +818,7 @@ func (e *Engine) claim(ctx context.Context, m store.Message) (store.Message, boo
 	now := e.clock.Now()
 	ctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
 	defer cancel()
-	// The lease outlasts a whole attempt, so that it never runs out while
-	// the attempt is still going and another task delivers m a second time.
-	c, err := e.store.Claim(ctx, m.Recipient, m.ID, e.cfg.InstanceID, now, now.Add(3*e.cfg.DeliveryTimeout))
+	c, err := e.store.Claim(ctx, m.Recipient, m.ID, e.cfg.InstanceID, now, now.Add(e.lease()))
 	switch {
 	case err == nil:
 		return c, true
@@ -598,7 +833,7 @@ func (e *Engine) claim(ctx context.Context, m store.Message) (store.Message, boo
 func (e *Engine) viaLeg(ctx context.Context, l *Leg, m store.Message) outcome {
 	c, ok := e.claim(ctx, m)
 	if !ok {
-		return done
+		return taken
 	}
 	if c.Summary {
 		return e.sendSummary(ctx, l, c)
@@ -625,6 +860,7 @@ func (e *Engine) sendClaimedThen(ctx context.Context, l *Leg, m store.Message, o
 	case err == nil && code == msrp.StatusOK:
 		e.metrics.Count("delivery.msrp", 1)
 		e.remove(m)
+		e.markReached(m.Recipient)
 		return done
 	case err == nil && permanent(code):
 		e.giveUp(m, "delivery.refused")
@@ -649,7 +885,7 @@ func permanent(code int) bool {
 func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 	m, ok := e.claim(ctx, m)
 	if !ok {
-		return done
+		return taken
 	}
 	d := Delivery{
 		Recipient: m.Recipient, Sender: m.Sender, Mode: m.Mode, Notification: m.Notification, CPIM: m.CPIM,
@@ -670,6 +906,7 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 	case err == nil:
 		e.metrics.Count("delivery.pager", 1)
 		e.remove(m)
+		e.markReached(m.Recipient)
 		return done
 	case errors.Is(err, ErrUndeliverable):
 		e.giveUp(m, "delivery.undeliverable")
@@ -683,10 +920,14 @@ func (e *Engine) viaPager(ctx context.Context, m store.Message) outcome {
 // inviteMark is an invitation asked for, waited for until until. by is
 // the terminating large-mode leg that marked it while it makes its attempt
 // (activate), so that it deletes its own mark and never a newer one;
-// nil for the invitations invite asks for.
+// nil for the invitations invite asks for. failed marks one that failed
+// (InviteFailed): it tells only that the recipient could not be reached
+// when it was asked, so any registration since clears it, a refresh too
+// (UserRegistered).
 type inviteMark struct {
-	until time.Time
-	by    *Leg
+	until  time.Time
+	by     *Leg
+	failed bool
 }
 
 // invitation is the session m waits for, and its key in e.invites.
@@ -759,6 +1000,15 @@ func (e *Engine) ask(ctx context.Context, inv Invitation, key inviteKey) {
 	// may ask again at once.
 	if (inv.Mode == store.Chat || inv.Mode == store.Group) && e.chatLegLocked(inv.Recipient, inv.Peer) != nil {
 		e.mu.Unlock()
+		return
+	}
+	// The recipient's own INVITE to the group is being served, and will
+	// open the leg m goes on (Joining); its end reads the queue again if
+	// it opens none.
+	if h := e.joins[legKey{inv.Recipient, inv.Peer}]; inv.Mode == store.Group && h != nil && now.Before(h.until) {
+		h.held = true
+		e.mu.Unlock()
+		e.metrics.Count("invite.held_for_join", 1)
 		return
 	}
 	if len(e.invites) >= e.cfg.MaxTracked {

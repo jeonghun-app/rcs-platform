@@ -3,19 +3,28 @@ package awsstore
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	dtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go/logging"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ftserver/store/storetest"
+	"github.com/jeonghun-app/rcs-platform/internal/sip/digest"
 )
 
 func fakeStores(t *testing.T) (*Stores, *fakeS3, *fakeDynamo) {
@@ -63,7 +72,7 @@ func TestObjectsAreEncryptedAndPrefixed(t *testing.T) {
 	}
 }
 
-func TestNonceCountsOnlyAdvance(t *testing.T) {
+func TestNonceCountsAcceptEachCountOnceInsideTheWindow(t *testing.T) {
 	s, _, _ := fakeStores(t)
 	ctx := t.Context()
 	n := s.NonceCounts
@@ -76,9 +85,14 @@ func TestNonceCountsOnlyAdvance(t *testing.T) {
 		{"alice", "n1", 1, true},
 		{"alice", "n1", 1, false},
 		{"alice", "n1", 3, true},
+		{"alice", "n1", 2, true}, // late, inside the window
 		{"alice", "n1", 2, false},
 		{"bob", "n1", 1, true},
 		{"alice", "n2", 1, true},
+		{"alice", "n1", 4 + digest.NonceCountWindow, true},
+		{"alice", "n1", 4, false}, // never used, but below the window
+		{"alice", "n1", 5, true},  // the lowest count inside it
+		{"alice", "n1", 5, false},
 	} {
 		got, err := n.Advance(ctx, c.user, c.nonce, c.nc, later)
 		if err != nil || got != c.want {
@@ -90,6 +104,253 @@ func TestNonceCountsOnlyAdvance(t *testing.T) {
 	n.now = func() time.Time { return later.Add(time.Second) }
 	if ok, err := n.Advance(ctx, "alice", "n1", 1, later.Add(time.Hour)); err != nil || !ok {
 		t.Fatalf("Advance after expiry = %v, %v", ok, err)
+	}
+}
+
+func TestNonceCountsAcceptEachCountOnceUnderConcurrency(t *testing.T) {
+	// maxNonceCountAttempts requests in flight on one nonce, each sent
+	// twice: every count is accepted exactly once, and none runs out of
+	// attempts, since each lost race is a win for another count.
+	s, _, _ := fakeStores(t)
+	var accepted [maxNonceCountAttempts + 1]atomic.Int32
+	var wg sync.WaitGroup
+	for nc := uint32(1); nc <= maxNonceCountAttempts; nc++ {
+		for range 2 {
+			wg.Go(func() {
+				ok, err := s.NonceCounts.Advance(context.Background(), "alice", "n", nc, storetest.T0.Add(time.Minute))
+				if err != nil {
+					t.Errorf("Advance(%d): %v", nc, err)
+				}
+				if ok {
+					accepted[nc].Add(1)
+				}
+			})
+		}
+	}
+	wg.Wait()
+	for nc := 1; nc <= maxNonceCountAttempts; nc++ {
+		if got := accepted[nc].Load(); got != 1 {
+			t.Errorf("nc %d accepted %d times", nc, got)
+		}
+	}
+}
+
+// racingDynamo records another count with the same nonce, through other,
+// before each of the next races updates reaches the table, as a request
+// verified on another task at that moment would.
+type racingDynamo struct {
+	*fakeDynamo
+	other *NonceCounts
+	races int
+	nc    uint32
+}
+
+func (r *racingDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	if r.races > 0 {
+		r.races--
+		r.nc++
+		if ok, err := r.other.Advance(ctx, "alice", "n", r.nc, storetest.T0.Add(time.Minute)); !ok || err != nil {
+			r.t.Fatalf("the racing Advance(%d) = %v, %v", r.nc, ok, err)
+		}
+	}
+	return r.fakeDynamo.UpdateItem(ctx, in, opts...)
+}
+
+func TestNonceCountsReadAgainAfterLosingARace(t *testing.T) {
+	s, _, ddb := fakeStores(t)
+	racing := &racingDynamo{fakeDynamo: ddb, other: s.NonceCounts, races: 3, nc: 100}
+	var waits []time.Duration
+	contended := 0
+	n := &NonceCounts{api: racing, table: s.NonceCounts.table, now: s.NonceCounts.now,
+		contended: func() { contended++ },
+		sleep:     func(_ context.Context, d time.Duration) error { waits = append(waits, d); return nil }}
+	ctx := t.Context()
+	exp := storetest.T0.Add(time.Minute)
+	if ok, err := n.Advance(ctx, "alice", "n", 90, exp); !ok || err != nil {
+		t.Fatalf("Advance after losing 3 races = %v, %v", ok, err)
+	}
+	// A random wait before each read after a lost write, below a bound
+	// that doubles; each lost write counted.
+	if len(waits) != 3 || contended != 3 {
+		t.Fatalf("waits %v, contended %d; want 3 of each", waits, contended)
+	}
+	for i, d := range waits {
+		if limit := nonceBackoffBase << i; d < 0 || d >= limit {
+			t.Fatalf("wait %d is %v, want below %v", i, d, limit)
+		}
+	}
+	// The window the winners and this request left: 101-103 and 90 used.
+	for _, nc := range []uint32{90, 101, 103} {
+		if ok, err := s.NonceCounts.Advance(ctx, "alice", "n", nc, exp); ok || err != nil {
+			t.Fatalf("nc %d again = %v, %v", nc, ok, err)
+		}
+	}
+	if ok, err := s.NonceCounts.Advance(ctx, "alice", "n", 91, exp); !ok || err != nil {
+		t.Fatalf("unused nc 91 = %v, %v", ok, err)
+	}
+
+	// Losing every attempt is an error, not a replay: the count is unused.
+	racing.races = maxNonceCountAttempts
+	waits = nil
+	if ok, err := n.Advance(ctx, "alice", "n", 92, exp); ok || !errors.Is(err, errNonceCountContended) {
+		t.Fatalf("Advance losing every race = %v, %v", ok, err)
+	}
+	// Random: 15 waits all of zero would mean no backoff at all.
+	if len(waits) != maxNonceCountAttempts-1 || slices.Max(waits) >= nonceBackoffMax || slices.Max(waits) == 0 {
+		t.Fatalf("waits %v", waits)
+	}
+	if ok, err := n.Advance(ctx, "alice", "n", 92, exp); !ok || err != nil {
+		t.Fatalf("nc 92 once the races stop = %v, %v", ok, err)
+	}
+}
+
+// resendingDynamo applies each update and then sends it again, as the SDK
+// does when the answer to a write that landed is lost, and answers with the
+// second outcome.
+type resendingDynamo struct{ *fakeDynamo }
+
+func (r resendingDynamo) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	_, _ = r.fakeDynamo.UpdateItem(ctx, in, opts...)
+	return r.fakeDynamo.UpdateItem(ctx, in, opts...)
+}
+
+func TestNonceCountResentAfterItLandedIsAccepted(t *testing.T) {
+	s, _, ddb := fakeStores(t)
+	resent := &NonceCounts{api: resendingDynamo{ddb}, table: s.NonceCounts.table, now: s.NonceCounts.now}
+	ctx := t.Context()
+	exp := storetest.T0.Add(time.Minute)
+	if ok, err := resent.Advance(ctx, "alice", "n", 3, exp); !ok || err != nil {
+		t.Fatalf("Advance whose write was resent = %v, %v; want the count it recorded", ok, err)
+	}
+	// The count is recorded: another request with it is a replay, resent
+	// or not.
+	for _, n := range []*NonceCounts{s.NonceCounts, resent} {
+		if ok, err := n.Advance(ctx, "alice", "n", 3, exp); ok || err != nil {
+			t.Fatalf("nc 3 again = %v, %v", ok, err)
+		}
+	}
+	if ok, err := resent.Advance(ctx, "alice", "n", 2, exp); !ok || err != nil {
+		t.Fatalf("nc 2 = %v, %v", ok, err)
+	}
+}
+
+func TestNonceCountResentBySDKAfterItLandedIsAccepted(t *testing.T) {
+	// Over the SDK: the first UpdateItem lands but answers 500, the resend
+	// fails its condition and gets back the item the first one wrote.
+	var mu sync.Mutex
+	var item map[string]any
+	updates := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		var in struct {
+			ExpressionAttributeValues           map[string]map[string]string
+			ReturnValuesOnConditionCheckFailure string
+		}
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		switch r.Header.Get("X-Amz-Target") {
+		case "DynamoDB_20120810.GetItem":
+			_, _ = io.WriteString(w, `{}`)
+		case "DynamoDB_20120810.UpdateItem":
+			updates++
+			if updates == 1 {
+				v := in.ExpressionAttributeValues
+				item = map[string]any{"pk": map[string]string{"S": "n"}, "nc": v[":nc"], "nc_window": v[":w"],
+					"nc_window_at": v[":nc"], "expires": v[":e"], "ttl": v[":ttl"], "nc_writer": v[":by"]}
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, `{"__type":"com.amazonaws.dynamodb.v20120810#InternalServerError","message":"lost"}`)
+				return
+			}
+			body := map[string]any{"__type": "com.amazonaws.dynamodb.v20120810#ConditionalCheckFailedException", "message": "The conditional request failed"}
+			if in.ReturnValuesOnConditionCheckFailure == "ALL_OLD" {
+				body["Item"] = item
+			}
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(body)
+		default:
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"__type":"com.amazonaws.dynamodb.v20120810#ValidationException","message":"unexpected"}`)
+		}
+	}))
+	defer srv.Close()
+	t.Setenv("AWS_REGION", "us-east-1")
+	t.Setenv("AWS_ACCESS_KEY_ID", "local")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "local")
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	stores, err := New(t.Context(), Config{Table: "files", DynamoDBEndpoint: srv.URL, Now: func() time.Time { return storetest.T0 }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ok, err := stores.NonceCounts.Advance(t.Context(), "alice", "n", 1, storetest.T0.Add(time.Minute))
+	if !ok || err != nil {
+		t.Fatalf("Advance = %v, %v; want the count that landed", ok, err)
+	}
+	if updates != 2 {
+		t.Fatalf("%d UpdateItem calls, want the original and one resend", updates)
+	}
+}
+
+func TestNonceCountsWrittenByThePreviousVersionCountAsUsedUpToTheirHighest(t *testing.T) {
+	// The version before #66 stores only nc and advances it alone; the
+	// window is trusted only where it was written for the nc stored.
+	s, _, ddb := fakeStores(t)
+	ctx := t.Context()
+	exp := storetest.T0.Add(time.Minute)
+	advance := func(nonce string, nc uint32, want bool) {
+		t.Helper()
+		if ok, err := s.NonceCounts.Advance(ctx, "alice", nonce, nc, exp); ok != want || err != nil {
+			t.Fatalf("Advance(%s, %d) = %v, %v; want %v", nonce, nc, ok, err, want)
+		}
+	}
+	old := nonceKey("alice", "old")
+	ddb.rows[old] = map[string]dtypes.AttributeValue{
+		attrPK: str(old), attrNC: num(5), attrExpires: num(exp.UnixMilli()), attrTTL: num(exp.Add(time.Hour).Unix()),
+	}
+	advance("old", 4, false)
+	advance("old", 6, true)
+	advance("old", 3, false)
+
+	advance("mixed", 10, true)
+	advance("mixed", 8, true)
+	// The previous version accepts 12 and moves nc, not the window.
+	ddb.rows[nonceKey("alice", "mixed")][attrNC] = num(12)
+	advance("mixed", 9, false)
+	advance("mixed", 11, false)
+	advance("mixed", 13, true)
+
+	// Nor is a window without the highest count's bit, which no version
+	// writes.
+	odd := nonceKey("alice", "odd")
+	ddb.rows[odd] = map[string]dtypes.AttributeValue{
+		attrPK: str(odd), attrNC: num(5), attrNCWindow: num(0), attrNCWindowAt: num(5),
+		attrExpires: num(exp.UnixMilli()), attrTTL: num(exp.Add(time.Hour).Unix()),
+	}
+	advance("odd", 5, false)
+	advance("odd", 4, false)
+}
+
+func TestMalformedNonceCountItemIsAnError(t *testing.T) {
+	s, _, ddb := fakeStores(t)
+	k := nonceKey("alice", "n")
+	exp := storetest.T0.Add(time.Minute)
+	for name, item := range map[string]map[string]dtypes.AttributeValue{
+		"no expiry":       {attrPK: str(k), attrNC: num(1)},
+		"no count":        {attrPK: str(k), attrExpires: num(exp.UnixMilli())},
+		"count too large": {attrPK: str(k), attrNC: num(1 << 32), attrExpires: num(exp.UnixMilli())},
+		"negative window": {attrPK: str(k), attrNC: num(1), attrNCWindow: num(-1), attrNCWindowAt: num(1), attrExpires: num(exp.UnixMilli())},
+		"string count":    {attrPK: str(k), attrNC: str("1"), attrExpires: num(exp.UnixMilli())},
+	} {
+		ddb.rows[k] = item
+		// Unusable, not a store failure: the item stays bad until it
+		// expires, so the client is sent to a new nonce (#621).
+		if ok, err := s.NonceCounts.Advance(t.Context(), "alice", "n", 2, exp); ok || !errors.Is(err, digest.ErrNonceCountUnusable) {
+			t.Errorf("%s: Advance = %v, %v", name, ok, err)
+		}
+	}
+	ddb.fail = &fakeAPIError{code: "ProvisionedThroughputExceededException"}
+	if _, err := s.NonceCounts.Advance(t.Context(), "alice", "n", 2, exp); err == nil || errors.Is(err, digest.ErrNonceCountUnusable) {
+		t.Errorf("a throttled read = %v, want a store failure", err)
 	}
 }
 

@@ -173,6 +173,20 @@ func TestE2EComposeStack(t *testing.T) {
 		t.Errorf("the chat to the unregistered peer was answered %d (on a new chat: %d, stored and delivered: %d), want rcs-as's 200 and its delivery on a chat opened once the peer registered",
 			r.Detail["status"], r.Detail["new_session"], r.Detail["stored"])
 	}
+	// The stack runs one rcs-as task, which holds every chat the client
+	// has, so everything for the client comes on them: a chat the network
+	// opened to the client, what came on one, or a notification in pager
+	// mode would break docs/rcs-as.md Delivery rule 1 (code review and QA
+	// on #654). With two tasks (#602) they come rightly, when the peer's
+	// registration lands on the task without the client's chat (#647):
+	// this check is then for a one-task stack only.
+	for _, step := range []string{"chat-invite/client-to-peer", "chat-invite/peer-to-client", "chat-invite/chunked-message", "chat-invite/peer-offline"} {
+		for _, c := range []string{"client_invites", "network_chat", "pager_notifications"} {
+			if v, ok := sipResults[step].Detail[c]; !ok || v != 0 {
+				t.Errorf("%s: %s is %d (reported: %v), want 0 on one rcs-as task", step, c, v, ok)
+			}
+		}
+	}
 	// So did the peer's delivery notification, a MESSAGE of its own.
 	if r := sipResults["pager-message/delivery-notification"]; r.Detail["status"] != 202 {
 		t.Errorf("the delivery notification's MESSAGE was answered %d, not rcs-as's 202", r.Detail["status"])

@@ -48,6 +48,7 @@ type Engine interface {
 	UserRegistered(user string, newFlow bool)
 	Invite(ctx context.Context, inv messaging.Invitation)
 	Wake(user, group string, registered bool)
+	Joining(user, group string) (done func())
 }
 
 // Config configures a Server.

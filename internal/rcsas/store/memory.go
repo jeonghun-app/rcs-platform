@@ -16,6 +16,8 @@ type Memory struct {
 	mu     sync.Mutex
 	queues map[string]map[string]Message
 	sent   map[sentKey]*sentRecord
+	// reached holds the marks of MarkReached by recipient, task and kind.
+	reached map[string]map[markKey]reachedMark
 	// fenced reports whether a Fence holds, from the groups store this
 	// one stands beside (SetFence); nil refuses every fenced enqueue.
 	fenced func(Fence) bool
@@ -40,11 +42,18 @@ type sentRecord struct {
 
 type mark struct{ token, status string }
 
+type markKey struct {
+	task string
+	kind MarkKind
+}
+
+type reachedMark struct{ at, expires time.Time }
+
 var _ Store = (*Memory)(nil)
 
 // NewMemory returns an empty Memory.
 func NewMemory() *Memory {
-	return &Memory{queues: map[string]map[string]Message{}, sent: map[sentKey]*sentRecord{}}
+	return &Memory{queues: map[string]map[string]Message{}, sent: map[sentKey]*sentRecord{}, reached: map[string]map[markKey]reachedMark{}}
 }
 
 // Len reports how many messages recipient's queue holds, claimed, expired
@@ -116,6 +125,34 @@ func (s *Memory) Pending(_ context.Context, recipient, after string, now time.Ti
 	}
 	slices.SortFunc(out, func(a, b Message) int { return cmp.Compare(a.ID, b.ID) })
 	return out[:min(len(out), max(limit, 0))], nil
+}
+
+// PendingHeld implements Store.
+func (s *Memory) PendingHeld(_ context.Context, recipient, after, owner string, now time.Time, limit int) ([]Message, bool, error) {
+	if limit <= 0 {
+		return nil, false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Message
+	var held []string
+	for _, m := range s.queues[recipient] {
+		switch {
+		case m.ID <= after || !m.Expires.After(now):
+		case m.Free(now):
+			out = append(out, m.Clone())
+		case m.Owner != owner:
+			held = append(held, m.ID)
+		}
+	}
+	slices.SortFunc(out, func(a, b Message) int { return cmp.Compare(a.ID, b.ID) })
+	out = out[:min(len(out), limit)]
+	for _, id := range held {
+		if len(out) < limit || id < out[len(out)-1].ID {
+			return out, true, nil
+		}
+	}
+	return out, false, nil
 }
 
 // Claim implements Store.
@@ -288,4 +325,33 @@ func (s *Memory) UnmarkNotified(_ context.Context, sender, messageID, key, token
 		delete(r.marks, key)
 	}
 	return nil
+}
+
+// MarkReached implements Store.
+func (s *Memory) MarkReached(_ context.Context, recipient string, m Mark, expires time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.reached[recipient] == nil {
+		s.reached[recipient] = map[markKey]reachedMark{}
+	}
+	s.reached[recipient][markKey{m.Task, m.Kind}] = reachedMark{at: m.At, expires: expires}
+	return nil
+}
+
+// Reached implements Store. Expired marks are deleted on the way.
+func (s *Memory) Reached(_ context.Context, recipient string, now time.Time) ([]Mark, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Mark
+	for k, m := range s.reached[recipient] {
+		if !m.expires.After(now) {
+			delete(s.reached[recipient], k)
+			continue
+		}
+		out = append(out, Mark{Task: k.task, Kind: k.kind, At: m.at})
+	}
+	if len(s.reached[recipient]) == 0 {
+		delete(s.reached, recipient)
+	}
+	return out, nil
 }

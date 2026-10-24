@@ -180,8 +180,8 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 		g.IdleTTL != 30*24*time.Hour || g.SenderRate.PerMinute != 60 || g.FanoutRate.PerMinute != 6000 || g.FanoutRate.Burst != 3960 || g.AddRate.PerMinute != 30 ||
 		g.AddRate.Burst != 100 || g.CreateRate.Burst != 10 || g.HomeDomain != "ims.mnc001.mcc001.3gppnetwork.org" ||
 		g.TaskHeartbeat != 5*time.Second || g.TaskLease != 20*time.Second || g.TaskSkew != 2*time.Second ||
-		c.ConferenceFactory.String() != "sip:conf-factory@ims.mnc001.mcc001.3gppnetwork.org" {
-		t.Fatalf("defaults %+v, factory %v", c.Group, c.ConferenceFactory)
+		c.Messaging.ClockSkew != 2*time.Second || c.ConferenceFactory.String() != "sip:conf-factory@ims.mnc001.mcc001.3gppnetwork.org" {
+		t.Fatalf("defaults %+v, factory %v, messaging clock skew %v", c.Group, c.ConferenceFactory, c.Messaging.ClockSkew)
 	}
 	// One spelling of the conference host, as the group writes its URIs
 	// and the SIP layer compares them (QA on #279).
@@ -205,8 +205,9 @@ func TestTheGroupSettingsAreRead(t *testing.T) {
 	g = c.Group
 	if c.GroupsTable != "rcs-groups" || c.ConferenceFactory.String() != "sip:Factory@conf.ims.example.net" || g.MaxParticipants != 20 || g.IdleTTL != 240*time.Hour || g.SenderRate.Burst != 3 ||
 		g.FanoutRate.PerMinute >= 0 || g.AddRate.Burst != 19 || g.CreateRate.PerMinute != 1 ||
-		g.TaskHeartbeat != 3*time.Second || g.TaskLease != 12*time.Second || g.TaskSkew != time.Second {
-		t.Fatalf("settings %+v", c.Group)
+		g.TaskHeartbeat != 3*time.Second || g.TaskLease != 12*time.Second || g.TaskSkew != time.Second ||
+		c.Messaging.ClockSkew != time.Second {
+		t.Fatalf("settings %+v, messaging clock skew %v", c.Group, c.Messaging.ClockSkew)
 	}
 	for name, c := range map[string]struct {
 		env  map[string]string

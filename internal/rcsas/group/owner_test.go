@@ -358,6 +358,34 @@ func TestAPausedOwnerQueuesNoCopy(t *testing.T) {
 	}
 }
 
+// #607: copies the owner queued and had not delivered when it stopped are
+// invited for by the task that takes the group over, at once, with no
+// other message written in the group: the old owner's retries ended with
+// it, and the new owner holds no state for the recipients that would bring
+// them about (#121 D4 design, §4).
+func TestATakeoverInvitesForTheCopiesTheOldOwnerQueued(t *testing.T) {
+	a, b, sa, _ := sharedTasks(t)
+	g := a.create(bob, carol)
+	if err := a.write(t, g.URI, alice, "m1"); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "a's invitations", func() bool { return a.invitesOf(g, bob) > 0 && a.invitesOf(g, carol) > 0 })
+	sa.failBeats.Store(true) // a stops beating, its copies still queued
+	b.pass(t, DefaultTaskLease+DefaultTaskSkew)
+	// Anything that has b serve the group, a roster read here, takes it
+	// over: not a message, which would read the queues anyway.
+	if owns, err := b.s.Owns(t.Context(), g.URI); err != nil || !owns {
+		t.Fatalf("b's Owns = %v, %v", owns, err)
+	}
+	waitFor(t, "b's invitations", func() bool { return b.invitesOf(g, bob) > 0 && b.invitesOf(g, carol) > 0 })
+	if n := b.invitesOf(g, alice); n != 0 {
+		t.Fatalf("b invited the author %d times, who has no copy", n)
+	}
+	if b.m.get("group.owner_takeover") != 1 {
+		t.Fatalf("%d takeovers", b.m.get("group.owner_takeover"))
+	}
+}
+
 // #121 D2: whether this task owns a group is remembered for a heartbeat
 // when another task does, so that a queue of the group's copies costs no
 // read of the store each.

@@ -523,6 +523,11 @@ message the worker does the first of these that applies:
    that takes no terminating sessions.
 3. **A terminating session** (`Invite`), at most once per recipient, peer and
    mode within `RCSAS_INVITE_TIMEOUT`, or until a registration on a new flow.
+   One that failed waits only for the next registration, a refresh too: the
+   core may give the user's de-registration to another task, and this task
+   then takes the next registration for a refresh (#653). The refresh leaves
+   the queue's retry timer as it is. One still waiting for its answer is not
+   asked for again on a refresh.
    - **Chat.** A chat session carries everything queued for it.
    - **Large mode.** A larger standalone message gets a large-mode session of
      its own, named by `Invitation.QueueID`. That leg delivers that message
@@ -544,13 +549,69 @@ What the last pass over a queue found decides what reads it again:
 | Last pass | A new message | Reads the whole queue |
 |---|---|---|
 | Everything went | reads the queue (one read when nothing waits) | any new message, registration or leg |
-| Messages wait for a session | is tried on its own | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer |
-| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits; one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer |
+| Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark, a refresh (without restarting the retry timer; an invitation asked for more than `RCSAS_INVITE_TIMEOUT` ago is asked again, #632, and one that failed is asked again at once, #653) |
+| The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark |
 
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
 `RCSAS_MAX_RETRY_INTERVAL` while the queue stays held. A recipient that never
 comes back costs a read an hour, not one per message sent to it. The reads of
 a queue grow with its messages, not with their square.
+
+### A recipient reached on another task
+
+A hold is the task's own. With several tasks, the core gives each third-party
+REGISTER to any of them. The session an invitation brings opens on the task
+that asked for it. So another task may reach the recipient and deliver the
+shared queue while this one still holds it (#605). The tasks tell each other
+through the store:
+
+- **Marks.** A task puts its own marks of the recipient in the `messages`
+  table, of two kinds:
+  - **A delivery got through:** in pager mode, on a leg, or a summary. A task
+    writes this at most once a minute per recipient. Once it is stored, the
+    task reads the queue once more after the pass, unless that pass found the
+    recipient unreachable: another task may have queued a message this task's
+    pass did not read, and looked for a mark just before this one was
+    written.
+  - **A registration on a new flow:** written after the pass that
+    registration ran, if that pass found anything queued. It is not followed
+    by another read. A message that another task queued during that pass, and
+    holds for a session, may wait for that task's next look or its own
+    timers. It is not blocked for its retry timer, as the delivery mark covers
+    that case.
+- **The look.** A task that holds a queue reads the recipient's marks when a
+  new message comes in (one strongly consistent query). Another task's mark
+  counts if it is newer than the newest of its kind this task already acted
+  on, and no earlier than a minute plus `RCSAS_TASK_SKEW` before the pass that
+  left the queue held: the minute between one task's delivery marks, and
+  `RCSAS_TASK_SKEW` for the tasks' clocks. A task's own marks never count,
+  since it knows what its deliveries did. A counted mark does this:
+  - **A delivery elsewhere** releases the hold and has the queue read, as a
+    refresh here would. The invitations asked for and the pager-only marker
+    stay.
+  - **A registration on a new flow elsewhere** also clears those, as one here
+    does, and a failure of an invitation asked before it is not marked. It is
+    not told on to group owners: the task that took the registration tells
+    them.
+- **When a stale mark counts.** A mark from before the hold, inside that
+  margin, costs one more attempt, once, as each mark counts once.
+- **A second hold within the minute.** Because each mark counts once, a mark
+  this task already acted on does not release a later hold. If the recipient
+  is lost again and this task holds the queue again, another task that
+  reaches the recipient within a minute of its last delivery mark writes no
+  new one. This task's next message then waits for its retry timer. The
+  counted mark reset that timer's backoff, so the wait is about
+  `RCSAS_RETRY_INTERVAL`, not up to `RCSAS_MAX_RETRY_INTERVAL`. The other
+  task's next delivery after that minute marks the recipient again. This is
+  the price of counting each mark once; otherwise one mark would release a
+  hold, and read the queue, for every new message. The exception is a
+  registration on a new flow on the other task whose pass finds the queue:
+  it writes a registration mark, which releases the hold at once.
+- **Cost.** A delivery costs no more than one write a minute per recipient
+  and task, and a registration on a new flow with something queued one write.
+  Each message to a held recipient costs one read. The queue is read once
+  more after a delivery mark, at most once a minute, and once for each mark
+  another task counts.
 
 ### Claims and shutdown
 
@@ -560,6 +621,31 @@ conditional write before it is sent. The claim's lease is three times
 the claim, so a message goes out once. If a task loses its lease while
 delivering, the message may go out twice, and clients drop the duplicate by
 Message-ID.
+
+A registration can come in while another task's attempt holds a message, for
+example a pager request sent on the flow the client has just left (#632). The
+registration's pass does not see the claimed message, or loses the claim to
+the other task's retry. If that attempt then fails, the other task holds the
+queue until its retry timer, up to `RCSAS_MAX_RETRY_INTERVAL`, and nothing else
+reads it. So a pass a registration asked for that passed over a message
+another task held, or lost a claim, reads the queue again after a second. It
+reads again after 2, 4, 8 s and so on while such a message is still held,
+until a wait reaches the lease. By then any attempt begun before the
+registration is over, and one begun after it went to the new flow. A
+recipient has one series of these reads at a time, and each registration
+starts it over, so a client that registers again and again costs about two
+reads per registration, not a series each. A refresh on a queue that waits
+for a session reads the queue too, with its retry timer left as it is: what
+waits for a session still waits, and an invitation asked for within
+`RCSAS_INVITE_TIMEOUT` is not asked again, unless it failed (#653). One asked
+for longer ago is asked again, however far the retry timer has backed off: a
+client that does not answer chat invitations gets one per refresh past that
+timeout, a large-mode message one each, and group copies have their owner
+woken. The
+store's read tells of the held message at no extra cost (`PendingHeld`), so a
+registration with nothing held costs nothing more. A message that comes in
+on the holding task meanwhile goes once the delivery here stores its reached
+mark ([A recipient reached on another task](#a-recipient-reached-on-another-task)).
 
 `Close` takes no new work, then lets the attempts in progress finish, for at
 most a delivery and two store calls, before it cancels the rest. The store
@@ -742,6 +828,30 @@ group's sessions and subscriptions is its conference URI.
   responses come back the same way. A task that does not know the group, or
   owns it, serves the request itself; one whose owner has stopped takes it over
   first.
+- **A takeover reads the queues.** The task that takes a group over has the
+  queues of its current participants (invited and joined) read at once
+  (`Engine.ReadQueues`). The copies the old owner queued and had not delivered
+  when it stopped are then delivered on a session open here, or invited for
+  as an owner does, rather than waiting for the next message written in the
+  group, the recipient's next registration on a new flow, or
+  `RCSAS_STORE_TTL` (#607): the old owner's retries ended with it. Each read
+  is a pass over the participant's whole queue, as a registration has: it
+  tries at once whatever else waits there, a 1-to-1 message on a long retry
+  wait say, and starts the queue's retry wait again at
+  `RCSAS_RETRY_INTERVAL`. A takeover costs one such pass per current
+  participant, at most `RCSAS_GROUP_MAX_PARTICIPANTS`, and a task that takes
+  many groups over at once, after a peer's crash, makes that many.
+- **No invitation to a participant joining.** While a task routes and serves
+  a participant's own `INVITE` to the conference URI, until its session's leg
+  is open or for `RCSAS_ANSWER_TIMEOUT` at most, the task does not invite that
+  participant to the group (`invite.held_for_join`): the queue passes the
+  routing's takeover starts, or a message written meanwhile, would otherwise
+  find its copies before the leg is open, and the focus's `INVITE` would ring
+  the client with a second session with the group, which rcsjta takes in
+  place of its own (code review on #628). The copies go on the session the
+  participant opens. A join that opens none has the queue read again as it
+  ends, so that they are invited for at once. Past 100 000 joins being served
+  at once a join holds nothing back (`invite.join_untracked`).
 - **No 404 for a group that exists.** A request that cannot reach the owner
   now is answered 500 with `Retry-After` (`group.forward_refused`): one
   forwarded here already, which is never forwarded again, so that two tasks
@@ -1131,7 +1241,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_GROUP_FANOUT_RATE`, `RCSAS_GROUP_FANOUT_BURST` | `6000`, 4 × 10 × (`RCSAS_GROUP_MAX_PARTICIPANTS` − 1) (`3960` for 100), at least `1000` | Deliveries per minute one group makes, a message counting once per recipient, per task. One sender may use a quarter of the rate and of the burst, and a quarter of the burst must cover 10 messages to a full group. With the defaults, one sender in a full group of 100 may send 10 messages at once and then 15 a minute; in a full group of 200, 10 at once and then 7 a minute |
 | `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
-| `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121): a task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
+| `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121). `RCSAS_TASK_SKEW` is also the margin for another task's reached marks, with group chat on or off (#605). A task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
 
 A rate of `0` turns that limit off.
 
@@ -1148,6 +1258,7 @@ There is one table with partition key `pk` and sort key `sk` (both strings).
 | Queue size | `c#<len>#<recipient>` | `n` |
 | A sender's share of a queue | `c#<len>#<recipient>` | `s#<len>#<sender>` |
 | Sent-message record | `s#<len>#<sender>` | IMDN Message-ID; for a group message, one under the group and one under the author, which names the group (`group`) |
+| Reached mark (#605) | `r#<len>#<recipient>` | `t#<len>#<task>`: one per task that delivered to the recipient lately; `f#<len>#<task>`: one per task that took its registration on a new flow with something queued. Each has `task`, `reached_at` and `expires` |
 
 There is one global secondary index, `expiry`:
 
@@ -1159,7 +1270,10 @@ The table's properties:
 - **Length prefix.** The identity's length goes in front, so that one identity
   can never be a prefix of another's key.
 - **Partitions.** A recipient's queue is one partition, read in sort-key
-  order, which is enqueue order.
+  order, which is enqueue order. The engine's read (`PendingHeld`) filters on
+  expiry only and tells free messages from claimed ones itself, so that it
+  can tell of a message another task holds (#632). A query is charged for
+  what it reads, whatever its filter returns.
 - **Bounds.** The queue's size item and the sender's share item count messages
   and bytes. Both are written in the same transaction as each enqueue and
   removal, and the enqueue is conditional on both bounds. A 1-to-1
@@ -1214,19 +1328,28 @@ The table's properties:
   only the backstop that keeps the table small, because TTL deletion can lag
   by days:
   - for queue and size items: the expiry plus one day;
-  - for sent-message records: their expiry.
+  - for sent-message records: their expiry;
+  - for reached marks: their expiry, `RCSAS_MAX_RETRY_INTERVAL` plus a minute
+    plus `RCSAS_TASK_SKEW` after the mark. That is as long as a task that held the queue
+    within the margin may still look before its retry timer reads the queue
+    anyway.
+- **Reached marks.** Each task puts its own mark of each kind over its last,
+  with no condition, so no task's mark hides another's. A mark of a kind a
+  task does not know is left out of its look. The look is a consistent
+  query of the recipient's partition. Old tasks never read or write these
+  items.
 
 The task role needs these IAM actions:
 
 | Action | Resource | Used by |
 |---|---|---|
 | `dynamodb:GetItem` | table | `Sent`; reads after a refused conditional write; recounts |
-| `dynamodb:PutItem` | table | `RecordSent`, and the `Put` inside the enqueue transaction |
+| `dynamodb:PutItem` | table | `RecordSent`, `MarkReached`, and the `Put` inside the enqueue transaction |
 | `dynamodb:UpdateItem` | table | `Claim`, `Release`, `MarkNotified`, `UnmarkNotified`, size corrections, and the `Update`s inside both transactions |
 | `dynamodb:DeleteItem` | table | the `Delete` inside the removal transactions |
 | `dynamodb:ConditionCheckItem` | table | the `ConditionCheck` inside a summary's removal |
 | `dynamodb:ConditionCheckItem` | the `groupchats` table | the `ConditionCheck` of a group's owner inside a group message copy's enqueue (#121) |
-| `dynamodb:Query` | table | `Pending`, recounts |
+| `dynamodb:Query` | table | `Pending`, `PendingHeld`, `Reached`, recounts |
 | `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
 | `dynamodb:DescribeTable` | table | readiness |
 
@@ -1385,11 +1508,14 @@ identifier ever appears in a metric name.
 | `imdn.incomplete_request` | Messages asking for notifications without a Message-ID or DateTime; delivered without them |
 | `imdn.duplicate` | Notifications dropped as repeats |
 | `imdn.route_untrusted`, `imdn.route_dropped` | IMDN routes not followed: in a forwarded notification, and in a generated one's record route |
+| `delivery.held_elsewhere` | #632: reads of a queue set for a registration's pass that passed over a message another task held |
 | `delivery.msrp`, `delivery.pager`, `delivery.msrp_failed`, `delivery.pager_failed` | Delivery attempts |
 | `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
+| `delivery.reached_marked`, `delivery.registered_marked`, `delivery.reached_elsewhere`, `delivery.registered_elsewhere` | #605: marks of a delivery and of a registration on a new flow this task stored, and other tasks' marks of each kind it acted on |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
-| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, which leave no mark (the registration had the queue read already); a group's 482 is never one |
+| `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, here or, as its mark told, on another task, which leave no mark (the registration had the queue read already); a group's 482 is never one |
+| `invite.held_for_join`, `invite.join_untracked` | Group invitations not asked for because the participant's own `INVITE` to the group was being served, and joins past the bound that held nothing back |
 | `leg.opened`, `leg.unanswered` | MSRP legs, and offers that got no answer |
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
@@ -1455,7 +1581,11 @@ Signals to alarm on (Phase 7):
   for a message read more than a day after it could have expired is refused
   as `imdn_unknown`.
 - **Per-task state.** The rate limit, the pager-only marker and the retry
-  timers are per task. A sender spread over N tasks gets N times the rate.
+  timers are per task. A sender spread over N tasks gets N times the rate. A
+  hold gives way when another task reaches the recipient. The invitations a
+  task asked for and its pager-only marker give way only when another task
+  takes a registration on a new flow whose pass finds something queued (see
+  [A recipient reached on another task](#a-recipient-reached-on-another-task)).
 - **No processing notifications.** rcs-as does not send "stored" processing
   notifications on its own.
 - **No IMDN-Record-Route entry.** rcs-as does not add itself to
@@ -1510,11 +1640,16 @@ Signals to alarm on (Phase 7):
   client's REGISTER (the default profile does not ask for it), so a client
   that moves to a new flow before its registration runs out looks like one
   refreshing. It keeps a pager-only marker until it de-registers, misses a
-  refresh, or opens a session itself; and what is queued for it after a
-  delivery on the old flow failed waits for the invitation's
-  `RCSAS_INVITE_TIMEOUT` (2 min) or the queue's retry interval (1 min and
-  growing) instead of going at once. Registrations are remembered per task, up
-  to 100 000 users.
+  refresh, or opens a session itself. An invitation that had failed before
+  the refresh holds nothing: the refresh clears its mark. Registrations are
+  remembered per task, up to 100 000 users, so a task that did not take a
+  user's de-registration takes the next registration for a refresh (#653).
+- **A failure after a refresh is marked.** An invitation still unanswered at a
+  refresh that fails after it, a 480 that reaches rcs-as after the
+  registration say, is marked as any failure is: what is queued behind it
+  waits for `RCSAS_INVITE_TIMEOUT` (2 min), the queue's retry interval (1 min
+  and growing) or the next registration, not the refresh the failure followed
+  (#653).
 - **Large messages from one sender go one session at a time.** The next one to
   the same recipient waits for the queue's next pass after the session ends.
 - **One user per registration.** `UserRegistered` gets the identity in the

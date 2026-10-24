@@ -70,7 +70,7 @@ func card(t *testing.T, m milenage.Milenage, ch Challenge, highest milenage.SQN)
 	p := ClientParams{Username: testUser, Method: "REGISTER", URI: testURI, CNonce: "aka-cnonce", NC: 1}
 	if milenage.Fresh(sqn, highest) {
 		res := m.F2(rand)
-		p.Password = res[:]
+		p.Password = secret.NewKey(res[:])
 	} else {
 		auts := m.AUTS(rand, highest)
 		p.AUTS = auts[:]
@@ -409,7 +409,7 @@ func TestAKASynchronisationFailureMustUseTheEmptyPassword(t *testing.T) {
 	h := newHarness(t)
 	_, v := set1(t)
 	ch, _ := h.server.AKAChallenge(v.RAND[:], v.AUTN[:], false)
-	c, err := Respond(ch, ClientParams{Username: testUser, Password: v.XRES[:], Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	c, err := Respond(ch, ClientParams{Username: testUser, Password: secret.NewKey(v.XRES[:]), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -457,7 +457,7 @@ func forgeRAND(t *testing.T, h *harness, m milenage.Milenage, v vector, fixOpaqu
 		ch.Opaque = h.server.opaqueFor(AKAv1MD5, ch.Nonce)
 	}
 	res := m.F2(otherRAND)
-	c, err := Respond(ch, ClientParams{Username: testUser, Password: res[:], Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	c, err := Respond(ch, ClientParams{Username: testUser, Password: secret.NewKey(res[:]), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}

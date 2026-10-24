@@ -5,6 +5,8 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 func checkParseError(t *testing.T, err error) {
@@ -43,7 +45,7 @@ func FuzzParseChallenge(f *testing.F) {
 func FuzzParseCredentials(f *testing.F) {
 	h := newHarness(f)
 	ch, _ := h.server.Challenge(SHA256, false)
-	c, _ := Respond(ch, ClientParams{Username: testUser, Password: []byte(testPass), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	c, _ := Respond(ch, ClientParams{Username: testUser, Password: secret.NewKey([]byte(testPass)), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	f.Add(c.Header())
 	f.Add(rfc2617Authorization)
 	f.Add(rfc7616Authorization("MD5", "8ca523f5e9506fed4657c9700eebdbec"))
@@ -86,6 +88,42 @@ func FuzzParseAKANonce(f *testing.F) {
 		}
 		if len(rand) != 16 || len(autn) != 16 {
 			t.Fatal("wrong sizes")
+		}
+	})
+}
+
+// FuzzUsedCounts checks UsedCounts against the rule it implements, kept here
+// as every count used so far: a count is accepted if it was never used and
+// lies less than NonceCountWindow below the highest one used.
+func FuzzUsedCounts(f *testing.F) {
+	f.Add([]byte{1, 0, 1, 0, 1, 5, 1, 0xfc, 1, 0xfc})
+	f.Add([]byte{1, 40, 1, 0xe0, 1, 0xe1, 1, 0xdf})
+	f.Add([]byte{0, 0xff, 0xff, 0x80, 1, 0x7f})
+	f.Fuzz(func(t *testing.T, ops []byte) {
+		var u UsedCounts
+		used := map[uint32]bool{}
+		var highest uint32
+		for i := 0; i+1 < len(ops); i += 2 {
+			// An odd op names a count near the highest one used, where the
+			// window's edges are; an even one a count anywhere.
+			nc := uint32(ops[i])<<24 | uint32(ops[i+1])<<16 | uint32(ops[i+1])
+			if ops[i]%2 == 1 {
+				nc = uint32(max(1, min(int64(highest)+int64(int8(ops[i+1])), 0xffffffff)))
+			}
+			want := !used[nc] && (len(used) == 0 || uint64(nc)+NonceCountWindow > uint64(highest))
+			next, ok := u.Use(nc)
+			if ok != want {
+				t.Fatalf("op %d: Use(%d) after %+v = %v, want %v", i/2, nc, u, ok, want)
+			}
+			if !ok {
+				if next != u {
+					t.Fatalf("op %d: a refused Use(%d) changed %+v to %+v", i/2, nc, u, next)
+				}
+				continue
+			}
+			used[nc] = true
+			highest = max(highest, nc)
+			u = next
 		}
 	})
 }

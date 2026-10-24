@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"math/rand/v2"
 	"strings"
@@ -63,7 +64,7 @@ func (h *harness) challenge(t *testing.T, alg Algorithm) Challenge {
 func answer(t *testing.T, ch Challenge, password string, nc uint32) Credentials {
 	t.Helper()
 	c, err := Respond(ch, ClientParams{
-		Username: testUser, Password: []byte(password), Method: "REGISTER", URI: testURI,
+		Username: testUser, Password: secret.NewKey([]byte(password)), Method: "REGISTER", URI: testURI,
 		CNonce: "cnonce-1", NC: nc,
 	})
 	if err != nil {
@@ -250,9 +251,22 @@ func TestReplayedNonceCountIsRejected(t *testing.T) {
 	if err := h.server.Verify(ctx, "REGISTER", third, secret); err != nil {
 		t.Fatalf("nc 3 after 1: %v", err)
 	}
+	// A count that arrives late is accepted once, inside the window.
 	second := answer(t, ch, testPass, 2)
+	if err := h.server.Verify(ctx, "REGISTER", second, secret); err != nil {
+		t.Fatalf("nc 2 after 3: %v", err)
+	}
 	if err := h.server.Verify(ctx, "REGISTER", second, secret); !errors.Is(err, ErrReplayed) {
-		t.Fatalf("nc 2 after 3: err = %v, want ErrReplayed", err)
+		t.Fatalf("nc 2 again: err = %v, want ErrReplayed", err)
+	}
+	ahead := answer(t, ch, testPass, 4+NonceCountWindow)
+	if err := h.server.Verify(ctx, "REGISTER", ahead, secret); err != nil {
+		t.Fatal(err)
+	}
+	for _, nc := range []uint32{2, 4} { // used, and unused, both below the window now
+		if err := h.server.Verify(ctx, "REGISTER", answer(t, ch, testPass, nc), secret); !errors.Is(err, ErrReplayed) {
+			t.Fatalf("nc %d below the window: err = %v, want ErrReplayed", nc, err)
+		}
 	}
 }
 
@@ -401,8 +415,41 @@ func TestNonceCountStoreFailureFailsVerification(t *testing.T) {
 	h.server.counts = failingCounts{}
 	c := answer(t, h.challenge(t, MD5), testPass, 1)
 	err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass)))
-	if err == nil || !strings.Contains(err.Error(), "table unavailable") {
-		t.Fatalf("err = %v, want the store's error", err)
+	if !errors.Is(err, ErrNonceCountStore) || !strings.Contains(err.Error(), "table unavailable") {
+		t.Fatalf("err = %v, want the store's error as ErrNonceCountStore", err)
+	}
+	if errors.Is(err, ErrReplayed) {
+		t.Fatal("a store failure looks like a replay")
+	}
+	if errors.Is(err, ErrStaleNonce) {
+		t.Fatal("a store failure sends the client to a new nonce")
+	}
+}
+
+// unusableCounts is a store whose record of every nonce cannot be read.
+type unusableCounts struct{}
+
+func (unusableCounts) Advance(context.Context, string, string, uint32, time.Time) (bool, error) {
+	return false, fmt.Errorf("%w: item is malformed", ErrNonceCountUnusable)
+}
+
+func TestAnUnusableNonceCountRecordMakesTheNonceStale(t *testing.T) {
+	// #621: the fault stays with the nonce, so the client is given a new
+	// one rather than told to retry this one later.
+	h := newHarness(t)
+	h.server.counts = unusableCounts{}
+	c := answer(t, h.challenge(t, MD5), testPass, 1)
+	err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass)))
+	if !errors.Is(err, ErrStaleNonce) || !errors.Is(err, ErrNonceCountUnusable) || !strings.Contains(err.Error(), "item is malformed") {
+		t.Fatalf("err = %v, want ErrStaleNonce wrapping the store's error", err)
+	}
+	if errors.Is(err, ErrNonceCountStore) || errors.Is(err, ErrReplayed) {
+		t.Fatalf("err = %v, an unusable record is neither a store failure nor a replay", err)
+	}
+	// Still after the response: a wrong one is refused as before.
+	c = answer(t, h.challenge(t, MD5), "wrong", 1)
+	if err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass))); !errors.Is(err, ErrWrongResponse) {
+		t.Fatalf("a wrong response over an unusable record = %v", err)
 	}
 }
 
@@ -520,7 +567,7 @@ func TestCustomNonceLifetimeIsHonoured(t *testing.T) {
 
 func TestRespondRefusesWhatItCannotAnswer(t *testing.T) {
 	ch := Challenge{Realm: "r", Nonce: "n", Algorithm: MD5, QOP: []string{"auth"}}
-	ok := ClientParams{Username: "u", Password: []byte("p"), Method: "REGISTER", URI: "sip:r", CNonce: "c", NC: 1}
+	ok := ClientParams{Username: "u", Password: secret.NewKey([]byte("p")), Method: "REGISTER", URI: "sip:r", CNonce: "c", NC: 1}
 	cases := []struct {
 		name   string
 		ch     func(*Challenge)
@@ -562,7 +609,7 @@ func TestRespondRefusesWhatItCannotAnswer(t *testing.T) {
 
 func TestRespondTreatsAMissingAlgorithmAsMD5(t *testing.T) {
 	ch := Challenge{Realm: "r", Nonce: "n", QOP: []string{"auth-int", "AUTH"}}
-	c, err := Respond(ch, ClientParams{Username: "u", Password: []byte("p"), Method: "M", URI: "u", CNonce: "c", NC: 1})
+	c, err := Respond(ch, ClientParams{Username: "u", Password: secret.NewKey([]byte("p")), Method: "M", URI: "u", CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +640,7 @@ func TestOneUserCannotUseUpAnotherUsersNonceCount(t *testing.T) {
 	ch := h.challenge(t, SHA256)
 	ctx := context.Background()
 	other, err := Respond(ch, ClientParams{
-		Username: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org", Password: []byte("other"),
+		Username: "001010000000002@ims.mnc001.mcc001.3gppnetwork.org", Password: secret.NewKey([]byte("other")),
 		Method: "REGISTER", URI: testURI, CNonce: "x", NC: 0xffffffff,
 	})
 	if err != nil {
@@ -626,7 +673,7 @@ func TestOpaqueIsBoundToAlgorithmAndRealm(t *testing.T) {
 	}
 	aka, _ := other.AKAChallenge(make([]byte, 16), make([]byte, 16), false)
 	aka.Realm = testRealm
-	c, err := Respond(aka, ClientParams{Username: testUser, Password: []byte("res"), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
+	c, err := Respond(aka, ClientParams{Username: testUser, Password: secret.NewKey([]byte("res")), Method: "REGISTER", URI: testURI, CNonce: "c", NC: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
