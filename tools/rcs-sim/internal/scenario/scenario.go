@@ -79,6 +79,20 @@ type Config struct {
 	// 24.229 §5.4.1.5), for reg-event's network-deregister step. Nil skips
 	// that step, which RequireAll (-require-all) makes a failure.
 	Deregister func(ctx context.Context, impu sip.URI) error
+	// ConferenceFactory is the URI group-chat creates its group at, the
+	// ConfFctyURI the client is provisioned with.
+	ConferenceFactory sip.URI
+	// GroupRejoins is how many times group-chat's client rejoins its group
+	// before the owner stops (at least once).
+	GroupRejoins int
+	// StopOwner stops the rcs-as task that owns the group at conf and
+	// returns once it has stopped, for group-chat's owner steps (#121).
+	// Nil skips them, which RequireAll makes a failure.
+	StopOwner func(ctx context.Context, conf sip.URI) error
+	// OwnerCrash says StopOwner kills the owner rather than stopping it
+	// cleanly: group-chat then expects no BYE and no end of its roster
+	// subscription, and its client gives up its own session (#121).
+	OwnerCrash bool
 	// RelayPublic is msrp-relay's public host:port, the authority of every
 	// client_path (RELAY_PUBLIC_HOST, RELAY_PUBLIC_PORT). chat-invite
 	// requires each a=path the network gives a client to name it, so a
@@ -127,6 +141,7 @@ var scenarios = map[string]func(*run) error{
 	"chat-client-originated": chatClientOriginated,
 	"chat-core-originated":   chatCoreOriginated,
 	"chat-invite":            chatInvite,
+	"group-chat":             groupChat,
 	"pager-message":          pagerMessage,
 	"reg-event":              regEvent,
 	"options":                options,
@@ -136,7 +151,7 @@ var scenarios = map[string]func(*run) error{
 // SIP configuration at all, as a stack without pcscf cannot run them
 // (#135). With SIP configured they run, and one that lacks a setting it
 // needs, such as the peer, fails at its first step rather than vanish.
-var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true, "options": true, "chat-invite": true}
+var sipScenarios = map[string]bool{"pager-message": true, "reg-event": true, "options": true, "chat-invite": true, "group-chat": true}
 
 // Names lists the built-in scenarios, sorted.
 func Names() []string {

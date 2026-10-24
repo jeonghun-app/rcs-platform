@@ -72,6 +72,7 @@ Local, S3Mock, 고정된 `acs` 릴리스가 함께 뜹니다.
 ```bash
 make up            # 로컬 스택을 띄우고 모두 정상이 될 때까지 기다림
 make e2e-compose   # 클라이언트 시뮬레이터를 스택에 실행
+# 둘 다 RCSAS_TASKS=2를 주면 rcs-as task 두 개로 띄우고 그 사이의 그룹 채팅도 실행
 make bridge-up     # 스택과 rcs-bridge를 127.0.0.1:8720에 띄움(docs/rcs-bridge.md)
 make down          # 스택을 멈추고 데이터를 지움
 ```

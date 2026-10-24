@@ -213,9 +213,9 @@ func (f *flakyStore) Pending(ctx context.Context, r, after string, now time.Time
 	return f.Store.Pending(ctx, r, after, now, n)
 }
 
-func (f *flakyStore) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, n int) ([]store.Message, bool, error) {
+func (f *flakyStore) PendingHeld(ctx context.Context, r, after, owner string, now time.Time, n int) ([]store.Message, time.Time, error) {
 	if f.failing("pending") {
-		return nil, false, errStore
+		return nil, time.Time{}, errStore
 	}
 	return f.Store.PendingHeld(ctx, r, after, owner, now, n)
 }

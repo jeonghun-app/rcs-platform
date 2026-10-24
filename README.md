@@ -73,6 +73,7 @@ Local, S3Mock and the pinned `acs` release. See
 ```bash
 make up            # start the local stack and wait until it is healthy
 make e2e-compose   # the client simulator against it
+# RCSAS_TASKS=2 on both: two rcs-as tasks, and the group chat across them
 make bridge-up     # the stack and rcs-bridge on 127.0.0.1:8720 (docs/rcs-bridge.md)
 make down          # stop it and remove its data
 ```

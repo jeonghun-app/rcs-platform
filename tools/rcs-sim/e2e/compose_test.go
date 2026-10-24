@@ -43,9 +43,10 @@ func TestE2EComposeStack(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf", "scscf", "pcscf", "rcs-as-a"} {
+	for _, svc := range []string{"hss", "ft-server", "msrp-relay", "icscf", "scscf", "pcscf"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
 	}
+	tasks := rcsasTasks(ctx, t)
 	waitReady(ctx, t, acsURL+"/readyz")
 
 	// acs: what a device is told points at this stack (stack-seed's
@@ -173,17 +174,25 @@ func TestE2EComposeStack(t *testing.T) {
 		t.Errorf("the chat to the unregistered peer was answered %d (on a new chat: %d, stored and delivered: %d), want rcs-as's 200 and its delivery on a chat opened once the peer registered",
 			r.Detail["status"], r.Detail["new_session"], r.Detail["stored"])
 	}
-	// The stack runs one rcs-as task, which holds every chat the client
-	// has, so everything for the client comes on them: a chat the network
-	// opened to the client, what came on one, or a notification in pager
-	// mode would break docs/rcs-as.md Delivery rule 1 (code review and QA
-	// on #654). With two tasks (#602) they come rightly, when the peer's
-	// registration lands on the task without the client's chat (#647):
-	// this check is then for a one-task stack only.
-	for _, step := range []string{"chat-invite/client-to-peer", "chat-invite/peer-to-client", "chat-invite/chunked-message", "chat-invite/peer-offline"} {
+	// Everything for the client comes on the chat it holds: a chat the
+	// network opened to the client, what came on one, or a notification
+	// in pager mode would break docs/rcs-as.md Delivery rule 1 (code
+	// review and QA on #654). In the steps on the client's open chat the
+	// task that holds it sends all of it, however many tasks there are
+	// (each was 0 in every two-task run QA measured on #654), so they are
+	// checked on both stacks. peer-offline's message is delivered when
+	// the peer registers again, and with two tasks that registration can
+	// land on the task without the client's chat, whose notifications
+	// then rightly come another way (#647): it is checked on one task
+	// only (the lead's decision on #602).
+	steps := []string{"chat-invite/client-to-peer", "chat-invite/peer-to-client", "chat-invite/chunked-message"}
+	if len(tasks) == 1 {
+		steps = append(steps, "chat-invite/peer-offline")
+	}
+	for _, step := range steps {
 		for _, c := range []string{"client_invites", "network_chat", "pager_notifications"} {
 			if v, ok := sipResults[step].Detail[c]; !ok || v != 0 {
-				t.Errorf("%s: %s is %d (reported: %v), want 0 on one rcs-as task", step, c, v, ok)
+				t.Errorf("%s: %s is %d (reported: %v), want 0 on %d rcs-as task(s)", step, c, v, ok, len(tasks))
 			}
 		}
 	}
@@ -263,6 +272,39 @@ func env(t *testing.T, name string) string {
 		t.Fatalf("%s is not set: run this through make e2e-compose, after make up", name)
 	}
 	return v
+}
+
+// rcsasTasks returns the stack's rcs-as services, rcs-as-a and, on two
+// tasks, rcs-as-b, as make e2e-compose was told (RCSAS_TASKS, here
+// RCS_E2E_RCSAS_TASKS), once each is ready. The AS URI's shared alias must
+// name as many running tasks, or the test fails here: some checks hold on
+// one task only (#654) and the group chat needs two (#602), so a stack of
+// another size would fail them for a reason that is not theirs. It is
+// checked first, as a task that is not there would otherwise be waited
+// for until the test's deadline.
+func rcsasTasks(ctx context.Context, t *testing.T) []string {
+	t.Helper()
+	var tasks []string
+	switch n := os.Getenv("RCS_E2E_RCSAS_TASKS"); n {
+	case "1":
+		tasks = []string{"rcs-as-a"}
+	case "2":
+		tasks = []string{"rcs-as-a", "rcs-as-b"}
+	default:
+		t.Fatalf("RCS_E2E_RCSAS_TASKS is %q, not 1 or 2: run the test through make e2e-compose", n)
+	}
+	addrs, err := net.DefaultResolver.LookupHost(ctx, "rcs-as.rcs.local")
+	if err != nil {
+		t.Fatalf("resolving rcs-as.rcs.local: %v", err)
+	}
+	if len(addrs) != len(tasks) {
+		t.Fatalf("rcs-as.rcs.local names %d running rcs-as tasks, and make e2e-compose was given RCSAS_TASKS=%d: give make up the same RCSAS_TASKS, or see why an earlier test left a task stopped",
+			len(addrs), len(tasks))
+	}
+	for _, svc := range tasks {
+		waitReady(ctx, t, "http://"+svc+":8080/readyz")
+	}
+	return tasks
 }
 
 // waitReady polls target until it answers 200: make up waits for the
