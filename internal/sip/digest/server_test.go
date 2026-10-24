@@ -446,6 +446,11 @@ func TestAnUnusableNonceCountRecordMakesTheNonceStale(t *testing.T) {
 	if errors.Is(err, ErrNonceCountStore) || errors.Is(err, ErrReplayed) {
 		t.Fatalf("err = %v, an unusable record is neither a store failure nor a replay", err)
 	}
+	// Callers log the message: it must name the record, not an expiry
+	// that did not happen (#641).
+	if !strings.HasPrefix(err.Error(), ErrNonceCountUnusable.Error()) || strings.Contains(err.Error(), "expired") {
+		t.Fatalf("err = %q, want the unusable record's message without an expiry", err)
+	}
 	// Still after the response: a wrong one is refused as before.
 	c = answer(t, h.challenge(t, MD5), "wrong", 1)
 	if err := h.server.Verify(context.Background(), "REGISTER", c, Password([]byte(testPass))); !errors.Is(err, ErrWrongResponse) {

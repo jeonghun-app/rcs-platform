@@ -629,5 +629,69 @@ class SecurityChecklistRound3(TemplateCase):
             "SERVICE_TASK_CONFIGURATION_FAILURE", "SERVICE_DEPLOYMENT_FAILED"})
 
 
+class AlarmSums(TemplateCase):
+    """Alarms that page on a sum of service metrics watch exactly those
+    metrics (#641: FtAuthBackendError and the stale loop)."""
+
+    def alarm(self, t: dict) -> dict:
+        return t["Resources"]["FtAuthBackendError"]["Properties"]
+
+    def metric(self, t: dict, metric_id: str) -> dict:
+        return next(m for m in self.alarm(t)["Metrics"] if m["Id"] == metric_id)
+
+    def test_the_backend_alarm_adds_the_unusable_nonce_counts(self):
+        sums = check_infra.ALARM_SUMS["FtAuthBackendError"]
+        self.assertEqual(sums.metrics, ("auth.backend_error", "auth.nonce_count_unusable"))
+        self.assertEqual(self.metric(self.template, "total")["Expression"], "FILL(m0, 0) + FILL(m1, 0)")
+
+    def test_an_expression_that_drops_a_metric_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.metric(t, "total")["Expression"] = "FILL(m0, 0)"
+        self.assertProblem(t, "FtAuthBackendError: expression 'FILL(m0, 0)', want 'FILL(m0, 0) + FILL(m1, 0)'")
+
+    def test_a_misspelt_metric_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.metric(t, "m1")["MetricStat"]["Metric"]["MetricName"] = "auth.nonce_count_unuseable"
+        self.assertProblem(t, "FtAuthBackendError: watches ['auth.backend_error', 'auth.nonce_count_unuseable']")
+
+    def test_another_dimension_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.metric(t, "m1")["MetricStat"]["Metric"]["Dimensions"] = [{"Name": "Service", "Value": "ft_server"}]
+        self.assertProblem(t, "FtAuthBackendError/m1: not the Service=ft-server metric in RCS/<stack>")
+
+    def test_another_namespace_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.metric(t, "m0")["MetricStat"]["Metric"]["Namespace"] = "RCS"
+        self.assertProblem(t, "FtAuthBackendError/m0: not the Service=ft-server metric in RCS/<stack>")
+
+    def test_a_missing_metric_block_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.alarm(t)["Metrics"] = [m for m in self.alarm(t)["Metrics"] if m["Id"] != "m1"]
+        self.assertProblem(t, "FtAuthBackendError: watches ['auth.backend_error']")
+
+    def test_another_statistic_or_period_is_refused(self):
+        for key, value in (("Stat", "Minimum"), ("Period", 60)):
+            with self.subTest(key=key):
+                t = copy.deepcopy(self.template)
+                self.metric(t, "m1")["MetricStat"][key] = value
+                self.assertProblem(t, "FtAuthBackendError/m1: not the Sum over 300 s")
+
+    def test_a_returned_input_is_refused(self):
+        t = copy.deepcopy(self.template)
+        self.metric(t, "m1")["ReturnData"] = True
+        self.assertProblem(t, "FtAuthBackendError: returns ['m1', 'total'], want only the sum")
+
+    def test_another_threshold_is_refused(self):
+        for key, value in (("Threshold", 5), ("ComparisonOperator", "GreaterThanOrEqualToThreshold")):
+            with self.subTest(key=key):
+                t = copy.deepcopy(self.template)
+                self.alarm(t)[key] = value
+                self.assertProblem(t, "FtAuthBackendError: does not fire on a sum above 0")
+
+    def test_a_missing_alarm_is_refused(self):
+        t = self.changed(FtAuthBackendError=None)
+        self.assertProblem(t, "FtAuthBackendError: missing")
+
+
 if __name__ == "__main__":
     unittest.main()

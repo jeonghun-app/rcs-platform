@@ -213,16 +213,20 @@ and answers it as MD5.
   line without the user name.
 - **Backend failures get 503.** A transport error, a timeout, or an HSS status
   other than `200` and `404` gets `503` with `Retry-After`. So does a failure
-  of the nonce-count store, DynamoDB throttling say, or an update that lost
-  every conditional write to other requests on its nonce: the response was
+  of the nonce-count store, DynamoDB throttling say, an update that lost
+  every conditional write to other requests on its nonce, or one that took
+  longer than `FT_HSS_TIMEOUT`: the response was
   right, but whether its nonce-count was used could not be told (#621). Each
   is counted in `auth.backend_error` and logged without the user name. It says
   nothing about the user, and clients retry a 503 but give up after a second
-  401. A nonce-count item that cannot be decoded is the exception: it stays
-  bad until the nonce expires, so a 503 would bring the client back to it on
-  every retry. It gets 401 with `stale=true` instead, and the client moves to
-  a new nonce at once. It is counted in `auth.stale` and logged as "nonce
-  count record unusable", without the user name.
+  401. A lookup or update cut short because the client closed its connection
+  is no fault of either backend. It is counted in `auth.interrupted` instead
+  and not logged (#641). A nonce-count item that cannot be decoded is the
+  exception: it stays bad until the nonce expires, so a 503 would bring the
+  client back to it on every retry. It gets 401 with `stale=true` instead,
+  and the client moves to a new nonce at once. It is counted in
+  `auth.nonce_count_unusable`, not `auth.stale`, and logged as "nonce count
+  record unusable", without the user name.
 - **Lookups are bounded.** Each task runs at most `FT_MAX_CONCURRENT_LOOKUPS` at
   once and answers `503` beyond that (`auth.lookup_busy`). Anyone who has
   fetched a nonce can trigger a lookup with a made-up user name. The HSS client
@@ -294,7 +298,7 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_NONCE_KEY` | random per start | At least 32 bytes, shared by every task. Required in staging and prod |
 | `FT_CREDENTIALS` | `hss` | `hss` or `static` (refused in staging and prod) |
 | `FT_HSS_URL`, `FT_HSS_TOKEN` | required with `hss` | HSS provisioning API base, such as `http://hss.rcs.local:8081` (the HSS API port, `HSS_API_ADDR`), and service bearer token. `https`, or `http` to a private host (see above). In staging and prod the token must be at least 43 characters: 256 random bits, such as 32 bytes in base64 (ADR 0007 §4) |
-| `FT_HSS_TIMEOUT` | `2s` | Per lookup |
+| `FT_HSS_TIMEOUT` | `2s` | Per credential lookup, and per nonce-count update in the files table, so that a stalled HSS or table fails the request before the client gives up on it (#641) |
 | `FT_MAX_CONCURRENT_LOOKUPS` | `16` | Credential lookups in progress per task, and HSS connections |
 | `FT_STATIC_USERS` | required with `static` | `user=password,...` |
 | `FT_STORE` | `aws` | `aws` or `memory` (refused in staging and prod) |
@@ -321,7 +325,7 @@ reads `RCS_SERVICE_NAMESPACE`, the Cloud Map namespace (for example
 | `FT_DOWNLOAD_PRESSURE_PERCENT` | `75` | Share of `FT_MAX_CONCURRENT_DOWNLOADS` in use, from 1 to 100, above which the pressure floor applies |
 | `FT_IDLE_TIMEOUT` | `30s` | A transfer that moves no byte for this long is cut off |
 | `FT_UPLOAD_TIMEOUT` | `30m` | Longest upload request |
-| `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call |
+| `FT_STORAGE_TIMEOUT` | `1m` | Each S3 or DynamoDB call for a file's record or content: in uploads, downloads and the sweeper. Nonce-count updates have `FT_HSS_TIMEOUT` instead |
 | `FT_SWEEP_INTERVAL` | `1h` | How often expired records are marked |
 | `FT_DRAIN_TIMEOUT` | `10s` | At shutdown, how long running requests may finish before uploads are cut off. Keep it a few seconds below `RCS_SHUTDOWN_TIMEOUT` |
 
@@ -442,6 +446,8 @@ identifier ever appears in a metric name:
 | `download.served`, `download.partial`, `download.bytes`, `download.not_found`, `download.unsatisfiable` | Downloads |
 | `download.failed.storage`, `download.failed.interrupted`, `download.failed.too_slow`, `download.failed.busy`, `download.failed.file_busy`, `download.failed.uploader_busy`, `download.failed.missing_object` | Failed downloads |
 | `auth.challenged`, `auth.stale`, `auth.failed`, `auth.backend_error`, `auth.bad_credential_record`, `auth.lookup_busy`, `auth.uri_path_only` | Authentication |
+| `auth.interrupted` | An HSS lookup or a nonce-count update cut short because the client closed its connection, answered `503` |
+| `auth.nonce_count_unusable` | A nonce-count item that cannot be decoded, answered `401` with `stale=true` |
 | `auth.nonce_contended` | DynamoDB store: a nonce-count update that waited for another on the same nonce in the task, or lost its conditional write to one on another task |
 | `sweep.expired`, `sweep.failed`, `sweep.duration` (ms) | Sweeper |
 
@@ -469,7 +475,7 @@ an alarm with a runbook section of the same name (handbook 06 §5):
 
 | Signal | Meaning |
 |---|---|
-| `auth.backend_error` > 0 | The HSS lookup fails. Uploads get `503` |
+| `auth.backend_error` + `auth.nonce_count_unusable` > 0 | The HSS lookup or the DynamoDB nonce-count store fails, and uploads get `503`; or nonce-count items cannot be read, and requests get stale challenges ([runbook](runbook.md#ftauthbackenderror)) |
 | `auth.lookup_busy` sustained | Lookups pile up (slow HSS, or an unauthenticated flood). Check the WAF rule |
 | `auth.bad_credential_record` > 0 | A subscriber's FT credential record in the HSS is unusable. That user cannot upload |
 | `upload.failed.storage`, `download.failed.storage` > 0 | S3 or DynamoDB fails |

@@ -23,7 +23,9 @@ platform the ADRs describe:
   role, and nothing may export them: msrp-bindings holds rcs-as session ids
   (threat model T3, #54); a wildcard ARN, or one naming the table, counts;
 * every task role is granted each action its service's code calls
-  (infra/task-role-actions.yaml).
+  (infra/task-role-actions.yaml);
+* alarms that page on a sum of service metrics watch exactly those metrics,
+  as the services emit them, and fire on any of it (ALARM_SUMS).
 
 Runs in the infra tools image (deploy/infra-tools.Dockerfile), which provides
 cfn-lint's CloudFormation YAML decoder. Usage: check_infra.py TEMPLATE...
@@ -871,6 +873,55 @@ def check_topics(template: dict) -> list[str]:
     return problems
 
 
+@dataclass(frozen=True)
+class AlarmSum:
+    """An alarm on the 5-minute sum of service metrics, firing above 0."""
+
+    service: str
+    metrics: tuple[str, ...]
+
+
+# A metric left out of the sum, or misspelt, would keep the alarm silent
+# with nothing to show for it: CloudWatch takes any name.
+ALARM_SUMS: dict[str, AlarmSum] = {
+    # HSS lookups and nonce-count updates that fail, and nonce-count items
+    # that cannot be read, which are answered as stale nonces (#641).
+    "FtAuthBackendError": AlarmSum("ft-server", ("auth.backend_error", "auth.nonce_count_unusable")),
+}
+
+
+def check_alarm_sums(template: dict) -> list[str]:
+    problems = []
+    alarms = resources(template, "AWS::CloudWatch::Alarm")
+    for name, want in ALARM_SUMS.items():
+        if name not in alarms:
+            problems.append(f"{name}: missing")
+            continue
+        props = alarms[name].get("Properties", {})
+        if props.get("ComparisonOperator") != "GreaterThanThreshold" or props.get("Threshold") != 0:
+            problems.append(f"{name}: does not fire on a sum above 0")
+        inputs = [m for m in props.get("Metrics", []) if "MetricStat" in m]
+        names = [m["MetricStat"].get("Metric", {}).get("MetricName") for m in inputs]
+        if names != list(want.metrics):
+            problems.append(f"{name}: watches {names}, want {list(want.metrics)}")
+        for m in inputs:
+            stat = m["MetricStat"]
+            metric = stat.get("Metric", {})
+            if (metric.get("Namespace") != {"Fn::Sub": "RCS/${AWS::StackName}"}
+                    or metric.get("Dimensions") != [{"Name": "Service", "Value": want.service}]):
+                problems.append(f"{name}/{m.get('Id')}: not the Service={want.service} metric in RCS/<stack>")
+            if stat.get("Stat") != "Sum" or stat.get("Period") != 300:
+                problems.append(f"{name}/{m.get('Id')}: not the Sum over 300 s")
+        returned = [m.get("Id") for m in props.get("Metrics", []) if m.get("ReturnData", True)]
+        if returned != ["total"]:
+            problems.append(f"{name}: returns {returned}, want only the sum")
+        expression = next((m.get("Expression") for m in props.get("Metrics", []) if m.get("Id") == "total"), None)
+        wanted = " + ".join(f"FILL({m.get('Id')}, 0)" for m in inputs)
+        if expression != wanted:
+            problems.append(f"{name}: expression {expression!r}, want {wanted!r}")
+    return problems
+
+
 def check_task_images_and_values(template: dict) -> list[str]:
     """Images by digest, so a task starts from the bytes deploy.sh checked;
     no secret resolved into a plain environment value or an output."""
@@ -939,6 +990,7 @@ CHECKS = (
     check_services,
     check_table_readers,
     check_required_actions,
+    check_alarm_sums,
 )
 
 
