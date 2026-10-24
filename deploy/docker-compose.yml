@@ -6,6 +6,7 @@
 # writes deploy/compose.env with fresh secrets:
 #
 #   make up             build, start, wait until every service is healthy
+#                       (RCSAS_TASKS=2 for a second rcs-as task)
 #   make e2e-compose    rcs-sim against the running stack
 #   make logs           the services' logs
 #   make down           stop and remove everything, data included
@@ -325,10 +326,12 @@ services:
   # rcs-as, the application server: chat, pager messages and
   # conferences, its queue and groups in DynamoDB Local (docs/rcs-as.md).
   # scscf reaches it as the default profile's AS, and msrp-relay connects
-  # to it on RELAY_CORE_PORTS (2855). Two tasks, rcs-as-a and rcs-as-b, as
-  # a deployment runs at least two: the same settings and shared aliases,
-  # each with an MSRP host of its own, so that a group's requests reach
-  # either task and are served on its owner (#121).
+  # to it on RELAY_CORE_PORTS (2855). One task, rcs-as-a, and with the
+  # profile rcs-as-b (make up RCSAS_TASKS=2) a second, as a deployment runs
+  # at least two: the same settings and shared aliases, each with an MSRP
+  # host of its own, so that a group's requests reach either task and are
+  # served on its owner (#121). Both stacks run in CI: some checks hold on
+  # one task only (#654), and the group chat needs two (#602).
   rcs-as-a:
     <<: *platform
     command: ["rcs-as"]
@@ -348,6 +351,7 @@ services:
 
   rcs-as-b:
     <<: *platform
+    profiles: ["rcs-as-b"]
     command: ["rcs-as"]
     environment:
       <<: *rcs-as

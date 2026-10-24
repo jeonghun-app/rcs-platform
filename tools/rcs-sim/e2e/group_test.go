@@ -225,8 +225,13 @@ func groupChat(t *testing.T, crash bool) {
 	impi := composeIMSI + "@" + domain
 	ctx, cancel := context.WithTimeout(context.Background(), groupTestWait)
 	defer cancel()
-	for _, svc := range []string{"hss", "msrp-relay", "icscf", "scscf", "pcscf", "rcs-as-a", "rcs-as-b"} {
+	for _, svc := range []string{"hss", "msrp-relay", "icscf", "scscf", "pcscf"} {
 		waitReady(ctx, t, "http://"+svc+":8080/readyz")
+	}
+	// A group moves to another task only if there is one: the one-task
+	// stack runs the checks that need one task instead, and CI runs both.
+	if tasks := rcsasTasks(ctx, t); len(tasks) < 2 {
+		t.Skip("group chat across rcs-as tasks needs two: make up and make e2e-compose with RCSAS_TASKS=2")
 	}
 	h := newHandshake(t)
 	h.reset(t)

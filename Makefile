@@ -154,8 +154,19 @@ e2e: volumes ## End-to-end: rcs-sim against ft-server and msrp-relay
 # ($(COMPOSE_PROJECT)_default) and its stack-init image. A second stack on
 # the same host, from another worktree say, needs a name and host ports of
 # its own (docs/local-stack.md).
+#
+# RCSAS_TASKS is how many rcs-as tasks the stack runs, 1 or 2: the second,
+# rcs-as-b, is the compose profile rcs-as-b. Pass the same value to up,
+# e2e-compose and logs. The test checks some things on one task only, and
+# the group chat across tasks on two (docs/local-stack.md, make
+# e2e-compose); CI runs both.
 COMPOSE_PROJECT ?= rcs-local
 COMPOSE_ENV     ?= deploy/compose.env
+RCSAS_TASKS     ?= 1
+ifeq ($(filter 1 2,$(RCSAS_TASKS)),)
+$(error RCSAS_TASKS must be 1 or 2, not "$(RCSAS_TASKS)")
+endif
+RCSAS_PROFILE = $(if $(filter 2,$(RCSAS_TASKS)),--profile rcs-as-b)
 COMPOSE = RCS_IMAGE="$(IMAGE):$$(printf %s "$$VERSION" | tr + _)" \
 	DDBLOCAL_IMAGE="$(DDBLOCAL_IMAGE)" S3MOCK_IMAGE="$(S3MOCK_IMAGE)" ACS_IMAGE="$(ACS_IMAGE)" \
 	STACK_INIT_IMAGE="$(COMPOSE_PROJECT)-stack-init" \
@@ -167,18 +178,21 @@ LOGS ?= --tail=200
 compose-env:
 	@scripts/compose-env.sh $(COMPOSE_ENV)
 
+# With one task, up removes an rcs-as-b an earlier make up RCSAS_TASKS=2
+# started: compose leaves a service whose profile is not given running.
 .PHONY: up
 up: image compose-env ## Start the local stack and wait until every service is healthy
-	$(COMPOSE) up -d --build --wait --wait-timeout 300
+	$(COMPOSE) $(RCSAS_PROFILE) up -d --build --wait --wait-timeout 300
+	$(if $(RCSAS_PROFILE),,$(COMPOSE) --profile rcs-as-b rm -fsv rcs-as-b)
 	$(COMPOSE) run --rm stack-seed
 
 .PHONY: down
 down: compose-env ## Stop the local stack and remove its containers and data
-	$(COMPOSE) --profile seed down -v --remove-orphans
+	$(COMPOSE) --profile seed --profile rcs-as-b down -v --remove-orphans
 
 .PHONY: logs
 logs: compose-env ## Logs of the local stack (LOGS="-f hss" to follow one service)
-	$(COMPOSE) logs $(LOGS)
+	$(COMPOSE) $(RCSAS_PROFILE) logs $(LOGS)
 
 # rcs-sim and acs checks against the stack `make up` started
 # (tools/rcs-sim/e2e, build tag e2ecompose), from the toolchain container on
@@ -193,7 +207,7 @@ e2e-compose: volumes ## End-to-end: rcs-sim against the running local stack
 	  { echo "no local stack $(COMPOSE_PROJECT) is running: run make up first" >&2; exit 1; }
 	scripts/e2e-compose.sh $(COMPOSE_PROJECT) $(E2E_HANDSHAKE) $(COMPOSE_PROJECT)-e2e \
 	  $(RUNGO) --name $(COMPOSE_PROJECT)-e2e --network $(COMPOSE_PROJECT)_default --env-file $(COMPOSE_ENV) -e CGO_ENABLED=0 \
-	  -e RCS_E2E_HANDSHAKE=/src/$(E2E_HANDSHAKE) \
+	  -e RCS_E2E_HANDSHAKE=/src/$(E2E_HANDSHAKE) -e RCS_E2E_RCSAS_TASKS=$(RCSAS_TASKS) \
 	  $(GOIMAGE) go test -tags e2ecompose -count=1 -timeout 15m -v ./tools/rcs-sim/e2e/
 
 # Every Fuzz* function in the module runs for FUZZTIME; see scripts/fuzz.sh.
