@@ -52,7 +52,7 @@ func TestComposeEnvGeneratesEverySecretOnce(t *testing.T) {
 		t.Fatalf("mode %v, %v", fi.Mode(), err)
 	}
 	first := readEnv(t, path)
-	for _, k := range []string{"HSS_ADMIN_TOKEN", "HSS_ACS_TOKEN", "HSS_FT_TOKEN", "RELAY_PCSCF_TOKEN", "ACS_ADMIN_TOKEN", "FT_NONCE_KEY", "RCS_PII_HMAC_KEY"} {
+	for _, k := range []string{"HSS_ADMIN_TOKEN", "HSS_ACS_TOKEN", "HSS_FT_TOKEN", "RELAY_PCSCF_TOKEN", "ACS_ADMIN_TOKEN", "RCS_BRIDGE_TOKEN", "RCS_BRIDGE_IMPI_KEY", "FT_NONCE_KEY", "RCS_PII_HMAC_KEY"} {
 		if !secret.MatchString(first[k]) {
 			t.Errorf("%s = %q, want 64 hex digits", k, first[k])
 		}

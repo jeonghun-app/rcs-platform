@@ -28,6 +28,8 @@ contracts as in AWS (#56); [Local and AWS](#local-and-aws) lists what differs.
 ```bash
 make up            # build the image, start everything, wait until healthy, seed
 make e2e-compose   # rcs-sim and the acs checks against the running stack
+make bridge-up     # make up, then rcs-bridge (docs/rcs-bridge.md)
+make e2e-bridge    # the rcs-bridge test against that compose service
 make logs          # the last 200 lines of every service; make logs LOGS="-f hss"
 make down          # stop and remove the containers and all data
 ```
@@ -97,6 +99,7 @@ DynamoDB Local or S3Mock.
 | `rcs-as-a`, `rcs-as-b` | platform image | rcs-as, the default profile's application server: chat, pager messages, group chat; its queue and groups in DynamoDB Local ([rcs-as](rcs-as.md)), SIP on 5060, MSRP on 2855. `rcs-as-b` only with `RCSAS_TASKS=2` | `rcs-as -healthcheck` |
 | `acs` | `ACS_IMAGE` (Makefile) | auto-configuration, memory store, mock SMS | the image's own `/healthz` check |
 | `stack-seed` | `deploy/stack-init.Dockerfile` | one-shot, after the services are healthy: the test subscriber ([Bootstrap](#bootstrap)) | exits 0 |
+| `rcs-bridge` | `deploy/rcs-bridge.Dockerfile` | profile `bridge`, started by `make bridge-up` only: the HTTP and WebSocket bridge of [rcs-bridge](rcs-bridge.md) | `rcs-bridge -healthcheck` |
 
 `-healthcheck` asks the process's own `/healthz` on `RCS_ADMIN_ADDR` (port
 8080), as the ECS container health check does. The distroless image has no
@@ -155,6 +158,7 @@ Published on `127.0.0.1` only. The defaults are in `deploy/compose.env`.
 | 18000 (`DYNAMODB_HOST_PORT`) | `dynamodb` | DynamoDB API (any credentials) |
 | 15060 (`PCSCF_SIP_HOST_PORT`) | `pcscf` | SIP for a client on the host, plain TCP |
 | 19090 (`S3_HOST_PORT`) | `s3` | S3 API |
+| 8720 (`RCS_BRIDGE_HOST_PORT`) | `rcs-bridge` | its API and event stream ([rcs-bridge](rcs-bridge.md)), with `make bridge-up` |
 
 The admin ports (8080) and Diameter (3868) are reachable on the compose network
 only. On the network every service has its compose name: `hss:8081`,
@@ -397,11 +401,18 @@ docker access. It:
 8. checks the results of every run by the same rules as `make e2e`: every
    step, the resume bounds, no busy retries, nothing secret or identifying
    in the output.
+8. in a test of its own, runs [rcs-bridge](rcs-bridge.md#tests) on the test
+   container: two of its endpoints register through the IMS core, a message
+   sent with no event stream open is kept by `rcs-as` until there is one, a
+   message goes from one to the other through `rcs-as` with its delivery and
+   display notifications, and one to the receiver offline arrives once it is
+   online again.
 
-The CI job "end to end (compose stack)" runs `make up`, `make e2e-compose`,
-`make logs` on failure, and `make down`, with one task. "end to end (compose
-stack, two rcs-as tasks)" runs the same with `RCSAS_TASKS=2`, on a runner and
-a stack of its own.
+The CI job "end to end (compose stack)" runs `make bridge-up` (`make up` and
+[rcs-bridge](rcs-bridge.md)), `make e2e-compose`, `make e2e-bridge`, `make
+logs` on failure, and `make down`, with one task. "end to end (compose
+stack, two rcs-as tasks)" runs `make up`, `make e2e-compose`, `make logs` and
+`make down` with `RCSAS_TASKS=2`, on a runner and a stack of its own.
 
 `scscf` allows each IMPI 10 challenges in each minute of the clock
 (`registrar.challenge_limited` in its metrics, #201), and a run registers each

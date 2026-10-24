@@ -169,7 +169,7 @@ endif
 RCSAS_PROFILE = $(if $(filter 2,$(RCSAS_TASKS)),--profile rcs-as-b)
 COMPOSE = RCS_IMAGE="$(IMAGE):$$(printf %s "$$VERSION" | tr + _)" \
 	DDBLOCAL_IMAGE="$(DDBLOCAL_IMAGE)" S3MOCK_IMAGE="$(S3MOCK_IMAGE)" ACS_IMAGE="$(ACS_IMAGE)" \
-	STACK_INIT_IMAGE="$(COMPOSE_PROJECT)-stack-init" \
+	STACK_INIT_IMAGE="$(COMPOSE_PROJECT)-stack-init" RCS_BRIDGE_IMAGE="$(COMPOSE_PROJECT)-rcs-bridge" \
 	$(DOCKER) compose -p $(COMPOSE_PROJECT) -f deploy/docker-compose.yml --env-file $(COMPOSE_ENV)
 # Passed to `docker compose logs`, e.g. make logs LOGS="-f hss".
 LOGS ?= --tail=200
@@ -186,16 +186,36 @@ up: image compose-env ## Start the local stack and wait until every service is h
 	$(if $(RCSAS_PROFILE),,$(COMPOSE) --profile rcs-as-b rm -fsv rcs-as-b)
 	$(COMPOSE) run --rm stack-seed
 
+# rcs-bridge (docs/rcs-bridge.md) on the stack make up starts, in the
+# compose profile bridge: built from deploy/rcs-bridge.Dockerfile, published
+# on 127.0.0.1:RCS_BRIDGE_HOST_PORT (8720), with the token RCS_BRIDGE_TOKEN
+# of deploy/compose.env.
+.PHONY: bridge-up
+bridge-up: up ## Start the local stack and rcs-bridge, and wait until it is healthy
+	$(COMPOSE) --profile bridge up -d --build --wait --wait-timeout 120 rcs-bridge
+
+# The rcs-bridge test of make e2e-compose run against the compose service
+# make bridge-up started (RCS_BRIDGE_E2E_URL), so that its image, its
+# settings and its health check are checked too, not only the bridge the
+# test builds itself.
+.PHONY: e2e-bridge
+e2e-bridge: volumes ## End-to-end: the rcs-bridge test against the compose service
+	@$(DOCKER) network inspect $(COMPOSE_PROJECT)_default >/dev/null 2>&1 && [ -f $(COMPOSE_ENV) ] || \
+	  { echo "no local stack $(COMPOSE_PROJECT) is running: run make bridge-up first" >&2; exit 1; }
+	$(RUNGO) --network $(COMPOSE_PROJECT)_default --env-file $(COMPOSE_ENV) -e CGO_ENABLED=0 \
+	  -e RCS_BRIDGE_E2E_URL=http://rcs-bridge:8720 \
+	  $(GOIMAGE) go test -tags e2ecompose -count=1 -v -run '^TestE2EBridgeOnTheComposeStack$$' ./tools/rcs-sim/e2e/
+
 # down also forgets when the last e2e-compose run ended: the challenge budget
 # it waits for (#648, scripts/e2e-compose.sh) is in DynamoDB Local's memory.
 .PHONY: down
 down: compose-env ## Stop the local stack and remove its containers and data
-	$(COMPOSE) --profile seed --profile rcs-as-b down -v --remove-orphans
+	$(COMPOSE) --profile seed --profile rcs-as-b --profile bridge down -v --remove-orphans
 	rm -f $(E2E_HANDSHAKE)-$(COMPOSE_PROJECT).ended
 
 .PHONY: logs
 logs: compose-env ## Logs of the local stack (LOGS="-f hss" to follow one service)
-	$(COMPOSE) $(RCSAS_PROFILE) logs $(LOGS)
+	$(COMPOSE) $(RCSAS_PROFILE) --profile bridge logs $(LOGS)
 
 # rcs-sim and acs checks against the stack `make up` started
 # (tools/rcs-sim/e2e, build tag e2ecompose), from the toolchain container on
