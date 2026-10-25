@@ -41,7 +41,10 @@ once code and docs cite 4.0, that claim is costly to take back.
      `absent` or `out of scope`. A **UP 2.4 → UP 4.0 gaps** row is `open`,
      `closed` or `out of scope`. `closed` means the change is merged and the row
      names its pull request. An issue closed without a merged change leaves the
-     row `open`. An `out of scope` row gives its reason in the row.
+     row `open`. A gap row may be `closed` only when its evidence is
+     *confirmed*: a *to confirm* row is not implemented, and stays `open` with
+     an issue to confirm the item. An `out of scope` row gives its reason in
+     the row.
 
    "Unverified" is a note, not a state. It says that a row relies on an edition
    marked *to confirm*, and it does not block stage 3. Nobody holds the text, so
