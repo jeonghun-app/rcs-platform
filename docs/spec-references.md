@@ -9,6 +9,13 @@ default. An edition marked *to confirm* has not been checked against a copy held
 a maintainer; behaviour built on it is listed as unverified in
 `docs/conformance.md`.
 
+The next target is **RCS Universal Profile 4.0**, reached in stages
+([ADR 0008](adr/0008-target-profile-up-4-0-in-stages.md)): UP 2.4 stays the
+target named here until stage 3 of that ADR. No maintainer holds the UP 4.0 text,
+so which edition of each GSMA document below belongs to UP 4.0 is *to confirm*
+for every document, and an item counts as UP 4.0 behaviour only under the ADR's
+evidence rule, from a row of [Public sources](#public-sources).
+
 ## GSMA
 
 | Document | Title (short) | Edition | Used by |
@@ -18,6 +25,19 @@ a maintainer; behaviour built on it is listed as unverified in
 | RCC.11 | Endorsement of OMA CPM for RCS | *to confirm* | `rcs-as` |
 | RCC.14 | Service provider device configuration | as in `acs` | `acs` |
 | RCC.15 | IMS device configuration and supporting services | *to confirm* | `pcscf`, `scscf` |
+
+## Public sources
+
+Public pages read for the move to UP 4.0 (ADR 0008). Cite a row by its short
+name. A page is summarised here, never quoted; a page that could not be opened is
+not listed.
+
+| Source | Publisher | URL | Date read | Used for |
+|---|---|---|---|---|
+| GSMA UP 4.0 article: *From Rich Text to Video: RCS Universal Profile 4.0 has arrived* | GSMA newsroom, 2026-03-26 | <https://www.gsma.com/newsroom/article/from-rich-text-to-video-rcs-universal-profile-4-0-has-arrived/> | 2026-10-25 | UP 4.0 feature summary: video calls started from a 1-to-1 or group conversation, rich text with an SMS fallback, discovery of the media formats a peer supports, streaming video and link handling in business rich cards. States no edition, clause or value. |
+| GSMA UP 4.1 article: *RCS Universal Profile 4.1: Stronger foundations for secure messaging* | GSMA newsroom, 2026-07-28 | <https://www.gsma.com/newsroom/article/rcs-universal-profile-4-1-stronger-foundations-for-secure-messaging/> | 2026-10-25 | That UP 4.1 followed 4.0; it is not a target (ADR 0008). |
+| Wikipedia RCS article: *Rich Communication Services* | Wikipedia | <https://en.wikipedia.org/wiki/Rich_Communication_Services> | 2026-10-25 | List of UP releases with dates and RCC.07 versions. Third-party: a lead to check against GSMA, confirms nothing. |
+| rcsjta: *android-rcs/rcsjta* | android-rcs project, GitHub | <https://github.com/android-rcs/rcsjta> | 2026-10-25 | Open-source Android RCS client stack. Its README names RCS-e Blackbird and GSMA terminal API 1.5.1 and 1.6.1, not a Universal Profile, and its last push is from 2017, so it says nothing about UP 4.0. |
 
 ## 3GPP
 
