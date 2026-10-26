@@ -39,8 +39,7 @@ built. This file links to the lists and does not copy them:
 
 One row per service area. "What is missing" is filled in for `partial` and
 `absent` rows only. In the evidence, "off by default" says the feature needs a
-setting turned on, and "not tested" that no test drives it; both are notes, not
-states.
+setting turned on; it is a note, not a state.
 
 | Feature | Status | Evidence | Specification | What is missing | Open issue |
 |---|---|---|---|---|---|
@@ -61,8 +60,8 @@ states.
 | Group Chat: icon | `absent` | No code found: `grep -rniE '\bicon' internal/rcsas internal/conference` finds nothing | RCC.07 Group Chat, clause *to confirm* | A group has no icon: nothing sets, stores or sends one. | none |
 | FT via HTTP: upload, resume, download | `implemented` | [`internal/ftserver/upload.go`](../internal/ftserver/upload.go) `Server.handleUpload`, `handleResume`, `handleInfo`; [`download.go`](../internal/ftserver/download.go) `Server.handleDownload` (single byte ranges). End to end: `ft` and `ft-resume` scenarios, [`ft.go`](../tools/rcs-sim/internal/scenario/ft.go). Unverified ([ft-server list](ft-server.md#unverified-against-rcc07)) | RCC.07 FT via HTTP, clause *to confirm*; RFC 9110, RFC 7578, RFC 6266 | | none |
 | FT via HTTP: thumbnails | `implemented` | `ftserver` stores the thumbnail the client uploads (`Thumbnail` form part, [`form.go`](../internal/ftserver/form.go); `Server.storeThumbnail`) and lists it in the file-info document; it makes none itself. End to end: `download-thumbnail` step of `ft` | RCC.07 FT via HTTP, clause *to confirm* | | none |
-| FT via HTTP: file-info in 1-to-1 chat and standalone messages | `implemented` | Not tested. `rcs-as` carries a CPIM body's content unchanged and does not read it ([`internal/rcsas/messaging/doc.go`](../internal/rcsas/messaging/doc.go); `Engine.submitMessage`), so a file-info document goes as any message does | RCC.07 FT via HTTP, clause *to confirm* | | none |
-| FT via HTTP in group chat | `implemented` | Not tested; off by default. Group messages keep their content headers and body (`groupView`, [`internal/rcsas/messaging/group.go`](../internal/rcsas/messaging/group.go)) | RCC.07 Group Chat and FT via HTTP, clause *to confirm* | | none |
+| FT via HTTP: file-info in 1-to-1 chat and standalone messages | `partial` | `rcs-as` carries a CPIM body's content unchanged and does not read it ([`internal/rcsas/messaging/doc.go`](../internal/rcsas/messaging/doc.go); `Engine.submitMessage`), so a file-info document should go as any message does | RCC.07 FT via HTTP, clause *to confirm* | No test shows the file-info document passing through. | none |
+| FT via HTTP in group chat | `partial` | Off by default. Group messages keep their content headers and body (`groupView`, [`internal/rcsas/messaging/group.go`](../internal/rcsas/messaging/group.go)) | RCC.07 Group Chat and FT via HTTP, clause *to confirm* | No test shows the file-info document passing through. | none |
 | File transfer over MSRP | `absent` | `Server.invite` ([`answer.go`](../internal/rcsas/sipas/answer.go)) and `Server.groupInvite` answer 403 to an offer with `a=file-selector` | RFC 5547 §6; RCC.07 clause *to confirm* | An INVITE for a file transfer over MSRP is refused, in 1-to-1 and in group chat. | none |
 | Geolocation push | `absent` | No code found: `grep -rni geoloc internal/ cmd/ tools/` finds nothing; the geopush IARI is only in a reference request of [`internal/hss/reference.go`](../internal/hss/reference.go) | *to confirm* | No code or test handles a geolocation push; whether one needs more than chat carrying its content unchanged is *to confirm*. | none |
 | Audio messaging | `absent` | No code found: `grep -rni audio internal/rcsas internal/ftserver` finds only an SDP fixture in a test | *to confirm* | Nothing treats an audio message apart from any other file; whether it needs more than FT via HTTP is *to confirm*. | none |
