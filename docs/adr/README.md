@@ -9,6 +9,7 @@
 | [0005](0005-shared-state-and-instance-addressing.md) | Shared state in DynamoDB, instance addressing only where a connection lives | accepted |
 | [0006](0006-acs-integration.md) | acs stays in its own repository and is deployed from a pinned release | accepted |
 | [0007](0007-internal-transport.md) | Plain transport inside the VPC, authenticated and scoped per caller | accepted |
+| [0008](0008-target-profile-up-4-0-in-stages.md) | The target profile moves to UP 4.0 in stages, on public sources | accepted |
 
 New ADRs use `NNNN-kebab-title.md` with the sections Context, Decision, Rationale
 and Consequences, and are added to this table.
