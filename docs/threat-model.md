@@ -129,7 +129,7 @@ group and tokens allow:
 | `msrp-relay` | `rcs-as` MSRP, binding table | SIP core, `hss` |
 | `ft-server` | `hss` FT-credential read, its S3 bucket and table | keys, provisioning writes, SIP, Diameter |
 | `acs` | `hss` credential issue/read for subscribers it provisions | keys, Cx, SIP |
-| `maap` (planned) | `rcs-as`'s chatbot API (sends from the chatbot range to subscribers only), its own tables, the internet on 443; it holds the alias table and the webhook signing key (T15) | `hss`, Diameter, SIP and MSRP ports, other services' tables, sending as a subscriber or to a chatbot |
+| `maap` (planned) | `rcs-as`'s chatbot API (sends from the chatbot range to subscribers only, bounded per subscriber and in total by `rcs-as`, ADR 0009 §9), its own tables, the internet on 443; it holds the alias table and the webhook signing key (T15) | `hss`, Diameter, SIP and MSRP ports, other services' tables, sending as a subscriber or to a chatbot |
 
 **Control:** ADR 0007 §2–§4; parsers are fuzzed, bounded and linear
 (architecture §8).
@@ -461,9 +461,10 @@ credentials of 256 random bits, stored as digests and compared in constant
 time, two per chatbot, taken from the `Authorization` header only; one 401,
 decided before the body is read, and failures limited per source; revocation
 and suspension on every task within 30 s. The API has no sender field. The
-sender is the registry's URI, and `rcs-as` builds every CPIM, IMDN and SIP
-header and Message-ID itself, refusing a sender outside the chatbot range and
-a recipient inside it. Registration, credentials and webhook settings are
+sender is the registry's URI, `maap` generates the Message-ID, and `rcs-as`
+builds every CPIM, IMDN and SIP header itself, refusing a sender outside the
+chatbot range and a recipient inside it. Suspension also stops what is
+already queued, at the next delivery attempt. Registration, credentials and webhook settings are
 operator-only, on a listener the public handler does not mount, and every
 change is audit-logged. URIs are unique in the one normal form (T14). Only
 the operator scope writes the PSI in `hss`. JSON is strict and bounded, with
@@ -471,7 +472,10 @@ one recipient per send.
 **Residual risk:** a stolen credential works until it is revoked, and for up
 to 30 s after. Look-alike display names are not caught (verification is out
 of scope). A compromised `maap` can send as any URI in the chatbot range,
-registered or not, because `rcs-as` checks the range, not the registry.
+registered or not, because `rcs-as` checks the range, not the registry;
+per-sender rates do not bound that, but `rcs-as`'s caps per subscriber
+across all chatbot senders and per task in total, and the quarter of each
+queue, do.
 **Status:** planned (#668).
 
 ## T14 — Chatbot PSI routing
@@ -520,9 +524,13 @@ privacy always gets the alias. Retention is bounded, recycled numbers are
 dropped through the operator API, and logs and metrics follow T8 for aliases
 too.
 **Residual risk:** aliases, conversations and blocks are keyed by the
-subscriber's tel URI, not the HSS subscription. A number recycled without the
-operator's call keeps its alias for up to 180 days. A chatbot allowed the
-MSISDN may misuse it outside the platform. A compromised `maap` holds the
+subscriber's tel URI, not the HSS subscription. If the recycling step is
+skipped, a number reassigned within 180 days of its last use with a chatbot
+inherits the alias, and keeps it for as long as the new holder goes on
+using it. An alias stays the same across anonymous conversations, so a
+chatbot that once links it to an MSISDN conversation links them all. A
+client that did not ask for privacy is shown `tk=off` while the chatbot sees
+an alias. A chatbot allowed the MSISDN may misuse it outside the platform. A compromised `maap` holds the
 alias table, which identifies everyone who wrote to a chatbot, and the
 signing key, which forges deliveries to any chatbot.
 **Status:** planned (#668).
@@ -557,6 +565,7 @@ checked, and media URLs reveal a subscriber's address to their host and can
 lead to phishing. For chatbots that start conversations, a failure still
 comes at once for an unknown number and only at expiry for an offline one.
 Subscribers have no way of their own to block or report a chatbot in the
-minimum. The `maap` security group's `0.0.0.0/0:443` also opens 443 inside
-the VPC, so the dialer is the primary control.
+minimum. The `maap` security group's egress to `0.0.0.0/0` also reaches VPC
+destinations that admit by CIDR rather than by security group, so the dialer
+is the primary control.
 **Status:** planned (#668).

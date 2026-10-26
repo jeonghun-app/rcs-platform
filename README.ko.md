@@ -34,7 +34,7 @@ I-CSCF, S-CSCF, HSS), RCS 메시징 애플리케이션 서버, MSRP 릴레이, H
   `rcs-bridge`([문서](docs/rcs-bridge.md))는 애플리케이션이 로컬 스택을 거쳐
   단독 메시지를 주고받는 HTTP·WebSocket API입니다. 엔드포인트마다 브리지가
   테스트 가입자를 만들어 직접 등록합니다.
-- **결정 기록**: ADR 0001–0007과 [위협 모델](docs/threat-model.md).
+- **결정 기록**: [ADR](docs/adr/README.md)과 [위협 모델](docs/threat-model.md).
 
 아직 릴리스는 없습니다.
 

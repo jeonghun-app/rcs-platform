@@ -52,8 +52,8 @@ traffic within an AZ is not assumed to be.
    `acs` and `ft-server` reach no SIP or Diameter port, and neither does `maap`,
    which reaches no MSRP or `hss` port either; its webhook egress is
    [ADR 0009](0009-maap-chatbot-platform.md) §8. (Amended in #671: the three
-   `maap` rows.) `pcscf` runs **two SIP
-   listeners**: the client listener behind the NLB (PROXY protocol, untrusted)
+   `maap` rows and this sentence.) `pcscf` runs **two SIP listeners**: the
+   client listener behind the NLB (PROXY protocol, untrusted)
    and a core listener on another port that only the core's security groups
    reach; the core-facing `Path` and `Record-Route` name the core listener. The
    security group, not application logic, is the trust-domain boundary. The infrastructure

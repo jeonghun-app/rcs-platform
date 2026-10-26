@@ -84,7 +84,7 @@ once code and docs cite 4.0, that claim is costly to take back.
 
    Gap rows tagged #668 (MaaP and chatbots) may be listed but do not count for
    the second condition: epic #667 puts MaaP out of scope, and ADR 0009
-   (reserved, #671) and epic #668 decide them. A row in any other state blocks
+   ([ADR 0009](0009-maap-chatbot-platform.md)) and epic #668 decide them. A row in any other state blocks
    stage 3.
 
 ## Rationale
@@ -108,7 +108,8 @@ rule names from passing stage 3 by having no row.
   [auto-configuration-server](https://github.com/jeonghun-app/auto-configuration-server)
   before then. The stage 3 change there is an issue in that repository, linked
   from the stage 3 issue here, and reaches the platform as a pinned `acs`
-  release (ADR 0006).
+  release (ADR 0006). (Amended in #671: provisioning changes MaaP needs are
+  tracked in #668; the profile `acs` provisions stays 2.4 until stage 3.)
 - With public sources only, most #667 gap rows are expected to reach stage 3
   as `open` and *to confirm*, each with an open issue to confirm it: public
   pages name features, not the editions, clauses and values a change needs.
