@@ -10,10 +10,13 @@ scale independently.
 ## Decision
 
 Services follow the 3GPP and GSMA functional entities: `pcscf`, `icscf`, `scscf`,
-`hss`, `rcs-as`, `msrp-relay`, `ft-server`, plus `acs` from its own repository.
-Services talk to each other only over the standard reference points (SIP, Diameter
-Cx/Sh, MSRP) or over a documented internal HTTP API (relay control, HSS
-provisioning). No service reads another service's table.
+`hss`, `rcs-as`, `msrp-relay`, `ft-server`, `maap` (planned), plus `acs` from its
+own repository. Services talk to each other only over the standard reference points
+(SIP, Diameter Cx/Sh, MSRP) or over a documented internal HTTP API (relay control,
+HSS provisioning, the chatbot APIs between `maap` and `rcs-as`). No service reads
+another service's table. (Amended in #671: `maap`, the chatbot platform of ADR
+0009, has no SIP, MSRP or Diameter; it reaches the core only through `rcs-as`'s
+internal HTTP API, and chatbots and operators reach it over HTTP.)
 
 ## Rationale
 
@@ -23,7 +26,8 @@ HSS and use only `rcs-as`, or put our `pcscf` in front of another core.
 
 ## Consequences
 
-- Seven deployables share one image and one release version.
+- Eight deployables, `maap` included once it is built, share one image and one
+  release version.
 - Cross-service behaviour is tested end to end in the compose stack with
   `tools/rcs-sim`, not by importing packages across services.
 - The internal HTTP APIs are versioned under `/v1/` and documented in

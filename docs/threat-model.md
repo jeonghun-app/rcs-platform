@@ -119,8 +119,9 @@ table, are planned (#56, Phase 7 infrastructure).
 
 ## T4 — Compromise of an internet-facing service
 
-`pcscf`, `msrp-relay`, `ft-server` and `acs` parse untrusted input. If one is
-compromised, its reach is what its security group and tokens allow:
+`pcscf`, `msrp-relay`, `ft-server` and `acs` parse untrusted input, and so will
+`maap` (planned, ADR 0009). If one is compromised, its reach is what its security
+group and tokens allow:
 
 | Service | Can reach | Cannot |
 |---|---|---|
@@ -128,6 +129,7 @@ compromised, its reach is what its security group and tokens allow:
 | `msrp-relay` | `rcs-as` MSRP, binding table | SIP core, `hss` |
 | `ft-server` | `hss` FT-credential read, its S3 bucket and table | keys, provisioning writes, SIP, Diameter |
 | `acs` | `hss` credential issue/read for subscribers it provisions | keys, Cx, SIP |
+| `maap` (planned) | `rcs-as`'s chatbot API (sends from the chatbot range to subscribers only), its own tables, the internet on 443; it holds the alias table and the webhook signing key (T15) | `hss`, Diameter, SIP and MSRP ports, other services' tables, sending as a subscriber or to a chatbot |
 
 **Control:** ADR 0007 §2–§4; parsers are fuzzed, bounded and linear
 (architecture §8).
@@ -139,6 +141,7 @@ compromised, its reach is what its security group and tokens allow:
 | `msrp-relay` | dials only `RELAY_CORE_NETWORKS` hosts on `RELAY_CORE_PORTS`, rechecked after name resolution, and never a client; the control API accepts only `pcscf`'s token ([msrp-relay](msrp-relay.md)) | security groups (#56); a task role limited to the binding table, with its IAM policy test (Phase 7) |
 | `ft-server` | reaches the HSS only with its own token, over `https` or over `http` to a private host, and in staging and prod only at an RFC 1918 or ULA address, rechecked after name resolution ([ft-server](ft-server.md)) | HSS token scope enforced by `hss` (#12); security groups (#56); a task role limited to its bucket and table (Phase 7) |
 | `acs` | in its own repository | token and http/https rules as a caller (auto-configuration-server#68) |
+| `maap` | not built | everything in [ADR 0009](adr/0009-maap-chatbot-platform.md) and T13–T16 (#668) |
 
 `acs` can re-issue credentials of
 every `acs_managed` subscription; the audit log and rate limit bound and reveal
@@ -440,3 +443,120 @@ on (`docs/scscf-state.md`).
 **Status:** implemented in `internal/scscf/registrar` (#201); wired to a
 listener with `cmd/scscf` (#14 PR F).
 
+## T13 — Chatbot credentials, impersonation and the registry
+
+Chatbots are parties outside the operator, holding API credentials on their
+own servers. An attacker could steal a chatbot's credential from its servers,
+CI or logs, or try to guess one, and send under a name subscribers trust
+(phishing). A chatbot could try to send as another chatbot or as a
+subscriber, through a sender field, CPIM or SIP header values, or a URI
+picked inside the chatbot range. The registry could be changed through a
+registration API a load balancer rule exposed, by a chatbot rewriting its own
+webhook, with a URI that differs from another only in case or escapes, or by
+writing the wildcarded PSI or its AS in `hss`. JSON could be read differently
+by two parsers, or be costly to read.
+
+**Control** ([ADR 0009](adr/0009-maap-chatbot-platform.md) §1, §4–§7, §9):
+credentials of 256 random bits, stored as digests and compared in constant
+time, two per chatbot, taken from the `Authorization` header only; one 401,
+decided before the body is read, and failures limited per source; revocation
+and suspension on every task within 30 s. The API has no sender field. The
+sender is the registry's URI, and `rcs-as` builds every CPIM, IMDN and SIP
+header and Message-ID itself, refusing a sender outside the chatbot range and
+a recipient inside it. Registration, credentials and webhook settings are
+operator-only, on a listener the public handler does not mount, and every
+change is audit-logged. URIs are unique in the one normal form (T14). Only
+the operator scope writes the PSI in `hss`. JSON is strict and bounded, with
+one recipient per send.
+**Residual risk:** a stolen credential works until it is revoked, and for up
+to 30 s after. Look-alike display names are not caught (verification is out
+of scope). A compromised `maap` can send as any URI in the chatbot range,
+registered or not, because `rcs-as` checks the range, not the registry.
+**Status:** planned (#668).
+
+## T14 — Chatbot PSI routing
+
+A wildcarded PSI decides where every request to its range goes. A pattern
+could catch a subscriber's IMPU. A regular expression applied to the whole
+URI could span `@`, `maddr` or URI headers and send a request off-net. Two
+services that normalise a URI differently (case, escapes, parameters) could
+disagree on whether it is a chatbot, so that one skips its checks or another
+chatbot gets the message. A pattern could be costly to match, an LIR answer
+could name an AS outside the platform, and a subscriber could invite a
+chatbot into a group, giving a third party the other participants' identities
+and messages.
+
+**Control** (ADR 0009 §2, §3): chatbot URIs have their own domain, which no
+IMPU may use. The pattern applies to the user part only; scheme, host, port,
+parameters and headers are checked as parsed parts. One normaliser in
+`internal/chatbot` serves `hss`, `icscf`, `scscf`, `rcs-as` and `maap`, and a
+URI at the chatbot domain that is not in normal form is 404 everywhere. A
+distinct identity wins over a wildcard (TS 29.228 Table 6.1.4.2), and `hss`
+refuses overlaps both ways. Patterns follow `internal/ifc`'s ERE rules and
+work budget, at most 256 bytes. `icscf` routes only to an AS on
+`ICSCF_AS_ROUTES`. At the PSI, `rcs-as` answers OPTIONS and refuses every
+other request, and it refuses a chatbot as a group invitee.
+**Status:** planned (#668).
+
+## T15 — Subscriber identities toward chatbots
+
+A chatbot could be told that a message comes from someone else: a CPIM `From`
+unlike the asserted identity, a forged POST to its webhook, another chatbot
+writing as a subscriber, or a call into `maap`'s inbound API. A chatbot that
+keys account data or transactions on the sender would then serve the wrong
+person. In the other direction, chatbots are third parties. With a subscriber's
+MSISDN, or with raw headers (addresses, cell location, device), they can
+market on other channels or link one subscriber across chatbots. A recycled
+number could carry its conversations and alias to a new person.
+
+**Control** (ADR 0009 §4, §8, §10): the subscriber a chatbot sees comes only
+from the identity the network asserted (T2), in canonical form, passed by
+`rcs-as` with a token only it holds. A chatbot never sends to a chatbot.
+Webhook deliveries are signed with Ed25519 over the audience, timestamp,
+delivery ID and body. Events carry a minimal set of fields, never SIP, CPIM or
+IMDN text. By default a chatbot sees a random per-chatbot alias. It sees the
+MSISDN only with the operator's permission, and a client's request for
+privacy always gets the alias. Retention is bounded, recycled numbers are
+dropped through the operator API, and logs and metrics follow T8 for aliases
+too.
+**Residual risk:** aliases, conversations and blocks are keyed by the
+subscriber's tel URI, not the HSS subscription. A number recycled without the
+operator's call keeps its alias for up to 180 days. A chatbot allowed the
+MSISDN may misuse it outside the platform. A compromised `maap` holds the
+alias table, which identifies everyone who wrote to a chatbot, and the
+signing key, which forges deliveries to any chatbot.
+**Status:** planned (#668).
+
+## T16 — Chatbot floods, webhooks and content
+
+A chatbot, or someone with its credential, could send to harvested MSISDNs,
+fill subscribers' queues (eight chatbots at one share each take a whole
+queue), or learn from delivery results which numbers use RCS and are online.
+A subscriber could flood a chatbot and lock other subscribers out of it. A
+webhook URL could point at the task metadata address, an internal API, or a
+name that resolves to a private address at connect time (DNS rebinding), or
+redirect to one, and a slow webhook could hold every delivery worker. A
+chatbot's content reaches clients' parsers, and its media URLs make clients
+connect to hosts the chatbot chose.
+
+**Control** (ADR 0009 §4, §5, §8, §9, §11): by default a chatbot only
+replies, within 24 hours of the subscriber's last message; starting
+conversations needs an operator permission, with lower limits. Limits per
+chatbot, pair and subscriber are counted across tasks. A chatbot holds one
+share of a subscriber's queue and all chatbots together a quarter, and
+messages to a chatbot queue per conversation. Statuses are `delivered`,
+`displayed` or `failed`, without a reason. The operator can suspend a
+chatbot or block a pair. The webhook dialer allows global unicast only,
+checked at connect time, with no redirect or proxy; URLs are `https`, checked
+when set and when dialled and verified by a challenge; timeouts apply, at
+most 4 KiB of a response is read, and deliveries are bounded per chatbot and
+per task. Content types come from an allow-list without the FT file
+information document, and JSON must be well-formed, at most 32 deep.
+**Residual risk:** content is otherwise opaque: the rich-card schema is not
+checked, and media URLs reveal a subscriber's address to their host and can
+lead to phishing. For chatbots that start conversations, a failure still
+comes at once for an unknown number and only at expiry for an offline one.
+Subscribers have no way of their own to block or report a chatbot in the
+minimum. The `maap` security group's `0.0.0.0/0:443` also opens 443 inside
+the VPC, so the dialer is the primary control.
+**Status:** planned (#668).

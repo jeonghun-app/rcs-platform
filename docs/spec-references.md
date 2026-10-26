@@ -26,18 +26,21 @@ rule, from a row of [Public sources](#public-sources).
 | RCC.11 | Endorsement of OMA CPM for RCS | *to confirm* | `rcs-as` |
 | RCC.14 | Service provider device configuration | as in `acs` | `acs` |
 | RCC.15 | IMS device configuration and supporting services | *to confirm* | `pcscf`, `scscf` |
+| RCC.07 §2.5.4, §3.6 | Chatbot addressing and the Chatbot service | v13.0 read (**GSMA RCC.07 v13.0**); the edition matching the target profile *to confirm* | `maap`, `rcs-as`, `hss`, `icscf` (ADR 0009) |
+| MaaP chatbot API | Interface between a chatbot and its platform | number and edition *to confirm*: RCC.07 v13.0 §3.6.1 puts this interface out of its scope | `maap` (ADR 0009) |
 
 ## Public sources
 
-Public pages read for the move to UP 4.0 (ADR 0008). Cite a row by the bold short
-name at the start of its Source cell. A page is summarised here, never quoted; a
-page that could not be opened is not listed.
+Public pages read for the move to UP 4.0 (ADR 0008) and for MaaP (ADR 0009). Cite
+a row by the bold short name at the start of its Source cell. A page is summarised
+here, never quoted; a page that could not be opened is not listed.
 
 | Source | Publisher | URL | Date read | Used for |
 |---|---|---|---|---|
 | **GSMA UP 4.0 article**: *From Rich Text to Video: RCS Universal Profile 4.0 has arrived* | GSMA newsroom (published 2026-03-26) | <https://www.gsma.com/newsroom/article/from-rich-text-to-video-rcs-universal-profile-4-0-has-arrived/> | 2026-10-25 | Announcement that UP 4.0 is finalised, and every new UP 4.0 feature the page names: video calls started from a 1-to-1 or group conversation (messaging-initiated video calls), with late joining by group members and the call log kept in the chat timeline; rich text (bold, italics, strikethrough) with a plain-text review when it falls back to SMS; discovery of the media formats a peer supports, so the sender picks the encoding; streaming video in business rich cards; business control of whether a link opens in the messaging app or another app; more efficient handling of deep links to businesses and of their verification. States no edition, clause or value. |
 | **GSMA UP 4.1 article**: *RCS Universal Profile 4.1: Stronger foundations for secure messaging* | GSMA newsroom (published 2026-07-28) | <https://www.gsma.com/newsroom/article/rcs-universal-profile-4-1-stronger-foundations-for-secure-messaging/> | 2026-10-25 | That UP 4.1 followed 4.0; it is not a target (ADR 0008). |
 | **Wikipedia RCS article**: *Rich Communication Services*, revision 1378528893 | Wikipedia | <https://en.wikipedia.org/w/index.php?title=Rich_Communication_Services&oldid=1378528893> | 2026-10-25 | List of UP releases with dates and RCC.07 versions. Third-party: a lead to check against GSMA, confirms nothing. |
+| **GSMA RCC.07 v13.0**: *RCC.07 Rich Communication Suite – Advanced Communications Services and Client Specification v13.0*, dated 2022-12-19, non-confidential | GSMA newsroom resource page, with the document as PDF | <https://www.gsma.com/newsroom/gsma_resources/rcc-07-rich-communication-suite-advanced-communications-services-and-client-specification-v13-0/> | 2026-10-26 | The chatbot items of ADR 0009: the chatbot service identifier form (§2.5.4.1), the anonymised address and the `tk` parameter (§2.5.4.2–§2.5.4.4), chatbot feature tags and version (§3.6.2), the split between the operator's network and a Chatbot Platform, with the chatbot-to-platform interface out of scope (§3.6.1), anonymization (§3.6.5.1), spam blocking, client block lists and spam reports (§3.6.6), the Chatbot service procedures and notifications (§3.6.8), and chatbot content types, multipart use and the suggested payload size (§3.6.10.1–§3.6.10.2). It does not name the Universal Profile it belongs to. |
 | **rcsjta**: *android-rcs/rcsjta*, commit f9e1e610880682a6a80869c3757e79f04205bda6 | android-rcs project, GitHub | <https://github.com/android-rcs/rcsjta/tree/f9e1e610880682a6a80869c3757e79f04205bda6> | 2026-10-25 | Open-source Android RCS client stack. At this commit (2017-03-08, the latest commit on master) its README names RCS-e Blackbird and the GSMA API (TAPI 1.5.1 and 1.6.1), not a Universal Profile, so it says nothing about UP 4.0. |
 
 ## 3GPP
@@ -54,6 +57,10 @@ page that could not be opened is not listed.
 | TS 23.003 | Numbering, addressing and identification | `internal/sip`, `hss` |
 | TS 23.334 | IMS-ALG and IMS-AGW | `pcscf`, `msrp-relay` |
 | TS 23.218 | IMS session handling: use of iFC and ServiceInfo by the S-CSCF | `scscf` (`internal/ifc`) |
+
+ADR 0009 relies on TS 23.003 §13.5 (wildcarded PSI syntax), TS 23.228 §5.4.12.2
+(routing to the AS hosting a PSI) and TS 29.228 §6.1.4.1 and Table 6.1.4.2 (LIR
+for a PSI), read in V20.1.0, V20.1.0 and V20.0.0.
 
 ## OMA
 
@@ -98,6 +105,8 @@ page that could not be opened is not listed.
 | 6750 | Bearer token usage: `Authorization: Bearer` and the b64token syntax (internal HTTP APIs, `msrp-relay` control API) |
 | 6459 | IPv6 in 3GPP EPS: one /64 per bearer (`msrp-relay` per-source limits) |
 | 5482 | TCP user timeout (§1): how long sent data may stay unacknowledged (`msrp-relay` client sockets) |
+| 8032 | Ed25519: the signature on `maap`'s webhook deliveries (ADR 0009) |
+| 3323 | `Privacy` header: a client's request to be anonymised toward a chatbot (ADR 0009) |
 
 ## Other
 

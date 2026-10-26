@@ -32,11 +32,12 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
 ## Decision
 
 1. **Place.** `maap` is outside the SIP trust domain (ADR 0007 §7): it has
-   no SIP, MSRP or Diameter and reaches only `rcs-as`, over an internal HTTP
-   API (ADR 0007 §3–§5). **`rcs-as` is the AS that hosts the chatbot PSI**
-   and builds every SIP request toward subscribers, with every identity
-   header, CPIM and IMDN body. `maap` is an endpoint behind it: the chatbot
-   registry, the chatbot API, webhook delivery, aliases and policy limits.
+   no SIP, MSRP or Diameter, and of the platform's services reaches only
+   `rcs-as`, over an internal HTTP API (ADR 0007 §3–§5). **`rcs-as` is the
+   AS that hosts the chatbot PSI** and builds every SIP request toward
+   subscribers, with every identity header, CPIM and IMDN body. `maap` is an
+   endpoint behind it: the chatbot registry, the chatbot API, webhook
+   delivery, aliases and policy limits.
    RCC.07 v13.0 §3.6.1 leaves the split inside an operator-hosted platform
    to the operator; `rcs-as` and `maap` together are the Chatbot Platform.
 2. **Chatbot addresses.** RCC.07 v13.0 §2.5.4.1.2 gives a chatbot service
@@ -122,8 +123,10 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      2. `maap` checks authentication, idempotency, the conversation or the
         right to start one, blocks and limits (§9). It generates the IMDN
         Message-ID (128 random bits) and stores it in the idempotency record
-        (`maap-requests`) before the call, so a retry resends the same ID,
-        which `rcs-as` takes as one message for the same recipient.
+        (`maap-requests`) before the call. A retry after `rcs-as` answered
+        gets the stored answer; one after a lost answer resends the same ID,
+        which `rcs-as` accepts again and the client drops as a duplicate
+        ([rcs-as](../rcs-as.md#the-pipeline) step 5).
      3. `maap` → `rcs-as` `POST /v1/chatbot/messages` (`maap` token): the
         sender (the registry's chatbot URI, never chosen per request), its
         registry display name, the recipient's canonical tel URI, the
@@ -274,7 +277,9 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    windows shared by every task (DynamoDB atomic counters with TTL, as in
    threat model T12); a task that saw a window go over refuses the rest of
    it from memory; the answer is 429 with Retry-After. The operator may set
-   a chatbot's limits lower, never higher.
+   a chatbot's limits lower, never higher. `rcs-as`'s per-sender rate takes
+   a chatbot sender at a setting of its own, 1,200 a minute per task by
+   default, a backstop above `maap`'s limits.
 
    | Bound | Default |
    |---|---|
@@ -375,6 +380,11 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
 - **Standalone from chatbots, no platform-started chat sessions:** pager and
   large mode exist and need only identity and tag changes; a platform-started
   chat session adds MSRP legs opened for a chatbot.
+- **Blocks and suspension are checked in `maap`, not `rcs-as`** (memo B5):
+  `rcs-as` keeps the checks that protect subscribers whatever `maap` does
+  (range, queue shares, rates). A compromised `maap` can already
+  impersonate any chatbot, so moving chatbot policy into `rcs-as` would not
+  narrow what it yields.
 
 ## Consequences
 
@@ -387,8 +397,9 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      form, the chain end at `RCS_CHATBOT_DOMAIN`, the check before the LIR,
      routing to an AS on `ICSCF_AS_ROUTES` (§2, §3).
   3. **`rcs-as`**: the `maap` API listener, token and scope; sender and
-     recipient range checks; CPIM and IMDN with bot tags and `tk`;
-     admission and delivery calls to `maap`; the OPTIONS answer, refusal of
+     recipient range checks; the chatbot sender rate; CPIM and IMDN with bot
+     tags and `tk`, honouring `Privacy: tk`; admission and delivery calls to
+     `maap`; the OPTIONS answer, refusal of
      other PSI requests and chatbot invitees; per-conversation queues and the
      quarter cap; content-type lists and the size check at start (§3–§5, §9).
   4. **`maap` core**: `cmd/maap`, tables (`maap-registry`,
@@ -414,8 +425,8 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
   and subscriber-side blocking; and whether a GSMA document defines the
   chatbot API and its authentication.
 - **Not in the minimum**, for the lead to decide: platform-started Chatbot
-  Chat Sessions; client-requested privacy, token deletion and MSISDN linking
-  (§3.6.5.1); receiving Spam Reports (§3.6.6.2); message revocation; the
+  Chat Sessions; token deletion and MSISDN linking (§3.6.5.1.2.3,
+  §3.6.5.1.2.4); receiving Spam Reports (§3.6.6.2); message revocation; the
   Traffic-Type CPIM header (§3.6.7); file transfer and geolocation with
   chatbots; pull delivery; coarser statuses for chatbots that start
   conversations (memo D5); rich-card schema validation; interconnection with
