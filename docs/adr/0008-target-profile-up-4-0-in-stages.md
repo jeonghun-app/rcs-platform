@@ -83,9 +83,9 @@ once code and docs cite 4.0, that claim is costly to take back.
      *to confirm* row.
 
    Gap rows tagged #668 (MaaP and chatbots) may be listed but do not count for
-   the second condition: epic #667 puts MaaP out of scope, and ADR 0009
-   ([ADR 0009](0009-maap-chatbot-platform.md)) and epic #668 decide them. A row in any other state blocks
-   stage 3.
+   the second condition: epic #667 puts MaaP out of scope, and
+   [ADR 0009](0009-maap-chatbot-platform.md) and epic #668 decide them. A row
+   in any other state blocks stage 3.
 
 ## Rationale
 

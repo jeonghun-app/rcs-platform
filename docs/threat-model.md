@@ -129,7 +129,7 @@ group and tokens allow:
 | `msrp-relay` | `rcs-as` MSRP, binding table | SIP core, `hss` |
 | `ft-server` | `hss` FT-credential read, its S3 bucket and table | keys, provisioning writes, SIP, Diameter |
 | `acs` | `hss` credential issue/read for subscribers it provisions | keys, Cx, SIP |
-| `maap` (planned) | `rcs-as`'s chatbot API (sends from the chatbot range to subscribers only, bounded per subscriber and in total by `rcs-as`, ADR 0009 §9), its own tables, the internet on 443; it holds the alias table and the webhook signing key (T15) | `hss`, Diameter, SIP and MSRP ports, other services' tables, sending as a subscriber or to a chatbot |
+| `maap` (planned) | `rcs-as`'s chatbot API (sends from the chatbot range to subscribers only, bounded per subscriber and in total by `rcs-as`, ADR 0009 §9), its own tables, the internet on 443 and `MAAP_WEBHOOK_PORTS` (ADR 0009 §8); it holds the alias table and the webhook signing key (T15) | `hss`, Diameter, SIP and MSRP ports, other services' tables, sending as a subscriber or to a chatbot |
 
 **Control:** ADR 0007 §2–§4; parsers are fuzzed, bounded and linear
 (architecture §8).
@@ -463,8 +463,11 @@ decided before the body is read, and failures limited per source; revocation
 and suspension on every task within 30 s. The API has no sender field. The
 sender is the registry's URI, `maap` generates the Message-ID, and `rcs-as`
 builds every CPIM, IMDN and SIP header itself, refusing a sender outside the
-chatbot range and a recipient inside it. Suspension also stops what is
-already queued, at the next delivery attempt. Registration, credentials and webhook settings are
+chatbot range and a recipient inside it. Suspension and blocks also stop
+what is queued: before each delivery `rcs-as` makes a delivery check that
+reads state only and fails closed, so without a positive answer nothing is
+delivered, and with `RCSAS_CHATBOTS=off` nothing is. Registration,
+credentials and webhook settings are
 operator-only, on a listener the public handler does not mount, and every
 change is audit-logged. URIs are unique in the one normal form (T14). Only
 the operator scope writes the PSI in `hss`. JSON is strict and bounded, with
@@ -475,7 +478,7 @@ of scope). A compromised `maap` can send as any URI in the chatbot range,
 registered or not, because `rcs-as` checks the range, not the registry;
 per-sender rates do not bound that, but `rcs-as`'s caps per subscriber
 across all chatbot senders and per task in total, and the quarter of each
-queue, do.
+queue, do; being per task, they scale with the number of `rcs-as` tasks.
 **Status:** planned (#668).
 
 ## T14 — Chatbot PSI routing
@@ -527,12 +530,14 @@ too.
 subscriber's tel URI, not the HSS subscription. If the recycling step is
 skipped, a number reassigned within 180 days of its last use with a chatbot
 inherits the alias, and keeps it for as long as the new holder goes on
-using it. An alias stays the same across anonymous conversations, so a
-chatbot that once links it to an MSISDN conversation links them all. A
+using it. The anonymous alias is distinct from the normal one, but stays
+the same across one subscriber's anonymous conversations with a chatbot. A
 client that did not ask for privacy is shown `tk=off` while the chatbot sees
-an alias. A chatbot allowed the MSISDN may misuse it outside the platform. A compromised `maap` holds the
-alias table, which identifies everyone who wrote to a chatbot, and the
-signing key, which forges deliveries to any chatbot.
+an alias. A chatbot allowed the MSISDN may misuse it outside the platform. A
+compromised `maap` holds the alias table, which identifies everyone who wrote
+to a chatbot, and the signing key, which forges deliveries to any chatbot;
+since chatbots may cache the public keys for an hour, a withdrawn key is
+still accepted for up to an hour.
 **Status:** planned (#668).
 
 ## T16 — Chatbot floods, webhooks and content
@@ -547,25 +552,26 @@ redirect to one, and a slow webhook could hold every delivery worker. A
 chatbot's content reaches clients' parsers, and its media URLs make clients
 connect to hosts the chatbot chose.
 
-**Control** (ADR 0009 §4, §5, §8, §9, §11): by default a chatbot only
-replies, within 24 hours of the subscriber's last message; starting
-conversations needs an operator permission, with lower limits. Limits per
-chatbot, pair and subscriber are counted across tasks. A chatbot holds one
+**Control** (ADR 0009 §4, §5, §8, §9, §11): by default a chatbot only replies,
+within 24 hours of the time `rcs-as` accepted the subscriber's last message;
+starting conversations needs an operator permission, with lower limits. Limits
+per chatbot, pair and subscriber are counted across tasks. A chatbot holds one
 share of a subscriber's queue and all chatbots together a quarter, and
 messages to a chatbot queue per conversation. Statuses are `delivered`,
-`displayed` or `failed`, without a reason. The operator can suspend a
-chatbot or block a pair. The webhook dialer allows global unicast only,
-checked at connect time, with no redirect or proxy; URLs are `https`, checked
-when set and when dialled and verified by a challenge; timeouts apply, at
-most 4 KiB of a response is read, and deliveries are bounded per chatbot and
-per task. Content types come from an allow-list without the FT file
-information document, and JSON must be well-formed, at most 32 deep.
+`displayed` or `failed`, without a reason. The operator can suspend a chatbot
+or block a pair. The webhook dialer allows global unicast only, checked at
+connect time, with no redirect or proxy; URLs are `https`, checked when set
+and when dialled and verified by a challenge; timeouts apply, at most 4 KiB of
+a response is read, and deliveries are bounded per chatbot and per task.
+Content types come from an allow-list without the FT file information
+document, and JSON must be well-formed, at most 32 deep.
 **Residual risk:** content is otherwise opaque: the rich-card schema is not
 checked, and media URLs reveal a subscriber's address to their host and can
-lead to phishing. For chatbots that start conversations, a failure still
-comes at once for an unknown number and only at expiry for an offline one.
+lead to phishing. For chatbots that start conversations, a failure still comes
+at once for an unknown number and only at expiry for an offline one.
 Subscribers have no way of their own to block or report a chatbot in the
-minimum. The `maap` security group's egress to `0.0.0.0/0` also reaches VPC
-destinations that admit by CIDR rather than by security group, so the dialer
-is the primary control.
+minimum, and a suspended chatbot still answers capability queries as usual
+(RCC.07 v13.0 §3.6.8.2.3), so clients get no warning. The `maap` security
+group's egress to `0.0.0.0/0` also reaches VPC destinations that admit by CIDR
+rather than by security group, so the dialer is the primary control.
 **Status:** planned (#668).

@@ -89,8 +89,9 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      IARIs match its RCS IARI pattern.
    - **`rcs-as` as the PSI host.** An OPTIONS reaches `rcs-as` twice: from
      iFC 30 with `P-Served-User`, which it forwards as today, then from
-     `icscf` without one, which it answers. The answer is 200 for an
-     `active` or `suspended` chatbot (§11), with the chatbot URI in
+     `icscf` without one, which it answers from the delivery check's state
+     (§4): 200 for an `active` or `suspended` chatbot, 403 for a blocked
+     pair (§11), with the chatbot URI in
      `P-Asserted-Identity` (`tk` as in §10) and the chatbot IARIs, version
      and `isbot` tags in `Contact` (RCC.07 v13.0 §3.6.2, §2.5.4.1.1); 404
      otherwise. Any other method or service reaching the PSI (REFER,
@@ -107,13 +108,15 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      2. `scscf` → `rcs-as` (iFC 10 or 20), `P-Served-User:
         <subscriber>;sescase=orig`.
      3. `rcs-as` runs its pipeline (identity, size, rate, CPIM From). A
-        message or INVITE (notifications aside) without the chatbot IARI in
-        `Accept-Contact` gets 403 with the Warning of RCC.07 v13.0 §3.6.8.2.1
-        (§3.6.8.2.2 for a MESSAGE).
+        message or INVITE (notifications aside; a large-mode INVITE too,
+        whose tags §3.6.8.3 does not give, so *to confirm*) without the
+        chatbot IARI in `Accept-Contact` gets 403 with the Warning of RCC.07
+        v13.0 §3.6.8.2.1 (§3.6.8.2.2 for a MESSAGE).
         Otherwise `rcs-as` asks `maap` for admission (`POST
         /v1/rcs/admissions`: chatbot, asserted subscriber, and whether
         `Privacy` holds `tk`), once per pager MESSAGE and once per session
-        INVITE. An unknown chatbot is 404; a pair the subscriber blocked is
+        INVITE; its answer carries the chatbot's state and out-of-service
+        text. An unknown chatbot is 404; a pair the subscriber blocked is
         403 with the Warning of §3.6.6; a suspended chatbot follows
         §3.6.8.2.3 (§11); over a subscriber limit (§9) 403, as `rcs-as`'s
         own rate limit answers; `maap` unavailable (§12) 500 with
@@ -157,25 +160,30 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
         v13.0 §3.6.8.1.2 and the name through `EscapeDisplayName`, To,
         DateTime, NS, `imdn.Message-ID`, `Disposition-Notification`),
         stores it and its sent record in `messages`, and answers 202.
-     5. Before each delivery attempt `rcs-as` asks admission for the pair
-        again; a suspended chatbot or blocked pair makes the message
-        undeliverable, so suspension reaches what is already queued within
-        `maap`'s 30 s cache (§7). Then `rcs-as` → `scscf`: a MESSAGE or
-        large-mode INVITE (§5) with `P-Served-User:
-        <subscriber>;sescase=term`, `P-Asserted-Identity: <chatbot
-        URI;tk=on|off>` (§10), Accept-Contact with the standalone ICSI, and
-        the standalone chatbot IARI (`…chatbot.sa`) with the bot version tag
+     5. Before each delivery attempt `rcs-as` makes a **delivery check** (`POST
+        /v1/rcs/delivery-checks`), a call of its own that reads state only (the
+        chatbot's state and the pair block), counts no limit and leaves the
+        reply window alone. Only a positive answer delivers. A suspended chatbot
+        or blocked pair makes the message undeliverable, so suspension reaches
+        what is queued within `maap`'s 30 s cache (§7); a timeout, open breaker
+        or store error holds it for retry, as for an offline subscriber. The
+        out-of-service text (§11) is a platform message and skips the check.
+        Then `rcs-as` → `scscf`: a MESSAGE or large-mode INVITE (§5) with
+        `P-Served-User: <subscriber>;sescase=term`, `P-Asserted-Identity:
+        <chatbot URI;tk=on|off>` (§10), Accept-Contact with the standalone ICSI,
+        and the standalone chatbot IARI (`…chatbot.sa`) with the bot version tag
         `;require;explicit`, P-Asserted-Service the standalone ICSI (RCC.07
-        v13.0 §3.6.2.1, §3.6.8.1.2). `scscf` → `pcscf` → UE along `Path`. A
-        488 or 606 (a client without chatbot support, §3.6.8.4.2) is
-        undeliverable, not offline.
+        v13.0 §3.6.2.1, §3.6.8.1.2). `scscf` → `pcscf` → UE along `Path`. A 488
+        or 606 (a client without chatbot support, §3.6.8.4.2) is undeliverable,
+        not offline.
    - **Notifications.** A subscriber's delivery or display notification
      about a chatbot's message follows steps 1–2 above (MESSAGE or chat
      leg); `rcs-as` checks it against the sent record (threat model T10),
      queues it for the conversation, and sends it with
-     `POST /v1/rcs/notifications`; `maap` records the status
-     (`maap-requests`, kept `RCSAS_SENT_TTL` with its owning chatbot) and
-     POSTs a signed `status` event. A chatbot's display notification is
+     `POST /v1/rcs/notifications`; `maap` updates the status record, which
+     it wrote with its owning chatbot when it accepted the send
+     (`maap-requests`, kept `RCSAS_SENT_TTL`, notifications asked for or
+     not), and POSTs a signed `status` event. A chatbot's display notification is
      `POST /v1/notifications` → `POST /v1/chatbot/notifications`; `rcs-as`
      builds the IMDN, accepts it only if that message went to that chatbot
      (T10), and delivers it as step 5. Negative notifications `rcs-as`
@@ -231,7 +239,7 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    | `maap` → chatbot | `message` and `status` events, POSTed to the chatbot's URL | `maap` |
    | internal | `/v1/chatbots[/{id}]` register, read, change, suspend, resume, delete; `…/credentials` issue, revoke; `…/blocks/{subscriber}` | operator |
    | internal | `DELETE /v1/subscribers/{tel}`: a recycled number; drops its aliases, conversations and blocks at every chatbot | operator |
-   | internal | `POST /v1/rcs/admissions`, `/v1/rcs/messages`, `/v1/rcs/notifications` | `rcs-as` |
+   | internal | `POST /v1/rcs/admissions`, `/v1/rcs/delivery-checks`, `/v1/rcs/messages`, `/v1/rcs/notifications` | `rcs-as` |
    | `rcs-as` internal | `POST /v1/chatbot/messages`, `/v1/chatbot/notifications` | `maap` |
 
    A send has one recipient; there is no batch endpoint. **Idempotency:** a
@@ -263,11 +271,13 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      default `append` mode. Every failure is the same 401, decided before the
      body is read, and failures are limited per source (§9).
    - **Cache.** `maap` tasks cache registry entries for at most 30 s, and an
-     unknown key ID for 30 s too: revocation, suspension, blocks and
-     permission changes take effect on every task within 30 s.
+     unknown key ID for 30 s too, at most 10,000 of them per task: revocation,
+     suspension, blocks and permission changes take effect on every task within
+     30 s.
    - **Registration** is operator-only. The operator issues the chatbot's
      URI (§2) by a conditional write, so a URI in normal form is unique, and
-     fixes its display name (at most 128 bytes), out-of-service text (§11),
+     fixes its display name (at most 128 bytes), out-of-service text (§11;
+     `text/plain`, at most 512 bytes),
      webhook URL, permissions and limits; a chatbot's credential changes none
      of them. Every change is an audit log line with the token name, the
      item, and the values before and after, without secrets. Look-alike
@@ -310,19 +320,19 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    refuse a timestamp more than 300 s off and a delivery ID seen in the
    last 600 s; they may cache `GET /v1/webhook-keys` for an hour and fetch
    it again on an unknown key ID (`docs/api/`).
-9. **Conversations and limits.** **By default a chatbot only replies
-   (U2):** it may send within 24 hours of the time `rcs-as` accepted the
-   subscriber's last message to it, so late delivery does not stretch the
-   window. The operator may let a chatbot start conversations, with the
-   lower limits below; that permission requires the MSISDN permission
-   (§10), since the chatbot must name someone it has no alias for. Counters
-   are fixed windows shared by every task (DynamoDB atomic counters with
-   TTL, as in threat model T12); a task that saw a window go over refuses
-   the rest of it from memory; refused requests are not counted. The answer
-   is 429 with Retry-After, or 503 if the counter store fails. Subscriber limits are counted at
-   admission (§4); messages within a session are bounded by `rcs-as`'s
-   per-sender rate. The operator may set a chatbot's limits lower, never
-   higher, which keeps the hottest counter near 100 writes a second.
+9. **Conversations and limits.** **By default a chatbot only replies (U2):** it
+   may send within 24 hours of the time `rcs-as` accepted the subscriber's last
+   message to it, so late delivery does not stretch the window. The operator may
+   let a chatbot start conversations, with the lower limits below; that
+   permission requires the MSISDN permission (§10), since the chatbot must name
+   someone it has no alias for. A per-minute bound is a token bucket with a
+   burst of a sixth of its rate (as `rcs-as`'s `Rate`), a daily bound a fixed
+   day; both live in DynamoDB items every task shares, with TTL (as threat model
+   T12). Refused requests are not counted. The answer is 429 with Retry-After,
+   or 503 if the counter store fails. Subscriber limits are counted at admission
+   (§4); messages within a session are bounded by `rcs-as`'s per-sender rate.
+   The operator may set a chatbot's limits lower, never higher, which keeps the
+   hottest counter near 100 writes a second.
 
    | Bound (in `maap`) | Default |
    |---|---|
@@ -336,41 +346,47 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    | requests per chatbot, all endpoints | 1,200 / min |
    | failed or unauthenticated requests per source (IPv4 /24, IPv6 /64), per task | 30 / min |
 
-   **Backstops in `rcs-as`** hold whatever `maap` asks, per task: chatbot
-   senders 1,200 a minute each with a burst of 200 (messages and
-   notifications alike, not `RCSAS_NOTIFICATION_RATE`); 60 a minute to one
-   subscriber from all chatbot senders together; 3,000 calls a minute to the
-   whole chatbot API. In a subscriber's queue a chatbot is a sender with one
-   share (an eighth), and all chatbots together hold at most a quarter, as
-   group notifications do (T10, memo D3). Messages to a chatbot queue per
+   **Backstops in `rcs-as`** hold whatever `maap` asks, as token buckets per
+   task: chatbot senders 1,500 a minute each, burst 250 (messages and
+   notifications alike, not `RCSAS_NOTIFICATION_RATE`), and 120 messages a
+   minute, burst 20, to one subscriber from all chatbot senders together
+   (notifications are bounded by T10's once per kind), both strictly above
+   `maap`'s per-chatbot and per-subscriber buckets, so a chatbot within its
+   limits never meets them; and 3,000 calls a minute, burst 500, to `rcs-as`'s
+   chatbot API, a ceiling on the whole path. A refusal is 429 to `maap`, which
+   answers the chatbot 503 with Retry-After; the count
+   `chatbot.backstop_refused` opens the ticket alarm `RcsAsChatbotBackstopHit`,
+   usually a sign to add capacity. In a subscriber's queue a chatbot is a sender
+   with one share (an eighth), and all chatbots together hold at most a quarter,
+   as group notifications do (T10, memo D3). Messages to a chatbot queue per
    conversation, so one subscriber's backlog does not take another's room.
-   **Bodies.** A send is at most 1,496 KiB: six times the content, since
-   JSON may write any character as `\uXXXX`, plus 8 KiB of envelope; other
-   chatbot bodies 8 KiB, operator bodies 16 KiB. `maap`'s `/v1/rcs/*` bodies
-   and a webhook body are at most six times `RCSAS_MAX_MESSAGE_SIZE` plus
-   8 KiB. JSON is strict: unknown fields, duplicate keys, keys differing
-   only in case and trailing data are refused; envelopes are at most 4 deep,
-   with arrays of at most 8 and strings bounded per field (`docs/api/`).
-   The public server's idle timeout is 120 s, above the ALB's 60 s, so the
-   ALB never reuses a connection the server is closing.
+   **Bodies.** A send is at most 1,496 KiB: six times the content, since JSON
+   may write any character as `\uXXXX`, plus 8 KiB of envelope; other chatbot
+   bodies 8 KiB, operator bodies 16 KiB. `maap`'s `/v1/rcs/*` bodies and a
+   webhook body are at most six times `RCSAS_MAX_MESSAGE_SIZE` plus 8 KiB. JSON
+   is strict: unknown fields, duplicate keys, keys differing only in case and
+   trailing data are refused; envelopes are at most 4 deep, with arrays of at
+   most 8 and strings bounded per field (`docs/api/`). The public server's idle
+   timeout is 120 s, above the ALB's 60 s, so the ALB never reuses a connection
+   the server is closing.
 10. **What a chatbot learns (U1).** By default a **per-chatbot alias**,
-    `sip:<alias-id>@<MAAP_ALIAS_HOST>;user=rcstk` (RCC.07 v13.0 §2.5.4.2):
-    the alias ID is 128 random bits in base32, a row in `maap-subscribers`
-    keyed both ways and created by a conditional write. Aliases of one
-    subscriber at two chatbots share nothing, and only `maap` maps one back.
-    The operator may let a chatbot see the **MSISDN** instead, as
-    `tel:+<E.164>`. When the client asked for anonymity (`Privacy` holds
-    `tk`, which triggers the anonymization function of §3.6.5.1), the
-    chatbot gets the alias whatever its permission, and the conversation is
-    kept apart from a non-anonymous one with the same pair (§3.6.8 allows
-    both at once). Toward the client, `tk` on the chatbot's
-    `P-Asserted-Identity` follows the request's `Privacy`: `on` when it held
-    `tk`, `off` otherwise, in INVITE and OPTIONS responses (§3.6.8.6.1) and
-    in the chatbot's requests within that conversation. A client that asked
-    for nothing thus sees `tk=off` while the chatbot sees an alias (see
-    Rationale). Events carry only the subscriber's identifier, content and
-    type, Message-ID, time and notification kind: no SIP or CPIM header,
-    IMDN XML, address, location or device data.
+    `sip:<alias-id>@<MAAP_ALIAS_HOST>;user=rcstk` (RCC.07 v13.0 §2.5.4.2): the
+    alias ID is 128 random bits in base32, a row in `maap-subscribers` keyed
+    both ways by (chatbot, subscriber, anonymous) and created by a conditional
+    write. Aliases of one subscriber, at two chatbots or in an anonymous and a
+    normal conversation, share nothing, so a reply to an alias names one
+    conversation; only `maap` maps one back. The operator may let a chatbot see
+    the **MSISDN** instead, as `tel:+<E.164>`. When the client asked for
+    anonymity (`Privacy` holds `tk`, which triggers the anonymization function
+    of §3.6.5.1), the chatbot gets the anonymous alias whatever its permission
+    (§3.6.8 allows an anonymous and a normal conversation at once). Toward the
+    client, `tk` on the chatbot's `P-Asserted-Identity` follows the request's
+    `Privacy`: `on` when it held `tk`, `off` otherwise, in INVITE and OPTIONS
+    responses (§3.6.8.6.1) and in the chatbot's requests within that
+    conversation. A client that asked for nothing thus sees `tk=off` while the
+    chatbot sees an alias (see Rationale). Events carry only the subscriber's
+    identifier, content and type, Message-ID, time and notification kind: no SIP
+    or CPIM header, IMDN XML, address, location or device data.
     - **Retention.** Aliases, conversations and blocks are keyed by the
       subscriber's canonical tel URI. An alias unused for 180 days expires.
       Recycling a number calls `DELETE /v1/subscribers/{tel}` as a required
@@ -402,18 +418,23 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
     names (the client's local block list, the Spam Report Message, an
     operator-managed list of blocked chatbots in client configuration) are
     not in the minimum (Consequences).
-12. **Calls between `rcs-as` and `maap`.** **Admission** has a 2 s timeout
-    and at most 64 calls at a time per `rcs-as` task; after 5 failures in a
-    row a breaker answers at once for 10 s, then lets one call through. Any
-    of these is "unavailable": 500 with `Retry-After: 5`, counted in
+12. **Calls between `rcs-as` and `maap`.** **Admission** has a 2 s timeout and
+    at most 64 calls at a time per `rcs-as` task; after 5 failures in a row a
+    breaker answers at once for 10 s, then lets one call through. Any of these
+    is "unavailable": 500 with `Retry-After: 5`, counted in
     `chatbot.admission_unavailable` beside the timing
-    `chatbot.admission_latency`. **Delivery** (`/v1/rcs/*`) has a 15 s
-    timeout, above the webhook's 10 s and below `RCSAS_DELIVERY_TIMEOUT`
-    (30 s); when a chatbot's deliveries are all in use, or its webhook failed
-    5 times in a row (that breaker holds 30 s), `maap` answers 503 at once.
-    **`RCSAS_CHATBOTS=off`** turns the path off: requests to
-    `RCS_CHATBOT_DOMAIN` get 404 without a call to `maap`, and the chatbot
-    API answers 503. ADR 0007 §2 has the ports, T4 what a compromised `maap`
+    `chatbot.admission_latency`. **Delivery** (`/v1/rcs/*`) has a 15 s timeout,
+    above the webhook's 10 s and below `RCSAS_DELIVERY_TIMEOUT` (30 s); when a
+    chatbot's deliveries are all in use, or its webhook failed 5 times in a row
+    (that breaker holds 30 s), `maap` answers 503 at once. **Delivery checks**
+    (2 s) and **delivery calls** each have their own cap of 64 at a time per
+    task and their own breaker (5 failures, 10 s), apart from admission, so a
+    queue drain never starves subscribers' admissions; over a cap the message
+    stays queued. **`RCSAS_CHATBOTS=off`** turns the path off: `rcs-as` makes no
+    call to `maap`; requests to `RCS_CHATBOT_DOMAIN` get 404; queued messages
+    either way are held and expire under their TTL as undeliverable; `rcs-as`'s
+    chatbot API answers 503, so `maap`'s `POST /v1/messages` answers 503 with
+    Retry-After. ADR 0007 §2 has the ports, T4 what a compromised `maap`
     reaches; its tables are written by its task role only.
 13. **New settings** (none exists on `main`):
 
@@ -426,6 +447,7 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
     | `MAAP_WEBHOOK_PORTS` | webhook ports besides 443; one infrastructure parameter sets it and the egress rule |
     | `RCSAS_CHATBOTS` | the switch of §12 |
     | `RCSAS_CHATBOT_STORE_TTL` | how long a message to a chatbot waits, 24 hours |
+    | `RCSAS_CHATBOT_SENDER_RATE`, `RCSAS_CHATBOT_SUBSCRIBER_RATE`, `RCSAS_CHATBOT_API_RATE` | the backstops of §9 |
 
 ## Rationale
 
@@ -452,7 +474,11 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
   notifications, instead of a second one in `maap`; a 24-hour TTL matches
   the reply window, so a dead webhook does not pile up a week of messages.
 - **Suspension rechecked at delivery, not purged:** queues are per recipient
-  with no index by sender, so a purge would scan them all.
+  with no index by sender, so a purge would scan them all. The check fails
+  closed, so a compromised or absent `maap` cannot keep queued spam flowing.
+- **A distinct anonymous alias:** a reply then names one conversation without
+  a conversation ID in the API, and the chatbot cannot link the two, the
+  stronger outcome under U1.
 - **Ed25519, not per-chatbot HMAC:** HMAC keys must be stored where `maap`
   reads them back, so a registry leak would forge deliveries to every
   chatbot; Ed25519 is in the standard library. **A random alias with a
@@ -495,27 +521,29 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
   2. **`internal/chatbot`, `icscf`, `scscf`**: the shared normaliser and URI
      form, the chain end at `RCS_CHATBOT_DOMAIN`, the check before the LIR,
      routing to an AS on `ICSCF_AS_ROUTES` without DNS (§2, §3).
-  3. **`rcs-as`**: the chatbot API listener, token and scope, with strict
-     JSON, limits, `Fuzz*` targets and its spec and scope table in
-     `docs/api/`; sender, recipient and identity checks; the backstops and
-     the chatbot sender rate; CPIM and IMDN with bot tags and `tk`;
-     admission with its timeout, cap and breaker, the recheck at delivery,
-     delivery calls; the IARI check and 488/606 handling; the OPTIONS
-     answer, suspended behaviour and refusal of other PSI requests and
-     chatbot invitees; per-conversation queues, the chatbot TTL and the
-     quarter cap; content-type lists, dropping is-composing, the size check
-     at start; the switch (§3–§5, §9, §11, §12).
+  3. **`rcs-as`**: `rcs-as`'s chatbot API listener, token and scope, with strict
+     JSON, limits, `Fuzz*` targets for its `/v1/chatbot/*` request bodies and
+     its spec and scope table in `docs/api/`; sender, recipient and identity
+     checks; the backstops and the chatbot sender rate; CPIM and IMDN with bot
+     tags and `tk`; admission, delivery checks and delivery calls, each with its
+     timeout, cap and breaker; the IARI check and 488/606 handling; the OPTIONS
+     answer, suspended behaviour and refusal of other PSI requests and chatbot
+     invitees; per-conversation queues, the chatbot TTL and the quarter cap;
+     content-type lists, dropping is-composing, the size check at start; the
+     switch (§3–§5, §9, §11, §12).
   4. **`maap` core**: `cmd/maap`, tables (`maap-registry`,
      `maap-subscribers`, `maap-requests` for idempotency and statuses,
      `maap-counters`) with memory backends, on-demand with PITR as ADR 0003
-     has (registry with deletion protection), each with its TTL; the
+     has, each with its TTL; the
      operator API, credentials, audit log and caches; aliases,
      conversations, states, blocks, recycling and expiry; the alias form in
      the privacy check (§6, §7, §10, §11).
   5. **`maap` chatbot API and webhooks**: authentication, limits, strict
      JSON and idempotency; send, status, notifications; the dialer, signing,
-     challenge, breaker and concurrency, with the server and dialer timeouts
-     as tuning (connect 3 s, TLS 3 s, response headers 5 s); shared counters,
+     challenge, breaker and webhook concurrency (8 per chatbot, 256 per
+     task); the dialer's connect 3 s, TLS 3 s and response headers 5 s; the
+     public server's header read 5 s, read and write 15 s, headers 8 KiB and
+     512 requests at a time per task (memo J1, F3); shared counters,
      failing closed; `docs/api/maap.yaml` and `docs/api/maap-scopes.md`;
      `Fuzz*` targets for the JSON envelope, aliases, webhook URLs and the
      chatbot URI (§6–§9).
@@ -547,7 +575,7 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
 - **To confirm**, for the RCC.07 edition matching the target profile: the
   chatbot URI form, feature-tag values and the bot version the platform may
   claim, content types, the anonymised address and `tk`, the Warning texts,
-  suspended behaviour, large mode toward chatbot recipients, and
+  suspended behaviour, large mode in both directions, and
   subscriber-side blocking; and whether a GSMA document defines the chatbot
   API and its authentication.
 - **Not in the minimum**, for the lead to decide: the Chatbot Information
