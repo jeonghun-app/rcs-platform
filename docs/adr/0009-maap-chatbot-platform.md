@@ -87,18 +87,19 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      INVITE with an RCS feature tag or MSRP stream (10) and a MESSAGE (20),
      SESSION_TERMINATED; an RCS OPTIONS (30), SESSION_CONTINUED. The chatbot
      IARIs match its RCS IARI pattern.
-   - **`rcs-as` as the PSI host.** An OPTIONS reaches `rcs-as` twice: from
-     iFC 30 with `P-Served-User`, which it forwards as today, then from
-     `icscf` without one, which it answers from the delivery check's state
-     (§4): 200 for an `active` or `suspended` chatbot, 403 for a blocked
-     pair (§11), with the chatbot URI in
-     `P-Asserted-Identity` (`tk` as in §10) and the chatbot IARIs, version
-     and `isbot` tags in `Contact` (RCC.07 v13.0 §3.6.2, §2.5.4.1.1); 404
-     otherwise. Any other method or service reaching the PSI (REFER,
-     SUBSCRIBE, an INVITE that missed the originating `rcs-as`) is 403 (memo
-     H5). A chatbot URI is refused as a group invitee, in a list or a REFER,
-     and an originating request whose asserted identity is at
-     `RCS_CHATBOT_DOMAIN` is 403.
+   - **`rcs-as` as the PSI host.** An OPTIONS reaches `rcs-as` twice: from iFC
+     30 with `P-Served-User`, which it forwards as today, then from `icscf`
+     without one, which it answers from the delivery check's state (§4): 200 for
+     an `active` or `suspended` chatbot, with the chatbot URI in
+     `P-Asserted-Identity` (`tk` as in §10) and the chatbot IARIs, version and
+     `isbot` tags in `Contact` (RCC.07 v13.0 §3.6.2, §2.5.4.1.1); 403 for a
+     blocked pair (§11); 404 otherwise. If the check fails, 500 with
+     `Retry-After: 5`, as admission: without the state it could advertise a
+     chatbot to a subscriber who blocked it.
+     Any other method or service reaching the PSI (REFER, SUBSCRIBE, an INVITE
+     that missed the originating `rcs-as`) is 403 (memo H5). A chatbot URI is
+     refused as a group invitee, in a list or a REFER, and an originating
+     request whose asserted identity is at `RCS_CHATBOT_DOMAIN` is 403.
 4. **Message flows.** "Stored" names a DynamoDB table.
    - **Subscriber → chatbot** (pager MESSAGE, or messages on a chat or
      large-mode session):
@@ -165,8 +166,14 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
         chatbot's state and the pair block), counts no limit and leaves the
         reply window alone. Only a positive answer delivers. A suspended chatbot
         or blocked pair makes the message undeliverable, so suspension reaches
-        what is queued within `maap`'s 30 s cache (§7); a timeout, open breaker
-        or store error holds it for retry, as for an offline subscriber. The
+        what is queued within `maap`'s 30 s cache (§7). A failed or unavailable
+        check (timeout, open breaker, store error), a full cap (§12) or
+        `RCSAS_CHATBOTS=off` holds the message on its own, the engine's `skip`
+        and not its `stop`: the messages after it, a person's included, are
+        still delivered, and later messages from the same chatbot keep their
+        order behind it. It is retried on a timer of its own, every
+        `RCSAS_RETRY_INTERVAL` (1 minute) without doubling, which leaves the
+        recipient's backoff alone, until its TTL ends it as undeliverable. The
         out-of-service text (§11) is a platform message and skips the check.
         Then `rcs-as` → `scscf`: a MESSAGE or large-mode INVITE (§5) with
         `P-Served-User: <subscriber>;sescase=term`, `P-Asserted-Identity:
@@ -293,7 +300,7 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      |---|---|
      | operator | registry, credentials, webhook settings, permissions, limits, blocks, number recycling |
      | chatbot | its own sends, statuses, notifications and webhook keys; another chatbot's message ID is 404 |
-     | `rcs-as` → `maap` | admissions; messages and notifications for chatbots |
+     | `rcs-as` → `maap` | admissions and delivery checks; messages and notifications for chatbots |
      | `maap` → `rcs-as` | sends and notifications from a sender in the chatbot range, to subscribers only |
 
 8. **Webhooks.** `maap` dials a webhook with a dialer that checks the
@@ -326,12 +333,13 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    let a chatbot start conversations, with the lower limits below; that
    permission requires the MSISDN permission (§10), since the chatbot must name
    someone it has no alias for. A per-minute bound is a token bucket with a
-   burst of a sixth of its rate (as `rcs-as`'s `Rate`), a daily bound a fixed
-   day; both live in DynamoDB items every task shares, with TTL (as threat model
-   T12). Refused requests are not counted. The answer is 429 with Retry-After,
-   or 503 if the counter store fails. Subscriber limits are counted at admission
-   (§4); messages within a session are bounded by `rcs-as`'s per-sender rate.
-   The operator may set a chatbot's limits lower, never higher, which keeps the
+   burst of a sixth of its rate, rounded up (tokens refilled continuously at the
+   rate, one taken per request), a daily bound a fixed day; both live in
+   DynamoDB items every task shares, with TTL (as threat model T12). Refused
+   requests are not counted. The answer is 429 with Retry-After, or 503 if the
+   counter store fails. Subscriber limits are counted at admission (§4);
+   messages within a session are bounded by `rcs-as`'s per-sender rate. The
+   operator may set a chatbot's limits lower, never higher, which keeps the
    hottest counter near 100 writes a second.
 
    | Bound (in `maap`) | Default |
@@ -423,19 +431,21 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
     breaker answers at once for 10 s, then lets one call through. Any of these
     is "unavailable": 500 with `Retry-After: 5`, counted in
     `chatbot.admission_unavailable` beside the timing
-    `chatbot.admission_latency`. **Delivery** (`/v1/rcs/*`) has a 15 s timeout,
-    above the webhook's 10 s and below `RCSAS_DELIVERY_TIMEOUT` (30 s); when a
-    chatbot's deliveries are all in use, or its webhook failed 5 times in a row
-    (that breaker holds 30 s), `maap` answers 503 at once. **Delivery checks**
-    (2 s) and **delivery calls** each have their own cap of 64 at a time per
-    task and their own breaker (5 failures, 10 s), apart from admission, so a
-    queue drain never starves subscribers' admissions; over a cap the message
-    stays queued. **`RCSAS_CHATBOTS=off`** turns the path off: `rcs-as` makes no
-    call to `maap`; requests to `RCS_CHATBOT_DOMAIN` get 404; queued messages
-    either way are held and expire under their TTL as undeliverable; `rcs-as`'s
-    chatbot API answers 503, so `maap`'s `POST /v1/messages` answers 503 with
-    Retry-After. ADR 0007 §2 has the ports, T4 what a compromised `maap`
-    reaches; its tables are written by its task role only.
+    `chatbot.admission_latency`. **Delivery** (`/v1/rcs/messages` and
+    `/v1/rcs/notifications`) has a 15 s timeout, above the webhook's 10 s and
+    below `RCSAS_DELIVERY_TIMEOUT` (30 s); when a chatbot's deliveries are all
+    in use, or its webhook failed 5 times in a row (that breaker holds 30 s),
+    `maap` answers 503 at once. **Delivery checks** (2 s) and **delivery calls**
+    each have their own cap of 64 at a time per task and their own breaker (5
+    failures, 10 s), apart from admission, so a queue drain never starves
+    subscribers' admissions; over a cap the message is held as in §4.
+    **`RCSAS_CHATBOTS=off`** turns the path off: `rcs-as` makes no call to
+    `maap`; requests to `RCS_CHATBOT_DOMAIN` get 404; queued messages either way
+    are held (chatbot-sent ones as in §4) and expire under their TTL as
+    undeliverable; `rcs-as`'s chatbot API answers 503, so `maap`'s `POST
+    /v1/messages` answers 503 with Retry-After. ADR 0007 §2 has the ports, T4
+    what a compromised `maap` reaches; its tables are written by its task role
+    only.
 13. **New settings** (none exists on `main`):
 
     | Setting | Meaning |
@@ -475,7 +485,8 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
   the reply window, so a dead webhook does not pile up a week of messages.
 - **Suspension rechecked at delivery, not purged:** queues are per recipient
   with no index by sender, so a purge would scan them all. The check fails
-  closed, so a compromised or absent `maap` cannot keep queued spam flowing.
+  closed, so an absent `maap` delivers nothing queued; a compromised `maap` can
+  answer it positively, so only `RCSAS_CHATBOTS=off` stops queued spam.
 - **A distinct anonymous alias:** a reply then names one conversation without
   a conversation ID in the API, and the chatbot cannot link the two, the
   stronger outcome under U1.
@@ -529,8 +540,9 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      timeout, cap and breaker; the IARI check and 488/606 handling; the OPTIONS
      answer, suspended behaviour and refusal of other PSI requests and chatbot
      invitees; per-conversation queues, the chatbot TTL and the quarter cap;
-     content-type lists, dropping is-composing, the size check at start; the
-     switch (§3–§5, §9, §11, §12).
+     content-type lists, dropping is-composing, the size check at start; a test
+     that a person's message queued behind a chatbot message whose check fails
+     is still delivered; the switch (§3–§5, §9, §11, §12).
   4. **`maap` core**: `cmd/maap`, tables (`maap-registry`,
      `maap-subscribers`, `maap-requests` for idempotency and statuses,
      `maap-counters`) with memory backends, on-demand with PITR as ADR 0003
@@ -538,39 +550,39 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      operator API, credentials, audit log and caches; aliases,
      conversations, states, blocks, recycling and expiry; the alias form in
      the privacy check (§6, §7, §10, §11).
-  5. **`maap` chatbot API and webhooks**: authentication, limits, strict
-     JSON and idempotency; send, status, notifications; the dialer, signing,
-     challenge, breaker and webhook concurrency (8 per chatbot, 256 per
-     task); the dialer's connect 3 s, TLS 3 s and response headers 5 s; the
-     public server's header read 5 s, read and write 15 s, headers 8 KiB and
-     512 requests at a time per task (memo J1, F3); shared counters,
-     failing closed; `docs/api/maap.yaml` and `docs/api/maap-scopes.md`;
-     `Fuzz*` targets for the JSON envelope, aliases, webhook URLs and the
-     chatbot URI (§6–§9).
-  6. **Infrastructure and operations.** Prerequisite: `rcs-as`, `scscf`,
-     `icscf` and `pcscf` are not yet ECS services in `infra/platform.yaml`.
-     The `maap` service and its three ports, ALB host rule and certificate,
-     security groups with the ADR 0007 §2 policy test, egress from the
-     `MAAP_WEBHOOK_PORTS` parameter, task role with its IAM policy test,
-     secrets, and `rcs-as`'s new listener; a stable NAT egress address as a
-     stack output, since chatbots allow it by address (a single NAT gateway
-     stops webhooks in an AZ outage); the WAF rate rule scoped down for
-     `MAAP_PUBLIC_HOST`. Alarms, `Service` dimension only, each with a
-     runbook section: paging `MaapAdmissionUnavailable`,
-     `MaapWebhookFailureRatio` (all chatbots), `MaapNoHealthyTargets`,
-     `MaapTarget5xx`, `MaapStoreErrors`; tickets for table throttling,
-     `MaapChatbotQueueAge` and the cost budget at 80 % and 100 %; memo D7
-     through Contributor Insights on logs. The runbook: rotation of
-     credentials, tokens and the signing key (a 32-byte Ed25519 seed; the
-     next key published at least an hour, the chatbots' cache, before use,
-     the old one 600 s after; withdrawn at once on compromise), suspension,
-     the recycling step, the switch, deploy order (`maap` first, rollback
-     the other way), RPO from PITR. Compose, with development defaults
-     refused in staging and prod, and an `rcs-sim` end-to-end test. Cost
-     (operations' estimate, Seoul prices on 2026-10-26): about $41 a month
-     for two small tasks and about $14 per million chatbot messages in
-     DynamoDB, plus secrets, WAF, NAT data and logs. A linked issue in
-     auto-configuration-server sets CHATBOT MSG TECH to a value allowing
+  5. **`maap` chatbot API and webhooks**: authentication, limits, strict JSON
+     and idempotency; send, status, notifications; the dialer, signing,
+     challenge, breaker and webhook concurrency (8 per chatbot, 256 per task);
+     the dialer's connect 3 s, TLS 3 s and response headers 5 s; the public
+     server's header read 5 s, read and write 15 s, headers 8 KiB and 512
+     requests at a time per task (memo J1, F3); shared counters as conditional
+     updates, where losing a race is retried and is not a store failure, failing
+     closed on real store errors; `docs/api/maap.yaml` and
+     `docs/api/maap-scopes.md`; `Fuzz*` targets for the JSON envelope, aliases,
+     webhook URLs and the chatbot URI (§6–§9).
+  6. **Infrastructure and operations.** Prerequisite: `rcs-as`, `scscf`, `icscf`
+     and `pcscf` are not yet ECS services in `infra/platform.yaml`. The `maap`
+     service and its three ports, ALB host rule and certificate, security groups
+     with the ADR 0007 §2 policy test, egress from the `MAAP_WEBHOOK_PORTS`
+     parameter, task role with its IAM policy test, secrets, and `rcs-as`'s new
+     listener; a stable NAT egress address as a stack output, since chatbots
+     allow it by address (a single NAT gateway stops webhooks in an AZ outage);
+     the WAF rate rule scoped down for `MAAP_PUBLIC_HOST`. Alarms, `Service`
+     dimension only, each with a runbook section: paging
+     `MaapAdmissionUnavailable`, `MaapWebhookFailureRatio` (all chatbots),
+     `MaapNoHealthyTargets`, `MaapTarget5xx`, `MaapStoreErrors`; tickets for
+     table throttling, `MaapChatbotQueueAge`, `RcsAsChatbotBackstopHit` and the
+     cost budget at 80 % and 100 %; memo D7 through Contributor Insights on
+     logs. The runbook: rotation of credentials, tokens and the signing key (a
+     32-byte Ed25519 seed; the next key published at least an hour, the
+     chatbots' cache, before use, the old one 600 s after; withdrawn at once on
+     compromise), suspension, the recycling step, the switch, deploy order
+     (`maap` first, rollback the other way), RPO from PITR. Compose, with
+     development defaults refused in staging and prod, and an `rcs-sim`
+     end-to-end test. Cost (operations' estimate, Seoul prices on 2026-10-26):
+     about $41 a month for two small tasks and about $14 per million chatbot
+     messages in DynamoDB, plus secrets, WAF, NAT data and logs. A linked issue
+     in auto-configuration-server sets CHATBOT MSG TECH to a value allowing
      standalone messaging (RCC.07 v13.0 §3.6.8.9).
 - **To confirm**, for the RCC.07 edition matching the target profile: the
   chatbot URI form, feature-tag values and the bot version the platform may

@@ -463,22 +463,22 @@ decided before the body is read, and failures limited per source; revocation
 and suspension on every task within 30 s. The API has no sender field. The
 sender is the registry's URI, `maap` generates the Message-ID, and `rcs-as`
 builds every CPIM, IMDN and SIP header itself, refusing a sender outside the
-chatbot range and a recipient inside it. Suspension and blocks also stop
-what is queued: before each delivery `rcs-as` makes a delivery check that
-reads state only and fails closed, so without a positive answer nothing is
-delivered, and with `RCSAS_CHATBOTS=off` nothing is. Registration,
-credentials and webhook settings are
-operator-only, on a listener the public handler does not mount, and every
-change is audit-logged. URIs are unique in the one normal form (T14). Only
-the operator scope writes the PSI in `hss`. JSON is strict and bounded, with
-one recipient per send.
+chatbot range and a recipient inside it. Suspension and blocks also stop what
+is queued: before each delivery `rcs-as` makes a delivery check that reads
+state only and fails closed, so without a positive answer nothing is
+delivered, and with `RCSAS_CHATBOTS=off` nothing is; a held message waits on
+its own and holds no other message for that subscriber. Registration,
+credentials and webhook settings are operator-only, on a listener the public
+handler does not mount, and every change is audit-logged. URIs are unique in
+the one normal form (T14). Only the operator scope writes the PSI in `hss`.
+JSON is strict and bounded, with one recipient per send.
 **Residual risk:** a stolen credential works until it is revoked, and for up
-to 30 s after. Look-alike display names are not caught (verification is out
-of scope). A compromised `maap` can send as any URI in the chatbot range,
+to 30 s after. Look-alike display names are not caught (verification is out of
+scope). A compromised `maap` can send as any URI in the chatbot range,
 registered or not, because `rcs-as` checks the range, not the registry;
-per-sender rates do not bound that, but `rcs-as`'s caps per subscriber
-across all chatbot senders and per task in total, and the quarter of each
-queue, do; being per task, they scale with the number of `rcs-as` tasks.
+per-sender rates do not bound that, but `rcs-as`'s caps per subscriber across
+all chatbot senders and per task in total, and the quarter of each queue, do;
+being per task, they scale with the number of `rcs-as` tasks.
 **Status:** planned (#668).
 
 ## T14 — Chatbot PSI routing
