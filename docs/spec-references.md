@@ -26,12 +26,14 @@ rule, from a row of [Public sources](#public-sources).
 | RCC.11 | Endorsement of OMA CPM for RCS | *to confirm* | `rcs-as` |
 | RCC.14 | Service provider device configuration | as in `acs` | `acs` |
 | RCC.15 | IMS device configuration and supporting services | *to confirm* | `pcscf`, `scscf` |
+| RCC.07 §2.5.4, §3.6 | Chatbot addressing and the Chatbot service | v13.0 *confirmed* (**GSMA RCC.07 v13.0**) for the items ADR 0009 cites; the edition matching the target profile *to confirm* | `maap`, `rcs-as`, `hss`, `icscf` (ADR 0009) |
+| *to confirm* | Chatbot-to-platform API, if a GSMA document defines one | *to confirm*: RCC.07 v13.0 §3.6.1 puts this interface out of its scope | `maap` (ADR 0009) |
 
 ## Public sources
 
-Public pages read for the move to UP 4.0 (ADR 0008). Cite a row by the bold short
-name at the start of its Source cell. A page is summarised here, never quoted; a
-page that could not be opened is not listed.
+Public pages read for the move to UP 4.0 (ADR 0008) and for MaaP (ADR 0009). Cite
+a row by the bold short name at the start of its Source cell. A page is summarised
+here, never quoted; a page that could not be opened is not listed.
 
 | Source | Publisher | URL | Date read | Used for |
 |---|---|---|---|---|
@@ -42,6 +44,7 @@ page that could not be opened is not listed.
 | **GSMA RCS encryption article**: *RCS Encryption: A Leap Towards Secure and Interoperable Messaging* | GSMA newsroom (published 2025-03-14) | <https://www.gsma.com/newsroom/article/rcs-encryption-a-leap-towards-secure-and-interoperable-messaging/> | 2026-10-26 | New GSMA specifications with end-to-end encryption between clients based on MLS, the main change of the UP 3.0 release; UP 3.0 also brings a richer deep link format for businesses, better audio messaging codecs and easier management of a user's subscriptions to business senders. States no edition, clause or value. |
 | **GSMA UP 3.1 article**: *Elevating the Messaging Experience with RCS Universal Profile 3.1* | GSMA newsroom (published 2025-07-25) | <https://www.gsma.com/newsroom/article/elevating-the-messaging-experience-with-rcs-universal-profile-3-1/> | 2026-10-26 | UP 3.1 builds on 3.0: new ways for a client to connect to operator services, with changes to client onboarding and use of the device operating system's push notification services, and the xHE-AAC codec for audio messaging. States no edition, clause or value. |
 | **GSMA RCS February 2026 publications page**: *Rich Communication Service (RCS) – February 2026 Publications* | GSMA, Networks resources (dated 2026-02-25) | <https://web.archive.org/web/20260906101137/https://www.gsma.com/solutions-and-impact/technologies/networks/gsma_resources/rich-communication-service-rcs-february-2026-publications/> | 2026-10-26 | Read through its Web Archive snapshot of 2026-09-06: gsma.com answered 403 to a direct fetch on 2026-10-26. That UP 4.0 is published, and the features the page names: video calls that work across implementations, started from any RCS conversation and with up to 32 participants; formatted text and higher-quality media; streaming video in rich cards; easier-to-recognise icons for suggested actions that open a URL; business control of whether such an action opens in a webview inside the client, in a web browser or in an installed app; deep links to chatbots and business senders, and information about chatbots more broadly, handled with less overhead and more robustly. States no edition or clause; the one value is the participant count. |
+| **GSMA RCC.07 v13.0**: *RCC.07 Rich Communication Suite – Advanced Communications Services and Client Specification v13.0*, dated 2022-12-19, non-confidential | GSMA newsroom resource page, with the document as PDF | <https://www.gsma.com/newsroom/gsma_resources/rcc-07-rich-communication-suite-advanced-communications-services-and-client-specification-v13-0/> | 2026-10-26 | The chatbot items of ADR 0009: the chatbot service identifier form (§2.5.4.1), the anonymised address and the `tk` parameter (§2.5.4.2–§2.5.4.4), chatbot feature tags and version (§3.6.2), the split between the operator's network and a Chatbot Platform, with the chatbot-to-platform interface out of scope (§3.6.1), anonymization (§3.6.5.1), spam blocking, client block lists and spam reports (§3.6.6), the Chatbot service procedures and notifications (§3.6.8), chatbot content types, multipart use and the suggested payload size (§3.6.10.1–§3.6.10.2), and, as items left out, Traffic-Type (§3.6.7) and the rich-card schema (§3.6.10.4). It does not name the Universal Profile it belongs to; its reference list names an RCC.71 v2.6 of the same date, a lead only. |
 
 ## 3GPP
 
@@ -57,6 +60,10 @@ page that could not be opened is not listed.
 | TS 23.003 | Numbering, addressing and identification | `internal/sip`, `hss` |
 | TS 23.334 | IMS-ALG and IMS-AGW | `pcscf`, `msrp-relay` |
 | TS 23.218 | IMS session handling: use of iFC and ServiceInfo by the S-CSCF | `scscf` (`internal/ifc`) |
+
+ADR 0009 relies on TS 23.003 §13.5 (wildcarded PSI syntax), TS 23.228 §5.4.12.2
+(routing to the AS hosting a PSI) and TS 29.228 §6.1.4.1 and Table 6.1.4.2 (LIR
+for a PSI), read in V20.1.0, V20.1.0 and V20.0.0.
 
 ## OMA
 
@@ -101,6 +108,8 @@ page that could not be opened is not listed.
 | 6750 | Bearer token usage: `Authorization: Bearer` and the b64token syntax (internal HTTP APIs, `msrp-relay` control API) |
 | 6459 | IPv6 in 3GPP EPS: one /64 per bearer (`msrp-relay` per-source limits) |
 | 5482 | TCP user timeout (§1): how long sent data may stay unacknowledged (`msrp-relay` client sockets) |
+| 8032 | Ed25519: the signature on `maap`'s webhook deliveries (ADR 0009) |
+| 3323 | `Privacy` header, which carries the `tk` value of RCC.07 v13.0 §3.6.8.3.1 (ADR 0009) |
 
 ## Other
 
