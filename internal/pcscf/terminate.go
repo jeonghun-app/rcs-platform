@@ -42,7 +42,9 @@ var toClientOnly = []string{"P-Served-User", "P-Profile-Key"}
 // values, the client-facing one on top, so that the dialog's requests come
 // back through this task on both sides; a standalone one, such as MESSAGE,
 // gets none. The core-facing one keeps the Path's ob and the request's icid
-// (§5.2.6.4.4 3)), and binds the flow to the dialog's Call-ID. A request
+// (§5.2.6.4.4 3)), and binds the flow to the dialog's Call-ID. A NOTIFY
+// inside a dialog gets the same two values again, as a subscriber takes its
+// route set from the first NOTIFY (RFC 6665 §4.4.1). A request
 // inside a dialog must name its live flow by the value written for its
 // Call-ID, or it is 403. P-Asserted-Identity is removed when the request
 // asks for privacy of the identity (RFC 3323 §4.2, RFC 3325 §9.3), and the
@@ -115,6 +117,16 @@ func (p *pcscf) terminate(_ context.Context, r *proxy.Request) proxy.Decision {
 				p.count(metricTerminatingFlow, 1)
 			}
 		},
+	}
+	// A NOTIFY inside a subscription's dialog is record-routed as the
+	// SUBSCRIBE was, with the same two values: the subscriber takes its
+	// route set from the NOTIFY that creates its dialog, not from the 2xx
+	// (RFC 6665 §4.3, §4.4.1), and without pcscf's values in it, its
+	// refresh and unsubscribe would be refused here (#550). Later
+	// NOTIFYs carry them too, which the subscriber ignores.
+	if !initial && r.Message.Method == "NOTIFY" {
+		rr := p.recordRoute(flow, entry.Params.Has("ob"), fallback, callID)
+		d.RecordRoute = []sip.Address{rr[1], rr[0]}
 	}
 	// routes is the Record-Route a 1xx or 2xx must return, nil when it
 	// cannot be known: the core's did not parse, so a rewrite would lose it.
