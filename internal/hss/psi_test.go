@@ -1,11 +1,13 @@
 package hss
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
+	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 )
 
 const botDomain = "botplatform.mnc001.mcc001.3gppnetwork.org"
@@ -144,7 +146,13 @@ func checkSameUserPart(t *testing.T, r *chatbotRange, d chatbot.Domain, user str
 	uri := "sip:" + user + "@" + botDomain
 	_, err := d.Normalise(uri)
 	matched, merr := r.userMatches(user)
-	if merr != nil || matched != (err == nil) {
+	var limit *ifc.LimitError
+	switch {
+	case errors.As(merr, &limit) && err != nil && len(uri) > chatbot.MaxURIBytes:
+		// Past the work budget the matcher answers neither way, as it must;
+		// only a user part far longer than any normal form gets there, and
+		// contains, below, refuses it before matching.
+	case merr != nil || matched != (err == nil):
 		t.Fatalf("user part %q: Normalise error %v, hss matched %t (%v)", user, err, matched, merr)
 	}
 	if in, cerr := r.contains(uri); cerr != nil || in != (err == nil) {
