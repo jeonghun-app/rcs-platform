@@ -19,6 +19,16 @@
 // [ClientIP] and [TruncateIP] log only the network it belongs to (IPv4 /24,
 // IPv6 /48), and [TruncateIPsIn] does so for the addresses in free text.
 //
+// A maap alias, sip:<alias-id>@<host>;user=rcstk (ADR 0009 §10), stands for
+// one subscriber's number, which only maap maps it back to, so it is personal
+// data like the number. It reaches a log only through [URI] or [Identity],
+// which never show its alias ID, and [Redact] masks it in free text as it
+// masks the user of any sip URI. Its hint is the lower-case alias ID's, so
+// one alias has the same hint in every form and case. An alias ID on its own
+// in free text is not recognised: log it with [Identity]. The repository's
+// privacy check (make privacy) refuses an alias written out in a tracked
+// file, unless .github/allowed-test-identifiers.txt lists its ID.
+//
 // Redaction is for identifiers only. Display names, message bodies, keys,
 // nonces, RAND/AUTN, digest responses and tokens are not recognised and must
 // never be logged at all (CONTRIBUTING.md, Privacy).
@@ -121,7 +131,8 @@ func (r *Redactor) URI(key, v string) slog.Attr {
 }
 
 // Identity returns a log attribute for a bare identifier (IMSI, IMPI, MSISDN,
-// IMEI, user name), masked whole whatever it looks like.
+// IMEI, user name, maap alias or alias ID), masked whole whatever it looks
+// like.
 func (r *Redactor) Identity(key, v string) slog.Attr {
 	return slog.String(key, r.mask(v))
 }
@@ -136,8 +147,9 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //     (07700) 900001, Tel.010-0000-0001); see [numberAt];
 //   - the subscriber of a tel URI (RFC 3966 §3), visual separators included;
 //   - the userinfo of a sip or sips URI (RFC 3261 §19.1.1), password included,
-//     and the user of an im or pres URI (RFC 3860 §3, RFC 3859 §3), quoted or
-//     not, as CPIM From and To carry them (RFC 3862 §3.4);
+//     which is the alias ID of a maap alias, and the user of an im or pres
+//     URI (RFC 3860 §3, RFC 3859 §3), quoted or not, as CPIM From and To
+//     carry them (RFC 3862 §3.4);
 //   - the IMEI of a urn:gsma:imei URN (RFC 7254 §3), all of its digit groups.
 //
 // Digits of any script count: every decimal digit (Unicode Nd) outside ASCII,
@@ -421,9 +433,12 @@ func letters(sum []byte, n int) string {
 
 // canonical reduces a telephone number to its digits, dropping the "+", the
 // visual separators of RFC 3966 §5.1.1 and spaces, also the Unicode spaces
-// that asciiNumberChars keeps inside a URI user; anything else is returned
-// unchanged.
+// that asciiNumberChars keeps inside a URI user, and an alias to its alias ID
+// in lower case (see aliasID); anything else is returned unchanged.
 func canonical(v string) string {
+	if id, ok := aliasID(v); ok {
+		return id
+	}
 	digits := false
 	for _, r := range v {
 		switch c, _ := asciiNumberChar(r); {
@@ -444,6 +459,33 @@ func canonical(v string) string {
 		}
 	}
 	return b.String()
+}
+
+// aliasIDLen is the length of a maap alias ID: 128 bits in RFC 4648 base32,
+// without padding (ADR 0009 §10).
+const aliasIDLen = 26
+
+// aliasID returns, in lower case, the alias ID that v is, or that v is the
+// sip or sips URI of. maap writes the ID in lower case, but base32 reads
+// both cases alike (RFC 4648 §6), so an ID read back in upper case is the
+// same alias and gets the same hint. Only the ID before the "@" is read: the
+// host and parameters do not change which subscriber an alias stands for.
+func aliasID(v string) (string, bool) {
+	for _, p := range []string{"sip:", "sips:"} {
+		if len(v) > len(p)+aliasIDLen && strings.EqualFold(v[:len(p)], p) && v[len(p)+aliasIDLen] == '@' {
+			v = v[len(p) : len(p)+aliasIDLen]
+			break
+		}
+	}
+	if len(v) != aliasIDLen {
+		return "", false
+	}
+	for i := 0; i < len(v); i++ {
+		if c := v[i]; !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '2' <= c && c <= '7') {
+			return "", false
+		}
+	}
+	return strings.ToLower(v), true
 }
 
 // sipUser returns the user of a SIP userinfo, without the password (RFC 3261

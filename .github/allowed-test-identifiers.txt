@@ -1,5 +1,5 @@
 # Every IMSI- or IMEI-shaped (15-16 digit) and E.164-shaped (+ and 10-15 digits)
-# identifier that may appear in this repository.
+# identifier, and every maap alias, that may appear in this repository.
 #
 # CI fails on any other one, because a 15-digit literal is most likely a real
 # IMSI and a real IMSI is subscriber-identifying data.
@@ -7,6 +7,7 @@
 # Rules for adding an entry:
 #   * IMSIs use MCC 001 / MNC 01, the reserved test network.
 #   * IMEIs come from documented example ranges and are not tied to a device.
+#   * maap alias IDs are made up, never copied from a running maap.
 #   * Add a comment saying which test or document uses the entry.
 #
 # Format: one identifier per line. Comments and blank lines are ignored.
@@ -33,3 +34,10 @@
 # none of them can be dialled either.
 +15550108000
 +15550108999
+
+# --- maap aliases (ADR 0009 §10) ---------------------------------------------
+# An alias sip:<alias-id>@<host>;user=rcstk is listed by its alias ID alone, in
+# lower case. These are spelt out of words, so no random 128-bit draw gives
+# them; internal/pii's tests and fuzz seeds use them.
+aliasforthetestsonly23456a
+secondtestaliasonly234567a

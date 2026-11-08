@@ -178,7 +178,11 @@ changes.
 ## T8 — Subscriber identifiers in logs and metrics
 
 **Control:** `internal/pii` masking and the privacy check in CI; no identifier as a
-metric dimension (architecture §8).
+metric dimension (architecture §8). A `maap` alias,
+`sip:<alias-id>@<host>;user=rcstk` with a 26-character base32 alias ID (ADR 0009
+§10), maps back to one subscriber and is treated as a number: `internal/pii`
+masks its alias ID, in either case, and the privacy check refuses one written in
+a tracked file unless its ID is on the allow-list.
 **Status:** implemented.
 
 ## T9 — Resource exhaustion from clients

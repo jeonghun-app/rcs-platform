@@ -268,8 +268,9 @@ docs: ## Check relative links and anchors in Markdown
 	python3 scripts/check-links.py
 
 .PHONY: privacy
-privacy: ## Refuse long numeric identifiers that are not on the allow-list
+privacy: ## Refuse long numeric identifiers and maap aliases that are not on the allow-list
 	scripts/check_identifiers.sh
+	scripts/test_check_identifiers.sh
 
 .PHONY: printguard
 printguard: volumes ## Refuse print calls that can show a SIP message's content (#599)

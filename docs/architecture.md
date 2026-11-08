@@ -60,7 +60,8 @@ internal/
                             EMF metrics, /healthz + /readyz, graceful shutdown,
                             -version and -healthcheck modes
   runtime/runtimetest/      a *runtime.Runtime for service tests, manual clock
-  pii/                      redaction of IMSI, MSISDN, IMEI, SIP/tel URIs in logs
+  pii/                      redaction of IMSI, MSISDN, IMEI, SIP/tel URIs and maap
+                            aliases in logs
   proxyproto/               PROXY protocol v2 parser shared by every service
                             behind the NLB (ADR 0003)
   sip/                      RFC 3261 message model, parser, serializer, URIs, headers
