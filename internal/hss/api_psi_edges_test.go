@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,29 +102,44 @@ func TestAnIfMatchWithNoPSIStoredIsRefusedAndStoresNothing(t *testing.T) {
 // With a keyed redactor, as in prod (RCS_PII_HMAC_KEY), the masked values
 // carry hints, so the audit line shows which PSI was replaced by which. The
 // unkeyed test redactor masks every PSI the same way and cannot show it.
+// Each PSI is masked whole, as one opaque value: EREs whose '"', '<', '>'
+// or '@' sit next to a name would lead a URI redactor to mask less than
+// all of it (#692 security review).
 func TestTheAuditLineTellsThePSIBeforeFromTheOneAfter(t *testing.T) {
 	keyed := pii.NewRedactor([]byte("hss-audit-test-key-0123456789abc"))
 	pii.SetDefault(keyed)
 	t.Cleanup(func() { pii.SetDefault(nil) })
 	a := newChatbotAPIEnv(t)
-	one, two := "sip:!one[a-z]*!@"+botDomain, "sip:!two[a-z]*!@"+botDomain
-	for _, psi := range []string{one, two} {
+	psis := []string{"sip:!one[a-z]*!@" + botDomain, "sip:!two[a-z]*!@" + botDomain}
+	for _, ere := range []string{`secretbot"x`, `<secretbot>`, `x@secretbot`, `secretbot@x`, `"secretbot<x>@y`} {
+		psis = append(psis, "sip:!"+ere+"!@"+botDomain)
+	}
+	masked := func(v string) string { return keyed.Identity("k", v).Value.String() }
+	seen := map[string]bool{}
+	for _, psi := range psis {
 		if code, body, _ := a.do("PUT", "/v1/chatbot-psi", adminToken, psiBody(psi)); code != http.StatusOK && code != http.StatusCreated {
-			t.Fatalf("PUT = %d %v", code, body)
+			t.Fatalf("PUT %q = %d %v", psi, code, body)
+		}
+		if m := masked(psi); seen[m] || !strings.HasPrefix(m, "***") || len(m) != len("***")+8 {
+			t.Fatalf("%q masks as %q, not one opaque value of its own", psi, m)
+		} else {
+			seen[m] = true
 		}
 	}
-	masked := func(v string) string { return keyed.URI("k", v).Value.String() }
-	if masked(one) == masked(two) {
-		t.Fatal("the keyed redactor masks both PSIs the same way")
-	}
 	audits := a.psiAudits()
-	if len(audits) != 2 {
-		t.Fatalf("%d audit records, want 2", len(audits))
+	if len(audits) != len(psis) {
+		t.Fatalf("%d audit records, want %d", len(audits), len(psis))
 	}
-	if r := audits[0]; r["psi_before"] != "" || r["psi_after"] != masked(one) {
-		t.Errorf("first write's audit = %v", r)
+	for i, r := range audits {
+		before := ""
+		if i > 0 {
+			before = masked(psis[i-1])
+		}
+		if r["psi_before"] != before || r["psi_after"] != masked(psis[i]) {
+			t.Errorf("write %d's audit = %v", i+1, r)
+		}
 	}
-	if r := audits[1]; r["psi_before"] != masked(one) || r["psi_after"] != masked(two) {
-		t.Errorf("replacement's audit = %v", r)
+	if logs := a.logs.String(); strings.Contains(logs, "secretbot") || strings.Contains(logs, botDomain) {
+		t.Error("the audit log carries part of a PSI")
 	}
 }

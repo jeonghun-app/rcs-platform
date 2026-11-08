@@ -68,7 +68,14 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      under `internal/ifc`'s ERE rules and work budget, at most 256 bytes.
      `hss` refuses every IMPU whose host is `RCS_CHATBOT_DOMAIN`, and a
      wildcard that matches an existing IMPU. Registering a chatbot writes
-     nothing to `hss`.
+     nothing to `hss`. (Amended in #679: there is no overlap search, which
+     would need a table scan. `hss` refuses IMPUs at the chatbot host when
+     they are provisioned, and the host is the PSI's alone: an IMPU left
+     there from before could have been used to impersonate a chatbot, so UAR
+     and SAR for an identity at the host are DIAMETER_ERROR_USER_UNKNOWN
+     whatever is stored, and an LIR in the range is answered from the PSI
+     even where such an IMPU exists. `RCS_CHATBOT_DOMAIN` must be a fresh
+     domain; threat model T14.)
    - **LIR** for a URI in the range: DIAMETER_SUCCESS, `Server-Name` the AS
      name, `Wildcarded-Public-Identity` the stored pattern (TS 29.228
      §6.1.4.1 step 2, Table 6.1.4.2, where a distinct identity takes

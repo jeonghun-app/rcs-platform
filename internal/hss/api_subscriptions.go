@@ -168,8 +168,9 @@ func (a *API) apply(req *subscriptionRequest, s *store.Subscription) error {
 // lookup uses (identity.CanonicalIMPU: the host in lower case), is a SIP or
 // SIPS URI at RCS_CHATBOT_DOMAIN, with or without a trailing dot; a tel
 // URI has no "@", so its whole text is the "host" and never matches. No
-// IMPU may be there: an IMPU takes precedence over the wildcarded PSI in
-// an LIR, so one in the range would hide part of it (ADR 0009 §3, #679).
+// IMPU may be there: the host is the wildcarded PSI's alone, and an IMPU
+// there could register and send as a chatbot URI (ADR 0009 §3 as amended
+// in #679, threat model T14).
 func (a *API) atChatbotHost(impu string) bool {
 	name := a.chatbotDomain.Name()
 	host := impu[strings.LastIndexByte(impu, '@')+1:]

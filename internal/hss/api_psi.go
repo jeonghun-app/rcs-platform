@@ -31,7 +31,7 @@ func writePSI(w http.ResponseWriter, status int, p *store.WildcardedPSI) {
 func (a *API) getChatbotPSI(w http.ResponseWriter, r *http.Request, _ Scope) error {
 	p, err := a.h.store.WildcardedPSI(r.Context())
 	if err != nil {
-		return err
+		return a.psiError(err)
 	}
 	writePSI(w, http.StatusOK, p)
 	return nil
@@ -62,7 +62,7 @@ func (a *API) putChatbotPSI(w http.ResponseWriter, r *http.Request, _ Scope) err
 		case errors.Is(err, store.ErrNotFound):
 			cur = nil
 		case err != nil:
-			return err
+			return a.psiError(err)
 		}
 		if want != 0 && (cur == nil || cur.Version != want) {
 			return errPrecondition
@@ -72,18 +72,37 @@ func (a *API) putChatbotPSI(w http.ResponseWriter, r *http.Request, _ Scope) err
 			continue
 		}
 		if err != nil {
-			return err
+			return a.psiError(err)
 		}
-		// The audit line shows the change (#679): before and after,
-		// through pii like every URI, so a PSI that names a chatbot is
-		// masked, its hint still telling one value from another.
+		// The audit line shows the change (#679): before and after, each
+		// masked whole as one opaque value. pii.URI would mask only the
+		// userinfo it finds, and an ERE can hold '"', '<' or '@' that make
+		// it find less; under RCS_PII_HMAC_KEY the hints still tell one
+		// value from another.
 		status, before := http.StatusCreated, slog.String("psi_before", "")
 		if cur != nil {
-			status, before = http.StatusOK, pii.URI("psi_before", cur.PSI)
+			status, before = http.StatusOK, pii.Identity("psi_before", cur.PSI)
 		}
-		noteAudit(r, before, pii.URI("psi_after", saved.PSI), slog.Int64("psi_version", saved.Version))
+		noteAudit(r, before, pii.Identity("psi_after", saved.PSI), slog.Int64("psi_version", saved.Version))
 		writePSI(w, status, saved)
 		return nil
 	}
-	return errContention
+	return a.psiError(errContention)
+}
+
+// psiError answers a store failure of a PSI request as classify does, in
+// words about the PSI: classify's speak of the subscriber store.
+func (a *API) psiError(err error) error {
+	var ae *apiError
+	if errors.As(err, &ae) {
+		return err
+	}
+	switch c := a.classify(err); c.status {
+	case http.StatusServiceUnavailable:
+		return &apiError{c.status, "the chatbot PSI could not be read or written; retry"}
+	case http.StatusInternalServerError:
+		return &apiError{c.status, "the stored chatbot PSI cannot be used; see the HSS log"}
+	default:
+		return c
+	}
 }

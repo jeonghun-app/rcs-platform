@@ -1,11 +1,16 @@
 package hss
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 )
 
 const chatbotAS = "sip:rcs-as.rcs.local;transport=tcp"
@@ -14,7 +19,10 @@ func newChatbotAPIEnv(t *testing.T) *apiEnv {
 	return newAPIEnv(t, func(o *APIOptions) { o.ChatbotDomain, o.ChatbotASName = testChatbotDomain(t), chatbotAS })
 }
 
-func psiBody(psi string) string { return `{"psi":"` + strings.ReplaceAll(psi, `\`, `\\`) + `"}` }
+func psiBody(psi string) string {
+	b, _ := json.Marshal(map[string]string{"psi": psi})
+	return string(b)
+}
 
 // psiAudits returns the audit records of PUT /v1/chatbot-psi.
 func (a *apiEnv) psiAudits() []map[string]any {
@@ -149,5 +157,73 @@ func TestRunGivesTheAPITheChatbotDomainAndASName(t *testing.T) {
 	var got psiResponse
 	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil || resp.StatusCode != http.StatusCreated || got.ServerName != chatbotAS {
 		t.Fatalf("PUT through Run = %d %+v, %v", resp.StatusCode, got, err)
+	}
+}
+
+// TestASubscriptionLeftWithAnIMPUAtTheChatbotHostMustDropIt: an IMPU that
+// was provisioned before RCS_CHATBOT_DOMAIN was set stays in the store
+// (hss does not search for it), and the subscription's next write must
+// drop it; the Cx answers keep it from registering meanwhile (#679).
+func TestASubscriptionLeftWithAnIMPUAtTheChatbotHostMustDropIt(t *testing.T) {
+	a := newChatbotAPIEnv(t)
+	leftover := "sip:bot@" + botDomain
+	s := &store.Subscription{IMPI: impi1, Profile: DefaultProfileID, PublicIdentities: []store.PublicIdentity{{IMPU: impu1}, {IMPU: leftover}}}
+	if _, err := a.store.CreateSubscription(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, subscriptionBody(impi1, true, impu1, leftover)); code != http.StatusBadRequest {
+		t.Fatalf("PUT keeping the IMPU = %d %v, want 400", code, body)
+	}
+	if got, _ := a.store.Subscription(t.Context(), impi1); got == nil || got.Identity(leftover) == nil || got.ACSManaged {
+		t.Fatalf("the refused PUT changed the subscription: %+v", got)
+	}
+	if code, body, _ := a.do("PUT", subPath(impi1), adminToken, subscriptionBody(impi1, true, impu1)); code != http.StatusOK {
+		t.Fatalf("PUT dropping the IMPU = %d %v, want 200", code, body)
+	}
+	if got, err := a.store.Subscription(t.Context(), impi1); err != nil || got.Identity(leftover) != nil || !got.ACSManaged {
+		t.Fatalf("after the PUT that drops it: %+v, %v", got, err)
+	}
+	if _, err := a.store.SubscriptionByIMPU(t.Context(), leftover); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the dropped IMPU still finds a subscription: %v", err)
+	}
+}
+
+// brokenPSIStore fails every PSI read, or loses every PSI write to another
+// writer, as a store outage or endless contention would.
+type brokenPSIStore struct {
+	store.Store
+	readErr error
+}
+
+func (s *brokenPSIStore) WildcardedPSI(ctx context.Context) (*store.WildcardedPSI, error) {
+	if s.readErr != nil {
+		return nil, s.readErr
+	}
+	return s.Store.WildcardedPSI(ctx)
+}
+
+func (s *brokenPSIStore) PutWildcardedPSI(context.Context, *store.WildcardedPSI, *store.WildcardedPSI) (*store.WildcardedPSI, error) {
+	return nil, fmt.Errorf("test: %w", store.ErrConflict)
+}
+
+// TestAPSIRequestTheStoreCannotServeIs503AboutThePSI: the answer is the
+// usual 503 with Retry-After, worded about the PSI, not the subscriber
+// store.
+func TestAPSIRequestTheStoreCannotServeIs503AboutThePSI(t *testing.T) {
+	outage := errors.New("test: the store is down")
+	for name, c := range map[string]struct {
+		readErr      error
+		method, body string
+	}{
+		"read failure":       {outage, "GET", ""},
+		"write read failure": {outage, "PUT", psiBody(chatbotPSI)},
+		"endless contention": {nil, "PUT", psiBody(chatbotPSI)},
+	} {
+		a := newChatbotAPIEnvOn(t, &brokenPSIStore{Store: store.NewMemory(), readErr: c.readErr})
+		code, body, h := a.do(c.method, "/v1/chatbot-psi", adminToken, c.body)
+		msg, _ := body["error"].(string)
+		if code != http.StatusServiceUnavailable || h.Get("Retry-After") == "" || !strings.Contains(msg, "chatbot PSI") || strings.Contains(msg, "subscri") {
+			t.Errorf("%s: %d %q, Retry-After %q", name, code, msg, h.Get("Retry-After"))
+		}
 	}
 }

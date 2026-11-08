@@ -96,15 +96,22 @@ without case. Only a URI already in that normal form is in the range.
 The operator writes it with `PUT /v1/chatbot-psi` (`docs/api/hss.yaml`), the PSI
 only: the AS name is `HSS_RCS_AS_URI` and the state active, whatever the request.
 A write replaces the one stored, and its audit line carries `psi_before` and
-`psi_after`, masked as URIs are, and `psi_version`. With `RCS_CHATBOT_DOMAIN`
-unset the write is 409. While it is set, no IMPU may have it as its host: a
-subscription that lists one, in any case of the host and with or without a
-trailing dot, is refused with 400, so an existing subscription that has one must
-drop it before any other change. An IMPU always takes precedence over the PSI in
-an LIR (TS 29.228 §6.1.4.1), and `hss` does not search the table for IMPUs the
-PSI would match, so `RCS_CHATBOT_DOMAIN` must be a **fresh** domain, one no
-subscriber IMPU has ever used: an IMPU provisioned at a reused domain before the
-setting would hide its part of the range ([runbook](runbook.md#the-chatbot-range)).
+`psi_after`, each masked whole as one opaque value (`pii.Identity`; keyed hints
+under `RCS_PII_HMAC_KEY` tell them apart), and `psi_version`. With
+`RCS_CHATBOT_DOMAIN` unset the write is 409.
+
+The chatbot host is the PSI's alone (the lead's decision on #679, ADR 0009 §3 as
+amended). While `RCS_CHATBOT_DOMAIN` is set, no IMPU may have it as its host: a
+subscription write that lists one, in any case of the host and with or without a
+trailing dot, is refused with 400, so a subscription that still has one must drop
+it before any other change. `hss` does not search the table for such IMPUs. One
+provisioned before the setting would let its subscriber register and send as a
+chatbot URI (threat model T13, T14), so the Cx answers treat the host as
+PSI-only: UAR and SAR for an identity there are DIAMETER_ERROR_USER_UNKNOWN
+whatever is stored, and an LIR in the range is answered from the PSI. Those
+answers come with the Cx part of #679; until then the PSI routes nothing. Choose
+`RCS_CHATBOT_DOMAIN` as a **fresh** domain, one no subscriber IMPU has ever used
+([runbook](runbook.md#the-chatbot-range)).
 
 Shared public identities and several IMPIs per subscription are not modelled;
 so Associated-Identities is never sent, and the S-CSCF name is kept once per

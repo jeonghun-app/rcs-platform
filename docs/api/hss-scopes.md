@@ -59,5 +59,5 @@ can issue a new password but never read a stored credential.
   no longer in use.
 - Every request is audited (`audit: provisioning request`): operation, caller, token
   slot, status and the masked IMPI; a write of the chatbot PSI also its value
-  before and after, masked as URIs are, and its new version. Tokens, bodies and
+  before and after, each masked whole as one opaque value, and its new version. Tokens, bodies and
   paths are never logged.
