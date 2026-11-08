@@ -74,6 +74,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	h, err := New(Options{
 		Store: st, Keys: keys, IMSRealm: cfg.IMSRealm, FTRealm: cfg.FTRealm, ServerNames: cfg.SCSCFNames,
 		MaxAuthItems: cfg.MaxAuthItems, Rand: d.rand, Logger: rt.Logger, Metrics: rt.Metrics,
+		ChatbotDomain: cfg.ChatbotDomain, ChatbotASName: cfg.RCSASURI,
 	})
 	if err != nil {
 		return err

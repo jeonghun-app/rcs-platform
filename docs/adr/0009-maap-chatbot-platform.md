@@ -66,22 +66,23 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      profile: with direct routing no S-CSCF evaluates one. Only the operator
      scope writes it, never `acs` or `ft-server`. A pattern is compiled
      under `internal/ifc`'s ERE rules and work budget, at most 256 bytes.
-     `hss` refuses every IMPU whose host is `RCS_CHATBOT_DOMAIN`, and a
-     wildcard that matches an existing IMPU. Registering a chatbot writes
-     nothing to `hss`. (Amended in #679: there is no overlap search, which
-     would need a table scan. `hss` refuses IMPUs at the chatbot host when
-     they are provisioned, and the host is the PSI's alone: an IMPU left
-     there from before could have been used to impersonate a chatbot, so UAR
-     and SAR for an identity at the host are DIAMETER_ERROR_USER_UNKNOWN
-     whatever is stored, and an LIR in the range is answered from the PSI
-     even where such an IMPU exists. `RCS_CHATBOT_DOMAIN` must be a fresh
-     domain; threat model T14.)
-   - **LIR** for a URI in the range: DIAMETER_SUCCESS, `Server-Name` the AS
-     name, `Wildcarded-Public-Identity` the stored pattern (TS 29.228
-     §6.1.4.1 step 2, Table 6.1.4.2, where a distinct identity takes
-     precedence over a wildcard). **SAR and UAR** for it find no
-     subscription, as today: DIAMETER_ERROR_USER_UNKNOWN, so `scscf`
-     answers 404 and a REGISTER 403; a directly routed PSI has no S-CSCF.
+     `hss` refuses every IMPU whose host is `RCS_CHATBOT_DOMAIN` when it is
+     provisioned, and does not search for older ones: the host is the PSI's
+     alone. Registering a chatbot writes nothing to `hss`. (Amended in #679:
+     this said `hss` also refuses a wildcard that matches an existing IMPU,
+     which needs a table scan. An IMPU left at the host from before could
+     have been used to impersonate a chatbot, so Cx refuses it instead, as
+     below; `RCS_CHATBOT_DOMAIN` must be a fresh domain, threat model T14.)
+   - **LIR** for a URI at the chatbot host: in the range, DIAMETER_SUCCESS,
+     `Server-Name` the AS name and `Wildcarded-Public-Identity` the stored
+     pattern (TS 29.228 §6.1.4.1 step 2), even where an IMPU is stored;
+     outside it, DIAMETER_ERROR_USER_UNKNOWN. **UAR, MAR and SAR** for an
+     identity at the host: DIAMETER_ERROR_USER_UNKNOWN whatever is stored,
+     so `scscf` answers 404 and a REGISTER 403; a directly routed PSI has no
+     S-CSCF, and User-Data never lists such an identity. (Amended in #679:
+     this said a distinct identity takes precedence over a wildcard, as in
+     TS 29.228 Table 6.1.4.2; at the chatbot host it does not, which
+     docs/conformance.md records.)
    - **`scscf`**: after the originating iFC, it sends a request whose
      Request-URI is at `RCS_CHATBOT_DOMAIN` to `icscf`, as it does for the
      home domain; today such a request is 404. **`icscf`** normalises the

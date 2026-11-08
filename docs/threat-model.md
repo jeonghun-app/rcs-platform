@@ -501,19 +501,21 @@ URI at the chatbot domain that is not in normal form is 404 everywhere. The
 chatbot host is the PSI's alone (#679): `hss` refuses provisioning an IMPU at
 `RCS_CHATBOT_DOMAIN`, in any case of the host, and does not scan the table for
 older ones. An IMPU left there from before the setting could have been used to
-register and send as a chatbot URI (T13), so Cx refuses it: UAR and SAR for an
-identity at that host are DIAMETER_ERROR_USER_UNKNOWN whatever is stored, and an
-LIR in the range is answered from the PSI, not from such an IMPU. The domain must
+register and send as a chatbot URI (T13), so Cx refuses it: UAR, MAR and SAR for
+an identity at that host are DIAMETER_ERROR_USER_UNKNOWN whatever is stored,
+User-Data never lists it, so registering its implicit set does not register it,
+and an LIR in the range is answered from the PSI, not from such an IMPU. The domain must
 be fresh (runbook). Patterns follow `internal/ifc`'s ERE rules and
 work budget, at most 256 bytes. `icscf` routes only to an AS on
 `ICSCF_AS_ROUTES`. At the PSI, `rcs-as` answers OPTIONS and refuses every
 other request, and it refuses a chatbot as a group invitee.
 **Residual risk:** a subscription that still lists a chatbot-host IMPU keeps it
-in the store until its next write, which must drop it; until the Cx part of
-#679, nothing refuses its registration.
-**Status:** in progress: `hss` stores the PSI, matches it whole and with regard
-to case, and refuses IMPUs at its host (#679); the Cx answers and the other
-services are planned (#668).
+in the store until its next write, which must drop it; Cx answers as if it were
+not there. A registration of such an IMPU made before `RCS_CHATBOT_DOMAIN` was
+set lasts at the S-CSCF until its next refresh, which SAR refuses.
+**Status:** in progress: `hss` is built (#679): it stores the PSI, matches it
+whole and with regard to case, refuses IMPUs at its host, and answers Cx with
+the host PSI-only. `icscf`, `scscf`, `rcs-as` and `maap` are planned (#668).
 
 ## T15 — Subscriber identities toward chatbots
 

@@ -491,7 +491,7 @@ func (h *HSS) send(ctx context.Context, n Notifier, s *store.Subscription, p *st
 		if p == nil {
 			return errors.New("hss: the service profile could not be read for User-Data")
 		}
-		data, err := userData(s, ps.set, p)
+		data, err := h.userData(s, ps.set, p)
 		if errors.Is(err, ifc.ErrTooLarge) {
 			h.metrics.Count("userdata.too_large", 1)
 		}
