@@ -50,24 +50,56 @@ func DefaultContentTypes() ContentTypes {
 	}
 }
 
-// MatchContentType reports whether contentType is one of allowed, the
-// shared rule rcs-as and maap both apply before answering 415 (ADR 0009 §5).
+// MatchContentType returns the entry of allowed that contentType matches,
+// the shared rule rcs-as and maap both apply before answering 415 (ADR 0009
+// §5). Callers write the entry it returns into CPIM, SIP or JSON, never the
+// sender's text.
+//
 // Types, subtypes and parameter names compare without regard to case
 // (RFC 2045 §5.1), and so does a charset value (RFC 2046 §4.1.2). Every
-// parameter of the allowed entry must be present with its value. The types
-// of RCC.07 v13.0 §3.6.10.2 carry no parameter, so the only one a sender may
-// add is charset=utf-8, the only charset content may have (§5). An entry
-// that does not parse matches nothing.
-func MatchContentType(contentType string, allowed []string) bool {
+// parameter of the entry must be present with its value. The types of
+// RCC.07 v13.0 §3.6.10.2 carry no parameter, so the only one a sender may
+// add is charset=utf-8, the only charset content may have (§5). A control
+// character anywhere, even the CR, LF or tab mime.ParseMediaType would trim,
+// and an RFC 2231 parameter name ("charset*="), which clients read in
+// different ways, match nothing; so does an entry that does not parse.
+func MatchContentType(contentType string, allowed []string) (string, bool) {
+	if strings.ContainsFunc(contentType, func(r rune) bool { return r < 0x20 || r == 0x7f }) || extendedParam(contentType) {
+		return "", false
+	}
 	got, gotParams, err := mime.ParseMediaType(contentType)
 	if err != nil {
-		return false
+		return "", false
 	}
 	for _, entry := range allowed {
 		want, wantParams, err := mime.ParseMediaType(entry)
 		if err == nil && got == want && sameParams(gotParams, wantParams) {
+			return entry, true
+		}
+	}
+	return "", false
+}
+
+// extendedParam reports whether a parameter name of the media type s, as
+// written, holds "*", the mark of RFC 2231's extended and continued
+// parameters. Quoted values are skipped, so a "*" inside one is no mark.
+func extendedParam(s string) bool {
+	_, rest, _ := strings.Cut(s, ";")
+	for rest != "" {
+		name, value, _ := strings.Cut(rest, "=")
+		if strings.Contains(name, "*") {
 			return true
 		}
+		if value = strings.TrimLeft(value, " "); strings.HasPrefix(value, `"`) {
+			i := 1
+			for ; i < len(value) && value[i] != '"'; i++ {
+				if value[i] == '\\' {
+					i++
+				}
+			}
+			value = value[min(i+1, len(value)):]
+		}
+		_, rest, _ = strings.Cut(value, ";")
 	}
 	return false
 }
