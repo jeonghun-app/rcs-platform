@@ -221,7 +221,16 @@ func TestParseASRoutesRefusesOnlyWhatCannotBeUsed(t *testing.T) {
 		"name with headers": `[{"name":"sip:as.rcs.local?x=y","uri":"sip:as.rcs.local"}]`,
 		"uri with a maddr":  `[{"name":"sip:as.rcs.local","uri":"sip:as.rcs.local;maddr=192.0.2.1"}]`,
 		"repeated name":     `[` + entry + `,{"name":"sip:AS.rcs.local","uri":"sip:other.rcs.local"}]`,
-		"too many":          "[" + strings.Join(many, ",") + "]",
+		// encoding/json keeps the last of a repeated key and matches keys
+		// in any case (review of #690).
+		"a key twice":         `[{"name":"sip:evil.example","name":"sip:as.rcs.local","uri":"sip:as.rcs.local"}]`,
+		"a uri twice":         `[{"name":"sip:as.rcs.local","uri":"sip:evil.example","uri":"sip:as.rcs.local"}]`,
+		"a key twice, null":   `[{"name":null,"name":"sip:as.rcs.local","uri":"sip:as.rcs.local"}]`,
+		"name in capitals":    `[{"NAME":"sip:as.rcs.local","uri":"sip:as.rcs.local"}]`,
+		"uri in mixed case":   `[{"name":"sip:as.rcs.local","Uri":"sip:as.rcs.local"}]`,
+		"a key twice by case": `[{"name":"sip:evil.example","Name":"sip:as.rcs.local","uri":"sip:as.rcs.local"}]`,
+		"a key twice, later":  `[` + entry + `,{"uri":"sip:b.rcs.local","name":"sip:b.rcs.local","uri":"sip:evil.example"}]`,
+		"too many":            "[" + strings.Join(many, ",") + "]",
 	}
 	for name, in := range cases {
 		if got, err := ParseASRoutes([]byte(in)); err == nil {
@@ -319,7 +328,7 @@ func TestAChatbotRequestReachesTheListedASThroughRun(t *testing.T) {
 
 // ParseASRoutes either refuses its input or returns a list New accepts.
 func FuzzParseASRoutes(f *testing.F) {
-	for _, s := range []string{asRoutes, `[]`, ``, `null`, `[{"name":"sip:a.rcs.local","uri":"sip:a.rcs.local;maddr=x"}]`, asRoutes + ` x`} {
+	for _, s := range []string{asRoutes, `[]`, ``, `null`, `[{"name":"sip:a.rcs.local","NAME":"sip:b.rcs.local","uri":"sip:a.rcs.local"}]`, `[{"name":"sip:a.rcs.local","uri":"sip:a.rcs.local;maddr=x"}]`, asRoutes + ` x`} {
 		f.Add([]byte(s))
 	}
 	f.Fuzz(func(t *testing.T, data []byte) {

@@ -69,8 +69,9 @@ name is only compared with the list, by RFC 3261 §19.1.4 (so
 the URI listed with it is resolved and failed over as an S-CSCF's is
 (`icscf.as.next_address`, `icscf.as.unreachable`).
 
-`ICSCF_AS_ROUTES` is a JSON array of `name` (the AS name the HSS stores,
-`HSS_RCS_AS_URI`) and `uri` (the AS's SIP listener): SIP or SIPS URIs with a
+`ICSCF_AS_ROUTES` is a JSON array of objects with exactly two keys, each once
+and in lower case: `name` (the AS name the HSS stores, `HSS_RCS_AS_URI`) and
+`uri` (the AS's SIP listener). Both are SIP or SIPS URIs with a
 host and no user part or headers, the `uri` without `maddr`, no name twice,
 at most 64 entries. For the platform's `rcs-as`:
 

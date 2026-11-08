@@ -150,7 +150,9 @@ type ASRoute struct {
 //
 //	[{"name":"sip:rcs-as.rcs.local;transport=tcp","uri":"sip:rcs-as.rcs.local:5060;transport=tcp"}]
 //
-// An empty value, or an empty array, is no route. The list holds at most
+// The keys are exact: a key in another case, or twice in an entry, is
+// refused, as are unknown keys and data after the array. An empty value,
+// or an empty array, is no route. The list holds at most
 // MaxASRoutes entries; each name and URI is a SIP or SIPS URI with a host
 // and no user part or headers, the URI without maddr, and no name twice.
 func ParseASRoutes(data []byte) ([]ASRoute, error) {
@@ -172,6 +174,9 @@ func ParseASRoutes(data []byte) ([]ASRoute, error) {
 	if entries == nil {
 		return nil, errors.New("icscf: AS routes: not an array")
 	}
+	if err := exactKeys(data); err != nil {
+		return nil, err
+	}
 	out := make([]ASRoute, 0, len(entries))
 	for i, e := range entries {
 		if e.Name == nil || e.URI == nil {
@@ -191,6 +196,46 @@ func ParseASRoutes(data []byte) ([]ASRoute, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// exactKeys refuses what encoding/json takes quietly in data, which decodes
+// as ParseASRoutes's list: a key twice in an entry, of which it keeps the
+// last, and a key written in another case, which it matches anyway. Either
+// lets a value other than the one an operator reads win (review of #690).
+// Every value is a string or null, so keys and values alternate in each
+// object.
+func exactKeys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var seen map[string]bool
+	key := false
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil // the end: Decode has checked the rest
+		}
+		switch tok {
+		case json.Delim('{'):
+			seen, key = map[string]bool{}, true
+			continue
+		case json.Delim('}'):
+			seen = nil
+			continue
+		}
+		if seen == nil {
+			continue
+		}
+		if key {
+			k, _ := tok.(string)
+			switch {
+			case k != "name" && k != "uri":
+				return errors.New(`icscf: AS routes: a key other than "name" and "uri", in lower case`)
+			case seen[k]:
+				return errors.New("icscf: AS routes: a key twice in one entry")
+			}
+			seen[k] = true
+		}
+		key = !key
+	}
 }
 
 // checkASRoutes refuses a list ParseASRoutes would not give.
