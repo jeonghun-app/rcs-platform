@@ -27,9 +27,12 @@ var ErrInvalidContent = errors.New("chatbot: invalid content")
 // is UTF-8 with no C0 control but tab, CR and LF, and content of a JSON type
 // (application/json or a +json suffix, RFC 6839 §3.1) is one JSON value with
 // no duplicate key, at most MaxJSONDepth deep, with arrays of at most
-// MaxJSONArray elements and only numbers a float64 holds. It does not check
-// the size, which is the caller's to bound, or the type, which is the
-// caller's to match against its ContentTypes.
+// MaxJSONArray elements and only numbers a float64 holds. In JSON the C0
+// rule holds for every string and key once its escapes are decoded, since
+// that is what a client's parser shows, and an escape of half a surrogate
+// pair, which parsers decode each their own way, is refused. It does not
+// check the size, which is the caller's to bound, or the type, which is the
+// caller's to match with [MatchContentType].
 func ValidateContent(contentType string, body []byte) error {
 	if !utf8.Valid(body) {
 		return refuse(ErrInvalidContent, "not UTF-8")
@@ -43,17 +46,32 @@ func ValidateContent(contentType string, body []byte) error {
 	if base = strings.ToLower(strings.TrimSpace(base)); base != "application/json" && !strings.HasSuffix(base, "+json") {
 		return nil
 	}
-	return walkJSON(body, walker{kind: ErrInvalidContent, maxDepth: MaxJSONDepth, maxArray: MaxJSONArray}, nil)
+	w := walker{kind: ErrInvalidContent, maxDepth: MaxJSONDepth, maxArray: MaxJSONArray, decodedControls: true}
+	if err := walkJSON(body, w, nil); err != nil {
+		return err
+	}
+	if loneSurrogate(body) {
+		return refuse(ErrInvalidContent, "an escape of half a surrogate pair")
+	}
+	return nil
+}
+
+// hasControl reports whether s holds a C0 control other than tab, CR or LF.
+func hasControl(s string) bool {
+	return strings.ContainsFunc(s, func(r rune) bool { return r < 0x20 && r != '\t' && r != '\r' && r != '\n' })
 }
 
 // walker reads one JSON value token by token and refuses it as kind when it
 // breaks a bound. With a type (envelopes), objects must be structs of that
 // type, keys must name their fields exactly, and keys that differ only in
 // case are refused; without one (content), any value is walked.
+// decodedControls refuses decoded strings and keys that hold a C0 control
+// other than tab, CR or LF.
 type walker struct {
 	kind               error
 	dec                *json.Decoder
 	maxDepth, maxArray int
+	decodedControls    bool
 }
 
 // walkJSON walks data as one JSON value of type t, or of any type when t is
@@ -61,7 +79,7 @@ type walker struct {
 func walkJSON(data []byte, w walker, t reflect.Type) error {
 	w.dec = json.NewDecoder(bytes.NewReader(data))
 	w.dec.UseNumber()
-	if err := w.value(0, t, 0); err != nil {
+	if err := w.value(0, t, 0, false); err != nil {
 		return err
 	}
 	if _, err := w.dec.Token(); err != io.EOF {
@@ -71,14 +89,23 @@ func walkJSON(data []byte, w walker, t reflect.Type) error {
 }
 
 // value walks the next value, inside depth containers. maxLen bounds a
-// string of type t, from its field's tag.
-func (w *walker) value(depth int, t reflect.Type, maxLen int) error {
+// string of type t, from its field's tag; element says the value is an
+// array element.
+func (w *walker) value(depth int, t reflect.Type, maxLen int, element bool) error {
 	tok, err := w.dec.Token()
 	if err != nil {
 		return refuse(w.kind, "not JSON")
 	}
-	if t != nil && tok == nil && (t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice) {
-		return nil // absent, as encoding/json writes a nil pointer or slice
+	if t != nil && tok == nil {
+		switch {
+		case element:
+			// An element cannot be absent, and a nil one would reach the
+			// handler.
+			return refuse(w.kind, "null as an array element")
+		case t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice:
+			return nil // absent, as encoding/json writes a nil pointer or slice
+		}
+		return refuse(w.kind, "null for a field that is not optional")
 	}
 	if t != nil && t.Kind() == reflect.Pointer {
 		t = t.Elem()
@@ -100,9 +127,8 @@ func (w *walker) value(depth int, t reflect.Type, maxLen int) error {
 		if t != nil && t.Kind() == reflect.String && len(v) > maxLen {
 			return refuse(w.kind, "a string longer than its field allows")
 		}
-	case nil:
-		if t != nil {
-			return refuse(w.kind, "null for a field that is not optional")
+		if w.decodedControls && hasControl(v) {
+			return refuse(w.kind, "an escaped control character other than tab, CR or LF")
 		}
 	}
 	return nil
@@ -127,6 +153,9 @@ func (w *walker) object(depth int, t reflect.Type) error {
 			return refuse(w.kind, "a duplicate key")
 		}
 		seen[key] = true
+		if w.decodedControls && hasControl(key) {
+			return refuse(w.kind, "an escaped control character other than tab, CR or LF")
+		}
 		var f field
 		if t != nil {
 			k := foldKey(key)
@@ -139,7 +168,7 @@ func (w *walker) object(depth int, t reflect.Type) error {
 				return refuse(w.kind, "an unknown field")
 			}
 		}
-		if err := w.value(depth, f.typ, f.maxLen); err != nil {
+		if err := w.value(depth, f.typ, f.maxLen, false); err != nil {
 			return err
 		}
 	}
@@ -158,7 +187,7 @@ func (w *walker) array(depth int, t reflect.Type, maxLen int) error {
 		if n > w.maxArray {
 			return refuse(w.kind, "an array of more than "+strconv.Itoa(w.maxArray)+" elements")
 		}
-		if err := w.value(depth, elem, maxLen); err != nil {
+		if err := w.value(depth, elem, maxLen, true); err != nil {
 			return err
 		}
 	}

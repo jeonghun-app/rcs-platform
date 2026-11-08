@@ -17,6 +17,8 @@ func TestValidContentIsAccepted(t *testing.T) {
 		"JSON at the depth":     {"application/json", deep},
 		"array at the bound":    {SuggestionResponseType, long},
 		"keys in two cases":     {ChipListType, `{"text":1,"Text":2}`},
+		"escaped tab, LF, CR":   {RichCardType, `{"t\u0009":"a\u000a\u000d\t"}`},
+		"escaped pair":          {RichCardType, `["\ud83d\ude00"]`},
 		"parameters and case":   {"Application/Vnd.GSMA.Botmessage.v1.0+JSON; charset=utf-8", `"s"`},
 	}
 	for name, tc := range tests {
@@ -32,6 +34,11 @@ func TestInvalidContentIsRefusedWithItsReason(t *testing.T) {
 	tests := map[string]struct{ contentType, body, reason string }{
 		"not UTF-8":        {"text/plain", "secret \xff", "not UTF-8"},
 		"NUL":              {"text/plain", "secret \x00", "a control character other than tab, CR or LF"},
+		"unit separator":   {"text/plain", "secret \x1f", "a control character other than tab, CR or LF"},
+		"escaped NUL":      {RichCardType, `{"secret":"\u0000"}`, "an escaped control character other than tab, CR or LF"},
+		"escaped ESC key":  {RichCardType, `{"\u001b[2J":"secret"}`, "an escaped control character other than tab, CR or LF"},
+		"lone low escape":  {RichCardType, `["secret\udc00"]`, "an escape of half a surrogate pair"},
+		"lone high key":    {RichCardType, `{"\ud800":"secret"}`, "an escape of half a surrogate pair"},
 		"escape character": {RichCardType, "{\"secret\":\"\x1b[2J\"}", "a control character other than tab, CR or LF"},
 		"two values":       {RichCardType, `{"secret":1} {}`, "data after the JSON value"},
 		"trailing data":    {RichCardType, `{"secret":1}x`, "data after the JSON value"},

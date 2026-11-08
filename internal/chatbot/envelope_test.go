@@ -2,8 +2,10 @@ package chatbot
 
 import (
 	"errors"
+	"math"
 	"strings"
 	"testing"
+	"time"
 )
 
 type testItem struct {
@@ -15,12 +17,13 @@ type testNest struct {
 }
 
 type testEnvelope struct {
-	Body  string     `json:"body" maxbytes:"64"`
-	Count int        `json:"count"`
-	Tags  []string   `json:"tags" maxbytes:"8"`
-	Item  *testItem  `json:"item"`
-	Items []testItem `json:"items"`
-	Nest  *testNest  `json:"nest"`
+	Body  string      `json:"body" maxbytes:"64"`
+	Count int         `json:"count"`
+	Tags  []string    `json:"tags" maxbytes:"8"`
+	Item  *testItem   `json:"item"`
+	Items []testItem  `json:"items"`
+	Nest  *testNest   `json:"nest"`
+	Refs  []*testItem `json:"refs"`
 }
 
 func decode(data string) (testEnvelope, error) {
@@ -37,6 +40,40 @@ func TestAStrictEnvelopeDecodes(t *testing.T) {
 	}
 	if e.Body != `hi 😀 \ud800` || e.Count != 3 || len(e.Tags) != 8 || e.Item != nil || e.Items[0].Kind != "x" || e.Nest.Next.Next == nil {
 		t.Errorf("decoded %+v", e)
+	}
+}
+
+func TestStringsAtTheirBoundAndEscapedSurrogatePairsDecode(t *testing.T) {
+	e, err := decode(`{"body":"` + strings.Repeat("s", 60) + `\ud83d\ude00","tags":["12345678","\u00e9"],"refs":[{"kind":"x"}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e.Body != strings.Repeat("s", 60)+"😀" || len(e.Body) != 64 || e.Tags[0] != "12345678" || e.Tags[1] != "é" || e.Refs[0].Kind != "x" {
+		t.Errorf("decoded %+v", e)
+	}
+}
+
+// Fields encoding/json skips, unexported or tagged "-", are no keys.
+func TestSkippedFieldsAreUnknownKeys(t *testing.T) {
+	var e struct {
+		Skip   string `json:"-"`
+		hidden string
+		Body   string `json:"body" maxbytes:"8"`
+	}
+	if err := DecodeEnvelope(strings.NewReader(`{"body":"x"}`), 64, &e); err != nil || e.Body != "x" {
+		t.Fatalf("DecodeEnvelope = %v, %+v", err, e)
+	}
+	for _, data := range []string{`{"Skip":"x"}`, `{"-":"x"}`, `{"hidden":"x"}`} {
+		if err := DecodeEnvelope(strings.NewReader(data), 64, &e); reasonOf(err) != "an unknown field" {
+			t.Errorf("%s: %v, want an unknown field", data, err)
+		}
+	}
+}
+
+func TestAnEnvelopeDecodesWithTheLargestLimit(t *testing.T) {
+	var e testEnvelope
+	if err := DecodeEnvelope(strings.NewReader(`{"count":1}`), math.MaxInt64, &e); err != nil || e.Count != 1 {
+		t.Errorf("DecodeEnvelope = %v, %+v", err, e)
 	}
 }
 
@@ -60,6 +97,11 @@ func TestAnEnvelopeBreakingARuleIsRefusedWithItsReason(t *testing.T) {
 		"not an object":         {`["secret"]`, "an array where its field holds another type"},
 		"high surrogate alone":  {`{"body":"secret\ud800"}`, "an escape of half a surrogate pair"},
 		"low surrogate alone":   {`{"body":"secret\udc00x"}`, "an escape of half a surrogate pair"},
+		"high, then a letter":   {`{"body":"secret\ud800A"}`, "an escape of half a surrogate pair"},
+		"high, then not low":    {`{"body":"secret\ud800\u0041"}`, "an escape of half a surrogate pair"},
+		"null pointer element":  {`{"refs":[{"kind":"secret"},null]}`, "null as an array element"},
+		"null string element":   {`{"tags":[null]}`, "null as an array element"},
+		"null struct element":   {`{"items":[null]}`, "null as an array element"},
 		"not UTF-8":             {"{\"body\":\"secret\xff\"}", "not UTF-8"},
 		"empty":                 {"", "not JSON"},
 	}
@@ -92,11 +134,36 @@ func TestAnEnvelopeTypeWithoutBoundsPanics(t *testing.T) {
 		"nested without maxbytes": &struct {
 			I []struct{ S *string } `json:"i"`
 		}{},
-		"map":       &struct{ M map[string]int }{},
-		"any":       &struct{ A any }{},
-		"[]byte":    &struct{ B []byte }{},
-		"no struct": new(string),
-		"nil":       (*testEnvelope)(nil),
+		"map": &struct{ M map[string]int }{},
+		"same JSON name": &struct {
+			A string `json:"B" maxbytes:"1"`
+			B string `maxbytes:"1"`
+		}{},
+		"JSON names in two cases": &struct {
+			A string `json:"x" maxbytes:"1"`
+			B string `json:"X" maxbytes:"1"`
+		}{},
+		"pointer to a pointer": &struct {
+			P **string `json:"p" maxbytes:"4"`
+		}{},
+		"time.Time": &struct {
+			T time.Time `json:"t"`
+		}{},
+		"pointer to time.Time": &struct {
+			T *time.Time `json:"t"`
+		}{},
+		"TextUnmarshaler element": &struct {
+			X []textOnly `json:"x"`
+		}{},
+		"type that decodes itself": &selfDecoding{},
+		",string": &struct {
+			N int `json:"n,string"`
+		}{},
+		"embedded struct": &struct{ testItem }{},
+		"any":             &struct{ A any }{},
+		"[]byte":          &struct{ B []byte }{},
+		"no struct":       new(string),
+		"nil":             (*testEnvelope)(nil),
 	}
 	for name, v := range tests {
 		func() {
@@ -109,3 +176,13 @@ func TestAnEnvelopeTypeWithoutBoundsPanics(t *testing.T) {
 		}()
 	}
 }
+
+type textOnly int
+
+func (*textOnly) UnmarshalText([]byte) error { return nil }
+
+type selfDecoding struct {
+	S string `json:"s" maxbytes:"1"`
+}
+
+func (*selfDecoding) UnmarshalJSON([]byte) error { return nil }
