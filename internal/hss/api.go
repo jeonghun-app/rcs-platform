@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/ifcjson"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
@@ -125,6 +126,11 @@ type APIOptions struct {
 	StoreTimeout time.Duration
 	// Now is the clock of the rate limits; time.Now when nil.
 	Now func() time.Time
+	// ChatbotDomain is RCS_CHATBOT_DOMAIN, and ChatbotASName the AS name a
+	// wildcarded PSI written through the API gets (HSS_RCS_AS_URI), never
+	// one from a request. The zero Domain means no chatbots.
+	ChatbotDomain chatbot.Domain
+	ChatbotASName string
 }
 
 // DefaultAPIStoreTimeout bounds the store work of one API request. Without
@@ -161,6 +167,8 @@ type API struct {
 	staleReserve   time.Duration
 	storeTimeout   time.Duration
 	workers        int
+	chatbotDomain  chatbot.Domain
+	chatbotAS      string
 
 	mu      sync.Mutex
 	fanouts map[string]context.CancelFunc
@@ -174,6 +182,7 @@ func (h *HSS) NewAPI(o APIOptions) *API {
 	a := &API{
 		h: h, mux: http.NewServeMux(), notifier: o.Notifier, defaultProfile: o.DefaultProfile,
 		pushTimeout: o.PushTimeout, pushBudget: o.PushBudget, workers: o.FanoutWorkers, fanouts: map[string]context.CancelFunc{},
+		chatbotDomain: o.ChatbotDomain, chatbotAS: o.ChatbotASName,
 	}
 	if a.pushTimeout <= 0 {
 		a.pushTimeout = DefaultPushTimeout
@@ -234,6 +243,8 @@ func (h *HSS) NewAPI(o APIOptions) *API {
 	a.route("GET /v1/service-profiles/{id}", "get_profile", admin, a.getProfile)
 	a.route("PUT /v1/service-profiles/{id}", "put_profile", admin, a.putProfile)
 	a.route("DELETE /v1/service-profiles/{id}", "delete_profile", admin, a.deleteProfile)
+	a.route("GET /v1/chatbot-psi", "get_chatbot_psi", admin, a.getChatbotPSI)
+	a.route("PUT /v1/chatbot-psi", "put_chatbot_psi", admin, a.putChatbotPSI)
 	return a
 }
 
@@ -277,7 +288,8 @@ func (a *API) route(pattern, name string, allowed Scope, h handler) {
 		rec := &statusRecorder{ResponseWriter: w}
 		ctx, cancel := context.WithTimeout(r.Context(), a.storeTimeout)
 		defer cancel()
-		r = r.WithContext(ctx)
+		var notes []slog.Attr
+		r = r.WithContext(context.WithValue(ctx, auditNotesKey{}, &notes))
 		tok, err := a.authenticate(r, allowed)
 		var caller Scope
 		if tok != nil {
@@ -291,15 +303,26 @@ func (a *API) route(pattern, name string, allowed Scope, h handler) {
 		}
 		a.h.metrics.Count("api."+name+"."+strconv.Itoa(rec.status), 1)
 		a.h.metrics.Timing("api."+name, time.Since(start))
-		a.audit(r, name, tok, rec.status)
+		a.audit(r, name, tok, rec.status, notes...)
 	})
+}
+
+type auditNotesKey struct{}
+
+// noteAudit adds attributes to the request's audit line, for a change the
+// line must show, such as a wildcarded PSI's value before and after.
+func noteAudit(r *http.Request, attrs ...slog.Attr) {
+	if notes, ok := r.Context().Value(auditNotesKey{}).(*[]slog.Attr); ok {
+		*notes = append(*notes, attrs...)
+	}
 }
 
 // audit logs who did what to which subscription (ADR 0007 §3): every
 // request authenticated with a token, the token's slot, and the outcome.
 // The IMPI is masked like every identifier; the path, the body and the
-// token itself are never logged.
-func (a *API) audit(r *http.Request, operation string, tok *acceptedToken, status int) {
+// token itself are never logged. A handler may add what its change needs
+// shown (noteAudit).
+func (a *API) audit(r *http.Request, operation string, tok *acceptedToken, status int, notes ...slog.Attr) {
 	attrs := []slog.Attr{slog.String("operation", operation), slog.Int("status", status)}
 	if tok != nil {
 		attrs = append(attrs, slog.String("caller", tok.scope.String()), slog.String("token", tok.slot))
@@ -312,6 +335,7 @@ func (a *API) audit(r *http.Request, operation string, tok *acceptedToken, statu
 	if id := r.PathValue("id"); id != "" {
 		attrs = append(attrs, slog.String("profile", pii.Redact(id)))
 	}
+	attrs = append(attrs, notes...)
 	a.h.log.LogAttrs(r.Context(), slog.LevelInfo, "audit: provisioning request", attrs...)
 }
 

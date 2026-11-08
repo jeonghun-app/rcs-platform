@@ -101,3 +101,43 @@ aws ecs describe-services --region "$REGION" --cluster "$STACK" --services ft-se
 
 **Verify.** The alarm returns to `OK` once 5 minutes pass without either
 metric.
+
+## hss
+
+### The chatbot range
+
+Not an alarm: the steps to turn the chatbot range on (ADR 0009 §3,
+[hss](hss.md#data-model)).
+
+Not yet wired end to end: the infrastructure parameter that sets
+`RCS_CHATBOT_DOMAIN` comes with #684, and the stored PSI routes nothing until the
+Cx part of #679 lands.
+
+1. Choose `RCS_CHATBOT_DOMAIN`, normally
+   `botplatform.mnc<MNC>.mcc<MCC>.3gppnetwork.org`. It must be a **fresh**
+   domain: no subscriber IMPU may ever have used it. The chatbot host is the
+   PSI's alone. `hss` refuses IMPUs at it once it is set, and the Cx part of
+   #679 refuses to register one, but `hss` does not search for IMPUs
+   provisioned before:
+   such a subscription keeps its other identities working and must drop the
+   chatbot-host IMPU at its next write. Do not reuse `RCS_IMS_DOMAIN` (refused at
+   start) or a domain retired from subscribers.
+2. Set the same `RCS_CHATBOT_DOMAIN` on **every** service (`hss`, `icscf`,
+   `scscf`, `rcs-as`, `maap`): they must agree on which URIs are chatbots
+   (threat model T14). Set `HSS_RCS_AS_URI` on `hss` (the AS the range is
+   routed to) and deploy.
+3. Write the PSI with the operator token. The ERE is `internal/chatbot`'s
+   `UserPartERE`; inside the JSON string its backslash is written `\\`:
+
+   ```bash
+   curl -sS -X PUT "http://hss.rcs.local:8081/v1/chatbot-psi" \
+     -H "Authorization: Bearer $HSS_ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     --data '{"psi":"sip:![a-z0-9-]{1,63}(\\.[a-z0-9-]{1,63})?!@botplatform.mnc001.mcc001.3gppnetwork.org"}'
+   ```
+
+   Replace the namespace (`rcs.local`) and the domain with yours. The answer is
+   201 (or 200 when it replaces one) with the stored PSI; a 400 names the rule
+   broken, and a 409 means `RCS_CHATBOT_DOMAIN` is unset on `hss`. The audit
+   line `audit: provisioning request` with operation `put_chatbot_psi` records
+   the write, its value before and after masked.

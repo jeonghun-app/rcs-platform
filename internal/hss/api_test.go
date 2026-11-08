@@ -205,7 +205,7 @@ func TestAPIAnswers401ForAMissingOrWrongToken(t *testing.T) {
 // The scope table of docs/api/hss-scopes.md, checked operation by
 // operation: every caller outside an operation's scope gets 403.
 func TestEveryOperationRefusesCallersOutsideItsScope(t *testing.T) {
-	a := newAPIEnv(t)
+	a := newChatbotAPIEnv(t)
 	a.create(impi1, true, impu1)
 	profile := `{"id":"p","initial_filter_criteria":[]}`
 	for _, c := range []struct {
@@ -224,6 +224,8 @@ func TestEveryOperationRefusesCallersOutsideItsScope(t *testing.T) {
 		{"PUT", "/v1/service-profiles/p", profile, []string{"admin"}},
 		{"DELETE", "/v1/service-profiles/p", "", []string{"admin"}},
 		{"DELETE", subPath(impi2), "", []string{"admin"}},
+		{"PUT", "/v1/chatbot-psi", psiBody(chatbotPSI), []string{"admin"}},
+		{"GET", "/v1/chatbot-psi", "", []string{"admin"}},
 	} {
 		for caller, tok := range map[string]string{"admin": adminToken, "acs": acsToken, "ft": ftToken} {
 			code, body, _ := a.do(c.method, c.path, tok, c.body)

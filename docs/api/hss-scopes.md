@@ -26,6 +26,10 @@ asks for next to the API.
 | `GET /v1/subscriptions/{impi}/ft-credential` | | | yes |
 | `POST /v1/service-profiles` | yes | | |
 | `GET`, `PUT`, `DELETE /v1/service-profiles/{id}` | yes | | |
+| `GET`, `PUT /v1/chatbot-psi` | yes | | |
+
+The wildcarded chatbot PSI routes a whole range of URIs to an AS (ADR 0009 §3), so
+only the operator reads or writes it; `acs` and `ft-server` get 403.
 
 The FT credential's HA1 is readable by `ft-server` alone: the operator and `acs`
 can issue a new password but never read a stored credential.
@@ -37,6 +41,7 @@ can issue a new password but never read a stored credential.
 | 503 | no token is configured that may use the operation (also: the store is unavailable; both with `Retry-After`) |
 | 401 | no bearer token, or one that is not accepted (`WWW-Authenticate: Bearer`) |
 | 403 | the token's caller is not allowed the operation |
+| 409 | `PUT /v1/chatbot-psi` with `RCS_CHATBOT_DOMAIN` unset: there is no chatbot range |
 | 404 | no such subscription; for `acs`, also a subscription without `acs_managed`, with the same body, so an `acs` token cannot tell which IMPIs exist outside its scope; for `ft-server`, also a user name that is not an IMPI, or no FT credential |
 | 429 | an `acs` token is over `HSS_ACS_RATE` requests per second (burst `HSS_ACS_BURST`), with `Retry-After`. The bucket is per token slot and per task, so one caller gets at most rate × tasks × 2 |
 | 500 | the stored subscription cannot be used (corrupt record, a secret that does not open); retrying does not help |
@@ -53,4 +58,6 @@ can issue a new password but never read a stored credential.
   slot (`current` or `next`) each request used, which shows when the old token is
   no longer in use.
 - Every request is audited (`audit: provisioning request`): operation, caller, token
-  slot, status and the masked IMPI. Tokens, bodies and paths are never logged.
+  slot, status and the masked IMPI; a write of the chatbot PSI also its value
+  before and after, each masked whole as one opaque value, and its new version. Tokens, bodies and
+  paths are never logged.

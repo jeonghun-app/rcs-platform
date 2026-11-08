@@ -142,6 +142,10 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 		"API timeout beyond 10 s":   {with(devEnv, "HSS_API_TIMEOUT", "11s"), "HSS_API_TIMEOUT"},
 		"bad networks":              {with(devEnv, "HSS_DIAMETER_PEER_NETWORKS", "10.0.0.1/8"), "HSS_DIAMETER_PEER_NETWORKS"},
 		"no IMS domain":             {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
+		"chatbot domain is the IMS": {with(devEnv, "RCS_CHATBOT_DOMAIN", domain), "RCS_CHATBOT_DOMAIN"},
+		// The chatbot range's AS name is HSS_RCS_AS_URI, so it is checked
+		// although no default profile is created.
+		"chatbot AS name": {with(devEnv, "RCS_CHATBOT_DOMAIN", botDomain, "HSS_CREATE_DEFAULT_PROFILE", "false", "HSS_RCS_AS_URI", "http://rcs-as"), "HSS_RCS_AS_URI"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := configure(c.env)
@@ -154,6 +158,12 @@ func TestInvalidSettingsAreReported(t *testing.T) {
 	c, err := configure(with(devEnv, "HSS_RCS_AS_URI", "sip:rcs-as.rcs.local:5070", "HSS_CREATE_DEFAULT_PROFILE", "false", "HSS_DEFAULT_PROFILE", "mine"))
 	if err != nil || c.CreateDefaultProfile || c.DefaultProfile != "mine" || c.RCSASURI != "sip:rcs-as.rcs.local:5070" {
 		t.Errorf("explicit settings: %v %+v", err, c)
+	}
+	if c, err := configure(with(devEnv, "RCS_CHATBOT_DOMAIN", botDomain)); err != nil || c.ChatbotDomain.Name() != botDomain {
+		t.Errorf("RCS_CHATBOT_DOMAIN: %v %q", err, c.ChatbotDomain.Name())
+	}
+	if c, err := configure(devEnv); err != nil || c.ChatbotDomain.Name() != "" {
+		t.Errorf("no RCS_CHATBOT_DOMAIN: %v %q", err, c.ChatbotDomain.Name())
 	}
 	if c, err := configure(with(devEnv, "HSS_START_TIMEOUT", "240s")); err != nil || c.StartTimeout != 240*time.Second {
 		t.Errorf("a 240 s start-up: %v %v", err, c.StartTimeout)
