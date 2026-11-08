@@ -232,6 +232,8 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    - **Validation.** Bodies are UTF-8 without C0 controls other than tab,
      CR and LF. A JSON type must be one JSON value without duplicate keys, at
      most 32 deep, with arrays of at most 1,000 elements and finite numbers.
+     In a JSON type these rules hold for every string and key once its
+     escapes are decoded, and an escape of half a surrogate pair is refused.
      Its schema (§3.6.10.4) is not checked: otherwise the content is opaque
      (residual risk in threat model T16).
 6. **API**, JSON under `/v1/`, specified in `docs/api/maap.yaml` by the
@@ -259,6 +261,11 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    push suits a webhook-style client such as chatbot-framework, and pull can
    follow without changing the send side. `/v1/` contracts only grow, since
    a rolling update runs two versions at once.
+
+   Strict decoding (§9) refuses unknown fields, so a receiver ships support
+   for a new field at least one release before any sender emits it. During a
+   rolling update, senders do not emit fields the oldest running receiver
+   does not know.
 7. **Who may call what.**
    - **Exposure (U3).** The chatbot API is public through the ALB on its own
      host name, `MAAP_PUBLIC_HOST`, HTTPS only in staging and prod (ADR

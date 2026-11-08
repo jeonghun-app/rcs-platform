@@ -81,7 +81,7 @@ internal/
                             DTD, depth, one root, attributes, character references
   chatbot/                  what every service applies alike to chatbots (ADR 0009):
                             the chatbot URI normal form and RCS_CHATBOT_DOMAIN,
-                            size bounds and default content types
+                            content checks, the strict JSON envelope decoder
   ftserver/                 ft-server service logic
   ftserver/store/           ft-server storage interfaces, memory backends,
                             storetest contract
