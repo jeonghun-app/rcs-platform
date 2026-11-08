@@ -699,7 +699,12 @@ surviving task, usually its next registration or refresh, or
 try, and any registration or refresh reads the queue and reaches a
 surviving task. Covering them would cost a write for every unreachable
 result, to save a wait the retry backoff, up to `RCSAS_MAX_RETRY_INTERVAL`,
-already allows.
+already allows. A task that dies after the sweep freed a claim and before
+it read the queue leaves the message free and out of the claims index, so
+it waits the same way for the recipient's next event; the sweep frees a
+page of claims before it reads their queues, so that window is usually
+tens of milliseconds, and at worst a page's store calls, the engine's
+`Batch` (50) times `RCSAS_STORE_TIMEOUT`.
 
 `Close` takes no new work, then lets the attempts in progress finish, for at
 most a delivery and two store calls, before it cancels the rest. The store
@@ -1379,7 +1384,8 @@ The table's properties:
   removal takes it out), and a sweep with nothing ended 16 queries of an
   empty bucket, half a read unit each: about 8 read units per task per
   `RCSAS_SWEEP_INTERVAL`. A claim left past its lease costs one more write
-  to free it, and a read of its queue on each task that finds it.
+  to free it, billed at the queue item's size like any release, and a read
+  of its queue on each task that finds it.
 - **Older tasks.** The claims index is keyed on attributes every image
   writes the same way, so during a rolling update an older task's claims
   are in it too, and found once their lease ends.
