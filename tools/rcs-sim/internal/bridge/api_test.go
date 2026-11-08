@@ -419,6 +419,43 @@ func TestMessagesSentAfterTheStreamOpensAreNotHeldBehindARefusedOne(t *testing.T
 	}
 }
 
+// A request on the events path that fails the WebSocket handshake opens no
+// stream, so it refreshes nobody: a refresh then would have rcs-as send
+// again to no stream, and cost a challenge of scscf's budget for nothing.
+// What was refused stays for the stream that does open (QA on #664).
+func TestARequestThatFailsTheHandshakeLeavesTheRefusedForTheNextStream(t *testing.T) {
+	var log lockedLog
+	h := newHarness(t, func(c *Config) { c.Logger = slog.New(slog.NewJSONHandler(&log, nil)) })
+	h.online("car")
+	h.online("phone")
+	phone := msisdnPrefix + "001"
+	h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "x", "message_id": "kept"})
+	if n := h.net.storedFor(phone); n != 1 {
+		t.Fatalf("%d messages kept for the phone, want the one it refused", n)
+	}
+	if status, _ := h.call(http.MethodGet, "/v1/events", nil); status != http.StatusUpgradeRequired {
+		t.Fatalf("answered %d, want 426", status)
+	}
+	// The take is answered before the 426 when it is there at all, so
+	// this needs no waiting.
+	h.b.hub.mu.Lock()
+	n := len(h.b.hub.refused)
+	h.b.hub.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d endpoints kept after a failed handshake, want the phone", n)
+	}
+	ev := h.events()
+	if m := ev.await("message", "phone"); m["message_id"] != "kept" {
+		t.Fatalf("message event %v", m)
+	}
+	eventually(t, "the refreshes are done", func() bool {
+		return strings.Count(log.String(), `"msg":"registrations refreshed once a stream opened"`) == 1
+	})
+	if r := h.net.refreshesOf(phone); r != 1 {
+		t.Fatalf("the phone refreshed %d times, want once, for the stream that opened", r)
+	}
+}
+
 // A message id the endpoint showed once stays displayable when a later
 // message with the same id is refused.
 func TestARefusedRepeatKeepsTheMessageShownBefore(t *testing.T) {
