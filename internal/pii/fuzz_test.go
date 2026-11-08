@@ -12,8 +12,9 @@ import (
 
 // FuzzRedact checks the guarantee services rely on: whatever the input, keyed
 // or not, the output has no run of minRun or more decimal digits of any
-// script and no number written in groups, in any script's digits, that
-// Redact promises to mask, and valid UTF-8 stays valid. The grouped
+// script, no number written in groups, in any script's digits, that
+// Redact promises to mask, and no alias ID in a sip or sips URI, and valid
+// UTF-8 stays valid. The grouped
 // rules are restated here independently of numberAt: a national number is any
 // group of two or more digits starting with 0, not preceded by a letter or
 // digit, followed by eight digits in total. The one documented exception is
@@ -22,6 +23,8 @@ import (
 var (
 	groupedInternational = regexp.MustCompile(`\+[0-9](?:[ ().-]{0,2}[0-9]){7,}`)
 	groupedNational      = regexp.MustCompile(`^0[0-9](?:[ ().-]{0,2}[0-9]){6,}`)
+	// An alias's ID before its "@" (ADR 0009 §10), in either case.
+	unmaskedAlias = regexp.MustCompile(`(?i)sips?:[a-z2-7]{26}@`)
 )
 
 // nationalNumberIn returns a national number left in s, if any. A match counts
@@ -93,6 +96,10 @@ func FuzzRedact(f *testing.F) {
 		"+1 \u200b(555) 010-0001 +1 \u2066(555)\u2069 010-0001 010-\u200b-0000-0001",
 		"sips:urn:gsma:imei:\u3000555\u3000010@x sip:ims.example.com経由\u3000０３\u3000１２３４",
 		"0900〜1800 sip:+1\u00a0555\u00a0010\u00a00001@x",
+		// maap aliases (#714).
+		"From: <sip:aliasforthetestsonly23456a@alias.example.net;user=rcstk>",
+		`{"to":"SIP:SECONDTESTALIASONLY234567A@ALIAS.EXAMPLE.NET;USER=RCSTK"}`,
+		"sips:aliasforthetestsonly\u200b23456a@x sip:sip:secondtestaliasonly234567a@x",
 	} {
 		f.Add(s, false)
 		f.Add(s, true)
@@ -121,6 +128,9 @@ func FuzzRedact(f *testing.F) {
 			}
 			if m := nationalNumberIn(asciiForm(a)); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the number %q", s, a, m)
+			}
+			if m := unmaskedAlias.FindString(a); m != "" {
+				t.Fatalf("redacting %q gave %q, which keeps the alias %q", s, a, m)
 			}
 		}
 		if !strings.ContainsRune(s, ':') && !strings.ContainsFunc(s, unicode.IsDigit) && out != s {
