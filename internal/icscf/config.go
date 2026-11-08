@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -37,6 +38,8 @@ const (
 	// MaxSCSCFs bounds the configured S-CSCF list, which every selection by
 	// capability walks.
 	MaxSCSCFs = 64
+	// MaxASRoutes bounds ICSCF_AS_ROUTES, which every chatbot request walks.
+	MaxASRoutes = 64
 )
 
 // HSS is the part of *cxclient.Client the I-CSCF uses (TS 29.228 §6.1.1,
@@ -115,7 +118,7 @@ func ParseSCSCFs(data []byte) ([]SCSCF, error) {
 }
 
 func (s SCSCF) validate() error {
-	if !s.URI.IsSIP() || s.URI.Host == "" || s.URI.User != "" || len(s.URI.Headers) > 0 {
+	if !serverURI(s.URI) {
 		return errors.New("uri must be a SIP or SIPS URI with a host and no user part or headers")
 	}
 	return nil
@@ -130,6 +133,138 @@ func checkDistinct(list []SCSCF) error {
 		}
 	}
 	return nil
+}
+
+// ASRoute is an application server icscf may route a chatbot URI to
+// (ICSCF_AS_ROUTES, ADR 0009 §3, memo H6): Name is the Server-Name the HSS
+// gives for it in an LIA, URI where icscf sends the request. The name is
+// only compared, never resolved, so an HSS answer cannot send a request
+// anywhere the operator did not list.
+type ASRoute struct {
+	Name sip.URI
+	URI  sip.URI
+}
+
+// ParseASRoutes reads the ICSCF_AS_ROUTES setting: a JSON array of objects
+// with a "name" and a "uri", such as
+//
+//	[{"name":"sip:rcs-as.rcs.local;transport=tcp","uri":"sip:rcs-as.rcs.local:5060;transport=tcp"}]
+//
+// The keys are exact: a key in another case, or twice in an entry, is
+// refused, as are unknown keys and data after the array. An empty value,
+// or an empty array, is no route. The list holds at most
+// MaxASRoutes entries; each name and URI is a SIP or SIPS URI with a host
+// and no user part or headers, the URI without maddr, and no name twice.
+func ParseASRoutes(data []byte) ([]ASRoute, error) {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil, nil
+	}
+	var entries []struct {
+		Name *string `json:"name"`
+		URI  *string `json:"uri"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&entries); err != nil {
+		return nil, fmt.Errorf("icscf: AS routes: %w", err)
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, errors.New("icscf: AS routes: trailing data after the array")
+	}
+	if entries == nil {
+		return nil, errors.New("icscf: AS routes: not an array")
+	}
+	if err := exactKeys(data); err != nil {
+		return nil, err
+	}
+	out := make([]ASRoute, 0, len(entries))
+	for i, e := range entries {
+		if e.Name == nil || e.URI == nil {
+			return nil, fmt.Errorf("icscf: AS route %d needs a name and a uri", i)
+		}
+		name, err := sip.ParseURI(*e.Name)
+		if err != nil {
+			return nil, fmt.Errorf("icscf: AS route %d: name: %w", i, err)
+		}
+		u, err := sip.ParseURI(*e.URI)
+		if err != nil {
+			return nil, fmt.Errorf("icscf: AS route %d: uri: %w", i, err)
+		}
+		out = append(out, ASRoute{Name: name, URI: u})
+	}
+	if err := checkASRoutes(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// exactKeys refuses what encoding/json takes quietly in data, which decodes
+// as ParseASRoutes's list: a key twice in an entry, of which it keeps the
+// last, and a key written in another case, which it matches anyway. Either
+// lets a value other than the one an operator reads win (review of #690).
+// Every value is a string or null, so keys and values alternate in each
+// object.
+func exactKeys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	var seen map[string]bool
+	key := false
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			return nil // the end: Decode has checked the rest
+		}
+		switch tok {
+		case json.Delim('{'):
+			seen, key = map[string]bool{}, true
+			continue
+		case json.Delim('}'):
+			seen = nil
+			continue
+		}
+		if seen == nil {
+			continue
+		}
+		if key {
+			k, _ := tok.(string)
+			switch {
+			case k != "name" && k != "uri":
+				return errors.New(`icscf: AS routes: a key other than "name" and "uri", in lower case`)
+			case seen[k]:
+				return errors.New("icscf: AS routes: a key twice in one entry")
+			}
+			seen[k] = true
+		}
+		key = !key
+	}
+}
+
+// checkASRoutes refuses a list ParseASRoutes would not give.
+func checkASRoutes(list []ASRoute) error {
+	if len(list) > MaxASRoutes {
+		return fmt.Errorf("icscf: %d AS routes, want at most %d", len(list), MaxASRoutes)
+	}
+	for i, a := range list {
+		if !serverURI(a.Name) || !serverURI(a.URI) {
+			return fmt.Errorf("icscf: AS route %d: name and uri must be SIP or SIPS URIs with a host and no user part or headers", i)
+		}
+		// RFC 3263 §4 would send the request to the maddr instead of the
+		// host the operator listed.
+		if _, ok := a.URI.Param("maddr"); ok {
+			return fmt.Errorf("icscf: AS route %d: uri has a maddr", i)
+		}
+		for j := range i {
+			if a.Name.Equal(list[j].Name) {
+				return fmt.Errorf("icscf: AS route %d repeats the name of AS route %d", i, j)
+			}
+		}
+	}
+	return nil
+}
+
+// serverURI reports whether u names a server: a SIP or SIPS URI with a host
+// and no user part or headers.
+func serverURI(u sip.URI) bool {
+	return u.IsSIP() && u.Host != "" && u.User == "" && len(u.Headers) == 0
 }
 
 // Config configures a Router.
@@ -173,6 +308,14 @@ type Config struct {
 	// stays at the back of the list, and behind the rate of a warning;
 	// nil is time.Now.
 	Now func() time.Time
+	// ChatbotDomain is RCS_CHATBOT_DOMAIN. A terminating request whose
+	// Request-URI is at it is for a chatbot: normalised before the LIR and
+	// sent to the AS the answer names, if that is on ASRoutes (ADR 0009
+	// §2, §3). The zero Domain leaves every request as it was.
+	ChatbotDomain chatbot.Domain
+	// ASRoutes are the application servers a chatbot request may go to
+	// (ParseASRoutes).
+	ASRoutes []ASRoute
 }
 
 func (c *Config) setDefaults() {
@@ -210,6 +353,9 @@ func (c *Config) validate() error {
 		if err := s.validate(); err != nil {
 			return fmt.Errorf("icscf: Config.SCSCFs[%d]: %w", i, err)
 		}
+	}
+	if err := checkASRoutes(c.ASRoutes); err != nil {
+		return err
 	}
 	return checkDistinct(c.SCSCFs)
 }

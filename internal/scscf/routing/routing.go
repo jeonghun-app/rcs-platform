@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
@@ -49,6 +50,11 @@ type Config struct {
 	// HomeDomain is the domain of the home network's SIP URIs: a tel URI
 	// with a global number is sent on as the SIP URI of the number in it.
 	HomeDomain string
+	// ChatbotDomain is RCS_CHATBOT_DOMAIN: an originating request for a
+	// chatbot URI at it goes to ICSCF as one for the home domain does. The
+	// zero Domain has none, and such a request is 404 as for any other
+	// domain.
+	ChatbotDomain chatbot.Domain
 	// RecordRoute is the S-CSCF's own Record-Route value, its service name
 	// with transport=tcp and lr (ADR 0005, #208), which keeps it on the
 	// route of the dialogs it forwards, so that their requests come back

@@ -28,6 +28,8 @@ the mapping of every HSS answer to a SIP response with its clause;
   `Retry-After`, which the originating S-CSCF passes on (a 503 it would turn
   into a 500 without one).
 - **An ACK without a To tag**: dropped.
+- **A request for a chatbot** (ADR 0009 §2, §3), when `RCS_CHATBOT_DOMAIN`
+  is set: see below.
 
 The S-CSCF is the one the HSS names (as Server-Name, or first among the names
 in its capabilities, TS 29.228 §6.7), or else the first in `ICSCF_SCSCF` that
@@ -41,6 +43,45 @@ and `hss` puts the names in `HSS_SCSCF_NAMES` into every Server-Capabilities
 it sends, so while that is set the profile's capabilities choose nothing: no
 REGISTER gets 600, and no request 480, for want of a capability. Capabilities
 choose the S-CSCF only with `HSS_SCSCF_NAMES` unset ([hss](hss.md)).
+
+## Requests for a chatbot
+
+With `RCS_CHATBOT_DOMAIN` set, a request with no To tag and no Route left
+whose Request-URI is at that domain is for a chatbot (ADR 0009 §2, §3).
+`icscf` puts the URI in normal form (`internal/chatbot`: `tk` dropped, the
+host in lower case) and the LIR asks for that. A URI at the chatbot domain
+not in normal form gets 404, and no LIR is sent.
+
+The HSS routes the chatbot range, a wildcarded PSI, directly to an
+application server (TS 23.228 §5.4.12.2 b), so a successful LIA's
+Server-Name names that AS. `icscf` sends the request on only if the name is
+on `ICSCF_AS_ROUTES` (memo H6 on #671), to the URI listed with it, as the
+topmost Route with `lr`; the Request-URI stays as it came. Any other name,
+an S-CSCF's included, or no name gets 500 with `Retry-After`
+(`icscf.as.unknown_name`), as an S-CSCF name nothing in `ICSCF_SCSCF`
+matches does. Other answers map as for any user: DIAMETER_ERROR_USER_UNKNOWN
+is 404. What reaches the AS carries no `P-Served-User`, whatever the request
+had: `rcs-as` tells a request for the chatbot it hosts by its absence.
+
+Neither the chatbot domain nor a Server-Name is resolved through DNS. The
+name is only compared with the list, by RFC 3261 §19.1.4 (so
+`sip:rcs-as.rcs.local` does not match `sip:rcs-as.rcs.local;transport=tcp`);
+the URI listed with it is resolved and failed over as an S-CSCF's is
+(`icscf.as.next_address`, `icscf.as.unreachable`).
+
+`ICSCF_AS_ROUTES` is a JSON array of objects with exactly two keys, each once
+and in lower case: `name` (the AS name the HSS stores, `HSS_RCS_AS_URI`) and
+`uri` (the AS's SIP listener). Both are SIP or SIPS URIs with a
+host and no user part or headers, the `uri` without `maddr`, no name twice,
+at most 64 entries. For the platform's `rcs-as`:
+
+```json
+[{"name":"sip:rcs-as.rcs.local;transport=tcp","uri":"sip:rcs-as.rcs.local:5060;transport=tcp"}]
+```
+
+In staging and prod `icscf` refuses to start with `RCS_CHATBOT_DOMAIN` set
+and `ICSCF_AS_ROUTES` empty; in dev such requests get 500. With
+`RCS_CHATBOT_DOMAIN` unset, a URI at that host is looked up as any other.
 
 ## Reaching the S-CSCF
 
@@ -68,7 +109,9 @@ No client reaches `icscf`, so it has no client-facing or UDP listener.
 ## Settings
 
 The shared `RCS_` settings are in `internal/runtime`; `RCS_IMS_DOMAIN` is
-required.
+required. `RCS_CHATBOT_DOMAIN` (default unset) is the host of chatbot URIs:
+a lower-case DNS name other than `RCS_IMS_DOMAIN`, or `icscf` refuses to
+start. Unset, there is no chatbot path.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -76,6 +119,7 @@ required.
 | `ICSCF_CORE_ADDR` | `0.0.0.0:5060` | the SIP listener |
 | `ICSCF_CORE_HOST` | the task's private IPv4 address | this task's address, in the Via of what it forwards |
 | `ICSCF_SCSCF` | `[{"uri":"sip:scscf.<namespace>:5060;transport=tcp"}]` | S-CSCFs to choose from, JSON: `uri`, and optional `mandatory` and `optional` capability numbers |
+| `ICSCF_AS_ROUTES` | none | the application servers a request for a chatbot may go to, JSON: `name` (the Server-Name the HSS gives) and `uri` (where `icscf` sends it); required in staging and prod when `RCS_CHATBOT_DOMAIN` is set ([Requests for a chatbot](#requests-for-a-chatbot)) |
 | `ICSCF_RETRY_AFTER` | `10s` | `Retry-After` of the 480 and 500 above, whole seconds up to 1 h |
 | `ICSCF_REGISTER_TIMEOUT` | `16s` | how long a REGISTER waits for the S-CSCF; with twice `ICSCF_CX_TIMEOUT` (the UAR and its retry) under 32 s, the client's Timer F |
 | `ICSCF_DIAMETER_HOST` | `icscf-<random>.<namespace>` drawn at start ([ADR 0005](adr/0005-shared-state-and-instance-addressing.md)) | this task's Diameter identity; leave unset in ECS (refused in staging and prod): every task needs its own, fresh at each start |
@@ -103,6 +147,8 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | `icscf.scscf.no_capable` | answers no configured S-CSCF can take: a provisioning problem; alarm on any |
 | `icscf.scscf.unreachable` | requests answered 500 because the S-CSCF could not be reached |
 | `icscf.scscf.next_address` | requests sent to the next address of the S-CSCF after one refused |
+| `icscf.as.unknown_name` | answers for a chatbot naming no AS on `ICSCF_AS_ROUTES`: a configuration problem; alarm on any |
+| `icscf.as.unreachable`, `icscf.as.next_address` | as the two above, for a chatbot's application server |
 | `icscf.routed.dropped_ack` | ACKs without a To tag, dropped |
 | `proxy.hook_panics` | panics recovered in icscf's routing: the request was answered 500 (#428); alarm on any |
 | `transaction.handler_panics` | panics recovered in a response handler; each ends only that call (#445); alarm on any |

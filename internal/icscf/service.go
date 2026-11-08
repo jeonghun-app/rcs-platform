@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
@@ -66,6 +67,10 @@ type ServiceConfig struct {
 	CoreHost netip.Addr
 	// SCSCFs are the S-CSCFs to choose from (ICSCF_SCSCF, ParseSCSCFs).
 	SCSCFs []SCSCF
+	// ChatbotDomain is RCS_CHATBOT_DOMAIN, ASRoutes ICSCF_AS_ROUTES
+	// (ParseASRoutes): Config's.
+	ChatbotDomain chatbot.Domain
+	ASRoutes      []ASRoute
 	// RetryAfter and RegisterTimeout are Config's.
 	RetryAfter      time.Duration
 	RegisterTimeout time.Duration
@@ -162,6 +167,17 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	} else {
 		c.SCSCFs = list
 	}
+
+	if list, err := ParseASRoutes([]byte(e.String("AS_ROUTES", ""))); err != nil {
+		e.Invalid("AS_ROUTES", err.Error())
+	} else {
+		c.ASRoutes = list
+	}
+	c.ChatbotDomain = chatbot.LoadDomain(s.Shared, domain)
+	// Without a route every request for a chatbot gets 500; in dev that
+	// is a stack without rcs-as, in production a missing setting (memo H6).
+	s.ForbidInProduction(c.ChatbotDomain.Name() != "" && len(c.ASRoutes) == 0,
+		"RCS_CHATBOT_DOMAIN is set and ICSCF_AS_ROUTES is empty: no request for a chatbot could reach its application server")
 
 	if domain != "" && !identity.IsDomainName(domain) {
 		s.Shared.Invalid("IMS_DOMAIN", "not a domain name")

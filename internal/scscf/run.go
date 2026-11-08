@@ -210,7 +210,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 	rr.Params.SetFlag("lr")
 	self := selfURIs(cfg, port)
 	router, err := routing.New(routing.Config{
-		Store: store, Registrar: g, ICSCF: cfg.ICSCF, HomeDomain: cfg.HomeDomain,
+		Store: store, Registrar: g, ICSCF: cfg.ICSCF, HomeDomain: cfg.HomeDomain, ChatbotDomain: cfg.ChatbotDomain,
 		RecordRoute: sip.Address{URI: rr}, Self: self, DialogKeys: cfg.DialogKeys,
 		EdgeProxyPort: cfg.PCSCFCorePort, ApplicationServers: cfg.ApplicationServers,
 		EdgeProxyPublicHosts: cfg.EdgeProxyPublicHosts, Sender: send,

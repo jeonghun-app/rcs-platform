@@ -53,7 +53,10 @@
 // The chain of an originating request ends at the I-CSCF (Config.ICSCF),
 // which finds the S-CSCF of the user it is for: a tel URI of a global number
 // is sent as the SIP URI of the number in the home domain, without ENUM, and
-// a request for another domain is 404. The P-Served-User toward the servers
+// a request for another domain is 404. A request for a chatbot
+// (Config.ChatbotDomain) goes to the I-CSCF too, which routes it to the AS
+// hosting the chatbot, and one at the chatbot domain whose Request-URI is
+// not a chatbot URI in normal form is 404 (ADR 0009 §2, §3). The P-Served-User toward the servers
 // is removed, or the terminating side would take the request for one an
 // application server sent for its user.
 //
