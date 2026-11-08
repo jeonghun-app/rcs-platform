@@ -521,6 +521,8 @@ func TestOnlyAServedSetLosingAChatbotHostIdentityIsMarkedStale(t *testing.T) {
 	reg, unreg, not := store.Registered, store.Unregistered, store.NotRegistered
 	staleAlready := sub(id{impu1, 0, not})
 	staleAlready.StaleSets = []int{0}
+	otherStale := sub(id{impu1, 0, not}, id{impu2, 1, reg})
+	otherStale.StaleSets = []int{1}
 	for _, c := range []struct {
 		name      string
 		old, next *store.Subscription
@@ -533,6 +535,7 @@ func TestOnlyAServedSetLosingAChatbotHostIdentityIsMarkedStale(t *testing.T) {
 		{"moved to another set", sub(id{impu1, 0, reg}, id{leftover, 0, reg}, id{impu2, 1, reg}),
 			sub(id{impu1, 0, not}, id{leftover, 1, not}, id{impu2, 1, not}), true, []int{0}},
 		{"already stale", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), staleAlready, true, []int{0}},
+		{"kept in order with a set already stale", sub(id{impu1, 0, reg}, id{leftover, 0, reg}, id{impu2, 1, reg}), otherStale, true, []int{0, 1}},
 		{"kept", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), sub(id{impu1, 0, not}, id{leftover, 0, not}), true, nil},
 		{"the set emptied", sub(id{impu1, 0, reg}, id{leftover, 1, reg}), sub(id{impu1, 0, not}), true, nil},
 		{"a set not served", sub(id{impu1, 0, not}, id{leftover, 0, not}), sub(id{impu1, 0, not}), true, nil},
