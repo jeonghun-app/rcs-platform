@@ -156,16 +156,28 @@ func TestTheStoredPSIIsCheckedOnEveryReadAndCompiledOncePerVersion(t *testing.T)
 		t.Fatalf("LIR in the new range = %+v", out)
 	}
 	// An inactive PSI is no range.
-	v3 := e.putPSI(v2, &store.WildcardedPSI{PSI: chatbotPSI, ServerName: chatbotAS, Active: false})
+	e.putPSI(v2, &store.WildcardedPSI{PSI: chatbotPSI, ServerName: chatbotAS, Active: false})
 	if out, _ := e.lirFor(leftover); out.result != exp(cx.ErrorUserUnknown) || out.wildcard != "" {
 		t.Fatalf("LIR with an inactive PSI = %+v", out)
 	}
-	// A read older than the cached version, overtaken by another request's
-	// read, leaves the newer version cached.
-	newer := &chatbotRange{psi: "newer"}
-	e.h.rangeVersion, e.h.rangeOf = v3.Version+1, newer
-	if r, err := e.h.chatbotRange(t.Context()); err != nil || r != newer || e.h.rangeVersion != v3.Version+1 {
-		t.Fatalf("an older read replaced the cached range: %+v, %v, version %d", r, err, e.h.rangeVersion)
+	// A table restored or recreated stores a lower version than a task has
+	// cached: it takes effect at the next LIR, an inactive one too.
+	restored := func(cached string, active bool) lirAnswer {
+		t.Helper()
+		cur, _ := e.store.WildcardedPSI(t.Context())
+		e.putPSI(cur, &store.WildcardedPSI{PSI: chatbotPSI, ServerName: chatbotAS, Active: active})
+		e.h.rangeVersion, e.h.rangeOf, e.h.rangeInvalid = 100, testChatbotRange(t, cached), false
+		out, err := e.lirFor(leftover)
+		if err != nil || e.h.rangeVersion >= 100 {
+			t.Fatalf("after a restore: %+v, %v, cached version %d", out, err, e.h.rangeVersion)
+		}
+		return out
+	}
+	if out := restored("sip:!news!@"+botDomain, true); out.wildcard != chatbotPSI {
+		t.Errorf("a restored lower version was not taken: %+v", out)
+	}
+	if out := restored(chatbotPSI, false); out.result != exp(cx.ErrorUserUnknown) || out.wildcard != "" {
+		t.Errorf("a restored inactive lower version still routes: %+v", out)
 	}
 }
 
@@ -327,11 +339,12 @@ func TestARefreshOfASetRegisteredBeforeTheSettingGetsUserDataWithoutTheHost(t *t
 	e := newEnv(t)
 	e.provision(impi1, impu1, leftover)
 	e.provision(impi2, impu2)
+	e.provision(impi3, impu3, leftoverUpperRaw)
 	before := serveHSS(t, e.h, "hss-a.rcs.local")
 	setOn := e.newHSS(func(o *Options) { o.ChatbotDomain, o.ChatbotASName = testChatbotDomain(t), chatbotAS })
 	after := serveHSS(t, setOn, "hss-b.rcs.local")
 	old, cur := connectCSCF(t, before, "scscf-1.rcs.local"), connectCSCF(t, after, "scscf-1.rcs.local")
-	for _, u := range []struct{ impi, impu string }{{impi1, impu1}, {impi2, impu2}} {
+	for _, u := range []struct{ impi, impu string }{{impi1, impu1}, {impi2, impu2}, {impi3, impu3}} {
 		old.mar(u.impi, u.impu, cx.SchemeDigestAKAv1MD5, 1, scscfName, nil)
 		wantResult(t, "SAR before the setting", old.sar(u.impi, []string{u.impu}, cx.Registration, scscfName).Result, resSuccess)
 	}
@@ -351,6 +364,10 @@ func TestARefreshOfASetRegisteredBeforeTheSettingGetsUserDataWithoutTheHost(t *t
 	}
 	if n := e.metrics.get("chatbot.userdata_resent"); n != 1 {
 		t.Errorf("chatbot.userdata_resent = %d, want 1", n)
+	}
+	// The same for an identity stored in a form that is not canonical.
+	if ids := userDataIdentities(t, refresh(impi3, impu3).UserData); len(ids) != 1 || ids[0] != impu3 {
+		t.Errorf("refresh with a non-canonical stored host: User-Data identities = %v", ids)
 	}
 	// A set without the host keeps the usual answer: no User-Data.
 	if saa := refresh(impi2, impu2); saa.Result != resSuccess || len(saa.UserData) != 0 {
