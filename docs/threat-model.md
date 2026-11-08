@@ -184,8 +184,18 @@ metric dimension (architecture §8). A `maap` alias,
 masks its alias ID, in either case, and the privacy check refuses one written in
 a tracked file unless its ID is on the allow-list. The same holds for an alias
 ID standing alone, as the chatbot API names a recipient by it: in text, JSON, a
-URL path or a percent-encoded alias, all in lower or all in upper case (#719).
+URL path, a key such as `conv_<id>`, a percent-encoded alias (single or double
+encoded) or after a backslash escape, all in lower or all in upper case (#719).
+Only one case is matched because base32 is written in one case (`maap` writes
+lower case), while every mixed-case 26-letter word in the repository is a Go,
+AWS or metric name, and a metric whose name `pii.Redact` changes is dropped
+(`runtime.validMetricName`).
 **Status:** implemented.
+**Residual risk:** an alias ID split by invisible characters (ZWSP), glued to a
+full-width digit, or written in mixed case is not recognised in free text.
+Each needs deliberate construction by someone who already knows the alias, and
+`maap` (#711, #712) refuses an alias ID that is not lower case and never writes
+one into an error or log line except through `pii.Identity`.
 
 ## T9 — Resource exhaustion from clients
 

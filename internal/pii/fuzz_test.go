@@ -28,13 +28,13 @@ var (
 )
 
 // aliasIDIn returns an alias ID left standing alone in s, if any: a word of
-// ASCII letters and digits, or such a word after a percent-escape without
-// it, that is 26 characters of base32 in one case.
+// ASCII letters and digits, or such a word without the escape glued to its
+// front (gluedEscape), that is 26 characters of base32 in one case.
 func aliasIDIn(s string) string {
 	for _, loc := range asciiWords.FindAllStringIndex(s, -1) {
 		w := s[loc[0]:loc[1]]
-		if len(w) == 28 && loc[0] > 0 && s[loc[0]-1] == '%' && strings.ContainsAny(w[:1], hexDigits) && strings.ContainsAny(w[1:2], hexDigits) {
-			w = w[2:]
+		if len(w) > 26 && loc[0] > 0 && gluedEscape.MatchString(s[loc[0]-1:loc[0]]+w[:len(w)-26]) {
+			w = w[len(w)-26:]
 		}
 		if len(w) == 26 && strings.Trim(strings.ToLower(w), "abcdefghijklmnopqrstuvwxyz234567") == "" &&
 			(strings.ToLower(w) == w || strings.ToUpper(w) == w) {
@@ -44,9 +44,12 @@ func aliasIDIn(s string) string {
 	return ""
 }
 
-var asciiWords = regexp.MustCompile(`[A-Za-z0-9]+`)
-
-const hexDigits = "0123456789abcdefABCDEF"
+var (
+	asciiWords = regexp.MustCompile(`[A-Za-z0-9]+`)
+	// A percent-escape, once or twice encoded, or a Go or JSON backslash
+	// escape.
+	gluedEscape = regexp.MustCompile(`^(%(25)?[0-9A-Fa-f]{2}|\\[ntr]|\\u[0-9A-Fa-f]{4})$`)
+)
 
 // nationalNumberIn returns a national number left in s, if any. A match counts
 // unless what comes before it makes it part of a word: a letter or digit, or a
@@ -121,6 +124,7 @@ func FuzzRedact(f *testing.F) {
 		`{"to":"aliasforthetestsonly23456a"} /v1/conversations/SECONDTESTALIASONLY234567A/x`,
 		"sip%3Aaliasforthetestsonly23456a%40x %2fsecondtestaliasonly234567a conv_aliasforthetestsonly23456a",
 		"aliasforthetestsonly23456 aliasforthetestsonly23456aa Aliasforthetestsonly23456a %zzaliasforthetestsonly23456a",
+		`q=sip%253Aaliasforthetestsonly23456a%2540x "\naliasforthetestsonly23456a" \u00e9SECONDTESTALIASONLY234567A \qaliasforthetestsonly23456a`,
 		"From: <sip:aliasforthetestsonly23456a@alias.example.net;user=rcstk>",
 		`{"to":"SIP:SECONDTESTALIASONLY234567A@ALIAS.EXAMPLE.NET;USER=RCSTK"}`,
 		"sips:aliasforthetestsonly\u200b23456a@x sip:sip:secondtestaliasonly234567a@x",

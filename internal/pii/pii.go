@@ -157,7 +157,10 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //   - the IMEI of a urn:gsma:imei URN (RFC 7254 §3), all of its digit groups;
 //   - a maap alias ID standing alone: 26 base32 characters, all in lower or
 //     all in upper case, between characters that are not ASCII letters or
-//     digits, or after a percent-escape ("sip%3A<id>%40…"). Mixed case is
+//     digits, or a mask; or right after an escape glued to its front, as
+//     already-escaped text has them: a percent-escape, single or double
+//     encoded ("sip%3A<id>%40…", "sip%253A<id>%2540…"), or a backslash
+//     escape ("\n", "\t", "\r", "\u00e9"); see [escapePrefix]. Mixed case is
 //     left alone: base32 is written in one case, and Go and metric names of
 //     26 letters ("ServerTransactionsRejected") are not identifiers.
 //
@@ -304,10 +307,10 @@ func (r *Redactor) maskAliasIDs(s string, masks [][2]int) string {
 			end++
 		}
 		from := i
-		// A percent-escape before the ID is not part of the word: "%3A" in
-		// a percent-encoded alias, "%2F" in an encoded path.
-		if end-i == aliasIDLen+2 && i > 0 && s[i-1] == '%' && isHex(s[i]) && isHex(s[i+1]) {
-			from = i + 2
+		// An escape glued to the front of the ID is not part of it: "%3A"
+		// in a percent-encoded alias, "n" of an escaped newline.
+		if p := end - i - aliasIDLen; p > 0 && i > 0 && escapePrefix(s[i-1], s[i:i+p]) {
+			from = i + p
 		}
 		if id, ok := aliasID(s[from:end]); ok && oneCase(s[from:end]) {
 			b.WriteString(s[last:from])
@@ -321,6 +324,23 @@ func (r *Redactor) maskAliasIDs(s string, masks [][2]int) string {
 	}
 	b.WriteString(s[last:])
 	return b.String()
+}
+
+// escapePrefix reports whether c followed by p is an escape, as text that
+// was escaped before it reached a log has them in front of a word: a
+// percent-escape, or a double-encoded one whose "%" became "%25" (RFC 3986
+// §2.1: "%3A", "%253A"), or a backslash escape of Go and JSON strings ("\n",
+// "\t", "\r", "\u00e9"). Further encodings are not undone.
+func escapePrefix(c byte, p string) bool {
+	switch c {
+	case '%':
+		return len(p) == 2 && isHex(p[0]) && isHex(p[1]) ||
+			len(p) == 4 && p[:2] == "25" && isHex(p[2]) && isHex(p[3])
+	case '\\':
+		return len(p) == 1 && (p[0] == 'n' || p[0] == 't' || p[0] == 'r') ||
+			len(p) == 5 && p[0] == 'u' && isHex(p[1]) && isHex(p[2]) && isHex(p[3]) && isHex(p[4])
+	}
+	return false
 }
 
 // oneCase reports whether the letters of s are all lower or all upper case.

@@ -12,6 +12,8 @@
 # Every tracked file is scanned.
 #
 set -euo pipefail
+# Bytes, not characters: a word is the same on glibc and musl, in any locale.
+export LC_ALL=C
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -53,20 +55,42 @@ if (( rc > 1 )); then
   echo "error: git grep failed ($rc)" >&2
   exit 2
 fi
-# An alias ID alone: a word of 26 base32 characters in one case, or one after
-# a percent-escape (sip%3A<id>%40...). Mixed case is left out, as in
+# An alias ID alone, read as pii.Redact reads it. A word is a run of ASCII
+# letters and digits, so "_", "-" and any non-ASCII byte end it; \b would not,
+# as it counts "_" (and, by locale, other letters) as part of a word. Only runs
+# of 26 or more are printed, each whole and with the byte before it when that
+# is "%" or "\", so two IDs one byte apart are two hits. The filter keeps a
+# word of 26 base32 characters in one case, or one with an escape glued to
+# its front: a percent-escape, once or twice encoded (sip%3A<id>, sip%253A<id>),
+# or a backslash escape (\n<id>, \u00e9<id>). Mixed case is left out, as in
 # internal/pii: Go identifiers of 26 letters are mixed case, alias IDs never.
 rc=0
-git grep -hIoE '\b([a-z2-7]{26}|[A-Z2-7]{26})\b|%[0-9A-Fa-f]{2}([a-z2-7]{26}|[A-Z2-7]{26})\b' -- ':!.github/allowed-test-identifiers.txt' ':!go.sum' >"$bare_hits" || rc=$?
+git grep -hIoE '[%\\]?[A-Za-z0-9]{26,}' -- ':!.github/allowed-test-identifiers.txt' ':!go.sum' >"$bare_hits" || rc=$?
 if (( rc > 1 )); then
   echo "error: git grep failed ($rc)" >&2
   exit 2
 fi
+bare_ids() {
+  awk '
+    function hex(s) { return s ~ /^[0-9A-Fa-f]+$/ }
+    {
+      pre = substr($0, 1, 1)
+      w = $0
+      if (pre == "%" || pre == "\\") w = substr($0, 2); else pre = ""
+      n = length(w)
+      id = substr(w, n - 25)
+      p = substr(w, 1, n - 26)
+      if (!(id ~ /^[a-z2-7]+$/ || id ~ /^[A-Z2-7]+$/)) next
+      pct = pre == "%" && (length(p) == 2 && hex(p) || length(p) == 4 && substr(p, 1, 2) == "25" && hex(substr(p, 3)))
+      esc = pre == "\\" && (p ~ /^[ntr]$/ || length(p) == 5 && substr(p, 1, 1) == "u" && hex(substr(p, 2)))
+      if (p == "" || pct || esc) print id
+    }' "$bare_hits"
+}
 
 found="$(grep -E '^\+?[0-9]+$' "$hits" | sort -u || true)"
 found_aliases="$( {
   sed -E 's/^[^:]*:([^@]*)@.*$/\1/' "$alias_hits"
-  grep -oE '[A-Za-z2-7]{26}$' "$bare_hits" || true
+  bare_ids
 } | tr '[:upper:]' '[:lower:]' | sort -u)"
 
 if [[ -z "$found$found_aliases" ]]; then

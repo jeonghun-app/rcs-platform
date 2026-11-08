@@ -109,7 +109,8 @@ func TestRedactMasksAnAliasInFreeText(t *testing.T) {
 
 // Redact masks an alias ID that stands alone, as the chatbot API names a
 // recipient by it (#719): between characters that are not ASCII letters or
-// digits, or after a percent-escape, all in lower or all in upper case.
+// digits, or after a percent-escape or a backslash escape, all in lower or
+// all in upper case.
 func TestRedactMasksAStandaloneAliasID(t *testing.T) {
 	upper := strings.ToUpper(testAlias)
 	tests := []struct{ name, in, want string }{
@@ -122,6 +123,11 @@ func TestRedactMasksAStandaloneAliasID(t *testing.T) {
 		{"in a percent-encoded alias", "sip%3A" + testAlias + "%40" + aliasHost + "%3Buser%3Drcstk", "sip%3A***6a%40" + aliasHost + "%3Buser%3Drcstk"},
 		{"after a lower-case percent-escape", "%2f" + upper, "%2f***6a"},
 		{"two in a list", testAlias + "," + testAlias2, "***6a,***7a"},
+		{"two joined by a dash", testAlias + "-" + testAlias2, "***6a-***7a"},
+		{"in a double-encoded alias", "q=sip%253A" + testAlias + "%2540" + aliasHost, "q=sip%253A***6a%2540" + aliasHost},
+		{"after an escaped newline", `"no alias\n` + testAlias + `"`, `"no alias\n***6a"`},
+		{"after an escaped tab and return", `\t` + testAlias + ` \r` + upper, `\t***6a \r***6a`},
+		{"after a unicode escape", `{"to":"\u00e9` + testAlias + `"}`, `{"to":"\u00e9***6a"}`},
 		{"at the end of a word in another script", "別名" + testAlias, "別名***6a"},
 		// Just outside the form: kept.
 		{"25 characters", testAlias[:25], testAlias[:25]},
@@ -133,6 +139,12 @@ func TestRedactMasksAStandaloneAliasID(t *testing.T) {
 		{"mixed case alias ID", "A" + testAlias[1:], "A" + testAlias[1:]},
 		{"after a percent sign that escapes nothing", "%zz" + testAlias, "%zz" + testAlias},
 		{"after a hex pair without a percent sign", "/3A" + testAlias, "/3A" + testAlias},
+		{"after a backslash that escapes nothing", `\q` + testAlias, `\q` + testAlias},
+		{"after an incomplete unicode escape", `\u00e` + testAlias, `\u00e` + testAlias},
+		{"after a unicode escape with a non-hex digit", `\u00eg` + testAlias, `\u00eg` + testAlias},
+		{"after four hex digits that are no double encoding", "%3A3A" + testAlias, "%3A3A" + testAlias},
+		{"after an escaped newline without the backslash", "n" + testAlias, "n" + testAlias},
+		{"after a triple-encoded escape", "%25253A" + testAlias, "%25253A" + testAlias},
 		{"a 128-bit hex ID", strings.Repeat("ab45", 8), strings.Repeat("ab45", 8)},
 	}
 	unkeyed, keyed := NewRedactor(nil), NewRedactor(testKey)
