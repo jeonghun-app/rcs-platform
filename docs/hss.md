@@ -107,10 +107,11 @@ trailing dot, is refused with 400, so a subscription that still has one must dro
 it before any other change. `hss` does not search the table for such IMPUs. One
 provisioned before the setting would let its subscriber register and send as a
 chatbot URI (threat model T13, T14), so the Cx answers treat the host as
-PSI-only: UAR, MAR and SAR for an identity there are
-DIAMETER_ERROR_USER_UNKNOWN whatever is stored, User-Data leaves such an
-identity out of its set, and an LIR at the host is answered from the PSI alone
-([Cx behaviour](#cx-behaviour)). Choose
+PSI-only: UAR, MAR and every SAR but a deregistration are
+DIAMETER_ERROR_USER_UNKNOWN for an identity there whatever is stored,
+User-Data leaves such an identity out of its set, also at a refresh of a set
+registered before the setting, and an LIR at the host is answered from the PSI
+alone ([Cx behaviour](#cx-behaviour)). Choose
 `RCS_CHATBOT_DOMAIN` as a **fresh** domain, one no subscriber IMPU has ever used
 ([runbook](runbook.md#the-chatbot-range)).
 
@@ -212,7 +213,7 @@ logged as contention rather than a store failure (#200).
 | MAR (§6.3.1) | `Digest-AKAv1-MD5`: up to `HSS_MAX_AUTH_ITEMS` vectors, their SQNs reserved in the same write that stores the S-CSCF name and sets authentication pending. `SIP Digest`: one item with the MD5 HA1 and the SHA-256 HA1 as alternate (Table 6.3.7). `Unknown` takes the stored scheme only if it is SIP Digest, as step 4 says ("neither NASS-Bundled nor SIP Digest" is 5006), so an AKA-only subscriber gets 5006; an S-CSCF wanting AKA vectors names the AKA scheme. A scheme the subscriber has no credential for: 5006. Resynchronisation (RAND‖AUTS in SIP-Authorization) only from the S-CSCF holding the challenge: SQN is reset to the card's when AUTS verifies and the network's SQN is out of range (TS 33.102 §6.3.5). |
 | SAR (§6.1.2.1, §8.1.2) | REGISTRATION / RE_REGISTRATION register the implicit set and return User-Data (the IMSSubscription document with the set's identities and the profile's iFC) and Charging-Information; UNREGISTERED_USER stores the name and makes the set unregistered; deregistrations clear the state, and the name once nothing is served; the `*_STORE_SERVER_NAME` types keep the name (state unregistered) when the profile has services for unregistered users, and otherwise answer 2004 SERVER_NAME_NOT_STORED. Another S-CSCF than the stored one gets 5005 with the stored name (NO_ASSIGNMENT: UNABLE_TO_COMPLY). User-Data beyond 128 KiB: 5008. |
 | LIR (§6.1.4.1) | registered or unregistered: the S-CSCF name; not registered with unregistered services (or an originating request): the name if one is stored, else 2003 with capabilities; otherwise 5003. |
-| An identity at `RCS_CHATBOT_DOMAIN` (ADR 0009 §3 as amended in #679) | the host is the wildcarded PSI's alone, whatever IMPU is stored there. UAR, MAR and SAR: 5001. LIR: in the range, DIAMETER_SUCCESS with `Server-Name` `HSS_RCS_AS_URI` (the configured name, not the stored one) and `Wildcarded-Public-Identity` the stored PSI; outside it, not in normal form, or with no range, 5001; a match the work budget cannot pay for (never with a valid PSI, `TestEveryNormalFormIsMatchedWithinTheWorkBudget`), `DIAMETER_UNABLE_TO_COMPLY`. User-Data never lists such an identity, so one in a registered set is not registered with it. A distinct identity therefore does not win over the wildcard at this host, unlike TS 29.228 Table 6.1.4.2 ([conformance](conformance.md#cx-departures)). With `RCS_CHATBOT_DOMAIN` unset, none of this applies. |
+| An identity at `RCS_CHATBOT_DOMAIN` (ADR 0009 §3 as amended in #679) | the host is the wildcarded PSI's alone, whatever IMPU is stored there. UAR, MAR and every SAR but a deregistration: 5001; a deregistration SAR may name such an identity, since it only clears state. LIR: in the range, DIAMETER_SUCCESS with `Server-Name` `HSS_RCS_AS_URI` (the configured name, not the stored one) and `Wildcarded-Public-Identity` the stored PSI; outside it, not in normal form, or with no range, 5001; a match the work budget cannot pay for (never with a valid PSI, `TestEveryNormalFormIsMatchedWithinTheWorkBudget`), `DIAMETER_UNABLE_TO_COMPLY`. User-Data never lists such an identity. A set that holds one gets its User-Data with every SAR that may carry it, even when the S-CSCF says it already has it, as a stale set does (§6.6; `chatbot.userdata_resent` counts these refreshes): a registration made before the setting, whose refreshes name another identity of the set, so loses the chatbot-host identity at its next refresh. A set made only of such identities gets an RTR where a change would push its User-Data (`push.chatbot_set_deregistered`) and is then not registered. A distinct identity therefore does not win over the wildcard at this host, unlike TS 29.228 Table 6.1.4.2 ([conformance](conformance.md#cx-departures)). With `RCS_CHATBOT_DOMAIN` unset, none of this applies. |
 
 The I-CSCF gets Server-Capabilities with the profile's mandatory and optional
 capabilities and the names in `HSS_SCSCF_NAMES`; without any it may pick any
@@ -225,8 +226,9 @@ one wildcarded PSI is the chatbot range, routed directly to an AS.
 Every LIR at the chatbot host reads the PSI item, so a new version is seen at
 once. Each task compiles a version once and checks it against its own
 `RCS_CHATBOT_DOMAIN`: a PSI that does not hold, as after the setting changed, or
-an inactive one, gives no range. The first is counted (`chatbot.psi_invalid`)
-and logged once per version, with the rule and without the PSI.
+an inactive one, gives no range. The first is counted on every LIR it leaves
+without a range (`chatbot.psi_invalid`), so it can raise an alarm, and logged
+once per version, with the rule and without the PSI.
 
 ### HSS-initiated requests
 
@@ -501,10 +503,12 @@ the CSCFs connect to `hss.<namespace>` and requests to the HSS go by realm.
   `push.rtr|ppr.sent|rejected|failed|no_peer`, `push.ppr.user_unknown`,
   `push.ppr.data_refused`, `push.over_budget`, `push.stale_marked`, `push.fanout.subscriptions`, `api.<operation>` (latency),
   `api.<operation>.<status>`, `api.rate_limited`, `api.store_failure`,
-  `api.data_error`, `chatbot.psi_invalid`, `cx.lir.chatbot_match_failed`.
+  `api.data_error`, `chatbot.psi_invalid`, `chatbot.userdata_resent`,
+  `cx.lir.chatbot_match_failed`, `push.chatbot_set_deregistered`.
 - Alarm candidates (Phase 7): `cx.*.error`, `lock.busy`, `api.store_failure`,
   `api.data_error`, `push.*.no_peer`, `push.*.failed`, `push.over_budget`,
-  `aka.sqn_exhausted`, `chatbot.psi_invalid`,
+  `aka.sqn_exhausted`, `chatbot.psi_invalid` (any: chatbot LIRs are refused
+  because the PSI does not hold under `RCS_CHATBOT_DOMAIN`),
   `profile.missing`, `keyring.created`, and `cx.mar`/`cx.sar` latency
   (Maximum, or the average `cx.sar.sum / cx.sar.count`) against
   `HSS_CX_TIMEOUT` (docs/architecture.md §8 has the rules for EMF alarms).

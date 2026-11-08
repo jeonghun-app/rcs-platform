@@ -3,6 +3,7 @@ package hss
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -15,8 +16,15 @@ import (
 )
 
 // leftover is an IMPU at the chatbot host provisioned before
-// RCS_CHATBOT_DOMAIN was set, which only a direct store write can make now.
-const leftover = "sip:bot@" + botDomain
+// RCS_CHATBOT_DOMAIN was set, which only a direct store write can make now;
+// the others are the host's other stored forms, the last one not canonical
+// (a record written past the API).
+const (
+	leftover         = "sip:bot@" + botDomain
+	leftoverSIPS     = "sips:bot@" + botDomain
+	leftoverDot      = "sip:dot@" + botDomain + "."
+	leftoverUpperRaw = "sip:Up@BOTPLATFORM.MNC001.MCC001.3GPPNETWORK.ORG"
+)
 
 // newChatbotCxEnv is an HSS with RCS_CHATBOT_DOMAIN set, holding a
 // subscription whose implicit set has impu1 and leftover, and the PSI with
@@ -25,7 +33,7 @@ func newChatbotCxEnv(t *testing.T) *env {
 	t.Helper()
 	e := newEnv(t)
 	e.h = e.newHSS(func(o *Options) { o.ChatbotDomain, o.ChatbotASName = testChatbotDomain(t), chatbotAS })
-	e.provision(impi1, impu1, leftover)
+	e.provision(impi1, impu1, leftover, leftoverSIPS, leftoverDot, leftoverUpperRaw)
 	e.putPSI(nil, &store.WildcardedPSI{PSI: chatbotPSI, ServerName: "sip:stored.example.net", Active: true})
 	return e
 }
@@ -49,7 +57,8 @@ func TestTheChatbotHostIsThePSIsAlone(t *testing.T) {
 	scscf := connectCSCF(t, node, "scscf-1.rcs.local")
 	unknown := exp(cx.ErrorUserUnknown)
 
-	for _, id := range []string{leftover, "sip:bot@" + strings.ToUpper(botDomain), "sips:bot@" + botDomain + "."} {
+	// Each is stored, so only the host rule makes it unknown.
+	for _, id := range []string{leftover, "sip:bot@" + strings.ToUpper(botDomain), leftoverSIPS, leftoverDot} {
 		wantResult(t, "UAR for "+id, icscf.uar(impi1, id, cx.AuthorizeRegistration).Result, unknown)
 		wantResult(t, "MAR for "+id, scscf.mar(impi1, id, cx.SchemeDigestAKAv1MD5, 1, scscfName, nil).Result, unknown)
 		wantResult(t, "SAR for "+id, scscf.sar(impi1, []string{id}, cx.Registration, scscfName).Result, unknown)
@@ -72,8 +81,9 @@ func TestTheChatbotHostIsThePSIsAlone(t *testing.T) {
 		}
 	}
 
-	// impu1 registers as before, and its set's User-Data leaves the
-	// leftover out, so the S-CSCF never holds it as registered.
+	// impu1 registers as before, and its set's User-Data leaves every form
+	// of the host out, the stored non-canonical one too, so the S-CSCF
+	// never holds one as registered.
 	wantResult(t, "UAR for impu1", icscf.uar(impi1, impu1, cx.AuthorizeRegistration).Result, exp(cx.FirstRegistration))
 	scscf.mar(impi1, impu1, cx.SchemeDigestAKAv1MD5, 1, scscfName, nil)
 	saa := scscf.sar(impi1, []string{impu1}, cx.Registration, scscfName)
@@ -123,6 +133,11 @@ func (e *env) lirFor(uri string) (lirAnswer, error) {
 }
 
 func TestTheStoredPSIIsCheckedOnEveryReadAndCompiledOncePerVersion(t *testing.T) {
+	none := newEnv(t)
+	none.h = none.newHSS(func(o *Options) { o.ChatbotDomain, o.ChatbotASName = testChatbotDomain(t), chatbotAS })
+	if out, err := none.lirFor(leftover); err != nil || out.result != exp(cx.ErrorUserUnknown) {
+		t.Fatalf("LIR with no PSI stored = %+v, %v", out, err)
+	}
 	e := newChatbotCxEnv(t)
 	if out, err := e.lirFor(leftover); err != nil || out.serverName != chatbotAS {
 		t.Fatalf("LIR = %+v, %v", out, err)
@@ -141,9 +156,16 @@ func TestTheStoredPSIIsCheckedOnEveryReadAndCompiledOncePerVersion(t *testing.T)
 		t.Fatalf("LIR in the new range = %+v", out)
 	}
 	// An inactive PSI is no range.
-	e.putPSI(v2, &store.WildcardedPSI{PSI: chatbotPSI, ServerName: chatbotAS, Active: false})
+	v3 := e.putPSI(v2, &store.WildcardedPSI{PSI: chatbotPSI, ServerName: chatbotAS, Active: false})
 	if out, _ := e.lirFor(leftover); out.result != exp(cx.ErrorUserUnknown) || out.wildcard != "" {
 		t.Fatalf("LIR with an inactive PSI = %+v", out)
+	}
+	// A read older than the cached version, overtaken by another request's
+	// read, leaves the newer version cached.
+	newer := &chatbotRange{psi: "newer"}
+	e.h.rangeVersion, e.h.rangeOf = v3.Version+1, newer
+	if r, err := e.h.chatbotRange(t.Context()); err != nil || r != newer || e.h.rangeVersion != v3.Version+1 {
+		t.Fatalf("an older read replaced the cached range: %+v, %v, version %d", r, err, e.h.rangeVersion)
 	}
 }
 
@@ -160,7 +182,9 @@ func TestAStoredPSIForAnotherChatbotDomainIsNoRangeAndIsReported(t *testing.T) {
 		}
 	}
 	logs := e.logs.String()
-	if n := e.metrics.get("chatbot.psi_invalid"); n != 1 || strings.Count(logs, "does not hold under RCS_CHATBOT_DOMAIN") != 1 {
+	// Counted on every LIR it leaves without a range, so that an alarm sees
+	// it; logged once.
+	if n := e.metrics.get("chatbot.psi_invalid"); n != 3 || strings.Count(logs, "does not hold under RCS_CHATBOT_DOMAIN") != 1 {
 		t.Errorf("chatbot.psi_invalid = %d; logs:\n%s", n, logs)
 	}
 	if strings.Contains(logs, "secretbot") || strings.Contains(logs, "old-bots") {
@@ -277,5 +301,128 @@ func TestAPPRLeavesAChatbotHostIMPUOutOfUserData(t *testing.T) {
 	}
 	if ids := doc.ServiceProfiles[0].PublicIdentities; len(ids) != 1 || ids[0].Identity != impu1 {
 		t.Fatalf("PPR User-Data identities = %+v, want impu1 only", ids)
+	}
+}
+
+func userDataIdentities(t *testing.T, data []byte) []string {
+	t.Helper()
+	doc, err := ifc.ParseSubscription(data)
+	if err != nil {
+		t.Fatalf("User-Data: %v", err)
+	}
+	var ids []string
+	for _, id := range doc.ServiceProfiles[0].PublicIdentities {
+		ids = append(ids, id.Identity)
+	}
+	return ids
+}
+
+// A registration made before RCS_CHATBOT_DOMAIN was set holds the
+// chatbot-host identity at the S-CSCF. Its refreshes say the User-Data is
+// already there (USER_DATA_ALREADY_AVAILABLE) and name impu1, so they are
+// never refused; the HSS sends the set's User-Data without the identity all
+// the same, as it does for a stale set, and the S-CSCF takes it (the
+// tester's probe on #695).
+func TestARefreshOfASetRegisteredBeforeTheSettingGetsUserDataWithoutTheHost(t *testing.T) {
+	e := newEnv(t)
+	e.provision(impi1, impu1, leftover)
+	e.provision(impi2, impu2)
+	before := serveHSS(t, e.h, "hss-a.rcs.local")
+	setOn := e.newHSS(func(o *Options) { o.ChatbotDomain, o.ChatbotASName = testChatbotDomain(t), chatbotAS })
+	after := serveHSS(t, setOn, "hss-b.rcs.local")
+	old, cur := connectCSCF(t, before, "scscf-1.rcs.local"), connectCSCF(t, after, "scscf-1.rcs.local")
+	for _, u := range []struct{ impi, impu string }{{impi1, impu1}, {impi2, impu2}} {
+		old.mar(u.impi, u.impu, cx.SchemeDigestAKAv1MD5, 1, scscfName, nil)
+		wantResult(t, "SAR before the setting", old.sar(u.impi, []string{u.impu}, cx.Registration, scscfName).Result, resSuccess)
+	}
+	refresh := func(impi, impu string) *cx.SAA {
+		r := &cx.SAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi, PublicIdentities: []string{impu},
+			ServerName: scscfName, AssignmentType: cx.ReRegistration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable}
+		a, err := cx.ParseSAA(cur.send(r.Message(cur.node)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return a
+	}
+	saa := refresh(impi1, impu1)
+	wantResult(t, "refresh", saa.Result, resSuccess)
+	if ids := userDataIdentities(t, saa.UserData); len(ids) != 1 || ids[0] != impu1 {
+		t.Fatalf("refresh User-Data identities = %v, want impu1 only", ids)
+	}
+	if n := e.metrics.get("chatbot.userdata_resent"); n != 1 {
+		t.Errorf("chatbot.userdata_resent = %d, want 1", n)
+	}
+	// A set without the host keeps the usual answer: no User-Data.
+	if saa := refresh(impi2, impu2); saa.Result != resSuccess || len(saa.UserData) != 0 {
+		t.Errorf("refresh of a set without the host = %+v", saa)
+	}
+	if s := e.sub(impi1); len(s.StaleSets) != 0 {
+		t.Errorf("the resend was stored: %+v", s)
+	}
+}
+
+// Deregistrations only clear state, so they may name an identity at the
+// chatbot host; registering it stays refused.
+func TestADeregistrationMayNameAChatbotHostIdentity(t *testing.T) {
+	for _, typ := range []cx.ServerAssignmentType{cx.UserDeregistration, cx.TimeoutDeregistration, cx.AdministrativeDeregistration} {
+		e := newChatbotCxEnv(t)
+		e.modify(impi1, func(s *store.Subscription) {
+			s.ServerName = scscfName
+			setState(s, 0, store.Registered)
+		})
+		scscf := connectCSCF(t, serveHSS(t, e.h, "hss-a.rcs.local"), "scscf-1.rcs.local")
+		wantResult(t, "registration SAR", scscf.sar(impi1, []string{leftover}, cx.ReRegistration, scscfName).Result, exp(cx.ErrorUserUnknown))
+		wantResult(t, fmt.Sprint("deregistration SAR ", typ), scscf.sar(impi1, []string{leftover}, typ, scscfName).Result, resSuccess)
+		if s := e.sub(impi1); s.Identity(leftover).State != store.NotRegistered || s.Identity(impu1).State != store.NotRegistered || s.ServerName != "" {
+			t.Errorf("after %v: %+v", typ, s)
+		}
+	}
+}
+
+// A set made only of chatbot-host identities, registered before the
+// setting, gets an RTR when a change would push its User-Data, which would
+// list no identity, and is then not registered at the HSS either.
+func TestASetOfOnlyChatbotHostIdentitiesIsDeregisteredRatherThanPushed(t *testing.T) {
+	a := newChatbotAPIEnv(t)
+	a.h.chatbot = testChatbotDomain(t)
+	profile := `{"id":"chat","initial_filter_criteria":[{"priority":1,"trigger_point":{"condition_type_cnf":false,"spt":[{"group":[0],"method":"MESSAGE"}]},` +
+		`"application_server":{"server_name":"` + asURI + `","default_handling":"SESSION_TERMINATED"}}]}`
+	if code, body, _ := a.do("POST", "/v1/service-profiles", adminToken, profile); code != http.StatusCreated {
+		t.Fatalf("create profile = %d %v", code, body)
+	}
+	s := &store.Subscription{IMPI: impi1, Profile: "chat", ServerName: scscfName, PublicIdentities: []store.PublicIdentity{
+		{IMPU: impu1, State: store.Registered}, {IMPU: leftover, ImplicitSet: 1, State: store.Registered}}}
+	if _, err := a.store.CreateSubscription(t.Context(), s); err != nil {
+		t.Fatal(err)
+	}
+	if code, body, _ := a.do("PUT", "/v1/service-profiles/chat", adminToken, strings.Replace(profile, `"MESSAGE"`, `"INVITE"`, 1)); code != http.StatusOK {
+		t.Fatalf("put profile = %d %v", code, body)
+	}
+	for range 2 {
+		select {
+		case <-a.notifier.sent:
+		case <-time.After(realWait):
+			t.Fatal("not every push went")
+		}
+	}
+	if err := a.api.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rtrs, pprs := a.notifier.got()
+	if len(pprs) != 1 || len(rtrs) != 1 {
+		t.Fatalf("%d PPRs and %d RTRs, want one of each", len(pprs), len(rtrs))
+	}
+	if ids := userDataIdentities(t, pprs[0].UserData); len(ids) != 1 || ids[0] != impu1 {
+		t.Errorf("PPR User-Data identities = %v", ids)
+	}
+	if r := rtrs[0]; len(r.PublicIdentities) != 1 || r.PublicIdentities[0] != leftover || r.DeregistrationReason.Code != cx.PermanentTermination {
+		t.Errorf("RTR = %+v", r)
+	}
+	got, err := a.store.Subscription(t.Context(), impi1)
+	if err != nil || got.Identity(leftover).State != store.NotRegistered || got.Identity(impu1).State != store.Registered || got.ServerName != scscfName {
+		t.Errorf("after the pushes: %+v, %v", got, err)
+	}
+	if n := a.metrics.get("push.chatbot_set_deregistered"); n != 1 {
+		t.Errorf("push.chatbot_set_deregistered = %d", n)
 	}
 }

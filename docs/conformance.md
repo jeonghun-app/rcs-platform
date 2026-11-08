@@ -84,14 +84,40 @@ Where `hss` answers Cx otherwise than TS 29.228 says, on purpose:
   §6.1.4.1 and Table 6.1.4.2 let a distinct identity take precedence over a
   wildcarded one. At `RCS_CHATBOT_DOMAIN`, `hss` does the reverse: an LIR in
   the range is answered from the wildcarded PSI even where an IMPU is stored,
-  and UAR, MAR and SAR answer DIAMETER_ERROR_USER_UNKNOWN for any identity
-  there, so none registers; User-Data leaves such an identity out of its
-  implicit set. No IMPU may be provisioned at the host, but one stored before
-  the setting could otherwise be registered and asserted as a chatbot URI
-  (threat model T13, T14). Code: [`internal/hss/cx.go`](../internal/hss/cx.go)
-  `CxServer.pair`, `CxServer.decideChatbotLIR`, `CxServer.applySAR`;
+  and UAR, MAR and every SAR but a deregistration answer
+  DIAMETER_ERROR_USER_UNKNOWN for any identity there, so no new registration
+  of one is made. A deregistration SAR may name one and is answered as
+  §6.1.2.1 has it for any identity: it only clears state, so it is not a
+  departure. User-Data leaves such an
+  identity out of its implicit set. No IMPU may be provisioned at the host,
+  but one stored before the setting could otherwise be registered and
+  asserted as a chatbot URI (threat model T13, T14). Code:
+  [`internal/hss/cx.go`](../internal/hss/cx.go) `CxServer.pair`,
+  `CxServer.decideChatbotLIR`, `CxServer.applySAR`;
   [`userdata.go`](../internal/hss/userdata.go) `HSS.userData`. Tests:
-  `TestTheChatbotHostIsThePSIsAlone`, `TestWithoutAChatbotDomainCxIsAsOnMain`.
+  `TestTheChatbotHostIsThePSIsAlone`, `TestWithoutAChatbotDomainCxIsAsOnMain`,
+  `TestADeregistrationMayNameAChatbotHostIdentity`,
+  `TestAPPRLeavesAChatbotHostIMPUOutOfUserData`,
+  `TestASetOfOnlyChatbotHostIdentitiesIsDeregisteredRatherThanPushed`.
+
+  Two related answers stay within the specification:
+  - **User-Data despite USER_DATA_ALREADY_AVAILABLE.** A set that holds an
+    identity at the host gets its User-Data, without that identity, with every
+    SAR that may carry it, even when the S-CSCF says it has the data. That is
+    how a registration made before the setting, whose refreshes name another
+    identity of the set and so are never refused, loses the identity at its
+    next refresh. It is the stale-set answer `hss` already gives
+    ([hss](hss.md#hss-initiated-requests)), and the same reason applies: the
+    S-CSCF holds User-Data the HSS no longer sends, which §6.6 lets the HSS
+    replace. Code: `applySARResending` in
+    [`procedures.go`](../internal/hss/procedures.go); tests:
+    `TestARefreshOfASetRegisteredBeforeTheSettingGetsUserDataWithoutTheHost`,
+    and on the S-CSCF side
+    `TestARefreshsUserDataWithoutAChatbotURIDropsItFromTheSet`.
+  - **An RTR instead of an empty PPR.** A set made only of such identities
+    would get User-Data listing none, which TS 29.228 Annex E does not allow,
+    so a change that would push it deregisters the set (§6.1.3,
+    PERMANENT_TERMINATION) and records it not registered.
 
 ## UP 2.4 → UP 4.0 gaps
 

@@ -36,7 +36,7 @@ func (h *HSS) userData(s *store.Subscription, set int, p *store.ServiceProfile) 
 	}
 	c := clone(s)
 	c.PublicIdentities = slices.DeleteFunc(c.PublicIdentities, func(id store.PublicIdentity) bool {
-		return atChatbotHost(h.chatbot, id.IMPU)
+		return storedAtChatbotHost(h.chatbot, id.IMPU)
 	})
 	return userData(c, set, p)
 }

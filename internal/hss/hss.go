@@ -106,11 +106,13 @@ type HSS struct {
 	chatbotAS string
 	// rangeMu guards the chatbot range compiled from the stored PSI of
 	// version rangeVersion (rangeRead once one was read); rangeOf is nil
-	// when that version gives no range.
+	// when that version gives no range, and rangeInvalid says it does not
+	// hold under RCS_CHATBOT_DOMAIN.
 	rangeMu      sync.Mutex
 	rangeRead    bool
 	rangeVersion int64
 	rangeOf      *chatbotRange
+	rangeInvalid bool
 }
 
 // subscriptionLock is one subscription's lock and the requests that hold it

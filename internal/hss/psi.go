@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 )
 
 // chatbotRange is the stored wildcarded PSI with its ERE compiled: the
@@ -98,13 +100,36 @@ func atChatbotHost(domain chatbot.Domain, impu string) bool {
 	return domain.Name() != "" && strings.TrimSuffix(host, ".") == domain.Name()
 }
 
+// storedAtChatbotHost is atChatbotHost for an identity as stored, put in
+// canonical form first: the store keeps IMPUs canonical, but a record
+// written past the API, as a migration might, need not be.
+func storedAtChatbotHost(domain chatbot.Domain, impu string) bool {
+	if c, ok := identity.CanonicalIMPU(impu); ok {
+		impu = c
+	}
+	return atChatbotHost(domain, impu)
+}
+
+// holdsChatbotHost reports whether the implicit set holds an identity at
+// the chatbot host, and onlyChatbotHost whether it holds nothing else.
+func (h *HSS) holdsChatbotHost(s *store.Subscription, set int) bool {
+	return slices.ContainsFunc(members(s, set), func(id store.PublicIdentity) bool { return storedAtChatbotHost(h.chatbot, id.IMPU) })
+}
+
+func (h *HSS) onlyChatbotHost(s *store.Subscription, set int) bool {
+	m := members(s, set)
+	return len(m) > 0 && !slices.ContainsFunc(m, func(id store.PublicIdentity) bool { return !storedAtChatbotHost(h.chatbot, id.IMPU) })
+}
+
 // chatbotRange returns the range of the stored PSI, or nil when there is
 // none: no PSI is stored, it is not active, or it does not hold under the
 // current RCS_CHATBOT_DOMAIN. Every call reads the item, so a new version
 // is seen at once; the compiled range is kept per version, so a version is
-// checked and compiled once per task. A PSI that does not hold, such as
-// one written for a domain since changed, is counted and logged once per
-// version, naming the rule and not the PSI.
+// checked and compiled once per task, and a read older than the version
+// cached, which another request's read overtook, does not replace it. A
+// PSI that does not hold, such as one written for a domain since changed,
+// is counted on every LIR it leaves without a range, so an alarm can see
+// it, and logged once per version, naming the rule and not the PSI.
 func (h *HSS) chatbotRange(ctx context.Context) (*chatbotRange, error) {
 	p, err := h.store.WildcardedPSI(ctx)
 	if errors.Is(err, store.ErrNotFound) {
@@ -115,19 +140,20 @@ func (h *HSS) chatbotRange(ctx context.Context) (*chatbotRange, error) {
 	}
 	h.rangeMu.Lock()
 	defer h.rangeMu.Unlock()
-	if h.rangeRead && h.rangeVersion == p.Version {
-		return h.rangeOf, nil
+	if !h.rangeRead || p.Version > h.rangeVersion {
+		r, err := parseChatbotRange(p.PSI, h.chatbot)
+		invalid := err != nil
+		if invalid {
+			h.log.Warn("the stored chatbot PSI does not hold under RCS_CHATBOT_DOMAIN, so there is no chatbot range",
+				slog.Int64("psi_version", p.Version), slog.String("reason", err.Error()))
+		}
+		if invalid || !p.Active {
+			r = nil
+		}
+		h.rangeRead, h.rangeVersion, h.rangeOf, h.rangeInvalid = true, p.Version, r, invalid
 	}
-	r, err := parseChatbotRange(p.PSI, h.chatbot)
-	switch {
-	case err != nil:
+	if h.rangeInvalid {
 		h.metrics.Count("chatbot.psi_invalid", 1)
-		h.log.Warn("the stored chatbot PSI does not hold under RCS_CHATBOT_DOMAIN, so there is no chatbot range",
-			slog.Int64("psi_version", p.Version), slog.String("reason", err.Error()))
-		r = nil
-	case !p.Active:
-		r = nil
 	}
-	h.rangeRead, h.rangeVersion, h.rangeOf = true, p.Version, r
-	return r, nil
+	return h.rangeOf, nil
 }
