@@ -1041,11 +1041,22 @@ func TestASweepNeverReadsALiveAttemptsClaim(t *testing.T) {
 }
 
 // endedTogether holds each task's first sweep that finds an ended claim
-// until every task has made one, so that they all read the queue at once.
+// until every task has made one, and then its first EndClaim until every
+// task has tried to free the claim, so that they all find it, one frees it,
+// and none reads the queue before the others have tried.
 type endedTogether struct {
 	store.Store
-	found  atomic.Bool
-	others *sync.WaitGroup
+	found, tried  atomic.Bool
+	others, freed *sync.WaitGroup
+}
+
+func (s *endedTogether) EndClaim(ctx context.Context, r, id string, lease, now time.Time) (bool, error) {
+	freed, err := s.Store.EndClaim(ctx, r, id, lease, now)
+	if s.tried.CompareAndSwap(false, true) {
+		s.freed.Done()
+		s.freed.Wait()
+	}
+	return freed, err
 }
 
 func (s *endedTogether) EndedClaims(ctx context.Context, now time.Time, cursor string, limit int) ([]store.Message, string, error) {
@@ -1058,17 +1069,19 @@ func (s *endedTogether) EndedClaims(ctx context.Context, now time.Time, cursor s
 }
 
 // #663: task-2 and task-3 both find task-9's ended claim of m1 in the same
-// sweep and both read bob's queue; the claim decides which delivers, once.
+// sweep. One of them frees it and counts it, both read bob's queue, and the
+// next claim decides which delivers, once.
 func TestTasksThatSweepOneEndedClaimDeliverItOnce(t *testing.T) {
 	st := store.NewMemory()
 	clock := newFakeClock()
-	var others sync.WaitGroup
+	var others, freed sync.WaitGroup
 	others.Add(2)
+	freed.Add(2)
 	var delivered atomic.Int64
 	var rigs []*rig
 	for i, task := range []string{"task-2", "task-3"} {
 		r := newRigWith(t, Config{InstanceID: task, RetryInterval: time.Hour, Rand: seeded(uint64(i + 2))},
-			&endedTogether{Store: st, others: &others}, clock)
+			&endedTogether{Store: st, others: &others, freed: &freed}, clock)
 		r.d.onPager(func(Delivery) error { delivered.Add(1); return nil })
 		rigs = append(rigs, r)
 	}
@@ -1078,9 +1091,62 @@ func TestTasksThatSweepOneEndedClaimDeliverItOnce(t *testing.T) {
 	if got := delivered.Load(); got != 1 {
 		t.Fatalf("m1 delivered %d times", got)
 	}
-	for _, r := range rigs {
-		if got := r.m.get("delivery.claim_recovered"); got != 1 {
-			t.Errorf("%s: delivery.claim_recovered = %d, want 1", r.e.cfg.InstanceID, got)
-		}
+	if got := rigs[0].m.get("delivery.claim_recovered") + rigs[1].m.get("delivery.claim_recovered"); got != 1 {
+		t.Errorf("delivery.claim_recovered = %d in all, want 1", got)
+	}
+}
+
+// #663, code review on #693: a pass that only invites for a message, a chat
+// message or a group copy waiting for a session, does not claim it, so a
+// dead task's ended claim on it would stay, and every sweep read the queue
+// again, invite, and start the retry wait over, for as long as the message
+// lives. The sweep frees the claim first: after that one read, the queue
+// is read and invited for exactly as often as when no task had held it.
+func TestAnEndedClaimOnAMessageWaitingForASessionIsRecoveredOnce(t *testing.T) {
+	for _, mode := range []store.Mode{store.Chat, store.Group} {
+		t.Run(mode.String(), func(t *testing.T) {
+			type counts struct{ reads, invites, recovered int64 }
+			run := func(held bool) counts {
+				st := &claimCounter{Store: store.NewMemory()}
+				clock := newFakeClock()
+				// RetryInterval apart from the sweep's minute, which sweeping
+				// counts timers by.
+				r := newRigWith(t, Config{InstanceID: "task-2", RetryInterval: 61 * time.Second}, st, clock)
+				r.e.SetGroupHandler(members{all: []string{alice, bob}})
+				drainInvites(t, r.d)
+				m := store.Message{Recipient: bob, ID: "0001", Sender: alice, Conversation: conv.ID, Contribution: conv.Contribution, Mode: mode,
+					CPIM: content.BodyOf(chat(t, "m1", "one", 0)), Enqueued: clock.Now(), Expires: clock.Now().Add(24 * time.Hour)}
+				if mode == store.Group {
+					m.Sender, m.Author = groupURI, alice
+				}
+				if err := st.Store.Enqueue(t.Context(), m, store.Limit{}); err != nil {
+					t.Fatal(err)
+				}
+				if held {
+					if _, err := st.Store.Claim(t.Context(), bob, m.ID, "task-9", clock.Now(), clock.Now().Add(r.e.lease())); err != nil {
+						t.Fatal(err)
+					}
+				}
+				idle := sweeping(t, 1, r)
+				if held {
+					if _, ok := stepUntil(t, clock, 10*time.Minute, idle, func() bool { return r.m.get("delivery.claim_recovered") == 1 }); !ok {
+						t.Fatal("the ended claim was not recovered")
+					}
+				} else {
+					r.e.ReadQueues([]string{bob})
+				}
+				waitFor(t, "the first read", idle)
+				before := counts{st.n.Load(), r.m.get("invite.sent"), 0}
+				stepUntil(t, clock, 40*time.Minute, idle, func() bool { return false })
+				if ended, _, err := st.EndedClaims(t.Context(), clock.Now(), "", 10); err != nil || len(ended) != 0 {
+					t.Fatalf("claims left: %v, %v", ended, err)
+				}
+				return counts{st.n.Load() - before.reads, r.m.get("invite.sent") - before.invites, r.m.get("delivery.claim_recovered")}
+			}
+			base, held := run(false), run(true)
+			if held.reads != base.reads || held.invites != base.invites || held.recovered != 1 || base.invites == 0 {
+				t.Fatalf("in 40 min after the first read: %+v with a dead task's claim, %+v without", held, base)
+			}
+		})
 	}
 }

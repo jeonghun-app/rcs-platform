@@ -339,6 +339,12 @@ type Store interface {
 	// with Release or Remove long before the lease does, so a claim left to
 	// its lease is one whose holder died with it (#663).
 	EndedClaims(ctx context.Context, now time.Time, cursor string, limit int) ([]Message, string, error)
+	// EndClaim frees a message whose claim, until lease, ended at or before
+	// now, as EndedClaims found it, so that it is retried as any free
+	// message is. It reports whether this call freed it. A message free
+	// already, by a repeat of this call or another caller's, is no error;
+	// ErrConflict if it is claimed again, ErrNotFound if it is gone.
+	EndClaim(ctx context.Context, recipient, id string, lease, now time.Time) (bool, error)
 	// RecordSent stores s: ErrExists if the sender already has a record for
 	// the Message-ID that has not expired at now. An expired one is
 	// replaced, since a backend may keep it for a while (DynamoDB TTL).

@@ -420,6 +420,32 @@ func endedClaims(t *testing.T, s store.Store) {
 	if got := ended(t0.Add(2 * time.Minute)); fmt.Sprint(got) != "[0003]" {
 		t.Fatalf("EndedClaims after a new claim = %v", got)
 	}
+	// EndClaim frees only the claim read, once over; a repeat, the message
+	// free already, is no error.
+	at := t0.Add(2 * time.Minute)
+	for _, c := range []struct {
+		r, id     string
+		lease, at time.Time
+		freed     bool
+		err       error
+	}{
+		{bob, "0001", t0.Add(time.Minute), at, false, store.ErrConflict},          // claimed again since
+		{bob, "0001", t0.Add(3 * time.Minute), at, false, store.ErrConflict},      // within its lease
+		{bob, "0004", t0.Add(time.Minute), at, false, store.ErrNotFound},          // removed
+		{carol, "0003", t0.Add(2 * time.Minute), at, true, nil},                   // ended
+		{carol, "0003", t0.Add(2 * time.Minute), at.Add(time.Second), false, nil}, // a repeat
+	} {
+		freed, err := s.EndClaim(ctx, c.r, c.id, c.lease, c.at)
+		if freed != c.freed || !errors.Is(err, c.err) || (c.err == nil) != (err == nil) {
+			t.Fatalf("EndClaim(%s until %v) = %v, %v; want %v, %v", c.id, c.lease, freed, err, c.freed, c.err)
+		}
+	}
+	if got := ended(t0.Add(time.Hour)); fmt.Sprint(got) != "[0001]" {
+		t.Fatalf("EndedClaims after EndClaim = %v", got)
+	}
+	if got, _ := s.Pending(ctx, carol, "", at, 10); len(got) != 1 || got[0].Owner != "" {
+		t.Fatalf("Pending of a freed message = %+v", got)
+	}
 	if got, _, _ := s.EndedClaims(ctx, t0.Add(time.Hour), "", 0); len(got) != 0 {
 		t.Fatalf("limit 0 returned %d", len(got))
 	}

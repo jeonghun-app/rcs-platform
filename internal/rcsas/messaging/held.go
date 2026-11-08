@@ -2,9 +2,11 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/store"
 )
 
 // A registration says the recipient can be reached now, but a message
@@ -150,25 +152,48 @@ func (e *Engine) leaseRead(user string, r *recipient, until time.Time) {
 	r.leaseTimer, r.leaseAt = t, until
 }
 
-// readEndedClaims has the queues of the recipients of up to Batch claims
-// whose lease has ended read again, from cursor on, and returns the cursor
-// to go on from. A claim ends with its attempt, by a release or a removal,
-// long before its lease does: one the store still holds at the lease's end
-// is a dead task's, and it may be a 1-to-1 message no pass on a surviving
-// task met (#663). The read is a pass over the whole queue, as for a lease
-// a pass met, and the claim decides which of the tasks that read it at once
-// delivers. A recipient already in read, of one Run's sweep, is not read
-// again.
+// readEndedClaims frees up to Batch claims whose lease has ended, from
+// cursor on, and has the queues they were in read again; it returns the
+// cursor to go on from. A claim ends with its attempt, by a release or a
+// removal, long before its lease does: one the store still holds at the
+// lease's end is a dead task's, or one whose release or removal failed, and
+// it may be a 1-to-1 message no pass on a surviving task met (#663). It is
+// freed before the read, on the condition that it is still that claim
+// (store.Store.EndClaim): a pass that does not claim the message, as for
+// one waiting for a session, would leave it in the index, and every sweep
+// on every task would read the queue again and start its retry wait over.
+// Freed, the message is retried as any free message is. Of the tasks that
+// find a claim at once, the one that frees it counts it; each reads a
+// queue whose message is free, and the next claim decides which delivers.
+// A queue in read, of one Run's sweep, is read and counted once.
 func (e *Engine) readEndedClaims(ctx context.Context, cursor string, read map[string]bool) (string, error) {
+	now := e.clock.Now()
 	sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
-	ended, next, err := e.store.EndedClaims(sctx, e.clock.Now(), cursor, e.cfg.Batch)
+	ended, next, err := e.store.EndedClaims(sctx, now, cursor, e.cfg.Batch)
 	cancel()
+	var kick []string
 	for _, m := range ended {
-		if !read[m.Recipient] {
-			read[m.Recipient] = true
-			e.metrics.Count("delivery.claim_recovered", 1)
-			e.kickEvent(m.Recipient)
+		sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
+		freed, cerr := e.store.EndClaim(sctx, m.Recipient, m.ID, m.LeaseUntil, now)
+		cancel()
+		switch {
+		case errors.Is(cerr, store.ErrConflict), errors.Is(cerr, store.ErrNotFound):
+			continue
+		case cerr != nil:
+			e.storeFailed("end claim", m.Recipient, cerr)
+			continue
 		}
+		counted, seen := read[m.Recipient]
+		if !seen {
+			kick = append(kick, m.Recipient)
+		}
+		if freed && !counted {
+			e.metrics.Count("delivery.claim_recovered", 1)
+		}
+		read[m.Recipient] = counted || freed
+	}
+	for _, u := range kick {
+		e.kickEvent(u)
 	}
 	return next, err
 }

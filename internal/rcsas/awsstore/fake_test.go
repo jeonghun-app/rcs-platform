@@ -121,37 +121,28 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 	row, exists := f.rows[k]
 	vals := in.ExpressionAttributeValues
 	switch cond, upd := aws.ToString(in.ConditionExpression), aws.ToString(in.UpdateExpression); {
-	case cond == "attribute_exists(#pk) AND "+freeAt && upd == "SET #owner = :owner, #lease = :until, #cb = :cb":
-		if !exists || !free(row, vals[":now"]) {
-			return nil, errCondition
-		}
-		row[attrOwner], row[attrLease], row[attrClaimBucket] = vals[":owner"], vals[":until"], vals[":cb"]
-		if in.ReturnValues != dtypes.ReturnValueAllNew {
-			f.t.Error("claim without ReturnValues ALL_NEW")
-		}
-		return &dynamodb.UpdateItemOutput{Attributes: maps.Clone(row)}, nil
 	case cond == "attribute_exists(#pk) AND "+freeAt && upd == "SET #owner = :owner, #lease = :until":
-		// A claim by a task on the image before the claims index (#663).
 		if !exists || !free(row, vals[":now"]) {
 			return nil, errCondition
 		}
 		row[attrOwner], row[attrLease] = vals[":owner"], vals[":until"]
+		if in.ReturnValues != dtypes.ReturnValueAllNew {
+			f.t.Error("claim without ReturnValues ALL_NEW")
+		}
 		return &dynamodb.UpdateItemOutput{Attributes: maps.Clone(row)}, nil
 	case cond == "#owner = :owner" && upd == "REMOVE #owner, #lease":
-		// Its release.
 		if !exists || sOf(row[attrOwner]) != sOf(vals[":owner"]) {
 			return nil, errCondition
 		}
 		delete(row, attrOwner)
 		delete(row, attrLease)
 		return &dynamodb.UpdateItemOutput{}, nil
-	case cond == "#owner = :owner" && upd == "REMOVE #owner, #lease, #cb":
-		if !exists || sOf(row[attrOwner]) != sOf(vals[":owner"]) {
+	case cond == "#lease = :seen AND #lease <= :now" && upd == "REMOVE #owner, #lease":
+		if !exists || row[attrLease] == nil || nOf(row[attrLease]) != nOf(vals[":seen"]) || nOf(row[attrLease]) > nOf(vals[":now"]) {
 			return nil, errCondition
 		}
 		delete(row, attrOwner)
 		delete(row, attrLease)
-		delete(row, attrClaimBucket)
 		return &dynamodb.UpdateItemOutput{}, nil
 	case cond == "#expires > :now AND attribute_not_exists(#seen.#k)" && upd == "SET #seen.#k = :entry ADD #marks :one":
 		mark := in.ExpressionAttributeNames["#k"]
@@ -459,7 +450,7 @@ func indexKey(r map[string]dtypes.AttributeValue) map[string]dtypes.AttributeVal
 }
 
 func claimsKey(r map[string]dtypes.AttributeValue) map[string]dtypes.AttributeValue {
-	return map[string]dtypes.AttributeValue{attrPK: r[attrPK], attrSK: r[attrSK], attrClaimBucket: r[attrClaimBucket], attrLease: r[attrLease]}
+	return map[string]dtypes.AttributeValue{attrPK: r[attrPK], attrSK: r[attrSK], attrBucket: r[attrBucket], attrLease: r[attrLease]}
 }
 
 // indexOrder sorts the expiry index: by expiry, then table key.
@@ -497,14 +488,14 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 	}
 	if aws.ToString(in.IndexName) == IndexClaims {
 		f.claimQueries++
-		if in.ConsistentRead != nil || aws.ToString(in.KeyConditionExpression) != "#cb = :b AND #lease <= :now" || in.FilterExpression != nil {
+		if in.ConsistentRead != nil || aws.ToString(in.KeyConditionExpression) != "#xb = :b AND #lease <= :now" || in.FilterExpression != nil {
 			f.t.Errorf("claims query %q filter %q", aws.ToString(in.KeyConditionExpression), aws.ToString(in.FilterExpression))
 		}
 		var rows []map[string]dtypes.AttributeValue
 		for _, r := range f.rows {
 			// An item is in the index only with both its keys; it projects
 			// those and the table's.
-			if _, ok := r[attrLease]; ok && sOf(r[attrClaimBucket]) == sOf(vals[":b"]) && nOf(r[attrLease]) <= nOf(vals[":now"]) {
+			if _, ok := r[attrLease]; ok && sOf(r[attrBucket]) == sOf(vals[":b"]) && nOf(r[attrLease]) <= nOf(vals[":now"]) {
 				rows = append(rows, claimsKey(r))
 			}
 		}

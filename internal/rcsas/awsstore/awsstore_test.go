@@ -62,6 +62,7 @@ func TestEveryOperationReportsAFailedRequest(t *testing.T) {
 		"Remove":         func() error { return s.Remove(ctx, store.Message{Recipient: "r", ID: "1"}, "o") },
 		"Expired":        func() error { _, _, err := s.Expired(ctx, t0, "", 1); return err },
 		"EndedClaims":    func() error { _, _, err := s.EndedClaims(ctx, t0, "", 1); return err },
+		"EndClaim":       func() error { _, err := s.EndClaim(ctx, "r", "1", t0, t0); return err },
 		"RecordSent":     func() error { return s.RecordSent(ctx, store.Sent{Sender: "s", MessageID: "m"}, t0) },
 		"Sent":           func() error { _, err := s.Sent(ctx, "s", "m", t0); return err },
 		"MarkNotified":   func() error { return s.MarkNotified(ctx, "s", "m", "k", "displayed", "t", t0) },
@@ -328,16 +329,16 @@ func TestEndedClaimsReadsTheIndexAndResumes(t *testing.T) {
 	}
 }
 
-func TestClaimsOfAnOlderTaskStayOutOfTheClaimsIndex(t *testing.T) {
+func TestClaimsOfAnOlderTaskAreInTheClaimsIndex(t *testing.T) {
 	olderTaskClaims(t, NewWithClient("messages", newFakeDynamo(t)))
 }
 
 // olderTaskClaims checks a rolling update over s (#663). A task on the
-// image before the claims index claims and releases with the expressions it
-// had, which neither set nor remove cb: its claims stay out of the index
-// and behave as before. Its release of a message a newer task once claimed
-// leaves cb without the lease the index is also keyed on, so the item stays
-// out. Each image reads the other's items.
+// image before the claims index claims and releases with the expressions
+// written out here, which this image's Claim and Release still send: the
+// index is keyed on what they already write. So an older task's claim is
+// in the index, listed once its lease has ended and not before, and its
+// release takes it out.
 func olderTaskClaims(t *testing.T, s *Store) {
 	ctx := t.Context()
 	bob := "sip:bob@example.net"
@@ -351,7 +352,7 @@ func olderTaskClaims(t *testing.T, s *Store) {
 		_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 			TableName: aws.String(s.table), Key: k, ReturnValues: dtypes.ReturnValueAllNew,
 			UpdateExpression:         aws.String("SET #owner = :owner, #lease = :until"),
-			ConditionExpression:      aws.String("attribute_exists(#pk) AND " + freeAt),
+			ConditionExpression:      aws.String("attribute_exists(#pk) AND (attribute_not_exists(#owner) OR #lease <= :now)"),
 			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#owner": attrOwner, "#lease": attrLease},
 			ExpressionAttributeValues: map[string]dtypes.AttributeValue{
 				":owner": str("old-task"), ":until": stamp(until), ":now": stamp(now),
@@ -361,43 +362,29 @@ func olderTaskClaims(t *testing.T, s *Store) {
 			t.Fatalf("an older task's claim = %v", err)
 		}
 	}
-	ended := func(now time.Time) int {
+	ended := func(now time.Time) []store.Message {
 		t.Helper()
 		got, _, err := s.EndedClaims(ctx, now, "", 10)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return len(got)
-	}
-	row := func() map[string]dtypes.AttributeValue {
-		t.Helper()
-		item, err := s.current(ctx, "read", k)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return item
+		return got
 	}
 	oldClaim(t0, t0.Add(time.Minute))
-	if got, _ := s.Pending(ctx, bob, "", t0.Add(30*time.Second), 10); len(got) != 0 {
-		t.Fatal("an older task's claim does not hold for its lease")
+	if got := ended(t0.Add(30 * time.Second)); len(got) != 0 {
+		t.Fatalf("an older task's claim within its lease is listed: %v", got)
 	}
-	if n := ended(t0.Add(2 * time.Minute)); n != 0 {
-		t.Fatalf("an older task's claim is in the claims index (%d)", n)
+	got := ended(t0.Add(time.Minute))
+	if len(got) != 1 || !got[0].LeaseUntil.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("an older task's ended claim = %+v", got)
 	}
-	if _, err := s.Claim(ctx, bob, m.ID, "new-task", t0.Add(2*time.Minute), t0.Add(3*time.Minute)); err != nil {
-		t.Fatalf("claim once an older task's lease ended = %v", err)
+	if freed, err := s.EndClaim(ctx, bob, m.ID, got[0].LeaseUntil, t0.Add(time.Minute)); err != nil || !freed {
+		t.Fatalf("EndClaim of an older task's claim = %v, %v", freed, err)
 	}
-	if n := ended(t0.Add(3 * time.Minute)); n != 1 {
-		t.Fatalf("a newer task's claim is not in the claims index (%d)", n)
+	if got, _ := s.Pending(ctx, bob, "", t0.Add(time.Minute), 10); len(got) != 1 || got[0].Owner != "" {
+		t.Fatalf("Pending once freed = %+v", got)
 	}
-	// What an older task reads it with, decodeMessage, did not change.
-	if _, until, err := s.PendingHeld(ctx, bob, "", "old-task", t0.Add(150*time.Second), 10); err != nil || !until.Equal(t0.Add(3*time.Minute)) {
-		t.Fatalf("PendingHeld of a newer task's claim = %v, %v", until, err)
-	}
-	oldClaim(t0.Add(3*time.Minute), t0.Add(4*time.Minute))
-	if n := ended(t0.Add(3*time.Minute + 30*time.Second)); n != 0 {
-		t.Fatal("an older task's claim within its lease is listed")
-	}
+	oldClaim(t0.Add(2*time.Minute), t0.Add(3*time.Minute))
 	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName: aws.String(s.table), Key: k,
 		UpdateExpression:          aws.String("REMOVE #owner, #lease"),
@@ -408,17 +395,8 @@ func olderTaskClaims(t *testing.T, s *Store) {
 	if err != nil {
 		t.Fatalf("an older task's release = %v", err)
 	}
-	if _, ok := row()[attrClaimBucket]; !ok || ended(t0.Add(time.Hour)) != 0 {
-		t.Fatal("an older task's release took cb, or left the item in the claims index")
-	}
-	if _, err := s.Claim(ctx, bob, m.ID, "new-task", t0.Add(5*time.Minute), t0.Add(6*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Release(ctx, bob, m.ID, "new-task"); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := row()[attrClaimBucket]; ok {
-		t.Fatal("a release left cb")
+	if got := ended(t0.Add(time.Hour)); len(got) != 0 {
+		t.Fatalf("an older task's released claim is listed: %v", got)
 	}
 }
 

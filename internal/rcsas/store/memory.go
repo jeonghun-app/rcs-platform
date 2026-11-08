@@ -274,6 +274,24 @@ func (s *Memory) EndedClaims(_ context.Context, now time.Time, cursor string, li
 	return out, claimKey(out[limit-1]), nil
 }
 
+// EndClaim implements Store.
+func (s *Memory) EndClaim(_ context.Context, recipient, id string, lease, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.queues[recipient][id]
+	switch {
+	case !ok:
+		return false, fmt.Errorf("store: end claim: %w", ErrNotFound)
+	case m.Owner == "":
+		return false, nil
+	case !m.LeaseUntil.Equal(lease) || lease.After(now):
+		return false, fmt.Errorf("store: end claim: %w", ErrConflict)
+	}
+	m.Owner, m.LeaseUntil = "", time.Time{}
+	s.queues[recipient][id] = m
+	return true, nil
+}
+
 // claimKey orders claims by the end of their lease, then queue and ID.
 func claimKey(m Message) string {
 	return fmt.Sprintf("%020d\x00%s\x00%s", m.LeaseUntil.UnixNano(), m.Recipient, m.ID)

@@ -202,7 +202,7 @@ Locally, `tools/stack-init` does it, in two one-shot containers built from
   - `registrations`, `auth-challenges` and `reg-subscriptions`
     ([scscf state](scscf-state.md)), through
     `internal/scscf/state/dynamostore.CreateTables`;
-  - `messages`, with its `expiry` index, and `groupchats`
+  - `messages`, with its `expiry` and `claims` indexes, and `groupchats`
     ([rcs-as](rcs-as.md#dynamodb-messages-table)), through
     `internal/rcsas/awsstore.CreateMessagesTable` and `CreateGroupsTable`;
   - `files` with TTL on `ttl` and the bucket `ft-content`
@@ -470,6 +470,7 @@ describe them. #56 provides the AWS values. Locally:
 | Symptom | Cause and fix |
 |---|---|
 | `make up` stops at "Waiting" and then fails with a service unhealthy | `make logs LOGS="<service>"`. A setting the service refuses is reported at start, every problem at once. |
+| rcs-as logs `ended claims` store failures every sweep | The `messages` table predates its `claims` index (#663): `make up` on a running stack keeps DynamoDB Local and its tables, and stack-init passes over a table that exists. Run `make down`, then `make up`. |
 | "port is already allocated" | Another process uses a host port. Change it in `deploy/compose.env`. |
 | "not in deploy/compose.env; make up adds new settings to it" | The env file lacks a setting. `make up` adds it (`scripts/compose-env.sh`); running `docker compose` directly does not. |
 | "run make up, which …" for an image variable | The compose file was used without make. Use the make targets, which set the image variables. |

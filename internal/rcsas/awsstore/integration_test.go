@@ -69,9 +69,9 @@ func TestIntegrationStoreMeetsTheContract(t *testing.T) {
 	storetest.Run(t, integrationStore)
 }
 
-// DynamoDB Local keeps an item out of the claims index while it lacks
-// either key, as a claim of an older task leaves it.
-func TestIntegrationClaimsOfAnOlderTaskStayOutOfTheClaimsIndex(t *testing.T) {
+// DynamoDB Local puts an item in the claims index while it has both keys,
+// whichever image claimed it, and takes it out once a release removes one.
+func TestIntegrationClaimsOfAnOlderTaskAreInTheClaimsIndex(t *testing.T) {
 	_, s := integrationTable(t)
 	olderTaskClaims(t, s)
 }

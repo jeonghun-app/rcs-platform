@@ -35,8 +35,9 @@ const ExpiryBuckets = 16
 // IndexExpiry is the expiry index's name.
 const IndexExpiry = "expiry"
 
-// IndexClaims is the claims index's name (#663): claimed queue items, by the
-// expiry index's bucket and the end of their lease.
+// IndexClaims is the claims index's name (#663): claimed queue items, by
+// their xb bucket and the end of their lease. Only a claim sets lease_until,
+// and a release removes it, so the index is as sparse as the claims.
 const IndexClaims = "claims"
 
 // Attribute names.
@@ -65,9 +66,6 @@ const (
 	attrMarkCount    = "marks"
 	attrDateTime     = "datetime"
 	attrSummary      = "summary"
-	// attrClaimBucket is attrBucket's value, on a queue item only while it
-	// is claimed: what puts it in the claims index.
-	attrClaimBucket = "cb"
 	// The two fields of a seen entry: the token of the attempt that set
 	// it, and the status the notification reported.
 	attrMarkToken  = "t"
@@ -623,13 +621,13 @@ func (s *Store) Claim(ctx context.Context, recipient, id, owner string, now, unt
 	out, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           aws.String(s.table),
 		Key:                 k,
-		UpdateExpression:    aws.String("SET #owner = :owner, #lease = :until, #cb = :cb"),
+		UpdateExpression:    aws.String("SET #owner = :owner, #lease = :until"),
 		ConditionExpression: aws.String("attribute_exists(#pk) AND " + freeAt),
 		ExpressionAttributeNames: map[string]string{
-			"#pk": attrPK, "#owner": attrOwner, "#lease": attrLease, "#cb": attrClaimBucket,
+			"#pk": attrPK, "#owner": attrOwner, "#lease": attrLease,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":owner": str(owner), ":until": stamp(until), ":now": stamp(now), ":cb": str(bucket(recipient)),
+			":owner": str(owner), ":until": stamp(until), ":now": stamp(now),
 		},
 		ReturnValues: types.ReturnValueAllNew,
 	})
@@ -660,9 +658,9 @@ func (s *Store) Release(ctx context.Context, recipient, id, owner string) error 
 	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(s.table),
 		Key:                       k,
-		UpdateExpression:          aws.String("REMOVE #owner, #lease, #cb"),
+		UpdateExpression:          aws.String("REMOVE #owner, #lease"),
 		ConditionExpression:       aws.String("#owner = :owner"),
-		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner, "#lease": attrLease, "#cb": attrClaimBucket},
+		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner, "#lease": attrLease},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
 	})
 	if errorCode(err) == conditionFailed {
@@ -809,7 +807,7 @@ type bucketIndex struct {
 
 var (
 	expiryIndex = bucketIndex{IndexExpiry, attrBucket, attrExpires}
-	claimsIndex = bucketIndex{IndexClaims, attrClaimBucket, attrLease}
+	claimsIndex = bucketIndex{IndexClaims, attrBucket, attrLease}
 )
 
 // keyOf is an item's key in the index, as a cursor keeps it.
@@ -847,12 +845,41 @@ func (s *Store) Expired(ctx context.Context, now time.Time, cursor string, limit
 // another task may claim at now.
 func (s *Store) EndedClaims(ctx context.Context, now time.Time, cursor string, limit int) ([]store.Message, string, error) {
 	return s.readBuckets(ctx, "query ended claims", claimsIndex, cursor, limit, func(in *dynamodb.QueryInput) {
-		in.KeyConditionExpression = aws.String("#cb = :b AND #lease <= :now")
-		in.ExpressionAttributeNames = map[string]string{"#cb": attrClaimBucket, "#lease": attrLease}
+		in.KeyConditionExpression = aws.String("#xb = :b AND #lease <= :now")
+		in.ExpressionAttributeNames = map[string]string{"#xb": attrBucket, "#lease": attrLease}
 		in.ExpressionAttributeValues[":now"] = stamp(now)
 	}, func(item map[string]types.AttributeValue, m *store.Message) error {
 		return getTime(item, attrLease, &m.LeaseUntil)
 	})
+}
+
+// EndClaim implements store.Store: a release on the condition that the lease
+// is still the one read and over, so that it cannot free a message another
+// task has claimed since.
+func (s *Store) EndClaim(ctx context.Context, recipient, id string, lease, now time.Time) (bool, error) {
+	k := key(identityKey(queuePrefix, recipient), id)
+	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(s.table),
+		Key:                       k,
+		UpdateExpression:          aws.String("REMOVE #owner, #lease"),
+		ConditionExpression:       aws.String("#lease = :seen AND #lease <= :now"),
+		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner, "#lease": attrLease},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":seen": stamp(lease), ":now": stamp(now)},
+	})
+	if errorCode(err) == conditionFailed {
+		item, err := s.current(ctx, "end claim", k)
+		if err != nil {
+			return false, err
+		}
+		if _, held := item[attrOwner]; held {
+			return false, fmt.Errorf("awsstore: end claim: %w", store.ErrConflict)
+		}
+		return false, nil
+	}
+	if err != nil {
+		return false, sanitize("end claim", err)
+	}
+	return true, nil
 }
 
 // readBuckets reads up to limit queue items of index from cursor on,
