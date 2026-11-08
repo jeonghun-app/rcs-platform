@@ -1,5 +1,10 @@
 package chatbot
 
+import (
+	"mime"
+	"strings"
+)
+
 // Bounds of ADR 0009 §5 and §7.
 const (
 	// MaxContentBytes bounds a chatbot's content, chip list included:
@@ -43,4 +48,47 @@ func DefaultContentTypes() ContentTypes {
 		ChipList:        ChipListType,
 		FromSubscribers: []string{"text/plain", SuggestionResponseType, SharedClientDataType},
 	}
+}
+
+// MatchContentType reports whether contentType is one of allowed, the
+// shared rule rcs-as and maap both apply before answering 415 (ADR 0009 §5).
+// Types, subtypes and parameter names compare without regard to case
+// (RFC 2045 §5.1), and so does a charset value (RFC 2046 §4.1.2). Every
+// parameter of the allowed entry must be present with its value. The types
+// of RCC.07 v13.0 §3.6.10.2 carry no parameter, so the only one a sender may
+// add is charset=utf-8, the only charset content may have (§5). An entry
+// that does not parse matches nothing.
+func MatchContentType(contentType string, allowed []string) bool {
+	got, gotParams, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return false
+	}
+	for _, entry := range allowed {
+		want, wantParams, err := mime.ParseMediaType(entry)
+		if err == nil && got == want && sameParams(gotParams, wantParams) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameParams(got, want map[string]string) bool {
+	for name, v := range want {
+		if !paramEqual(name, got[name], v) {
+			return false
+		}
+	}
+	for name, v := range got {
+		if _, ok := want[name]; !ok && !(name == "charset" && strings.EqualFold(v, "utf-8")) {
+			return false
+		}
+	}
+	return true
+}
+
+func paramEqual(name, a, b string) bool {
+	if name == "charset" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
 }

@@ -17,10 +17,12 @@ import (
 // against the whole user part; it is what [Domain.Normalise] accepts.
 const UserPartERE = `[a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})?`
 
-// MaxURIBytes bounds a chatbot URI in normal form, which rcs-as writes into
-// the CPIM it reserves room for (ADR 0009 §5). [NewDomain] refuses a domain
-// that a normal form of the longest user part would take past it.
-const MaxURIBytes = 256
+// MaxURIBytes bounds a chatbot URI in normal form: identity.MaxLength, the
+// bound every service puts on an identity, so that the longest normal form
+// is still an IMPU to icscf, hss and rcs-as (ADR 0009 §5). [NewDomain]
+// refuses a domain that a normal form of the longest user part would take
+// past it.
+const MaxURIBytes = identity.MaxLength
 
 // maxLabel and maxUser bound the user part: two labels of 63 and the dot.
 const (
@@ -60,15 +62,20 @@ type Domain struct{ name string }
 
 // NewDomain checks a value of RCS_CHATBOT_DOMAIN against the IMS domain:
 // a lower-case DNS name of at most MaxDomainBytes, without a trailing dot,
-// that differs from imsDomain without regard to case, since the chatbot
-// range and the IMPUs must not meet in hss (ADR 0009 §2, §3). An empty
-// name is the zero Domain. The error names the rule, not the value.
+// whose last label starts with a letter, as a SIP host name's must (RFC
+// 3261 §25.1 toplabel; so no IPv4 address), and that differs from
+// imsDomain without regard to case, since the chatbot range and the IMPUs
+// must not meet in hss (ADR 0009 §2, §3). An empty name is the zero Domain.
+// The error names the rule, not the value.
 func NewDomain(name, imsDomain string) (Domain, error) {
+	top := name[strings.LastIndexByte(name, '.')+1:]
 	switch {
 	case name == "":
 		return Domain{}, nil
 	case !identity.IsDomainName(name) || strings.ToLower(name) != name:
 		return Domain{}, errors.New("not a lower-case DNS name")
+	case top[0] < 'a' || top[0] > 'z':
+		return Domain{}, errors.New("not a host name a SIP URI can carry (the last label must start with a letter)")
 	case len(name) > MaxDomainBytes:
 		return Domain{}, errors.New("longer than the chatbot URI bound allows")
 	case strings.EqualFold(strings.TrimSuffix(imsDomain, "."), name):
@@ -110,9 +117,14 @@ func (d Domain) Normalise(uri string) (string, error) {
 		return "", refuse(ErrNotNormal, "not a valid SIP URI")
 	case u.Scheme != "sip":
 		return "", refuse(ErrNotNormal, "not a sip: URI")
-	case u.Password != "" || u.User != "" && userinfo(uri) != u.User:
-		// The parser reads "sip:a:@host" as user a with no password.
+	case u.Password != "":
 		return "", refuse(ErrNotNormal, "a password")
+	case u.String() != "sip"+uri[len("sip"):]:
+		// A service that parses the URI and writes it back must not get
+		// another URI than the one judged here: a form the parser drops
+		// part of, such as the empty password of "sip:a:@host", is
+		// refused. Only the scheme's case may differ.
+		return "", refuse(ErrNotNormal, "a form that does not write back as received")
 	case u.Port != 0:
 		return "", refuse(ErrNotNormal, "a port")
 	case len(u.Headers) > 0:
@@ -155,14 +167,6 @@ func (d Domain) atDomain(uri string) bool {
 		}
 	}
 	return false
-}
-
-// userinfo returns what uri, a sip: or sips: URI, has between the scheme
-// and the first "@".
-func userinfo(uri string) string {
-	_, rest, _ := strings.Cut(uri, ":")
-	info, _, _ := strings.Cut(rest, "@")
-	return info
 }
 
 // userPartProblem names what keeps user from matching UserPartERE, or

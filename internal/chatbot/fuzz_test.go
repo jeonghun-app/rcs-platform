@@ -9,13 +9,15 @@ import (
 )
 
 // FuzzNormalise checks that a normal form is a fixed point inside the bound,
-// that the strict parse never reads a URI as at the chatbot domain that the
-// loose check misses, and, with the input as a user part, that Normalise
-// and UserPartERE accept the same ones.
+// that an accepted URI writes back as received, that the strict parse never
+// reads a URI as at the chatbot domain that the loose check misses, and,
+// with the input as a user part, that Normalise and UserPartERE accept the
+// same ones.
 func FuzzNormalise(f *testing.F) {
 	for _, s := range []string{
 		"sip:mybot@" + botDomain, "sip:my-bot.pub@" + botDomain + ";tk=on", "sips:mybot@" + botDomain,
 		"sip:mybot@" + botDomain + ":5060", "sip:a@b@" + botDomain, "tel:+15550100001", "mybot", "a.b.c", "my%62ot",
+		"sip:sips:@" + botDomain, "sip:mybot@" + botDomain + ";x=@evil.example.net",
 	} {
 		f.Add(s)
 	}
@@ -30,6 +32,9 @@ func FuzzNormalise(f *testing.F) {
 			}
 			if again, err := d.Normalise(got); err != nil || again != got {
 				t.Fatalf("Normalise(%q) = %q, %v; want it unchanged", got, again, err)
+			}
+			if u, _ := sip.ParseURI(s); u.String() != "sip"+s[len("sip"):] {
+				t.Fatalf("Normalise accepted %q, which writes back as %q", s, u.String())
 			}
 		case errors.Is(err, ErrNotChatbot):
 			if u, perr := sip.ParseURI(s); perr == nil && (u.Scheme == "sip" || u.Scheme == "sips") && strings.EqualFold(u.Host, botDomain) {
