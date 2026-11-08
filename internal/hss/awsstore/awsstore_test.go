@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -110,6 +111,7 @@ func TestCorruptItemsAreRefused(t *testing.T) {
 	f.tables["subscribers"]["u#"+storetest.IMPU1] = map[string]types.AttributeValue{attrPK: str("u#" + storetest.IMPU1)}
 	f.tables["subscribers"]["u#"+storetest.IMPU2] = map[string]types.AttributeValue{attrPK: str("u#x"), attrIMPI: str(storetest.IMPI2)}
 	f.tables["subscribers"][keyringPK] = map[string]types.AttributeValue{attrPK: str(keyringPK), "key_1": str("not binary")}
+	f.tables["subscribers"][psiPK] = map[string]types.AttributeValue{attrPK: str(psiPK), attrVersion: &types.AttributeValueMemberN{Value: "x"}, attrDoc: &types.AttributeValueMemberB{}}
 	f.tables["service-profiles"]["p"] = map[string]types.AttributeValue{attrPK: str("p"), attrVersion: &types.AttributeValueMemberN{Value: "x"}, attrDoc: &types.AttributeValueMemberB{}}
 	for name, err := range map[string]error{
 		"subscription without doc": second(d.Subscription(ctx, storetest.IMPI1)),
@@ -117,6 +119,7 @@ func TestCorruptItemsAreRefused(t *testing.T) {
 		"identity to nothing":      second(d.SubscriptionByIMPU(ctx, storetest.IMPU2)),
 		"profile with bad version": second(d.Profile(ctx, "p")),
 		"data key not binary":      second(d.DataKeys(ctx)),
+		"PSI with bad version":     second(d.WildcardedPSI(ctx)),
 	} {
 		if err == nil {
 			t.Errorf("%s: accepted", name)
@@ -318,5 +321,51 @@ func TestAWriteWhoseResponseWasLostStands(t *testing.T) {
 	}
 	if len(f.tokens) != 2 || f.tokens[0] == f.tokens[1] {
 		t.Errorf("transactions share a request token: %v", f.tokens)
+	}
+}
+
+// TestTheWildcardedPSIItemIsOutsideTheProfileIndex pins the item's shape
+// that docs/hss.md gives, and what keeps it out of every listing of the
+// release before it: no profile attribute.
+func TestTheWildcardedPSIItemIsOutsideTheProfileIndex(t *testing.T) {
+	d, f := fakeStore(t)
+	if _, err := d.PutWildcardedPSI(context.Background(), nil, storetest.PSI()); err != nil {
+		t.Fatal(err)
+	}
+	item := f.tables["subscribers"][psiPK]
+	var names []string
+	for name := range item {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	if want := []string{attrDoc, attrPK, attrVersion, attrWriter}; !reflect.DeepEqual(names, want) {
+		t.Errorf("item attributes %v, want %v", names, want)
+	}
+	if sv(item[attrPK]) != "wildcarded-psi" || sv(item[attrVersion]) != "1" {
+		t.Errorf("item key %q, version %q", sv(item[attrPK]), sv(item[attrVersion]))
+	}
+}
+
+func TestAWildcardedPSIWriteWhoseResponseWasLostStands(t *testing.T) {
+	d, f := fakeStore(t)
+	ctx := context.Background()
+	f.loseNextResponse = true
+	v1, err := d.PutWildcardedPSI(ctx, nil, storetest.PSI())
+	if err != nil || v1.Version != 1 {
+		t.Fatalf("first write whose response was lost = %+v, %v; it was applied", v1, err)
+	}
+	if _, err := d.PutWildcardedPSI(ctx, nil, storetest.PSI()); !errors.Is(err, store.ErrExists) {
+		t.Errorf("another first write = %v, want ErrExists", err)
+	}
+	f.loseNextResponse = true
+	if v2, err := d.PutWildcardedPSI(ctx, v1, storetest.PSI()); err != nil || v2.Version != 2 {
+		t.Fatalf("replacement whose response was lost = %+v, %v", v2, err)
+	}
+	if _, err := d.PutWildcardedPSI(ctx, v1, storetest.PSI()); !errors.Is(err, store.ErrConflict) {
+		t.Errorf("a replacement from the old version = %v, want ErrConflict", err)
+	}
+	f.raceNext = true
+	if _, err := d.PutWildcardedPSI(ctx, nil, storetest.PSI()); !errors.Is(err, store.ErrConflict) {
+		t.Errorf("a write that met a transaction = %v, want ErrConflict", err)
 	}
 }

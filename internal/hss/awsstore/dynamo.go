@@ -44,6 +44,10 @@ const (
 	ProfileIndex = "profile-index"
 
 	keyringPK = "keyring"
+	// psiPK is the wildcarded PSI's item. It has no profile attribute, so
+	// the profile index, and every listing and scan the HSS makes, leaves
+	// it out (docs/hss.md, Tables).
+	psiPK = "wildcarded-psi"
 )
 
 func subscriptionKey(impi string) string { return "s#" + impi }
@@ -561,6 +565,69 @@ func (d *Dynamo) DeleteProfile(ctx context.Context, p *store.ServiceProfile) err
 		return sanitize("delete profile", err)
 	}
 	return nil
+}
+
+// WildcardedPSI implements store.Store.
+func (d *Dynamo) WildcardedPSI(ctx context.Context) (*store.WildcardedPSI, error) {
+	item, err := d.get(ctx, d.subscribers, psiPK, "get wildcarded PSI")
+	if err != nil {
+		return nil, err
+	}
+	doc, ok := item[attrDoc].(*types.AttributeValueMemberB)
+	v, okV := item[attrVersion].(*types.AttributeValueMemberN)
+	if !ok || !okV {
+		return nil, fmt.Errorf("%w: wildcarded PSI item without doc or version", store.ErrInvalid)
+	}
+	version, err := strconv.ParseInt(v.Value, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("%w: wildcarded PSI item with an invalid version", store.ErrInvalid)
+	}
+	return store.DecodeWildcardedPSI(doc.Value, version)
+}
+
+// PutWildcardedPSI implements store.Store with one conditional PutItem.
+func (d *Dynamo) PutWildcardedPSI(ctx context.Context, old, p *store.WildcardedPSI) (*store.WildcardedPSI, error) {
+	doc, err := store.EncodeWildcardedPSI(p)
+	if err != nil {
+		return nil, err
+	}
+	in := &dynamodb.PutItemInput{
+		TableName:                aws.String(d.subscribers),
+		ConditionExpression:      aws.String("attribute_not_exists(#pk)"),
+		ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+	}
+	version := int64(1)
+	if old != nil {
+		version = old.Version + 1
+		in.ConditionExpression = aws.String("#v = :v")
+		in.ExpressionAttributeNames = map[string]string{"#v": attrVersion}
+		in.ExpressionAttributeValues = map[string]types.AttributeValue{":v": num(old.Version)}
+	}
+	in.Item = map[string]types.AttributeValue{
+		attrPK:      str(psiPK),
+		attrVersion: num(version),
+		attrDoc:     &types.AttributeValueMemberB{Value: doc},
+		attrWriter:  str(d.token()),
+	}
+	_, err = d.api.PutItem(ctx, in)
+	var ccf *types.ConditionalCheckFailedException
+	switch {
+	case errors.As(err, &ccf):
+		// A resent first write that had succeeded carries this write's
+		// token, as a resent update does (conflictOrGone).
+		err := d.conflictOrGone(ctx, d.subscribers, psiPK, in.Item, "put wildcarded PSI")
+		if old == nil && errors.Is(err, store.ErrConflict) {
+			return nil, fmt.Errorf("awsstore: put wildcarded PSI: %w", store.ErrExists)
+		}
+		if err != nil {
+			return nil, err
+		}
+	case raced(err):
+		return nil, fmt.Errorf("awsstore: put wildcarded PSI: %w", store.ErrConflict)
+	case err != nil:
+		return nil, sanitize("put wildcarded PSI", err)
+	}
+	return store.DecodeWildcardedPSI(doc, version)
 }
 
 // DataKeys implements keyring.Store.

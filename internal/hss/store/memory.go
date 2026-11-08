@@ -18,6 +18,7 @@ type Memory struct {
 	subs     map[string]stored // by IMPI
 	impus    map[string]string // IMPU → IMPI
 	profiles map[string]stored // by ID
+	psi      *stored           // the wildcarded PSI, nil when none
 	keys     []keyring.WrappedKey
 }
 
@@ -257,6 +258,38 @@ func (m *Memory) DeleteProfile(_ context.Context, p *ServiceProfile) error {
 	}
 	delete(m.profiles, p.ID)
 	return nil
+}
+
+// WildcardedPSI implements Store.
+func (m *Memory) WildcardedPSI(context.Context) (*WildcardedPSI, error) {
+	m.mu.Lock()
+	st := m.psi
+	m.mu.Unlock()
+	if st == nil {
+		return nil, fmt.Errorf("store: wildcarded PSI: %w", ErrNotFound)
+	}
+	return DecodeWildcardedPSI(st.doc, st.version)
+}
+
+// PutWildcardedPSI implements Store.
+func (m *Memory) PutWildcardedPSI(_ context.Context, old, p *WildcardedPSI) (*WildcardedPSI, error) {
+	doc, err := EncodeWildcardedPSI(p)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v := int64(1)
+	switch {
+	case old == nil && m.psi != nil:
+		return nil, fmt.Errorf("store: put wildcarded PSI: %w", ErrExists)
+	case old != nil && (m.psi == nil || m.psi.version != old.Version):
+		return nil, fmt.Errorf("store: put wildcarded PSI: %w", ErrConflict)
+	case old != nil:
+		v = m.psi.version + 1
+	}
+	m.psi = &stored{doc, v}
+	return DecodeWildcardedPSI(doc, v)
 }
 
 // DataKeys implements keyring.Store.
