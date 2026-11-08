@@ -11,6 +11,11 @@ focus (sessions, the conference event package and REFER) are served. The core
 is driven through interfaces so
 that it can be built and tested first.
 
+Chatbots (ADR 0009) are not served yet. The chatbot API that `rcs-as` will
+serve to `maap` is specified in [api/rcs-as.yaml](api/rcs-as.yaml), with its
+scope in [api/rcs-as-scopes.md](api/rcs-as-scopes.md) (#697); the listener
+comes with #698.
+
 The code:
 
 - `internal/rcsas/messaging`: the engine. It has no SIP and no AWS code.

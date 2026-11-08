@@ -1,0 +1,129 @@
+# rcs-as chatbot API (ADR 0009 §4, §6), which maap calls; its scope is in
+# rcs-as-scopes.md. The bodies are internal/chatbot's BotMessage and
+# BotNotification, which maap uses too. Nothing serves it before #698.
+openapi: 3.1.0
+info:
+  title: rcs-as chatbot API
+  version: 1.0.0
+  description: |
+    One caller, maap, with its own bearer token (ADR 0007 §3–§5, ADR 0009
+    §7). The listener is apart from SIP and admin, inside the VPC only; its
+    address and token settings are in docs/rcs-as.md once #698 adds them.
+
+    Bodies are strict JSON (ADR 0009 §9): UTF-8, one value, at most 4 deep,
+    arrays of at most 8, every string bounded as below; unknown fields,
+    duplicate keys, keys that differ only in case, `null` for a field that
+    is not optional, and data after the value are 400. No string but `body`
+    and `chip_list` may hold a C0 control or DEL. The content (`body`,
+    `chip_list`) follows ADR 0009 §5.
+
+    Fields only grow (§6): every rcs-as task accepts a new field before maap
+    sends it. Answers are JSON with `Cache-Control: no-store`. Errors are
+    `{"error": "<reason>"}`; the reason names a rule, never a value.
+security:
+  - bearer: []
+paths:
+  /v1/chatbot/messages:
+    post:
+      operationId: sendBotMessage
+      summary: Accept a chatbot's message to one subscriber
+      description: |
+        ADR 0009 §4, chatbot → subscriber steps 3–4. rcs-as builds the CPIM
+        (RCC.07 v13.0 §3.6.8.1.2, §3.6.10.1) from these fields, stores the
+        message and its sent record, and answers 202; it is delivered later,
+        after a delivery check. A retry with the same `message_id` is accepted
+        again, and the client drops the duplicate.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BotMessage" }
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "400": { description: "The body breaks a rule above, or `recipient` is not a canonical tel URI.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { description: "`sender` is outside the chatbot range, or `recipient` inside it.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "`sender` is at RCS_CHATBOT_DOMAIN but not in normal form (ADR 0009 §2).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: "The body is larger than 1,496 KiB.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "415": { description: "The request is not application/json, or `content_type` is not on the chatbot content types.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/Backstop" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/chatbot/notifications:
+    post:
+      operationId: sendBotNotification
+      summary: Accept a chatbot's display notification
+      description: |
+        ADR 0009 §4 Notifications. rcs-as accepts it only if the message
+        went to that chatbot (threat model T10), builds the IMDN and
+        delivers it as a chatbot's message.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BotNotification" }
+      responses:
+        "202": { $ref: "#/components/responses/Accepted" }
+        "400": { description: The body breaks a rule above., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { description: "`chatbot` is outside the chatbot range, or `subscriber` inside it.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "No message with `message_id` from `subscriber` went to `chatbot` within RCSAS_SENT_TTL (T10).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "413": { description: The body is larger than 8 KiB., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "415": { description: The request is not application/json., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { $ref: "#/components/responses/Backstop" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer }
+  schemas:
+    BotMessage:
+      type: object
+      required: [sender, display_name, recipient, message_id, content_type, body, dispositions, anonymous]
+      additionalProperties: false
+      properties:
+        sender: { type: string, maxLength: 255, description: "The chatbot's URI from the registry, in normal form." }
+        display_name: { type: string, maxLength: 128, description: "The registry display name, before rcs-as escapes it into CPIM From. Bytes, as every maxLength here." }
+        recipient: { type: string, maxLength: 255, description: The subscriber's canonical tel URI. }
+        message_id:
+          type: string
+          pattern: "^[A-Za-z0-9._~-]{1,128}$"
+          description: The imdn.Message-ID maap generated (128 random bits, memo B3).
+        content_type: { type: string, maxLength: 269, description: The entry of the chatbot content types the chatbot's type matched. }
+        body: { type: string, maxLength: 253952, description: The content. }
+        chip_list: { type: string, maxLength: 253952, description: "Optional suggested chip list, sent as the second part of a multipart CPIM. `body` and `chip_list` together are at most 253,952 bytes (248 KiB)." }
+        dispositions: { $ref: "#/components/schemas/Dispositions" }
+        anonymous: { type: boolean, description: "The conversation's anonymity flag (ADR 0009 §10)." }
+    BotNotification:
+      type: object
+      required: [chatbot, subscriber, message_id, kind]
+      additionalProperties: false
+      properties:
+        chatbot: { type: string, maxLength: 255, description: The chatbot that read the message. }
+        subscriber: { type: string, maxLength: 255, description: "The canonical tel URI of the message's sender." }
+        message_id: { type: string, minLength: 1, maxLength: 128, description: "The imdn.Message-ID of the message the chatbot received, as the subscriber's client chose it; no C0 control or DEL." }
+        kind: { type: string, enum: [display-notification], description: "The only kind a chatbot sends; its status is displayed." }
+    Dispositions:
+      type: object
+      description: The notifications asked for (RFC 5438 §7.1.1.3). An absent member is false.
+      additionalProperties: false
+      properties:
+        positive_delivery: { type: boolean }
+        negative_delivery: { type: boolean }
+        display: { type: boolean }
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+  responses:
+    Accepted:
+      description: Accepted. The body is an object with no member yet.
+      content: { application/json: { schema: { type: object, additionalProperties: false } } }
+    Unauthenticated:
+      description: No bearer token, or not one of maap's (`WWW-Authenticate`).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Backstop:
+      description: Over a backstop of ADR 0009 §9 (a chatbot sender, one subscriber, or the whole API), with `Retry-After`.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unavailable:
+      description: RCSAS_CHATBOTS is off, or the store failed, with `Retry-After`.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }

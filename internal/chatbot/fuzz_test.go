@@ -120,3 +120,48 @@ func FuzzDecodeEnvelope(f *testing.F) {
 		}
 	})
 }
+
+// FuzzBotMessage and FuzzBotNotification check rcs-as's chatbot API bodies
+// (memo J6): DecodeEnvelope and Validate never panic, and a body they accept
+// encodes again to one they accept, of the same value.
+func FuzzBotMessage(f *testing.F) {
+	addWireSeeds(f, "BotMessage")
+	f.Fuzz(func(t *testing.T, data []byte) { checkWireBody[BotMessage](t, data, MaxBotMessageBytes) })
+}
+
+func FuzzBotNotification(f *testing.F) {
+	addWireSeeds(f, "BotNotification")
+	f.Fuzz(func(t *testing.T, data []byte) { checkWireBody[BotNotification](t, data, MaxBotNotificationBytes) })
+}
+
+func addWireSeeds(f *testing.F, name string) {
+	for _, tc := range wireCases() {
+		if tc.name == name {
+			f.Add([]byte(tc.body))
+			f.Add([]byte(strings.Replace(tc.body, `"tel:`, `"\r\ntel:`, 1)))
+		}
+	}
+	f.Add([]byte(`{"dispositions":null}`))
+}
+
+func checkWireBody[T any, P interface {
+	*T
+	wireType
+}](t *testing.T, data []byte, limit int64) {
+	var v T
+	err := DecodeEnvelope(bytes.NewReader(data), limit, P(&v))
+	if err == nil {
+		err = P(&v).Validate()
+	}
+	if err != nil {
+		if !errors.Is(err, ErrInvalidEnvelope) && !errors.Is(err, ErrBodyTooLarge) {
+			t.Fatalf("unexpected error %v", err)
+		}
+		return
+	}
+	again, _ := json.Marshal(v)
+	var v2 T
+	if err := DecodeEnvelope(bytes.NewReader(again), limit, P(&v2)); err != nil || P(&v2).Validate() != nil || !reflect.DeepEqual(v, v2) {
+		t.Fatalf("%q was accepted as %+v; its encoding %q gave %+v, %v", data, v, again, v2, err)
+	}
+}
