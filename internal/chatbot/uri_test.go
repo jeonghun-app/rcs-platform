@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
 
@@ -37,26 +38,32 @@ func TestEachURIAtTheChatbotDomainOutOfNormalFormHasItsReason(t *testing.T) {
 	d := testDomain(t)
 	label := strings.Repeat("a", 63)
 	tests := map[string]struct{ uri, reason string }{
-		"sips":                 {"sips:mybot@" + botDomain, "not a sip: URI"},
-		"port":                 {"sip:mybot@" + botDomain + ":5060", "a port"},
-		"header":               {"sip:mybot@" + botDomain + "?Subject=hi", "URI headers"},
-		"escape":               {"sip:my%62ot@" + botDomain, "an escape in the user part"},
-		"user=phone":           {"sip:mybot@" + botDomain + ";user=phone", "a parameter other than tk=on or tk=off"},
-		"upper-case user":      {"sip:MyBot@" + botDomain, "a character of the user part outside a-z, 0-9 and -"},
-		"three labels":         {"sip:my.bot.pub@" + botDomain, "more than two labels in the user part"},
-		"64-character label":   {"sip:" + label + "a@" + botDomain, "a label of the user part that is empty or longer than 63 bytes"},
-		"empty label":          {"sip:.pub@" + botDomain, "a label of the user part that is empty or longer than 63 bytes"},
-		"underscore":           {"sip:my_bot@" + botDomain, "a character of the user part outside a-z, 0-9 and -"},
-		"no user part":         {"sip:" + botDomain, "no user part"},
-		"password":             {"sip:mybot:secret@" + botDomain, "a password"},
-		"empty password":       {"sip:mybot:@" + botDomain, "a password"},
-		"other tk value":       {"sip:mybot@" + botDomain + ";tk=yes", "a parameter other than tk=on or tk=off"},
-		"tk without value":     {"sip:mybot@" + botDomain + ";tk", "a parameter other than tk=on or tk=off"},
-		"tk and another":       {"sip:mybot@" + botDomain + ";tk=on;lr", "a parameter other than tk=on or tk=off"},
-		"trailing dot":         {"sip:mybot@" + botDomain + ".", "a host that is not the chatbot domain as written"},
-		"empty port":           {"sip:mybot@" + botDomain + ":", "not a valid SIP URI"},
-		"two @":                {"sip:my@bot@" + botDomain, "not a valid SIP URI"},
-		"escape in parameters": {"sip:mybot@" + botDomain + ";t%6b=on", "a parameter other than tk=on or tk=off"},
+		"sips":               {"sips:mybot@" + botDomain, "not a sip: URI"},
+		"port":               {"sip:mybot@" + botDomain + ":5060", "a port"},
+		"header":             {"sip:mybot@" + botDomain + "?Subject=hi", "URI headers"},
+		"escape":             {"sip:my%62ot@" + botDomain, "an escape in the user part"},
+		"user=phone":         {"sip:mybot@" + botDomain + ";user=phone", "a parameter other than tk=on or tk=off"},
+		"upper-case user":    {"sip:MyBot@" + botDomain, "a character of the user part outside a-z, 0-9 and -"},
+		"three labels":       {"sip:my.bot.pub@" + botDomain, "more than two labels in the user part"},
+		"64-character label": {"sip:" + label + "a@" + botDomain, "a label of the user part that is empty or longer than 63 bytes"},
+		"empty label":        {"sip:.pub@" + botDomain, "a label of the user part that is empty or longer than 63 bytes"},
+		"underscore":         {"sip:my_bot@" + botDomain, "a character of the user part outside a-z, 0-9 and -"},
+		"no user part":       {"sip:" + botDomain, "no user part"},
+		"password":           {"sip:mybot:secret@" + botDomain, "a password"},
+		"empty password":     {"sip:mybot:@" + botDomain, "a form that does not write back as received"},
+		// Forms a random sweep found where the raw text and the text
+		// sip.URI.String writes back would be judged apart.
+		"sweep: sips:@":            {"sip:sips:@" + botDomain, "a form that does not write back as received"},
+		"sweep: SIP:xsip:@":        {"SIP:xsip:@" + botDomain, "a form that does not write back as received"},
+		"sweep: tktksips:@":        {"sip:tktksips:@" + botDomain, "a form that does not write back as received"},
+		"domain after the first @": {"sip:mybot@" + botDomain + ";x=@evil.example.net", "not a valid SIP URI"},
+		"other tk value":           {"sip:mybot@" + botDomain + ";tk=yes", "a parameter other than tk=on or tk=off"},
+		"tk without value":         {"sip:mybot@" + botDomain + ";tk", "a parameter other than tk=on or tk=off"},
+		"tk and another":           {"sip:mybot@" + botDomain + ";tk=on;lr", "a parameter other than tk=on or tk=off"},
+		"trailing dot":             {"sip:mybot@" + botDomain + ".", "a host that is not the chatbot domain as written"},
+		"empty port":               {"sip:mybot@" + botDomain + ":", "not a valid SIP URI"},
+		"two @":                    {"sip:my@bot@" + botDomain, "not a valid SIP URI"},
+		"escape in parameters":     {"sip:mybot@" + botDomain + ";t%6b=on", "a parameter other than tk=on or tk=off"},
 	}
 	for name, tc := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -86,9 +93,23 @@ func TestNormaliseLowersTheHostAndDropsTk(t *testing.T) {
 			t.Errorf("Normalise(%q) = %q, %v; want %q", uri, got, err, want)
 		}
 	}
+}
+
+// The longest normal form, two 63-byte labels at a domain of
+// MaxDomainBytes, is exactly MaxURIBytes and still an IMPU to the services
+// that canonicalise identities.
+func TestTheLongestNormalFormIsAnIMPU(t *testing.T) {
+	d, err := NewDomain(strings.Repeat("a", 60)+"."+strings.Repeat("b", 58)+".net", imsDomain)
+	if err != nil || len(d.Name()) != MaxDomainBytes {
+		t.Fatalf("a domain of MaxDomainBytes: %q, %v", d.Name(), err)
+	}
 	label := strings.Repeat("9", 63)
-	if got, err := d.Normalise("sip:" + label + "." + label + "@" + botDomain); err != nil || len(got) > MaxURIBytes {
-		t.Errorf("two 63-byte labels: %q (%d bytes), %v", got, len(got), err)
+	got, err := d.Normalise("sip:" + label + "." + label + "@" + d.Name())
+	if err != nil || len(got) != MaxURIBytes {
+		t.Fatalf("Normalise = %q (%d bytes), %v; want %d bytes", got, len(got), err, MaxURIBytes)
+	}
+	if impu, ok := identity.CanonicalIMPU(got); !ok || impu != got {
+		t.Errorf("identity.CanonicalIMPU(%q) = %q, %v; want it unchanged", got, impu, ok)
 	}
 }
 
@@ -172,7 +193,10 @@ func TestTheChatbotDomainIsALowerCaseDNSNameOtherThanTheIMSDomain(t *testing.T) 
 		"trailing dot":                   {botDomain + ".", imsDomain},
 		"the IMS domain":                 {imsDomain, imsDomain},
 		"the IMS domain in another case": {imsDomain, "IMS.mnc001.mcc001.3gppnetwork.org."},
-		"too long":                       {strings.Repeat("a", 60) + "." + strings.Repeat("b", 60) + ".net", imsDomain},
+		"too long":                       {strings.Repeat("a", 60) + "." + strings.Repeat("b", 59) + ".net", imsDomain},
+		"IPv4 address":                   {"10.0.0.5", imsDomain},
+		"numeric last label":             {"chatbot.123", imsDomain},
+		"last label starts with a digit": {"chatbot.1bc", imsDomain},
 	}
 	for name, tc := range tests {
 		if d, err := NewDomain(tc.value, tc.ims); err == nil {
@@ -181,8 +205,8 @@ func TestTheChatbotDomainIsALowerCaseDNSNameOtherThanTheIMSDomain(t *testing.T) 
 			t.Errorf("%s: the error %q repeats the value", name, err)
 		}
 	}
-	if d, err := NewDomain(strings.Repeat("a", 60)+"."+strings.Repeat("b", 59)+".net", imsDomain); err != nil || len(d.Name()) != MaxDomainBytes {
-		t.Errorf("a domain of MaxDomainBytes: %v", err)
+	if d, err := NewDomain("1bc.botplatform.example.net", imsDomain); err != nil || d.Name() == "" {
+		t.Errorf("an inner label that starts with a digit: %v", err)
 	}
 }
 

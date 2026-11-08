@@ -8,6 +8,12 @@
 // read differently, or a body one of them refuses and another takes, cannot
 // cross a trust boundary.
 //
+// Callers pass [Domain.Normalise] a URI exactly as they received it, and
+// never trim, unwrap or re-parse it after the check: the check holds for
+// that text only. ErrNotChatbot means only that the value is not a chatbot
+// URI, not that it is a valid URI of any kind; the caller's own checks
+// still apply to it.
+//
 // No error of this package repeats the URI, key or value it refused: a URI
 // names a chatbot or a subscriber, and a body is chatbot free text. Callers
 // log identifiers only through internal/pii.
