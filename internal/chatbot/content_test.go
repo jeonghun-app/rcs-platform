@@ -27,38 +27,55 @@ func TestTheDefaultContentTypesAreThoseOfRCC07AndFreshEachTime(t *testing.T) {
 
 func TestAContentTypeMatchesItsEntryWhateverTheCaseAndAUTF8Charset(t *testing.T) {
 	c := DefaultContentTypes()
+	chatbotText, subscriberText := c.FromChatbots[0], c.FromSubscribers[0]
 	tests := []struct {
 		contentType string
 		allowed     []string
-		want        bool
+		want        string // the entry matched, "" for none
 	}{
-		{"text/plain;charset=utf-8", c.FromChatbots, true},
-		{"Text/Plain; Charset=UTF-8", c.FromChatbots, true},
-		{`text/plain; charset="utf-8"`, c.FromChatbots, true},
-		{"text/plain", c.FromChatbots, false},
-		{"text/plain;charset=iso-8859-1", c.FromChatbots, false},
-		{"text/plain;charset=utf-8;format=flowed", c.FromChatbots, false},
-		{"APPLICATION/VND.GSMA.BOTMESSAGE.V1.0+JSON", c.FromChatbots, true},
-		{RichCardType + "; charset=utf-8", c.FromChatbots, true},
-		{RichCardType + "; version=2", c.FromChatbots, false},
-		{ChipListType, c.FromChatbots, false},
-		{"text/plain", c.FromSubscribers, true},
-		{"text/plain;charset=UTF-8", c.FromSubscribers, true},
-		{"text/plain;charset=utf-16", c.FromSubscribers, false},
-		{SharedClientDataType, c.FromSubscribers, true},
-		{RichCardType, c.FromSubscribers, false},
-		{"application/vnd.gsma.rcs-ft-http+xml", c.FromSubscribers, false},
-		{"text/plain;charset=utf-8;charset=iso-8859-1", c.FromChatbots, false},
-		{"text/", c.FromSubscribers, false},
-		{"", c.FromSubscribers, false},
-		{"text/plain", []string{"not a type", "text/plain"}, true},
-		{"text/plain", nil, false},
-		{"application/x-test;v=1", []string{"application/x-test; V=1"}, true},
-		{"application/x-test;v=A", []string{"application/x-test;v=a"}, false},
+		{"text/plain;charset=utf-8", c.FromChatbots, chatbotText},
+		{"Text/Plain; Charset=UTF-8", c.FromChatbots, chatbotText},
+		{`text/plain; charset="utf-8"`, c.FromChatbots, chatbotText},
+		{"text/plain", c.FromChatbots, ""},
+		{"text/plain;charset=iso-8859-1", c.FromChatbots, ""},
+		{"text/plain;charset=utf-8;format=flowed", c.FromChatbots, ""},
+		{"APPLICATION/VND.GSMA.BOTMESSAGE.V1.0+JSON", c.FromChatbots, RichCardType},
+		{RichCardType + "; charset=utf-8", c.FromChatbots, RichCardType},
+		{RichCardType + "; version=2", c.FromChatbots, ""},
+		{ChipListType, c.FromChatbots, ""},
+		{"text/plain", c.FromSubscribers, subscriberText},
+		{"text/plain;charset=UTF-8", c.FromSubscribers, subscriberText},
+		{"text/plain;charset=utf-16", c.FromSubscribers, ""},
+		{SharedClientDataType, c.FromSubscribers, SharedClientDataType},
+		{RichCardType, c.FromSubscribers, ""},
+		{"application/vnd.gsma.rcs-ft-http+xml", c.FromSubscribers, ""},
+		{"text/plain;charset=utf-8;charset=iso-8859-1", c.FromChatbots, ""},
+		{"text/", c.FromSubscribers, ""},
+		{"", c.FromSubscribers, ""},
+		{"text/plain", []string{"not a type", "text/plain"}, "text/plain"},
+		{"text/plain", nil, ""},
+		{"application/x-test;v=1", []string{"application/x-test; V=1"}, "application/x-test; V=1"},
+		{"application/x-test;v=A", []string{"application/x-test;v=a"}, ""},
+		// Control characters mime.ParseMediaType would trim, and RFC 2231
+		// parameter names, match nothing.
+		{"\r\ntext/plain", c.FromSubscribers, ""},
+		{"text/plain\r\n", c.FromSubscribers, ""},
+		{"text/plain;charset=utf-8\r\n\r\n", c.FromChatbots, ""},
+		{"text/plain;\r\n charset=utf-8", c.FromChatbots, ""},
+		{"text/plain;\tcharset=utf-8", c.FromChatbots, ""},
+		{"text/plain\x00", c.FromSubscribers, ""},
+		{"text/plain\x7f", c.FromSubscribers, ""},
+		{"text/plain;charset*=utf-8''utf-8", c.FromChatbots, ""},
+		{"text/plain;charset*0=utf;charset*1=-8", c.FromChatbots, ""},
+		{"text/plain;CHARSET*=utf-8''utf-8", c.FromSubscribers, ""},
+		// A "*" inside a quoted value is no RFC 2231 mark.
+		{`application/x-test;v="a;*=b";w=1`, []string{`application/x-test;v="a;*=b";w=1`}, `application/x-test;v="a;*=b";w=1`},
+		{`application/x-test;v="a\";*=b"`, []string{`application/x-test;v="a\";*=b"`}, `application/x-test;v="a\";*=b"`},
 	}
 	for _, tc := range tests {
-		if got := MatchContentType(tc.contentType, tc.allowed); got != tc.want {
-			t.Errorf("MatchContentType(%q, %q) = %v, want %v", tc.contentType, tc.allowed, got, tc.want)
+		got, ok := MatchContentType(tc.contentType, tc.allowed)
+		if got != tc.want || ok != (tc.want != "") {
+			t.Errorf("MatchContentType(%q, %q) = %q, %v; want %q", tc.contentType, tc.allowed, got, ok, tc.want)
 		}
 	}
 }

@@ -147,8 +147,10 @@ func (d Domain) Normalise(uri string) (string, error) {
 // loosely, is the chatbot domain: after the first or the last "@", up to a
 // port, parameter or header, without regard to case and with one trailing
 // dot dropped. It must hold for every URI the strict parse reads as at the
-// domain, and also for malformed ones, so that a URI meant for a chatbot
-// that another parser might read differently is 404 here, not sent on.
+// domain. It also holds for some malformed ones, such as an empty port or a
+// second "@", which are then 404 rather than sent on. A value with framing
+// around the URI (white space, angle brackets, a display name) is not one,
+// and gets ErrNotChatbot: callers pass the URI itself (see the package doc).
 func (d Domain) atDomain(uri string) bool {
 	scheme, rest, ok := strings.Cut(uri, ":")
 	if !ok || !strings.EqualFold(scheme, "sip") && !strings.EqualFold(scheme, "sips") {
