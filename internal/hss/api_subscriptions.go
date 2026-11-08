@@ -267,6 +267,7 @@ func (a *API) putSubscription(w http.ResponseWriter, r *http.Request, _ Scope) e
 			return err
 		}
 		pushes = reconcile(old, s, old.Profile != s.Profile)
+		a.h.markChatbotHostLeft(old, s)
 		return nil
 	})
 	if err != nil {

@@ -118,6 +118,34 @@ func reconcile(old, next *store.Subscription, profileChanged bool) []push {
 	return pushes
 }
 
+// markChatbotHostLeft marks stale, in next, every served set of old that
+// loses an identity at the chatbot host to the change, removed or moved to
+// another set, and keeps another identity (#696). Once the identity is no
+// longer in the set, nothing else makes a refresh that says the S-CSCF has
+// the data get User-Data without it (holdsChatbotHost), and the change's
+// push may fail without the budget cutting it short, which marks nothing
+// (notify): the S-CSCF would keep the identity as long as the user
+// refreshes. Marked in the change's own write, the set gets its User-Data
+// with its next registration whatever becomes of the push (applySAR).
+// An emptied set needs no mark: its refreshes name identities no longer
+// stored, which Cx refuses.
+func (h *HSS) markChatbotHostLeft(old, next *store.Subscription) {
+	for _, set := range targetSets(old, nil) {
+		was := members(old, set)
+		if !was[0].State.Served() || len(members(next, set)) == 0 || slices.Contains(next.StaleSets, set) {
+			continue
+		}
+		left := slices.ContainsFunc(was, func(p store.PublicIdentity) bool {
+			now := next.Identity(p.IMPU)
+			return storedAtChatbotHost(h.chatbot, p.IMPU) && (now == nil || now.ImplicitSet != set)
+		})
+		if left {
+			next.StaleSets = append(next.StaleSets, set)
+		}
+	}
+	slices.Sort(next.StaleSets)
+}
+
 // gives maps each implicit set of old to the sets of next its identities
 // moved to.
 func gives(old, next *store.Subscription) map[int]map[int]bool {

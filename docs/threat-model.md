@@ -516,8 +516,15 @@ in the store until its next write, which must drop it; Cx answers as if it were
 not there. A registration made before `RCS_CHATBOT_DOMAIN` was set keeps the
 identity at the S-CSCF until the set's next refresh or change: a refresh naming
 another identity gets User-Data without it, a refresh naming it is refused at
-the UAR, and a set of nothing else gets an RTR at its next change. Until then,
-up to one registration period, it can be asserted.
+the UAR, and a set of nothing else gets an RTR at its next change. The write
+that drops the identity marks the set stale (#696), so a refresh after it gets
+User-Data without the identity even if the write's PPR or RTR failed or got no
+answer. Until then the identity can be asserted, for at most one registration
+period: the expiry `scscf` granted, at most its registrar's `MaxExpires`
+(2 hours, `registrar.DefaultMaxExpires`). A `pcscf` registration whose To is
+the chatbot URI keeps it in its P-Associated-URI until that registration
+expires, as its refreshes are refused; `pcscf` keeps the expiry the S-CSCF
+granted, so the same bound holds.
 **Status:** in progress: `hss` is built (#679): it stores the PSI, matches it
 whole and with regard to case, refuses IMPUs at its host, and answers Cx with
 the host PSI-only. `icscf`, `scscf`, `rcs-as` and `maap` are planned (#668).

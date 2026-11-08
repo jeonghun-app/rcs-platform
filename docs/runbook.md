@@ -119,7 +119,9 @@ Not yet wired end to end: `hss` answers LIRs from the PSI, but `icscf` and
    PSI's alone. `hss` refuses IMPUs at it once it is set, and Cx refuses to
    register one, but `hss` does not search for IMPUs provisioned before:
    such a subscription keeps its other identities working and must drop the
-   chatbot-host IMPU at its next write. `chatbot.userdata_resent` counts the
+   chatbot-host IMPU at its next write. That write marks the set stale, so
+   its next refresh gets User-Data without the IMPU even if the write's push
+   to the S-CSCF failed. `chatbot.userdata_resent` counts the
    refreshes of sets that still hold one. Do not reuse `RCS_IMS_DOMAIN` (refused at
    start) or a domain retired from subscribers.
 2. Set the same `RCS_CHATBOT_DOMAIN` on **every** service (`hss`, `icscf`,

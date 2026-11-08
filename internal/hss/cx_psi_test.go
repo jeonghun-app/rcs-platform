@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -441,5 +442,150 @@ func TestASetOfOnlyChatbotHostIdentitiesIsDeregisteredRatherThanPushed(t *testin
 	}
 	if n := a.metrics.get("push.chatbot_set_deregistered"); n != 1 {
 		t.Errorf("push.chatbot_set_deregistered = %d", n)
+	}
+}
+
+// The runbook has the operator drop a chatbot-host identity left in a
+// registered set. If that write's push fails, or gets no answer, the
+// S-CSCF keeps User-Data that lists the identity, and the HSS no longer
+// stores anything that would make it resend (holdsChatbotHost): the write
+// itself marks the set stale, so the next refresh replaces the data, even
+// one saying the S-CSCF has it (the security review of #695).
+func TestAWriteDroppingAChatbotHostIdentityMarksItsSetStale(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		silent bool     // else every PPR fails
+		ids    []string // the set as stored; the write keeps impu1 only
+	}{
+		{"the PPR fails", false, []string{impu1, leftover}},
+		{"the PPR gets no answer", true, []string{impu1, leftover}},
+		// The identity was the set's default: a SERVER_CHANGE RTR.
+		{"the RTR gets no answer", true, []string{leftover, impu1}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a := newAPIEnv(t, func(o *APIOptions) {
+				o.ChatbotDomain, o.ChatbotASName, o.PushTimeout = testChatbotDomain(t), chatbotAS, 200*time.Millisecond
+				if c.silent {
+					o.Notifier = &silentNotifier{}
+				}
+			})
+			a.notifier.pprErr = errors.New("test: no peer")
+			a.h.chatbot = testChatbotDomain(t)
+			s := &store.Subscription{IMPI: impi1, Profile: DefaultProfileID, ServerName: scscfName}
+			for _, id := range c.ids {
+				s.PublicIdentities = append(s.PublicIdentities, store.PublicIdentity{IMPU: id, State: store.Registered})
+			}
+			if _, err := a.store.CreateSubscription(t.Context(), s); err != nil {
+				t.Fatal(err)
+			}
+			if code, body, _ := a.do("PUT", subPath(impi1), adminToken, subscriptionBody(impi1, false, impu1)); code != http.StatusOK {
+				t.Fatalf("put = %d %v", code, body)
+			}
+			if got := a.sub(impi1).StaleSets; !slices.Equal(got, []int{0}) {
+				t.Errorf("stale sets after the write = %v, want [0]", got)
+			}
+			scscf := connectCSCF(t, serveHSS(t, a.h, "hss-a.rcs.local"), "scscf-1.rcs.local")
+			r := &cx.SAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentities: []string{impu1},
+				ServerName: scscfName, AssignmentType: cx.ReRegistration, UserDataAlreadyAvailable: cx.UserDataAlreadyAvailable}
+			saa, err := cx.ParseSAA(scscf.send(r.Message(scscf.node)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantResult(t, "refresh", saa.Result, resSuccess)
+			if ids := userDataIdentities(t, saa.UserData); len(ids) != 1 || ids[0] != impu1 {
+				t.Fatalf("refresh User-Data identities = %v, want impu1 only", ids)
+			}
+			if got := a.sub(impi1).StaleSets; len(got) != 0 {
+				t.Errorf("stale sets after the refresh = %v", got)
+			}
+		})
+	}
+}
+
+// Which sets a write marks stale for a chatbot-host identity it takes away
+// (markChatbotHostLeft): a served set that loses one, removed or moved, and
+// keeps another identity.
+func TestOnlyAServedSetLosingAChatbotHostIdentityIsMarkedStale(t *testing.T) {
+	type id struct {
+		impu  string
+		set   int
+		state store.RegistrationState
+	}
+	sub := func(ids ...id) *store.Subscription {
+		s := &store.Subscription{IMPI: impi1}
+		for _, p := range ids {
+			s.PublicIdentities = append(s.PublicIdentities, store.PublicIdentity{IMPU: p.impu, ImplicitSet: p.set, State: p.state})
+		}
+		return s
+	}
+	reg, unreg, not := store.Registered, store.Unregistered, store.NotRegistered
+	staleAlready := sub(id{impu1, 0, not})
+	staleAlready.StaleSets = []int{0}
+	for _, c := range []struct {
+		name      string
+		old, next *store.Subscription
+		domainSet bool
+		want      []int
+	}{
+		{"removed from a registered set", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), sub(id{impu1, 0, not}), true, []int{0}},
+		{"removed from an unregistered set", sub(id{impu1, 0, unreg}, id{leftover, 0, unreg}), sub(id{impu1, 0, not}), true, []int{0}},
+		{"stored in a form not canonical", sub(id{impu1, 0, reg}, id{leftoverUpperRaw, 0, reg}), sub(id{impu1, 0, not}), true, []int{0}},
+		{"moved to another set", sub(id{impu1, 0, reg}, id{leftover, 0, reg}, id{impu2, 1, reg}),
+			sub(id{impu1, 0, not}, id{leftover, 1, not}, id{impu2, 1, not}), true, []int{0}},
+		{"already stale", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), staleAlready, true, []int{0}},
+		{"kept", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), sub(id{impu1, 0, not}, id{leftover, 0, not}), true, nil},
+		{"the set emptied", sub(id{impu1, 0, reg}, id{leftover, 1, reg}), sub(id{impu1, 0, not}), true, nil},
+		{"a set not served", sub(id{impu1, 0, not}, id{leftover, 0, not}), sub(id{impu1, 0, not}), true, nil},
+		{"another identity removed", sub(id{impu1, 0, reg}, id{impu2, 0, reg}), sub(id{impu1, 0, not}), true, nil},
+		{"RCS_CHATBOT_DOMAIN unset", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), sub(id{impu1, 0, not}), false, nil},
+	} {
+		h := &HSS{}
+		if c.domainSet {
+			h.chatbot = testChatbotDomain(t)
+		}
+		h.markChatbotHostLeft(c.old, c.next)
+		if !slices.Equal(c.next.StaleSets, c.want) {
+			t.Errorf("%s: stale sets %v, want %v", c.name, c.next.StaleSets, c.want)
+		}
+	}
+}
+
+// fixedPSIRead returns psi whatever is stored, as a restored table can
+// hold, at the version a task has cached, another PSI or activation.
+type fixedPSIRead struct {
+	store.Store
+	psi store.WildcardedPSI
+}
+
+func (f *fixedPSIRead) WildcardedPSI(context.Context) (*store.WildcardedPSI, error) {
+	p := f.psi
+	return &p, nil
+}
+
+// The compiled range is kept for the PSI and its activation as well as the
+// version, so that the same version number with other content takes effect
+// (the tester's nit on #695).
+func TestTheSameVersionWithAnotherPSIOrActivationTakesEffect(t *testing.T) {
+	e := newChatbotCxEnv(t)
+	read := &fixedPSIRead{Store: e.store, psi: store.WildcardedPSI{PSI: chatbotPSI, ServerName: chatbotAS, Active: true, Version: 5}}
+	e.h.store = read
+	news := "sip:!news!@" + botDomain
+	for _, c := range []struct {
+		psi    string
+		active bool
+		uri    string
+		in     bool
+	}{
+		{chatbotPSI, true, leftover, true},
+		{chatbotPSI, false, leftover, false},
+		{chatbotPSI, true, leftover, true},
+		{news, true, leftover, false},
+		{news, true, "sip:news@" + botDomain, true},
+	} {
+		read.psi.PSI, read.psi.Active = c.psi, c.active
+		out, err := e.lirFor(c.uri)
+		if err != nil || (out.serverName == chatbotAS) != c.in {
+			t.Errorf("v5 %s active %v, LIR %s = %+v, %v; want in the range %v", c.psi, c.active, c.uri, out, err, c.in)
+		}
 	}
 }

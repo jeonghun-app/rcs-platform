@@ -105,12 +105,15 @@ type HSS struct {
 	chatbot   chatbot.Domain
 	chatbotAS string
 	// rangeMu guards the chatbot range compiled from the stored PSI of
-	// version rangeVersion (rangeRead once one was read); rangeOf is nil
-	// when that version gives no range, and rangeInvalid says it does not
-	// hold under RCS_CHATBOT_DOMAIN.
+	// version rangeVersion, text rangePSI and activation rangeActive
+	// (rangeRead once one was read); rangeOf is nil when that PSI gives no
+	// range, and rangeInvalid says it does not hold under
+	// RCS_CHATBOT_DOMAIN.
 	rangeMu      sync.Mutex
 	rangeRead    bool
 	rangeVersion int64
+	rangePSI     string
+	rangeActive  bool
 	rangeOf      *chatbotRange
 	rangeInvalid bool
 }
