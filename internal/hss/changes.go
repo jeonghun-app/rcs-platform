@@ -118,29 +118,37 @@ func reconcile(old, next *store.Subscription, profileChanged bool) []push {
 	return pushes
 }
 
-// markChatbotHostLeft marks stale, in next, every served set of old that
-// loses an identity at the chatbot host to the change, removed or moved to
-// another set, and keeps another identity (#696). Once the identity is no
-// longer in the set, nothing else makes a refresh that says the S-CSCF has
-// the data get User-Data without it (holdsChatbotHost), and the change's
-// push may fail without the budget cutting it short, which marks nothing
-// (notify): the S-CSCF would keep the identity as long as the user
-// refreshes. Marked in the change's own write, the set gets its User-Data
-// with its next registration whatever becomes of the push (applySAR).
-// An emptied set needs no mark: its refreshes name identities no longer
-// stored, which Cx refuses.
+// markChatbotHostLeft marks stale, in next, the sets that the other
+// identities of every served set of old losing an identity at the chatbot
+// host (removed, or moved to another set) are in after the change (#696).
+// Once the identity is no longer in the set, nothing else makes a refresh
+// that says the S-CSCF has the data get User-Data without it
+// (holdsChatbotHost), and the change's push may fail without the budget
+// cutting it short, which marks nothing (notify): the S-CSCF would keep the
+// identity as long as the user refreshes. Such a refresh names one of the
+// set's other identities, and is answered from the set that identity is in
+// now, which the same change may have numbered otherwise: that set is the
+// one marked, in the change's own write, so it gets its User-Data with its
+// next registration whatever becomes of the push (applySAR). The
+// chatbot-host identities themselves are skipped: a set that still holds
+// one resends anyway. A set none of whose other identities is still stored
+// needs no mark: its refreshes name identities Cx refuses.
 func (h *HSS) markChatbotHostLeft(old, next *store.Subscription) {
 	for _, set := range targetSets(old, nil) {
 		was := members(old, set)
-		if !was[0].State.Served() || len(members(next, set)) == 0 || slices.Contains(next.StaleSets, set) {
-			continue
-		}
 		left := slices.ContainsFunc(was, func(p store.PublicIdentity) bool {
 			now := next.Identity(p.IMPU)
 			return storedAtChatbotHost(h.chatbot, p.IMPU) && (now == nil || now.ImplicitSet != set)
 		})
-		if left {
-			next.StaleSets = append(next.StaleSets, set)
+		if !was[0].State.Served() || !left {
+			continue
+		}
+		for _, p := range was {
+			now := next.Identity(p.IMPU)
+			if now == nil || storedAtChatbotHost(h.chatbot, p.IMPU) || slices.Contains(next.StaleSets, now.ImplicitSet) {
+				continue
+			}
+			next.StaleSets = append(next.StaleSets, now.ImplicitSet)
 		}
 	}
 	slices.Sort(next.StaleSets)

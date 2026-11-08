@@ -517,9 +517,10 @@ not there. A registration made before `RCS_CHATBOT_DOMAIN` was set keeps the
 identity at the S-CSCF until the set's next refresh or change: a refresh naming
 another identity gets User-Data without it, a refresh naming it is refused at
 the UAR, and a set of nothing else gets an RTR at its next change. The write
-that drops the identity marks the set stale (#696), so a refresh after it gets
-User-Data without the identity even if the write's PPR or RTR failed or got no
-answer. Until then the identity can be asserted, for at most one registration
+that drops the identity marks stale the sets the set's other identities are in
+after it (#696), whatever numbers the same write gave them, so a refresh naming
+any of them gets User-Data without the identity even if the write's PPR or RTR
+failed or got no answer. Until then the identity can be asserted, for at most one registration
 period: the expiry `scscf` granted, at most its registrar's `MaxExpires`
 (2 hours, `registrar.DefaultMaxExpires`). A `pcscf` registration whose To is
 the chatbot URI keeps it in its P-Associated-URI until that registration

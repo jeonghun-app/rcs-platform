@@ -107,8 +107,9 @@ Where `hss` answers Cx otherwise than TS 29.228 says, on purpose:
     how a registration made before the setting, whose refreshes name another
     identity of the set and so are never refused, loses the identity at its
     next refresh. A write that takes such an identity out of a served set
-    marks the set stale (#696), so its next refresh gets User-Data even if the
-    write's push failed. Both are the stale-set answer `hss` already gives
+    marks stale the sets the set's other identities are in after the write,
+    whatever numbers it gave them (#696), so a refresh naming any of them gets
+    User-Data even if the write's push failed. Both are the stale-set answer `hss` already gives
     ([hss](hss.md#hss-initiated-requests)), and the same reason applies: the
     S-CSCF holds User-Data the HSS no longer sends. The clauses allow it
     (*confirmed* in TS 29.228 V20.0.0): §6.1.2.1 has the HSS download the user

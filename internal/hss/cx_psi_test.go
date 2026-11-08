@@ -449,18 +449,25 @@ func TestASetOfOnlyChatbotHostIdentitiesIsDeregisteredRatherThanPushed(t *testin
 // registered set. If that write's push fails, or gets no answer, the
 // S-CSCF keeps User-Data that lists the identity, and the HSS no longer
 // stores anything that would make it resend (holdsChatbotHost): the write
-// itself marks the set stale, so the next refresh replaces the data, even
-// one saying the S-CSCF has it (the security review of #695).
+// itself marks stale the set impu1 is in after it, so impu1's next refresh
+// replaces the data, even one saying the S-CSCF has it (the security review
+// of #695), also when the same write gave impu1 another set number (the
+// reviews of #715).
 func TestAWriteDroppingAChatbotHostIdentityMarksItsSetStale(t *testing.T) {
 	for _, c := range []struct {
 		name   string
-		silent bool     // else every PPR fails
-		ids    []string // the set as stored; the write keeps impu1 only
+		silent bool  // else every PPR fails
+		stored []any // IMPU and set pairs, every set registered
+		put    []any // the write, without leftover
+		want   []int // the stale sets after it
 	}{
-		{"the PPR fails", false, []string{impu1, leftover}},
-		{"the PPR gets no answer", true, []string{impu1, leftover}},
+		{"the PPR fails", false, []any{impu1, 0, leftover, 0}, []any{impu1, 0}, []int{0}},
+		{"the PPR gets no answer", true, []any{impu1, 0, leftover, 0}, []any{impu1, 0}, []int{0}},
 		// The identity was the set's default: a SERVER_CHANGE RTR.
-		{"the RTR gets no answer", true, []string{leftover, impu1}},
+		{"the RTR gets no answer", true, []any{leftover, 0, impu1, 0}, []any{impu1, 0}, []int{0}},
+		// Set 0 empties, and impu1 is set 1 now: a PERMANENT_TERMINATION RTR.
+		{"impu1 moves to another set", true, []any{impu1, 0, leftover, 0}, []any{impu1, 1}, []int{1}},
+		{"the sets swap numbers", true, []any{impu1, 0, leftover, 0, impu2, 1}, []any{impu2, 0, impu1, 1}, []int{1}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			a := newAPIEnv(t, func(o *APIOptions) {
@@ -472,17 +479,18 @@ func TestAWriteDroppingAChatbotHostIdentityMarksItsSetStale(t *testing.T) {
 			a.notifier.pprErr = errors.New("test: no peer")
 			a.h.chatbot = testChatbotDomain(t)
 			s := &store.Subscription{IMPI: impi1, Profile: DefaultProfileID, ServerName: scscfName}
-			for _, id := range c.ids {
-				s.PublicIdentities = append(s.PublicIdentities, store.PublicIdentity{IMPU: id, State: store.Registered})
+			for i := 0; i < len(c.stored); i += 2 {
+				s.PublicIdentities = append(s.PublicIdentities,
+					store.PublicIdentity{IMPU: c.stored[i].(string), ImplicitSet: c.stored[i+1].(int), State: store.Registered})
 			}
 			if _, err := a.store.CreateSubscription(t.Context(), s); err != nil {
 				t.Fatal(err)
 			}
-			if code, body, _ := a.do("PUT", subPath(impi1), adminToken, subscriptionBody(impi1, false, impu1)); code != http.StatusOK {
+			if code, body, _ := a.do("PUT", subPath(impi1), adminToken, setsBody(impi1, c.put...)); code != http.StatusOK {
 				t.Fatalf("put = %d %v", code, body)
 			}
-			if got := a.sub(impi1).StaleSets; !slices.Equal(got, []int{0}) {
-				t.Errorf("stale sets after the write = %v, want [0]", got)
+			if got := a.sub(impi1).StaleSets; !slices.Equal(got, c.want) {
+				t.Errorf("stale sets after the write = %v, want %v", got, c.want)
 			}
 			scscf := connectCSCF(t, serveHSS(t, a.h, "hss-a.rcs.local"), "scscf-1.rcs.local")
 			r := &cx.SAR{Request: cx.Request{DestinationRealm: domain}, UserName: impi1, PublicIdentities: []string{impu1},
@@ -503,8 +511,8 @@ func TestAWriteDroppingAChatbotHostIdentityMarksItsSetStale(t *testing.T) {
 }
 
 // Which sets a write marks stale for a chatbot-host identity it takes away
-// (markChatbotHostLeft): a served set that loses one, removed or moved, and
-// keeps another identity.
+// (markChatbotHostLeft): those that the other identities of a served set
+// losing one, removed or moved, are in after the write.
 func TestOnlyAServedSetLosingAChatbotHostIdentityIsMarkedStale(t *testing.T) {
 	type id struct {
 		impu  string
@@ -537,7 +545,13 @@ func TestOnlyAServedSetLosingAChatbotHostIdentityIsMarkedStale(t *testing.T) {
 		{"already stale", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), staleAlready, true, []int{0}},
 		{"kept in order with a set already stale", sub(id{impu1, 0, reg}, id{leftover, 0, reg}, id{impu2, 1, reg}), otherStale, true, []int{0, 1}},
 		{"kept", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), sub(id{impu1, 0, not}, id{leftover, 0, not}), true, nil},
-		{"the set emptied", sub(id{impu1, 0, reg}, id{leftover, 1, reg}), sub(id{impu1, 0, not}), true, nil},
+		{"the identity left moves to another set", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), sub(id{impu1, 1, not}), true, []int{1}},
+		{"the sets swap numbers", sub(id{impu1, 0, reg}, id{leftover, 0, reg}, id{impu2, 1, reg}),
+			sub(id{impu2, 0, not}, id{impu1, 1, not}), true, []int{1}},
+		{"the identities left split", sub(id{impu1, 0, reg}, id{leftover, 0, reg}, id{impu2, 0, reg}),
+			sub(id{impu1, 0, not}, id{impu2, 2, not}), true, []int{0, 2}},
+		{"no other identity of the set is left", sub(id{impu1, 0, reg}, id{impu2, 1, reg}, id{leftover, 1, reg}),
+			sub(id{impu1, 0, not}), true, nil},
 		{"a set not served", sub(id{impu1, 0, not}, id{leftover, 0, not}), sub(id{impu1, 0, not}), true, nil},
 		{"another identity removed", sub(id{impu1, 0, reg}, id{impu2, 0, reg}), sub(id{impu1, 0, not}), true, nil},
 		{"RCS_CHATBOT_DOMAIN unset", sub(id{impu1, 0, reg}, id{leftover, 0, reg}), sub(id{impu1, 0, not}), false, nil},
