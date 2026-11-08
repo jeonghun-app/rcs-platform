@@ -46,8 +46,10 @@ licensed. Cite the document and clause, for example `RCC.07 §3.2.5.1`, or
 - No real IMSI, IMEI, MSISDN, key or credential anywhere: code, tests, logs, issues,
   pull requests. Test IMSIs use MCC 001 / MNC 01 and are listed in
   `.github/allowed-test-identifiers.txt`; `make privacy` enforces it. The
-  same goes for `maap` aliases (`sip:<alias-id>@<host>;user=rcstk`): a test
-  alias ID is made up and listed there.
+  same goes for `maap` aliases (`sip:<alias-id>@<host>;user=rcstk`) and for an
+  alias ID on its own, any word of 26 base32 characters in one case: a test
+  alias ID is made up and listed there, and any other such word is built at
+  run time.
 - Identifiers reach a log only through `internal/pii`. Message bodies, keys,
   nonces, RAND/AUTN and tokens never reach a log.
 

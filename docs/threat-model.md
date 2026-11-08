@@ -182,7 +182,9 @@ metric dimension (architecture §8). A `maap` alias,
 `sip:<alias-id>@<host>;user=rcstk` with a 26-character base32 alias ID (ADR 0009
 §10), maps back to one subscriber and is treated as a number: `internal/pii`
 masks its alias ID, in either case, and the privacy check refuses one written in
-a tracked file unless its ID is on the allow-list.
+a tracked file unless its ID is on the allow-list. The same holds for an alias
+ID standing alone, as the chatbot API names a recipient by it: in text, JSON, a
+URL path or a percent-encoded alias, all in lower or all in upper case (#719).
 **Status:** implemented.
 
 ## T9 — Resource exhaustion from clients
