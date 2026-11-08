@@ -68,7 +68,9 @@
 // pattern matches anywhere in its field, as a POSIX regexec would; anchor it
 // with ^ and $ to match the whole field. Request-URI patterns ignore case,
 // because host names do (RFC 3261 §19.1.4); header values and SDP content are
-// matched as written. A pattern means what it means as Go's POSIX parser
+// matched as written. A [WholePattern], outside any criteria, follows the same
+// rules but matches the whole value, with regard to case.
+// A pattern means what it means as Go's POSIX parser
 // reads an ERE, also where Perl syntax, which Go's matcher reads, would
 // differ: "0+?" is (0+)?, not a lazy repetition; and, as regexec reads a
 // value without REG_NEWLINE, "." and "[^x]" match a newline and "^" and "$"

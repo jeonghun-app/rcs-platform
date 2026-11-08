@@ -66,6 +66,8 @@ const (
 	MaxCapabilities     = 32
 	MaxIdentityLength   = 255
 	MaxProfileIDLength  = 64
+	// MaxPSILength bounds a wildcarded PSI as written (ADR 0009 §3).
+	MaxPSILength = 256
 )
 
 // RegistrationState is the state of a public identity at the HSS
@@ -243,6 +245,22 @@ type ServiceProfile struct {
 	Compiled *ifc.Set
 }
 
+// WildcardedPSI is the one wildcarded Public Service Identity the HSS keeps:
+// the chatbot range of ADR 0009 §3. It is routed directly to an application
+// server (TS 23.228 §5.4.12.2 b), so it has an AS name and no IMPI, service
+// profile or registration state.
+type WildcardedPSI struct {
+	// PSI is the identity as provisioned, sip:!<ERE>!@<host> (TS 23.003
+	// §13.5); the HSS checks the ERE before it writes.
+	PSI string
+	// ServerName is the AS name that a Location-Info-Answer for an identity
+	// in the range carries.
+	ServerName string
+	// Active is the PSI activation state; the HSS writes it active.
+	Active  bool
+	Version int64
+}
+
 // Page is one page of a listing.
 type Page struct {
 	IMPIs []string
@@ -253,10 +271,10 @@ type Page struct {
 // MaxPageSize bounds a page.
 const MaxPageSize = 100
 
-// Store keeps subscriptions, service profiles and the wrapped data keys of
-// internal/hss/keyring. Reads are strongly consistent except
-// SubscriptionsByProfile. Implementations are safe for concurrent use and
-// return copies: changing a returned value changes nothing stored.
+// Store keeps subscriptions, service profiles, the wildcarded PSI and the
+// wrapped data keys of internal/hss/keyring. Reads are strongly consistent
+// except SubscriptionsByProfile. Implementations are safe for concurrent use
+// and return copies: changing a returned value changes nothing stored.
 type Store interface {
 	// CreateSubscription stores a new subscription with version 1. It fails
 	// with ErrExists, ErrIdentityInUse or ErrProfileMissing.
@@ -286,6 +304,15 @@ type Store interface {
 	// DeleteProfile deletes the profile with p.Version, or fails with
 	// ErrProfileInUse while a subscription refers to it.
 	DeleteProfile(ctx context.Context, p *ServiceProfile) error
+
+	// WildcardedPSI returns the wildcarded PSI, or fails with ErrNotFound
+	// when none is stored.
+	WildcardedPSI(ctx context.Context) (*WildcardedPSI, error)
+	// PutWildcardedPSI stores p in place of old, as read, and returns p
+	// with its new version. With old nil it stores p only if no wildcarded
+	// PSI is stored (ErrExists otherwise); else old.Version must still be
+	// the stored version (ErrConflict otherwise).
+	PutWildcardedPSI(ctx context.Context, old, p *WildcardedPSI) (*WildcardedPSI, error)
 
 	// HasSubscriptions reports whether any subscription is stored, which
 	// decides whether a first data key may be created (keyring.Open). It is

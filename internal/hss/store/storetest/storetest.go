@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,25 @@ func Subscription(impi, profile string, impus ...string) *store.Subscription {
 	return s
 }
 
+// PSI returns a valid wildcarded PSI of the chatbot range at a test domain.
+func PSI() *store.WildcardedPSI {
+	return &store.WildcardedPSI{
+		PSI:        `sip:![a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})?!@botplatform.mnc001.mcc001.3gppnetwork.org`,
+		ServerName: "sip:rcs-as.rcs.local;transport=tcp",
+		Active:     true,
+	}
+}
+
+// InvalidPSIs returns wildcarded PSIs that break a structural rule of the
+// stored item, by the rule: neither backend writes or reads them.
+func InvalidPSIs() map[string]*store.WildcardedPSI {
+	empty, noServer, long := PSI(), PSI(), PSI()
+	empty.PSI = ""
+	noServer.ServerName = ""
+	long.PSI = "sip:!" + strings.Repeat("a", store.MaxPSILength) + "!@botplatform.mnc001.mcc001.3gppnetwork.org"
+	return map[string]*store.WildcardedPSI{"empty PSI": empty, "empty server name": noServer, "PSI over MaxPSILength": long}
+}
+
 // Options adapts the suite to a backend.
 type Options struct {
 	// ListingWait is how long SubscriptionsByProfile may lag a write
@@ -84,6 +104,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store, o Options) {
 		{"OnlyOneFirstDataKeyIsStored", testDataKeys},
 		{"StoredSubscriptionsAreSeen", testHasSubscriptions},
 		{"AProfileCarryingItsCompiledSetIsNotCompiledAgain", testPrecompiledProfile},
+		{"TheWildcardedPSIIsOneItemReplacedByVersion", testWildcardedPSI},
+		{"TheWildcardedPSIIsNeitherASubscriptionNorListed", testWildcardedPSIIsNoSubscription},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) { tc.fn(t, newStore(t), o) })
@@ -486,5 +508,91 @@ func testPrecompiledProfile(t *testing.T, s store.Store, _ Options) {
 	p.Version = saved.Version
 	if _, err := s.UpdateProfile(ctx(t), p); err != nil {
 		t.Fatalf("UpdateProfile compiled again: %v", err)
+	}
+}
+
+func testWildcardedPSI(t *testing.T, s store.Store, _ Options) {
+	_, err := s.WildcardedPSI(ctx(t))
+	wantErr(t, err, store.ErrNotFound)
+	// A replacement of a version that is not stored is a conflict, also
+	// when nothing is stored, and stores nothing.
+	ghost := PSI()
+	ghost.Version = 1
+	_, err = s.PutWildcardedPSI(ctx(t), ghost, PSI())
+	wantErr(t, err, store.ErrConflict)
+	_, err = s.WildcardedPSI(ctx(t))
+	wantErr(t, err, store.ErrNotFound)
+	v1 := must(s.PutWildcardedPSI(ctx(t), nil, PSI()))(t)
+	want := PSI()
+	want.Version = 1
+	if !reflect.DeepEqual(v1, want) {
+		t.Fatalf("stored %+v, want %+v", v1, want)
+	}
+	if got := must(s.WildcardedPSI(ctx(t)))(t); !reflect.DeepEqual(got, want) {
+		t.Fatalf("read %+v, want %+v", got, want)
+	}
+	// There is one: a second first write fails, and a write replaces it
+	// only from the version it read.
+	_, err = s.PutWildcardedPSI(ctx(t), nil, PSI())
+	wantErr(t, err, store.ErrExists)
+	next := PSI()
+	next.PSI = strings.Replace(next.PSI, "{1,63}", "{1,32}", 1)
+	v2 := must(s.PutWildcardedPSI(ctx(t), v1, next))(t)
+	if v2.Version != 2 || v2.PSI != next.PSI {
+		t.Fatalf("replaced with %+v", v2)
+	}
+	_, err = s.PutWildcardedPSI(ctx(t), v1, PSI())
+	wantErr(t, err, store.ErrConflict)
+	for name, bad := range InvalidPSIs() {
+		_, err = s.PutWildcardedPSI(ctx(t), v2, bad)
+		if !errors.Is(err, store.ErrInvalid) {
+			t.Errorf("%s: error = %v, want ErrInvalid", name, err)
+		}
+	}
+	got := must(s.WildcardedPSI(ctx(t)))(t)
+	if !reflect.DeepEqual(got, v2) {
+		t.Fatalf("after the refused writes: %+v, want %+v", got, v2)
+	}
+	got.PSI = "changed"
+	if again := must(s.WildcardedPSI(ctx(t)))(t); again.PSI != v2.PSI {
+		t.Fatal("a returned PSI aliases the stored one")
+	}
+}
+
+// testWildcardedPSIIsNoSubscription checks what lets a task of the release
+// before the PSI ignore its item: the HSS reads subscriptions, IMPUs and
+// keys by key, lists by profile and scans the profile index, and the PSI
+// is in none of them. Once the only subscription is gone, the store must
+// again have none, which it would not if the PSI were taken for one.
+func testWildcardedPSIIsNoSubscription(t *testing.T, s store.Store, o Options) {
+	must(s.PutWildcardedPSI(ctx(t), nil, PSI()))(t)
+	withProfile(t, s, "p")
+	sub := must(s.CreateSubscription(ctx(t), Subscription(IMPI1, "p", IMPU1)))(t)
+	deadline := time.Now().Add(o.ListingWait)
+	for {
+		page := must(s.SubscriptionsByProfile(ctx(t), "p", "", store.MaxPageSize))(t)
+		if reflect.DeepEqual(page.IMPIs, []string{IMPI1}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("listed %v, want only %s", page.IMPIs, IMPI1)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if keys := must(s.DataKeys(ctx(t)))(t); len(keys) != 0 {
+		t.Fatalf("the PSI reads as data keys: %+v", keys)
+	}
+	if err := s.DeleteSubscription(ctx(t), sub); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(o.ListingWait)
+	for must(s.HasSubscriptions(ctx(t)))(t) {
+		if time.Now().After(deadline) {
+			t.Fatal("with only the PSI stored, the store has subscriptions")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := must(s.WildcardedPSI(ctx(t)))(t); got.PSI != PSI().PSI {
+		t.Fatalf("PSI = %+v", got)
 	}
 }

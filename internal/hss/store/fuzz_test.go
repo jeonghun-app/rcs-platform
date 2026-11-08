@@ -65,3 +65,27 @@ func FuzzDecodeProfile(f *testing.F) {
 		}
 	})
 }
+
+// FuzzDecodeWildcardedPSI does the same for the stored wildcarded PSI.
+func FuzzDecodeWildcardedPSI(f *testing.F) {
+	doc, err := store.EncodeWildcardedPSI(storetest.PSI())
+	if err != nil {
+		f.Fatal(err)
+	}
+	f.Add(doc)
+	f.Add([]byte(`{"schema":1,"psi":"x","server_name":"y","active":false}`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		got, err := store.DecodeWildcardedPSI(data, 1)
+		if err != nil {
+			return
+		}
+		again, err := store.EncodeWildcardedPSI(got)
+		if err != nil {
+			t.Fatalf("decoded PSI does not encode: %v", err)
+		}
+		back, err := store.DecodeWildcardedPSI(again, 1)
+		if err != nil || !reflect.DeepEqual(back, got) {
+			t.Fatalf("round trip changed the PSI: %v\n%+v\n%+v", err, got, back)
+		}
+	})
+}

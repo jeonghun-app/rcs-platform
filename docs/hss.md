@@ -79,6 +79,18 @@ IMPUs are stored and matched in one canonical form: `sip:` and `sips:` URIs as
 URIs as `tel:+digits` without visual separators. URI parameters in a Cx request
 (`;user=phone`) are ignored.
 
+Beside the subscriptions, `hss` keeps at most one wildcarded Public Service
+Identity (TS 23.003 §13.5): the chatbot range of ADR 0009 §3,
+`sip:!<ERE>!@<RCS_CHATBOT_DOMAIN>`, at most 256 bytes, with its activation state
+(written active) and the AS name a Location-Info-Answer in the range carries. It
+belongs to no subscription and has no service profile: it is routed directly to
+the AS (TS 23.228 §5.4.12.2 b), so no S-CSCF serves it. Its ERE is compiled
+under `internal/ifc`'s rules and budget, and matched against the whole user part
+of a chatbot URI in the normal form of `internal/chatbot`, with regard to case
+(`ifc.WholePattern`), not as a trigger's Request-URI pattern is, anywhere and
+without case. Only a URI already in that normal form is in the range. No API
+writes it yet (#679).
+
 Shared public identities and several IMPIs per subscription are not modelled;
 so Associated-Identities is never sent, and the S-CSCF name is kept once per
 subscription, which matches the platform's single S-CSCF service name (ADR 0005).
@@ -89,13 +101,19 @@ subscription, which matches the platform's single S-CSCF service name (ADR 0005)
 
 | Table | Key | Index | Notes |
 |---|---|---|---|
-| `subscribers` | `pk` (S) | `profile-index`: hash `profile` (S), keys only | items `s#<IMPI>`, `u#<IMPU>`, `keyring`; on-demand; point-in-time recovery; deletion protection |
+| `subscribers` | `pk` (S) | `profile-index`: hash `profile` (S), keys only | items `s#<IMPI>`, `u#<IMPU>`, `keyring`, `wildcarded-psi`; on-demand; point-in-time recovery; deletion protection |
 | `service-profiles` | `pk` (S) | | one item per profile; on-demand; point-in-time recovery; deletion protection |
 
 The task role needs `dynamodb:GetItem`, `PutItem`, `DeleteItem`, `Query` and
 `Scan` (on the index), `TransactWriteItems`, `ConditionCheckItem` and
 `DescribeTable` on both tables, and `kms:GenerateDataKey` and `kms:Decrypt` on
 `HSS_KMS_KEY_ID` with the encryption context `service=hss`, `purpose=subscriber-secrets`.
+
+The `wildcarded-psi` item has `pk`, `version` (N), `doc` (B, the document below)
+and `writer` (S, the token of the write that stored it), and no `profile`, so
+the profile index leaves it out. A task of a release before it never reads it:
+that release reads items by key (`s#`, `u#`, `keyring`) and lists and scans
+only the profile index, so the item changes nothing for it.
 
 Every write is conditional on the version read, so two tasks cannot both reserve
 the same AKA sequence numbers or overwrite each other's S-CSCF assignment: the
@@ -104,10 +122,10 @@ written in one transaction, so an IMPU never belongs to two subscriptions.
 
 ### Stored document format
 
-A subscription or a profile is stored as a JSON document with a schema number
-(`internal/hss/store/codec.go`), the same bytes in DynamoDB and in memory. A
-task decodes it strictly: a field it does not know makes the record unreadable
-to it. A new field therefore ships in two releases, so that no task of the
+A subscription, a profile or the wildcarded PSI is stored as a JSON document
+with a schema number (`internal/hss/store/codec.go`), the same bytes in DynamoDB
+and in memory. A task decodes it strictly: a field it does not know makes the
+record unreadable to it. A new field therefore ships in two releases, so that no task of the
 release still running during a rolling deploy meets a field it refuses:
 
 1. a release whose decoder accepts the field, and does not write it;

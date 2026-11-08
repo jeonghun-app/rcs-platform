@@ -67,6 +67,13 @@ type profileRecord struct {
 	Optional  []uint32            `json:"optional_capabilities,omitempty"`
 }
 
+type psiRecord struct {
+	Schema     int    `json:"schema"`
+	PSI        string `json:"psi"`
+	ServerName string `json:"server_name"`
+	Active     bool   `json:"active,omitempty"`
+}
+
 // EncodeSubscription returns the stored form of s, without its version.
 func EncodeSubscription(s *Subscription) ([]byte, error) {
 	if err := ValidateSubscription(s); err != nil {
@@ -151,6 +158,41 @@ func DecodeProfile(data []byte, version int64) (*ServiceProfile, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// EncodeWildcardedPSI returns the stored form of p, without its version.
+func EncodeWildcardedPSI(p *WildcardedPSI) ([]byte, error) {
+	if err := ValidateWildcardedPSI(p); err != nil {
+		return nil, err
+	}
+	return marshalRecord(psiRecord{Schema: recordSchema, PSI: p.PSI, ServerName: p.ServerName, Active: p.Active})
+}
+
+// DecodeWildcardedPSI reads a stored wildcarded PSI and checks it as
+// ValidateWildcardedPSI does. The HSS compiles its ERE again when it reads
+// it, as it does on every write.
+func DecodeWildcardedPSI(data []byte, version int64) (*WildcardedPSI, error) {
+	var r psiRecord
+	if err := unmarshalRecord(data, &r, &r.Schema); err != nil {
+		return nil, err
+	}
+	p := &WildcardedPSI{PSI: r.PSI, ServerName: r.ServerName, Active: r.Active, Version: version}
+	if err := ValidateWildcardedPSI(p); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// ValidateWildcardedPSI checks the structural rules a stored wildcarded PSI
+// keeps. Its form and its ERE are the HSS's to check before it writes.
+func ValidateWildcardedPSI(p *WildcardedPSI) error {
+	switch {
+	case p.PSI == "" || len(p.PSI) > MaxPSILength:
+		return fmt.Errorf("%w: wildcarded PSI: the PSI is empty or too long", ErrInvalid)
+	case p.ServerName == "" || len(p.ServerName) > MaxIdentityLength:
+		return fmt.Errorf("%w: wildcarded PSI: the server name is empty or too long", ErrInvalid)
+	}
+	return nil
 }
 
 func marshalRecord(r any) ([]byte, error) {
