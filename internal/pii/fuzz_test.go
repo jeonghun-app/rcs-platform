@@ -13,8 +13,8 @@ import (
 // FuzzRedact checks the guarantee services rely on: whatever the input, keyed
 // or not, the output has no run of minRun or more decimal digits of any
 // script, no number written in groups, in any script's digits, that
-// Redact promises to mask, and no alias ID in a sip or sips URI, and valid
-// UTF-8 stays valid. The grouped
+// Redact promises to mask, and no alias ID, in a sip or sips URI or standing
+// alone (aliasIDIn), and valid UTF-8 stays valid. The grouped
 // rules are restated here independently of numberAt: a national number is any
 // group of two or more digits starting with 0, not preceded by a letter or
 // digit, followed by eight digits in total. The one documented exception is
@@ -25,6 +25,30 @@ var (
 	groupedNational      = regexp.MustCompile(`^0[0-9](?:[ ().-]{0,2}[0-9]){6,}`)
 	// An alias's ID before its "@" (ADR 0009 §10), in either case.
 	unmaskedAlias = regexp.MustCompile(`(?i)sips?:[a-z2-7]{26}@`)
+)
+
+// aliasIDIn returns an alias ID left standing alone in s, if any: a word of
+// ASCII letters and digits, or such a word without the escape glued to its
+// front (gluedEscape), that is 26 characters of base32 in one case.
+func aliasIDIn(s string) string {
+	for _, loc := range asciiWords.FindAllStringIndex(s, -1) {
+		w := s[loc[0]:loc[1]]
+		if len(w) > 26 && loc[0] > 0 && gluedEscape.MatchString(s[loc[0]-1:loc[0]]+w[:len(w)-26]) {
+			w = w[len(w)-26:]
+		}
+		if len(w) == 26 && strings.Trim(strings.ToLower(w), "abcdefghijklmnopqrstuvwxyz234567") == "" &&
+			(strings.ToLower(w) == w || strings.ToUpper(w) == w) {
+			return w
+		}
+	}
+	return ""
+}
+
+var (
+	asciiWords = regexp.MustCompile(`[A-Za-z0-9]+`)
+	// A percent-escape, once or twice encoded, or a Go or JSON backslash
+	// escape.
+	gluedEscape = regexp.MustCompile(`^(%(25)?[0-9A-Fa-f]{2}|\\[ntr]|\\u[0-9A-Fa-f]{4})$`)
 )
 
 // nationalNumberIn returns a national number left in s, if any. A match counts
@@ -96,7 +120,11 @@ func FuzzRedact(f *testing.F) {
 		"+1 \u200b(555) 010-0001 +1 \u2066(555)\u2069 010-0001 010-\u200b-0000-0001",
 		"sips:urn:gsma:imei:\u3000555\u3000010@x sip:ims.example.com経由\u3000０３\u3000１２３４",
 		"0900〜1800 sip:+1\u00a0555\u00a0010\u00a00001@x",
-		// maap aliases (#714).
+		// maap aliases (#714) and alias IDs standing alone (#719).
+		`{"to":"aliasforthetestsonly23456a"} /v1/conversations/SECONDTESTALIASONLY234567A/x`,
+		"sip%3Aaliasforthetestsonly23456a%40x %2fsecondtestaliasonly234567a conv_aliasforthetestsonly23456a",
+		"aliasforthetestsonly23456 aliasforthetestsonly23456aa Aliasforthetestsonly23456a %zzaliasforthetestsonly23456a",
+		`q=sip%253Aaliasforthetestsonly23456a%2540x "\naliasforthetestsonly23456a" \u00e9SECONDTESTALIASONLY234567A \qaliasforthetestsonly23456a`,
 		"From: <sip:aliasforthetestsonly23456a@alias.example.net;user=rcstk>",
 		`{"to":"SIP:SECONDTESTALIASONLY234567A@ALIAS.EXAMPLE.NET;USER=RCSTK"}`,
 		"sips:aliasforthetestsonly\u200b23456a@x sip:sip:secondtestaliasonly234567a@x",
@@ -132,9 +160,17 @@ func FuzzRedact(f *testing.F) {
 			if m := unmaskedAlias.FindString(a); m != "" {
 				t.Fatalf("redacting %q gave %q, which keeps the alias %q", s, a, m)
 			}
+			// A mask and its hint end a word. Only a keyed hint can be told
+			// from the text after it (8 letters a-p); an unkeyed one has 0
+			// or 2 characters, so unkeyed output is left to the tests.
+			if withKey {
+				if m := aliasIDIn(keyedMask.ReplaceAllString(a, " ")); m != "" {
+					t.Fatalf("redacting %q gave %q, which keeps the alias ID %q", s, a, m)
+				}
+			}
 		}
-		if !strings.ContainsRune(s, ':') && !strings.ContainsFunc(s, unicode.IsDigit) && out != s {
-			t.Fatalf("Redact(%q) = %q changed text with no digits or schemes", s, out)
+		if !strings.ContainsRune(s, ':') && !strings.ContainsFunc(s, unicode.IsDigit) && aliasIDIn(s) == "" && out != s {
+			t.Fatalf("Redact(%q) = %q changed text with no digits, schemes or alias IDs", s, out)
 		}
 		// Never less than main masked at the frozen copy's commit (review
 		// of #398, #490).

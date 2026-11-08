@@ -6,11 +6,14 @@
 # 10-15 digits is most likely an E.164 phone number. Both identify a subscriber and
 # must never be committed. So does a maap alias, sip:<alias-id>@<host>;user=rcstk
 # with a 26-character base32 alias ID (ADR 0009 §10), which maap maps back to one
-# subscriber; it is allowed by its ID. The allow-list is
+# subscriber, and so does the alias ID alone, which the chatbot API names a
+# recipient by (#719); both are allowed by the ID. The allow-list is
 # .github/allowed-test-identifiers.txt, which documents why each entry is safe.
 # Every tracked file is scanned.
 #
 set -euo pipefail
+# Bytes, not characters: a word is the same on glibc and musl, in any locale.
+export LC_ALL=C
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -33,7 +36,8 @@ allowed_aliases="$(grep -E '^[a-z2-7]{26}$' "$ALLOWLIST" | sort -u || true)"
 # scans run at top level (not in a command substitution) so `exit` really exits.
 hits="$(mktemp)"
 alias_hits="$(mktemp)"
-trap 'rm -f "$hits" "$alias_hits"' EXIT
+bare_hits="$(mktemp)"
+trap 'rm -f "$hits" "$alias_hits" "$bare_hits"' EXIT
 for pattern in '\b[0-9]{15,16}\b' '\+[0-9]{10,15}\b'; do
   rc=0
   git grep -hIoE "$pattern" -- ':!.github/allowed-test-identifiers.txt' ':!go.sum' >>"$hits" || rc=$?
@@ -51,9 +55,43 @@ if (( rc > 1 )); then
   echo "error: git grep failed ($rc)" >&2
   exit 2
 fi
+# An alias ID alone, read as pii.Redact reads it. A word is a run of ASCII
+# letters and digits, so "_", "-" and any non-ASCII byte end it; \b would not,
+# as it counts "_" (and, by locale, other letters) as part of a word. Only runs
+# of 26 or more are printed, each whole and with the byte before it when that
+# is "%" or "\", so two IDs one byte apart are two hits. The filter keeps a
+# word of 26 base32 characters in one case, or one with an escape glued to
+# its front: a percent-escape, once or twice encoded (sip%3A<id>, sip%253A<id>),
+# or a backslash escape (\n<id>, \u00e9<id>). Mixed case is left out, as in
+# internal/pii: Go identifiers of 26 letters are mixed case, alias IDs never.
+rc=0
+git grep -hIoE '[%\\]?[A-Za-z0-9]{26,}' -- ':!.github/allowed-test-identifiers.txt' ':!go.sum' >"$bare_hits" || rc=$?
+if (( rc > 1 )); then
+  echo "error: git grep failed ($rc)" >&2
+  exit 2
+fi
+bare_ids() {
+  awk '
+    function hex(s) { return s ~ /^[0-9A-Fa-f]+$/ }
+    {
+      pre = substr($0, 1, 1)
+      w = $0
+      if (pre == "%" || pre == "\\") w = substr($0, 2); else pre = ""
+      n = length(w)
+      id = substr(w, n - 25)
+      p = substr(w, 1, n - 26)
+      if (!(id ~ /^[a-z2-7]+$/ || id ~ /^[A-Z2-7]+$/)) next
+      pct = pre == "%" && (length(p) == 2 && hex(p) || length(p) == 4 && substr(p, 1, 2) == "25" && hex(substr(p, 3)))
+      esc = pre == "\\" && (p ~ /^[ntr]$/ || length(p) == 5 && substr(p, 1, 1) == "u" && hex(substr(p, 2)))
+      if (p == "" || pct || esc) print id
+    }' "$bare_hits"
+}
 
 found="$(grep -E '^\+?[0-9]+$' "$hits" | sort -u || true)"
-found_aliases="$(sed -E 's/^[^:]*:([^@]*)@.*$/\1/' "$alias_hits" | tr '[:upper:]' '[:lower:]' | sort -u)"
+found_aliases="$( {
+  sed -E 's/^[^:]*:([^@]*)@.*$/\1/' "$alias_hits"
+  bare_ids
+} | tr '[:upper:]' '[:lower:]' | sort -u)"
 
 if [[ -z "$found$found_aliases" ]]; then
   echo "no subscriber-shaped identifiers found"
@@ -73,8 +111,9 @@ if [[ -n "$unexpected" ]]; then
 If these are test data, add them to .github/allowed-test-identifiers.txt with a
 comment explaining why they are safe: IMSIs from MCC 001, phone numbers from the
 fictional ranges listed there, alias IDs made up for the test (the ID alone, in
-lower case). If any of them is a real subscriber identifier or alias,
-remove it and rewrite history before pushing.
+lower case). Build any other 26-character base32 word at run time. If any of
+them is a real subscriber identifier or alias, remove it and rewrite history
+before pushing.
 HINT
   exit 1
 fi

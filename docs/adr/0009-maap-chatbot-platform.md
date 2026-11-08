@@ -407,6 +407,10 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
       are conversation metadata, like T10's sent records.
     - **Logs** carry subscriber identifiers and aliases only through
       `pii.URI` or `pii.Identity`; the privacy check learns the alias form.
+      `pii.Redact` masks any word of 26 base32 characters in one case as an
+      alias ID (#719), so `maap`'s other 128-bit IDs (Message-ID, delivery
+      ID) are 32 hex characters, and `maap` never puts an alias ID in an
+      error value.
       Never logged: bodies, chatbot free text, idempotency keys, credentials,
       signatures, webhook paths or queries (the host only), webhook
       responses. **Metrics** have only the `Service` dimension (the registry

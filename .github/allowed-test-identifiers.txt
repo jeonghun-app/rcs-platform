@@ -36,8 +36,9 @@
 +15550108999
 
 # --- maap aliases (ADR 0009 §10) ---------------------------------------------
-# An alias sip:<alias-id>@<host>;user=rcstk is listed by its alias ID alone, in
-# lower case. These are spelt out of words, so no random 128-bit draw gives
+# An alias sip:<alias-id>@<host>;user=rcstk, or an alias ID on its own (any word
+# of 26 base32 characters in one case), is listed by its alias ID, in lower
+# case. These are spelt out of words, so no random 128-bit draw gives
 # them; internal/pii's tests and fuzz seeds use them.
 aliasforthetestsonly23456a
 secondtestaliasonly234567a

@@ -23,11 +23,15 @@
 // one subscriber's number, which only maap maps it back to, so it is personal
 // data like the number. It reaches a log only through [URI] or [Identity],
 // which never show its alias ID, and [Redact] masks it in free text as it
-// masks the user of any sip URI. Its hint is the lower-case alias ID's, so
-// one alias has the same hint in every form and case. An alias ID on its own
-// in free text is not recognised: log it with [Identity]. The repository's
-// privacy check (make privacy) refuses an alias written out in a tracked
-// file, unless .github/allowed-test-identifiers.txt lists its ID.
+// masks the user of any sip URI. The chatbot API names a recipient by the
+// alias ID alone, so Redact masks that too wherever it stands alone (see
+// [Redactor.Redact]). Its hint is the lower-case alias ID's, so one alias has
+// the same hint in every form and case. No other identifier the platform
+// issues is 26 base32 characters (maap's are 32 hex characters, ADR 0009
+// §10); MSRP Message-IDs are, and are masked where they reach Redact. The
+// repository's privacy check (make privacy) refuses an alias or a
+// lower-case alias ID written out in a tracked file, unless
+// .github/allowed-test-identifiers.txt lists its ID.
 //
 // Redaction is for identifiers only. Display names, message bodies, keys,
 // nonces, RAND/AUTN, digest responses and tokens are not recognised and must
@@ -150,7 +154,15 @@ func (r *Redactor) Identity(key, v string) slog.Attr {
 //     which is the alias ID of a maap alias, and the user of an im or pres
 //     URI (RFC 3860 §3, RFC 3859 §3), quoted or not, as CPIM From and To
 //     carry them (RFC 3862 §3.4);
-//   - the IMEI of a urn:gsma:imei URN (RFC 7254 §3), all of its digit groups.
+//   - the IMEI of a urn:gsma:imei URN (RFC 7254 §3), all of its digit groups;
+//   - a maap alias ID standing alone: 26 base32 characters, all in lower or
+//     all in upper case, between characters that are not ASCII letters or
+//     digits, or a mask; or right after an escape glued to its front, as
+//     already-escaped text has them: a percent-escape, single or double
+//     encoded ("sip%3A<id>%40…", "sip%253A<id>%2540…"), or a backslash
+//     escape ("\n", "\t", "\r", "\u00e9"); see [escapePrefix]. Mixed case is
+//     left alone: base32 is written in one case, and Go and metric names of
+//     26 letters ("ServerTransactionsRejected") are not identifiers.
 //
 // Digits of any script count: every decimal digit (Unicode Nd) outside ASCII,
 // such as a full-width digit from a CJK input mode or an Arabic-Indic digit,
@@ -184,6 +196,14 @@ func (r *Redactor) Redact(s string) string {
 	cuts := &cutList{at: cutAt}
 	var b strings.Builder
 	b.Grow(len(s))
+	// masks are where the masks written so far start and end, for
+	// maskAliasIDs.
+	var masks [][2]int
+	writeMask := func(v string) {
+		start := b.Len()
+		b.WriteString(r.mask(v))
+		masks = append(masks, [2]int{start, b.Len()})
+	}
 	// A sip or sips URI that starts before noUserBefore has no '@' before its end:
 	// remembering this keeps a line full of "sip:" prefixes linear.
 	noUserBefore := 0
@@ -197,7 +217,7 @@ func (r *Redactor) Redact(s string) string {
 				if s[from] == '+' {
 					b.WriteByte('+')
 				}
-				b.WriteString(r.mask(s[from:end]))
+				writeMask(s[from:end])
 			}
 			i = end
 			continue
@@ -214,7 +234,7 @@ func (r *Redactor) Redact(s string) string {
 		switch {
 		case hasUserinfo(s[start-n : start]):
 			if open, close, at := quotedUser(s, start, s[start-n:start]); at > 0 {
-				b.WriteString(r.mask(s[open+1 : close]))
+				writeMask(s[open+1 : close])
 				i = at
 				continue
 			}
@@ -230,7 +250,7 @@ func (r *Redactor) Redact(s string) string {
 				continue
 			}
 			if end > start {
-				b.WriteString(r.mask(sipUser(s[start:end])))
+				writeMask(sipUser(s[start:end]))
 				i = end
 			}
 		default:
@@ -251,12 +271,85 @@ func (r *Redactor) Redact(s string) string {
 				if num[0] == '+' {
 					b.WriteByte('+')
 				}
-				b.WriteString(r.mask(num))
+				writeMask(num)
 				i = end
 			}
 		}
 	}
+	return r.maskAliasIDs(b.String(), masks)
+}
+
+// maskAliasIDs masks every alias ID that stands alone in s (see Redact). It
+// runs on Redact's output, after the masks of URI users, so an alias ID in a
+// sip URI keeps the hint the URI gives it. masks are where the masks in s
+// start and end, in increasing order: a mask's hint is no part of a word, so
+// that a hint and the letters after it never read as an alias ID. It is
+// linear: each word is read twice at most.
+func (r *Redactor) maskAliasIDs(s string, masks [][2]int) string {
+	var b strings.Builder
+	last := 0 // s[:last] has been written
+	k := 0    // masks[:k] end at or before i
+	for i := 0; i < len(s); {
+		for k < len(masks) && masks[k][1] <= i {
+			k++
+		}
+		if k < len(masks) && masks[k][0] <= i {
+			i = masks[k][1]
+			continue
+		}
+		if !isAlnum(s[i]) {
+			i++
+			continue
+		}
+		// A word ends at a mask, which starts with mark.
+		end := i
+		for end < len(s) && isAlnum(s[end]) {
+			end++
+		}
+		from := i
+		// An escape glued to the front of the ID is not part of it: "%3A"
+		// in a percent-encoded alias, "n" of an escaped newline.
+		if p := end - i - aliasIDLen; p > 0 && i > 0 && escapePrefix(s[i-1], s[i:i+p]) {
+			from = i + p
+		}
+		if id, ok := aliasID(s[from:end]); ok && oneCase(s[from:end]) {
+			b.WriteString(s[last:from])
+			b.WriteString(r.mask(id))
+			last = end
+		}
+		i = end
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
 	return b.String()
+}
+
+// escapePrefix reports whether c followed by p is an escape, as text that
+// was escaped before it reached a log has them in front of a word: a
+// percent-escape, or a double-encoded one whose "%" became "%25" (RFC 3986
+// §2.1: "%3A", "%253A"), or a backslash escape of Go and JSON strings ("\n",
+// "\t", "\r", "\u00e9"). Further encodings are not undone.
+func escapePrefix(c byte, p string) bool {
+	switch c {
+	case '%':
+		return len(p) == 2 && isHex(p[0]) && isHex(p[1]) ||
+			len(p) == 4 && p[:2] == "25" && isHex(p[2]) && isHex(p[3])
+	case '\\':
+		return len(p) == 1 && (p[0] == 'n' || p[0] == 't' || p[0] == 'r') ||
+			len(p) == 5 && p[0] == 'u' && isHex(p[1]) && isHex(p[2]) && isHex(p[3]) && isHex(p[4])
+	}
+	return false
+}
+
+// oneCase reports whether the letters of s are all lower or all upper case.
+func oneCase(s string) bool {
+	return strings.ToLower(s) == s || strings.ToUpper(s) == s
+}
+
+func isHex(c byte) bool {
+	return isDigit(c) || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
 }
 
 // startsNumber reports whether a written number can start at s[i]: a digit, or
