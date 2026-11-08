@@ -106,12 +106,23 @@ Where `hss` answers Cx otherwise than TS 29.228 says, on purpose:
     SAR that may carry it, even when the S-CSCF says it has the data. That is
     how a registration made before the setting, whose refreshes name another
     identity of the set and so are never refused, loses the identity at its
-    next refresh. It is the stale-set answer `hss` already gives
+    next refresh. A write that takes such an identity out of a served set
+    marks stale the sets the set's other identities are in after the write,
+    whatever numbers it gave them (#696), so a refresh naming any of them gets
+    User-Data even if the write's push failed. Both are the stale-set answer `hss` already gives
     ([hss](hss.md#hss-initiated-requests)), and the same reason applies: the
-    S-CSCF holds User-Data the HSS no longer sends, which §6.6 lets the HSS
-    replace. Code: `applySARResending` in
-    [`procedures.go`](../internal/hss/procedures.go); tests:
+    S-CSCF holds User-Data the HSS no longer sends. The clauses allow it
+    (*confirmed* in TS 29.228 V20.0.0): §6.1.2.1 has the HSS download the user
+    information for REGISTRATION, RE_REGISTRATION, UNREGISTERED_USER and
+    NO_ASSIGNMENT taking User-Data-Already-Available into account as §6.6
+    describes, and §6.6 says that with USER_DATA_ALREADY_AVAILABLE the HSS
+    "should not" return the data and "may" override the value and download
+    it. Nothing there requires the data to be left out, so neither answer is
+    a departure. Code: `applySARResending` in
+    [`procedures.go`](../internal/hss/procedures.go), `HSS.markChatbotHostLeft`
+    in [`changes.go`](../internal/hss/changes.go); tests:
     `TestARefreshOfASetRegisteredBeforeTheSettingGetsUserDataWithoutTheHost`,
+    `TestAWriteDroppingAChatbotHostIdentityMarksItsSetStale`,
     and on the S-CSCF side
     `TestARefreshsUserDataWithoutAChatbotURIDropsItFromTheSet`.
   - **An RTR instead of an empty PPR.** A set made only of such identities

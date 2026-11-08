@@ -124,16 +124,17 @@ func (h *HSS) onlyChatbotHost(s *store.Subscription, set int) bool {
 // chatbotRange returns the range of the stored PSI, or nil when there is
 // none: no PSI is stored, it is not active, or it does not hold under the
 // current RCS_CHATBOT_DOMAIN. Every call reads the item, so a new version
-// is seen at once; the compiled range is kept per version, so a version is
-// checked and compiled once per task. Any other version than the cached
-// one replaces it, a lower one too: a table restored or recreated starts
-// its versions again, and its PSI, active or not, must take effect at
-// once. A read that another request's newer read overtook may so put an
-// older version back for a moment; the next read, which sees the newer
-// item, corrects it. A
+// is seen at once; the compiled range is kept per version, PSI and
+// activation, so a stored PSI is checked and compiled once per task. Any
+// other than the cached one replaces it, a lower version too: a table
+// restored or recreated starts its versions again, and its PSI, active or
+// not, must take effect at once, even at the version number the task has
+// cached (the tester on #695). A read that another request's newer read
+// overtook may so put an older PSI back for a moment; the next read, which
+// sees the newer item, corrects it. A
 // PSI that does not hold, such as one written for a domain since changed,
 // is counted on every LIR it leaves without a range, so an alarm can see
-// it, and logged once per version, naming the rule and not the PSI.
+// it, and logged once per stored PSI, naming the rule and not the PSI.
 func (h *HSS) chatbotRange(ctx context.Context) (*chatbotRange, error) {
 	p, err := h.store.WildcardedPSI(ctx)
 	if errors.Is(err, store.ErrNotFound) {
@@ -144,7 +145,7 @@ func (h *HSS) chatbotRange(ctx context.Context) (*chatbotRange, error) {
 	}
 	h.rangeMu.Lock()
 	defer h.rangeMu.Unlock()
-	if !h.rangeRead || p.Version != h.rangeVersion {
+	if !h.rangeRead || p.Version != h.rangeVersion || p.PSI != h.rangePSI || p.Active != h.rangeActive {
 		r, err := parseChatbotRange(p.PSI, h.chatbot)
 		invalid := err != nil
 		if invalid {
@@ -154,7 +155,8 @@ func (h *HSS) chatbotRange(ctx context.Context) (*chatbotRange, error) {
 		if invalid || !p.Active {
 			r = nil
 		}
-		h.rangeRead, h.rangeVersion, h.rangeOf, h.rangeInvalid = true, p.Version, r, invalid
+		h.rangeRead, h.rangeVersion, h.rangePSI, h.rangeActive = true, p.Version, p.PSI, p.Active
+		h.rangeOf, h.rangeInvalid = r, invalid
 	}
 	if h.rangeInvalid {
 		h.metrics.Count("chatbot.psi_invalid", 1)
