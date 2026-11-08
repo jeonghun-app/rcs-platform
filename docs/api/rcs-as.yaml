@@ -17,8 +17,10 @@ info:
     and `chip_list` may hold a C0 control or DEL. The content (`body`,
     `chip_list`) follows ADR 0009 §5.
 
-    Fields only grow (§6): every rcs-as task accepts a new field before maap
-    sends it. Answers are JSON with `Cache-Control: no-store`. Errors are
+    Every `required` field must be present, even when false or empty: a
+    missing one is 400. Fields only grow (§6): a field added later is
+    optional, absent means the old behaviour, and every rcs-as task accepts
+    it, as a new enum value, before maap sends it. Answers are JSON with `Cache-Control: no-store`. Errors are
     `{"error": "<reason>"}`; the reason names a rule, never a value.
 security:
   - bearer: []
@@ -80,14 +82,14 @@ components:
       required: [sender, display_name, recipient, message_id, content_type, body, dispositions, anonymous]
       additionalProperties: false
       properties:
-        sender: { type: string, maxLength: 255, description: "The chatbot's URI from the registry, in normal form." }
+        sender: { type: string, minLength: 1, maxLength: 255, description: "The chatbot's URI from the registry, in normal form." }
         display_name: { type: string, maxLength: 128, description: "The registry display name, before rcs-as escapes it into CPIM From. Bytes, as every maxLength here." }
-        recipient: { type: string, maxLength: 255, description: The subscriber's canonical tel URI. }
+        recipient: { type: string, minLength: 1, maxLength: 255, description: The subscriber's canonical tel URI. }
         message_id:
           type: string
           pattern: "^[A-Za-z0-9._~-]{1,128}$"
           description: The imdn.Message-ID maap generated (128 random bits, memo B3).
-        content_type: { type: string, maxLength: 269, description: The entry of the chatbot content types the chatbot's type matched. }
+        content_type: { type: string, minLength: 1, maxLength: 269, description: The entry of the chatbot content types the chatbot's type matched. }
         body: { type: string, maxLength: 253952, description: The content. }
         chip_list: { type: string, maxLength: 253952, description: "Optional suggested chip list, sent as the second part of a multipart CPIM. `body` and `chip_list` together are at most 253,952 bytes (248 KiB)." }
         dispositions: { $ref: "#/components/schemas/Dispositions" }
@@ -97,9 +99,9 @@ components:
       required: [chatbot, subscriber, message_id, kind]
       additionalProperties: false
       properties:
-        chatbot: { type: string, maxLength: 255, description: The chatbot that read the message. }
-        subscriber: { type: string, maxLength: 255, description: "The canonical tel URI of the message's sender." }
-        message_id: { type: string, minLength: 1, maxLength: 128, description: "The imdn.Message-ID of the message the chatbot received, as the subscriber's client chose it; no C0 control or DEL." }
+        chatbot: { type: string, minLength: 1, maxLength: 255, description: The chatbot that read the message. }
+        subscriber: { type: string, minLength: 1, maxLength: 255, description: "The canonical tel URI of the message's sender." }
+        message_id: { type: string, minLength: 1, maxLength: 128, description: "The imdn.Message-ID of the message the chatbot received, as the subscriber's client chose it: a CPIM token (RFC 3862 §3.6) that XML can carry." }
         kind: { type: string, enum: [display-notification], description: "The only kind a chatbot sends; its status is displayed." }
     Dispositions:
       type: object

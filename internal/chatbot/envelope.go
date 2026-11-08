@@ -50,6 +50,11 @@ var (
 // the walker would then check what the decoder does not read. DecodeEnvelope
 // panics on a type that breaks this, a programming error that any test of
 // the envelope finds.
+//
+// When v has a method Validate() error, as every wire type of this package
+// does, DecodeEnvelope returns what it returns, so that no handler can
+// decode a body and forget its field rules. Such a method's errors should
+// wrap ErrInvalidEnvelope, as this package's do, to answer 400.
 func DecodeEnvelope(r io.Reader, maxBytes int64, v any) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() || rv.Elem().Kind() != reflect.Struct {
@@ -82,6 +87,9 @@ func DecodeEnvelope(r io.Reader, maxBytes int64, v any) error {
 	if dec.Decode(v) != nil {
 		// The decoder's error quotes the value; this one names no part of it.
 		return refuse(ErrInvalidEnvelope, "a value of the wrong type for its field")
+	}
+	if val, ok := v.(interface{ Validate() error }); ok {
+		return val.Validate()
 	}
 	return nil
 }

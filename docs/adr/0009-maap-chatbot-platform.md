@@ -128,7 +128,8 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      4. `rcs-as` → `maap` `POST /v1/rcs/messages` (`rcs-as` token): the
         subscriber's asserted identity in canonical form (`messaging.UserOf`),
         never a CPIM or SIP `From`; the anonymity flag; Message-ID, DateTime,
-        content type, body, dispositions asked for.
+        content type, body, dispositions asked for. (Amended in #697: and
+        the chatbot, which `maap` needs to find the webhook.)
      5. `maap` maps the subscriber to the identifier the chatbot sees (§10),
         records the conversation (`maap-subscribers`) and POSTs a signed
         `message` event to the webhook (§8). Webhook 2xx: 200, and `rcs-as`
@@ -265,7 +266,12 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
    Strict decoding (§9) refuses unknown fields, so a receiver ships support
    for a new field at least one release before any sender emits it. During a
    rolling update, senders do not emit fields the oldest running receiver
-   does not know.
+   does not know. (Amended in #697: both sides share the wire types of
+   `internal/chatbot`, so a field added later is `omitempty`, left zero by
+   senders until every receiver knows it, never required, and its zero or
+   absent value means the old behaviour. A new value of an enumerated field
+   ships in the receiver first too. The fields of the first contract must
+   be present.)
 7. **Who may call what.**
    - **Exposure (U3).** The chatbot API is public through the ALB on its own
      host name, `MAAP_PUBLIC_HOST`, HTTPS only in staging and prod (ADR
