@@ -115,6 +115,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	api := h.NewAPI(APIOptions{
 		Tokens: cfg.Tokens, ACSRate: float64(cfg.ACSRate), ACSBurst: cfg.ACSBurst, Notifier: pusher,
 		DefaultProfile: cfg.DefaultProfile, PushTimeout: cfg.PushTimeout, StoreTimeout: cfg.APITimeout,
+		ChatbotDomain: cfg.ChatbotDomain, ChatbotASName: cfg.RCSASURI,
 	})
 
 	dl, err := d.listen("tcp", cfg.DiameterAddr)

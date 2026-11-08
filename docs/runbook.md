@@ -101,3 +101,24 @@ aws ecs describe-services --region "$REGION" --cluster "$STACK" --services ft-se
 
 **Verify.** The alarm returns to `OK` once 5 minutes pass without either
 metric.
+
+## hss
+
+### The chatbot range
+
+Not an alarm: the steps to turn the chatbot range on (ADR 0009 §3,
+[hss](hss.md#data-model)).
+
+1. Choose `RCS_CHATBOT_DOMAIN`, normally
+   `botplatform.mnc<MNC>.mcc<MCC>.3gppnetwork.org`. It must be a **fresh**
+   domain: no subscriber IMPU may ever have used it. `hss` refuses new IMPUs at
+   it once it is set, but it does not search for old ones, and an IMPU always
+   wins over the wildcarded PSI in an LIR, so one left from before would hide
+   part of the range. Do not reuse `RCS_IMS_DOMAIN` (refused at start) or a
+   domain retired from subscribers.
+2. Set it, with `HSS_RCS_AS_URI` (the AS the range is routed to), and deploy.
+3. Write the PSI with the operator token:
+   `PUT /v1/chatbot-psi` with `{"psi": "sip:!<ERE>!@<RCS_CHATBOT_DOMAIN>"}`, the
+   ERE being `internal/chatbot`'s `UserPartERE`. A 400 names the rule broken.
+   The audit line `audit: provisioning request` with operation
+   `put_chatbot_psi` records the write.

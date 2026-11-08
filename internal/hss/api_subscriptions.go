@@ -117,6 +117,8 @@ func (a *API) apply(req *subscriptionRequest, s *store.Subscription) error {
 			return fail(http.StatusBadRequest, where+".impu: "+identity.ErrIMPU.Error())
 		case seen[impu]:
 			return fail(http.StatusBadRequest, where+".impu: listed twice")
+		case a.atChatbotHost(impu):
+			return fail(http.StatusBadRequest, where+".impu: its host is RCS_CHATBOT_DOMAIN, which only the chatbot range may use")
 		case p.IdentityType != "" && p.IdentityType != identityTypePublicUser:
 			return fail(http.StatusBadRequest, where+".identity_type: only PUBLIC_USER_IDENTITY is supported")
 		case p.ImplicitSet < 0 || p.ImplicitSet > maxImplicitSet:
@@ -160,6 +162,18 @@ func (a *API) apply(req *subscriptionRequest, s *store.Subscription) error {
 	}
 	s.IMSI, s.PublicIdentities, s.Profile, s.Charging, s.ACSManaged = req.IMSI, ids, profile, ch, req.ACSManaged
 	return nil
+}
+
+// atChatbotHost reports whether impu, in the canonical form the IMPU
+// lookup uses (identity.CanonicalIMPU: the host in lower case), is a SIP or
+// SIPS URI at RCS_CHATBOT_DOMAIN, with or without a trailing dot; a tel
+// URI has no "@", so its whole text is the "host" and never matches. No
+// IMPU may be there: an IMPU takes precedence over the wildcarded PSI in
+// an LIR, so one in the range would hide part of it (ADR 0009 §3, #679).
+func (a *API) atChatbotHost(impu string) bool {
+	name := a.chatbotDomain.Name()
+	host := impu[strings.LastIndexByte(impu, '@')+1:]
+	return name != "" && strings.TrimSuffix(host, ".") == name
 }
 
 // isDiameterURI checks the form of a DiameterURI (RFC 6733 §4.3.1) loosely:

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
@@ -77,6 +78,10 @@ type Config struct {
 	DefaultProfile       string
 	CreateDefaultProfile bool
 	RCSASURI             string
+	// ChatbotDomain is RCS_CHATBOT_DOMAIN: with it set, the chatbot range
+	// can be provisioned, with RCSASURI as its AS name, and no IMPU may be
+	// at its host (ADR 0009 §3). Unset, hss is as without chatbots.
+	ChatbotDomain chatbot.Domain
 
 	MaxAuthItems int
 	CxTimeout    time.Duration
@@ -124,6 +129,7 @@ func Configure(s *runtime.Settings) Config {
 	// Over TCP, rcs-as's only SIP transport: a URI without one would be
 	// sent over UDP (RFC 3263 §4.1), which scscf has no listener for (#14).
 	c.RCSASURI = e.String("RCS_AS_URI", "sip:rcs-as."+c.Namespace+";transport=tcp")
+	c.ChatbotDomain = chatbot.LoadDomain(s.Shared, domain)
 
 	for _, addr := range []struct{ name, v string }{{"DIAMETER_ADDR", c.DiameterAddr}, {"API_ADDR", c.APIAddr}} {
 		if _, _, err := net.SplitHostPort(addr.v); err != nil {
@@ -148,7 +154,7 @@ func Configure(s *runtime.Settings) Config {
 	if err := ValidProfileID(c.DefaultProfile); err != nil {
 		e.Invalid("DEFAULT_PROFILE", err.Error())
 	}
-	if c.CreateDefaultProfile && !isSIPHostURI(c.RCSASURI) {
+	if (c.CreateDefaultProfile || c.ChatbotDomain.Name() != "") && !isSIPHostURI(c.RCSASURI) {
 		e.Invalid("RCS_AS_URI", "not a SIP URI sip:host[:port][;transport=tcp|tls]")
 	}
 	if c.MaxAuthItems < 1 || c.MaxAuthItems > 16 {

@@ -320,6 +320,68 @@ paths:
         "409": { description: A subscription uses the profile. }
         "412": { $ref: "#/components/responses/PreconditionFailed" }
         "503": { $ref: "#/components/responses/Unavailable" }
+  /v1/chatbot-psi:
+    get:
+      operationId: getChatbotPSI
+      summary: Read the wildcarded chatbot PSI
+      description: Caller admin (hss-scopes.md); acs and ft-server get 403.
+      responses:
+        "200":
+          description: The PSI.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatbotPSI" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { description: No PSI is stored. }
+        "503": { $ref: "#/components/responses/Unavailable" }
+    put:
+      operationId: putChatbotPSI
+      summary: Write the wildcarded chatbot PSI
+      description: |
+        Caller admin; acs and ft-server get 403. Creates the one wildcarded PSI
+        (ADR 0009 §3) or replaces it. The request names the PSI only: the AS
+        name is HSS_RCS_AS_URI and the activation state active. The PSI is
+        sip:!<ERE>!@<RCS_CHATBOT_DOMAIN> (TS 23.003 §13.5), at most 256 bytes
+        of printable ASCII, with the host exactly RCS_CHATBOT_DOMAIN and an ERE
+        without "!" under internal/ifc's ERE rules and budget, matched against
+        the whole user part with regard to case (docs/hss.md). The audit line
+        carries the value before and after, masked.
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [psi]
+              additionalProperties: false
+              properties:
+                psi: { type: string, maxLength: 256 }
+      responses:
+        "200":
+          description: Replaced.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatbotPSI" }
+        "201":
+          description: Created.
+          headers:
+            ETag: { $ref: "#/components/headers/ETag" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ChatbotPSI" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { description: RCS_CHATBOT_DOMAIN is unset, so there is no chatbot range. }
+        "412": { $ref: "#/components/responses/PreconditionFailed" }
+        "503": { $ref: "#/components/responses/Unavailable" }
 components:
   securitySchemes:
     bearer:
@@ -384,6 +446,16 @@ components:
     ProfileID:
       type: string
       pattern: "^[a-z0-9._-]{1,64}$"
+    ChatbotPSI:
+      type: object
+      required: [psi, server_name, active, version]
+      properties:
+        psi:
+          type: string
+          example: sip:![a-z0-9-]{1,63}(\.[a-z0-9-]{1,63})?!@botplatform.mnc001.mcc001.3gppnetwork.org
+        server_name: { type: string, description: The AS name an LIR in the range gets (HSS_RCS_AS_URI). }
+        active: { type: boolean }
+        version: { type: integer }
     PublicIdentity:
       type: object
       required: [impu]
@@ -392,7 +464,7 @@ components:
         impu:
           type: string
           maxLength: 255
-          description: SIP URI with a user part, or a global tel URI; stored in canonical form (docs/hss.md).
+          description: SIP URI with a user part, or a global tel URI; stored in canonical form (docs/hss.md). Not at RCS_CHATBOT_DOMAIN, in any case.
           example: sip:+15550100001@ims.mnc001.mcc001.3gppnetwork.org
         barred:
           type: boolean

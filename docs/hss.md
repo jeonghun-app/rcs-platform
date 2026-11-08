@@ -15,7 +15,10 @@ that operators, `acs` and `ft-server` call. Code: `internal/hss`, wired by
 
 Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 `internal/runtime` (`RCS_ENV`, `RCS_ADMIN_ADDR`, `RCS_PII_HMAC_KEY`, ...).
-`RCS_IMS_DOMAIN` is required. Settings marked *prod* are refused in `staging` and
+`RCS_IMS_DOMAIN` is required. `RCS_CHATBOT_DOMAIN`, unset by default, is the host
+of chatbot URIs (ADR 0009 §2): a lower-case DNS name other than
+`RCS_IMS_DOMAIN`; with it unset there is no chatbot range and `hss` is as without
+chatbots. Settings marked *prod* are refused in `staging` and
 `prod` when unsafe, and every problem is reported at once at start.
 
 | Variable | Default | Meaning |
@@ -43,7 +46,7 @@ Environment variables, prefixed `HSS_`, plus the shared `RCS_` settings of
 | `HSS_ACS_RATE`, `HSS_ACS_BURST` | `20`, `40` | requests per second and burst of each `acs` token, in each task: a bucket per token slot per task, so the most one caller gets is rate × tasks × 2 slots (a shared limit is a follow-up) |
 | `HSS_DEFAULT_PROFILE` | `rcs-default` | profile of subscriptions created without one |
 | `HSS_CREATE_DEFAULT_PROFILE` | `true` | create that profile at start, as [below](#default-service-profile), unless it exists |
-| `HSS_RCS_AS_URI` | `sip:rcs-as.<namespace>;transport=tcp` | application server of the default profile; `sip:host[:port]` with at most `;transport=tcp` or `tls` |
+| `HSS_RCS_AS_URI` | `sip:rcs-as.<namespace>;transport=tcp` | application server of the default profile, and the AS name of the chatbot range when `RCS_CHATBOT_DOMAIN` is set; `sip:host[:port]` with at most `;transport=tcp` or `tls` |
 | `HSS_MAX_AUTH_ITEMS` | `4` | AKA vectors per MAR at most (1 to 16) |
 | `HSS_CX_TIMEOUT` | `3s` | store work per Cx request, waiting for the subscriber's lock included |
 | `HSS_API_TIMEOUT` | `5s` | store work per API request, lock wait included; at most `10s`, so that a change's store work and its pushes' budget fit in the API's 30 s write timeout |
@@ -88,8 +91,20 @@ the AS (TS 23.228 §5.4.12.2 b), so no S-CSCF serves it. Its ERE is compiled
 under `internal/ifc`'s rules and budget, and matched against the whole user part
 of a chatbot URI in the normal form of `internal/chatbot`, with regard to case
 (`ifc.WholePattern`), not as a trigger's Request-URI pattern is, anywhere and
-without case. Only a URI already in that normal form is in the range. No API
-writes it yet (#679).
+without case. Only a URI already in that normal form is in the range.
+
+The operator writes it with `PUT /v1/chatbot-psi` (`docs/api/hss.yaml`), the PSI
+only: the AS name is `HSS_RCS_AS_URI` and the state active, whatever the request.
+A write replaces the one stored, and its audit line carries `psi_before` and
+`psi_after`, masked as URIs are, and `psi_version`. With `RCS_CHATBOT_DOMAIN`
+unset the write is 409. While it is set, no IMPU may have it as its host: a
+subscription that lists one, in any case of the host and with or without a
+trailing dot, is refused with 400, so an existing subscription that has one must
+drop it before any other change. An IMPU always takes precedence over the PSI in
+an LIR (TS 29.228 §6.1.4.1), and `hss` does not search the table for IMPUs the
+PSI would match, so `RCS_CHATBOT_DOMAIN` must be a **fresh** domain, one no
+subscriber IMPU has ever used: an IMPU provisioned at a reused domain before the
+setting would hide its part of the range ([runbook](runbook.md#the-chatbot-range)).
 
 Shared public identities and several IMPIs per subscription are not modelled;
 so Associated-Identities is never sent, and the S-CSCF name is kept once per
