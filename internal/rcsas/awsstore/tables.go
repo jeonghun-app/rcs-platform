@@ -11,7 +11,7 @@ import (
 )
 
 // CreateMessagesTable creates the messages table as docs/rcs-as.md defines
-// it, its expiry index included, and waits until it is active.
+// it, its expiry and claims indexes included, and waits until it is active.
 // CreateGroupsTable does the same for the groupchats table. They are for
 // DynamoDB Local (integration tests, the compose stack); in AWS the tables
 // come from CloudFormation, which also turns on TTL on ttl.
@@ -21,6 +21,7 @@ func CreateMessagesTable(ctx context.Context, api *dynamodb.Client, name string)
 		AttributeDefinitions: []types.AttributeDefinition{
 			attribute(attrPK, types.ScalarAttributeTypeS), attribute(attrSK, types.ScalarAttributeTypeS),
 			attribute(attrBucket, types.ScalarAttributeTypeS), attribute(attrExpires, types.ScalarAttributeTypeN),
+			attribute(attrLease, types.ScalarAttributeTypeN),
 		},
 		KeySchema: []types.KeySchemaElement{keyElement(attrPK, types.KeyTypeHash), keyElement(attrSK, types.KeyTypeRange)},
 		GlobalSecondaryIndexes: []types.GlobalSecondaryIndex{{
@@ -30,6 +31,10 @@ func CreateMessagesTable(ctx context.Context, api *dynamodb.Client, name string)
 				ProjectionType:   types.ProjectionTypeInclude,
 				NonKeyAttributes: []string{attrOwner, attrLease},
 			},
+		}, {
+			IndexName:  aws.String(IndexClaims),
+			KeySchema:  []types.KeySchemaElement{keyElement(attrBucket, types.KeyTypeHash), keyElement(attrLease, types.KeyTypeRange)},
+			Projection: &types.Projection{ProjectionType: types.ProjectionTypeKeysOnly},
 		}},
 	})
 }

@@ -27,9 +27,10 @@ type fakeDynamo struct {
 	fail     error
 	pageSize int
 	status   dtypes.TableStatus
-	// indexQueries counts Query calls on the expiry index, recounts those
-	// that count a queue.
+	// indexQueries counts Query calls on the expiry index, claimQueries
+	// those on the claims index, recounts those that count a queue.
 	indexQueries int
+	claimQueries int
 	recounts     int
 }
 
@@ -131,6 +132,13 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 		return &dynamodb.UpdateItemOutput{Attributes: maps.Clone(row)}, nil
 	case cond == "#owner = :owner" && upd == "REMOVE #owner, #lease":
 		if !exists || sOf(row[attrOwner]) != sOf(vals[":owner"]) {
+			return nil, errCondition
+		}
+		delete(row, attrOwner)
+		delete(row, attrLease)
+		return &dynamodb.UpdateItemOutput{}, nil
+	case cond == "#lease = :seen AND #lease <= :now" && upd == "REMOVE #owner, #lease":
+		if !exists || row[attrLease] == nil || nOf(row[attrLease]) != nOf(vals[":seen"]) || nOf(row[attrLease]) > nOf(vals[":now"]) {
 			return nil, errCondition
 		}
 		delete(row, attrOwner)
@@ -441,6 +449,10 @@ func indexKey(r map[string]dtypes.AttributeValue) map[string]dtypes.AttributeVal
 	return map[string]dtypes.AttributeValue{attrPK: r[attrPK], attrSK: r[attrSK], attrBucket: r[attrBucket], attrExpires: r[attrExpires]}
 }
 
+func claimsKey(r map[string]dtypes.AttributeValue) map[string]dtypes.AttributeValue {
+	return map[string]dtypes.AttributeValue{attrPK: r[attrPK], attrSK: r[attrSK], attrBucket: r[attrBucket], attrLease: r[attrLease]}
+}
+
 // indexOrder sorts the expiry index: by expiry, then table key.
 func indexOrder(r map[string]dtypes.AttributeValue) string {
 	return strconv.FormatInt(1e18+nOf(r[attrExpires]), 10) + "\x00" + rowKey(r)
@@ -472,6 +484,24 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 			}
 		}
 		items, last := f.page(rows, indexOrder, in.ExclusiveStartKey, func(r map[string]dtypes.AttributeValue) bool { return free(r, vals[":now"]) }, indexKey)
+		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
+	}
+	if aws.ToString(in.IndexName) == IndexClaims {
+		f.claimQueries++
+		if in.ConsistentRead != nil || aws.ToString(in.KeyConditionExpression) != "#xb = :b AND #lease <= :now" || in.FilterExpression != nil {
+			f.t.Errorf("claims query %q filter %q", aws.ToString(in.KeyConditionExpression), aws.ToString(in.FilterExpression))
+		}
+		var rows []map[string]dtypes.AttributeValue
+		for _, r := range f.rows {
+			// An item is in the index only with both its keys; it projects
+			// those and the table's.
+			if _, ok := r[attrLease]; ok && sOf(r[attrBucket]) == sOf(vals[":b"]) && nOf(r[attrLease]) <= nOf(vals[":now"]) {
+				rows = append(rows, claimsKey(r))
+			}
+		}
+		items, last := f.page(rows, func(r map[string]dtypes.AttributeValue) string {
+			return strconv.FormatInt(1e18+nOf(r[attrLease]), 10) + "\x00" + rowKey(r)
+		}, in.ExclusiveStartKey, func(map[string]dtypes.AttributeValue) bool { return true }, claimsKey)
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
 	if strings.HasPrefix(sOf(vals[":pk"]), reachedPrefix) {

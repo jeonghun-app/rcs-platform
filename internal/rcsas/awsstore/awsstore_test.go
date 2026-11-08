@@ -61,6 +61,8 @@ func TestEveryOperationReportsAFailedRequest(t *testing.T) {
 		"Release":        func() error { return s.Release(ctx, "r", "1", "o") },
 		"Remove":         func() error { return s.Remove(ctx, store.Message{Recipient: "r", ID: "1"}, "o") },
 		"Expired":        func() error { _, _, err := s.Expired(ctx, t0, "", 1); return err },
+		"EndedClaims":    func() error { _, _, err := s.EndedClaims(ctx, t0, "", 1); return err },
+		"EndClaim":       func() error { _, err := s.EndClaim(ctx, "r", "1", t0, t0); return err },
 		"RecordSent":     func() error { return s.RecordSent(ctx, store.Sent{Sender: "s", MessageID: "m"}, t0) },
 		"Sent":           func() error { _, err := s.Sent(ctx, "s", "m", t0); return err },
 		"MarkNotified":   func() error { return s.MarkNotified(ctx, "s", "m", "k", "displayed", "t", t0) },
@@ -135,6 +137,9 @@ func TestLimitZeroAsksForNothing(t *testing.T) {
 	}
 	if got, _, err := s.Expired(context.Background(), t0, "", 0); err != nil || got != nil {
 		t.Fatalf("Expired = %v, %v", got, err)
+	}
+	if got, _, err := s.EndedClaims(context.Background(), t0, "", 0); err != nil || got != nil {
+		t.Fatalf("EndedClaims = %v, %v", got, err)
 	}
 }
 
@@ -264,6 +269,134 @@ func TestExpiredReadsTheIndexAndResumes(t *testing.T) {
 	f.fail = nil
 	if _, _, err := s.Expired(ctx, t0.Add(time.Hour), "not a cursor", 1); err != nil {
 		t.Fatalf("a cursor from elsewhere = %v", err)
+	}
+}
+
+// #663: a sweep with no claim ended costs one query of each bucket of the
+// claims index and nothing else; claims spread over the buckets are all
+// found, page by page.
+func TestEndedClaimsReadsTheIndexAndResumes(t *testing.T) {
+	f := newFakeDynamo(t)
+	f.pageSize = 1
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	var want []string
+	for i := range 40 {
+		r := fmt.Sprintf("sip:user%d@example.net", i)
+		m := store.Message{Recipient: r, ID: fmt.Sprint(i), Sender: "s", Mode: store.Chat, CPIM: content.BodyOf([]byte("x")),
+			Enqueued: t0, Expires: t0.Add(time.Hour)}
+		if err := s.Enqueue(ctx, m, store.Limit{}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.Claim(ctx, r, m.ID, "task-a", t0, t0.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, m.ID)
+	}
+	if got, cursor, err := s.EndedClaims(ctx, t0.Add(-time.Second), "", 7); err != nil || len(got) != 0 || cursor != "" {
+		t.Fatalf("EndedClaims with none ended = %v, %q, %v", got, cursor, err)
+	}
+	if f.claimQueries != ExpiryBuckets || f.indexQueries != 0 || f.recounts != 0 {
+		t.Fatalf("a sweep with none ended made %d claims index queries, %d expiry, %d recounts", f.claimQueries, f.indexQueries, f.recounts)
+	}
+	var got []string
+	cursor := ""
+	for range 100 {
+		page, next, err := s.EndedClaims(ctx, t0.Add(time.Minute), cursor, 7)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range page {
+			got = append(got, m.ID)
+		}
+		if cursor = next; cursor == "" {
+			break
+		}
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if !slices.Equal(got, want) {
+		t.Fatalf("EndedClaims found %v, want %v", got, want)
+	}
+	f.pageSize = 100
+	_, cursor, err := s.EndedClaims(ctx, t0.Add(time.Minute), "", 3)
+	if err != nil || cursor == "" {
+		t.Fatalf("EndedClaims = %q, %v", cursor, err)
+	}
+	f.fail = &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException"}
+	if part, again, err := s.EndedClaims(ctx, t0.Add(time.Minute), cursor, 3); err == nil || len(part) != 0 || again != cursor {
+		t.Fatalf("EndedClaims while failing = %v, %q, %v", part, again, err)
+	}
+}
+
+func TestClaimsOfAnOlderTaskAreInTheClaimsIndex(t *testing.T) {
+	olderTaskClaims(t, NewWithClient("messages", newFakeDynamo(t)))
+}
+
+// olderTaskClaims checks a rolling update over s (#663). A task on the
+// image before the claims index claims and releases with the expressions
+// written out here, which this image's Claim and Release still send: the
+// index is keyed on what they already write. So an older task's claim is
+// in the index, listed once its lease has ended and not before, and its
+// release takes it out.
+func olderTaskClaims(t *testing.T, s *Store) {
+	ctx := t.Context()
+	bob := "sip:bob@example.net"
+	m := store.Message{Recipient: bob, ID: "1", Sender: "s", Mode: store.Standalone, CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	if err := s.Enqueue(ctx, m, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	k := key(identityKey(queuePrefix, bob), m.ID)
+	oldClaim := func(now, until time.Time) {
+		t.Helper()
+		_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+			TableName: aws.String(s.table), Key: k, ReturnValues: dtypes.ReturnValueAllNew,
+			UpdateExpression:         aws.String("SET #owner = :owner, #lease = :until"),
+			ConditionExpression:      aws.String("attribute_exists(#pk) AND (attribute_not_exists(#owner) OR #lease <= :now)"),
+			ExpressionAttributeNames: map[string]string{"#pk": attrPK, "#owner": attrOwner, "#lease": attrLease},
+			ExpressionAttributeValues: map[string]dtypes.AttributeValue{
+				":owner": str("old-task"), ":until": stamp(until), ":now": stamp(now),
+			},
+		})
+		if err != nil {
+			t.Fatalf("an older task's claim = %v", err)
+		}
+	}
+	ended := func(now time.Time) []store.Message {
+		t.Helper()
+		got, _, err := s.EndedClaims(ctx, now, "", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	oldClaim(t0, t0.Add(time.Minute))
+	if got := ended(t0.Add(30 * time.Second)); len(got) != 0 {
+		t.Fatalf("an older task's claim within its lease is listed: %v", got)
+	}
+	got := ended(t0.Add(time.Minute))
+	if len(got) != 1 || !got[0].LeaseUntil.Equal(t0.Add(time.Minute)) {
+		t.Fatalf("an older task's ended claim = %+v", got)
+	}
+	if freed, err := s.EndClaim(ctx, bob, m.ID, got[0].LeaseUntil, t0.Add(time.Minute)); err != nil || !freed {
+		t.Fatalf("EndClaim of an older task's claim = %v, %v", freed, err)
+	}
+	if got, _ := s.Pending(ctx, bob, "", t0.Add(time.Minute), 10); len(got) != 1 || got[0].Owner != "" {
+		t.Fatalf("Pending once freed = %+v", got)
+	}
+	oldClaim(t0.Add(2*time.Minute), t0.Add(3*time.Minute))
+	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(s.table), Key: k,
+		UpdateExpression:          aws.String("REMOVE #owner, #lease"),
+		ConditionExpression:       aws.String("#owner = :owner"),
+		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner, "#lease": attrLease},
+		ExpressionAttributeValues: map[string]dtypes.AttributeValue{":owner": str("old-task")},
+	})
+	if err != nil {
+		t.Fatalf("an older task's release = %v", err)
+	}
+	if got := ended(t0.Add(time.Hour)); len(got) != 0 {
+		t.Fatalf("an older task's released claim is listed: %v", got)
 	}
 }
 

@@ -69,6 +69,13 @@ func TestIntegrationStoreMeetsTheContract(t *testing.T) {
 	storetest.Run(t, integrationStore)
 }
 
+// DynamoDB Local puts an item in the claims index while it has both keys,
+// whichever image claimed it, and takes it out once a release removes one.
+func TestIntegrationClaimsOfAnOlderTaskAreInTheClaimsIndex(t *testing.T) {
+	_, s := integrationTable(t)
+	olderTaskClaims(t, s)
+}
+
 // pagerCount is a messaging.Deliverer that counts each body it delivers.
 type pagerCount struct {
 	online atomic.Bool

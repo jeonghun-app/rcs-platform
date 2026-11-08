@@ -254,6 +254,49 @@ func expiryKey(m Message) string {
 	return fmt.Sprintf("%020d\x00%s\x00%s", m.Expires.UnixNano(), m.Recipient, m.ID)
 }
 
+// EndedClaims implements Store. The cursor is the last key returned.
+func (s *Memory) EndedClaims(_ context.Context, now time.Time, cursor string, limit int) ([]Message, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []Message
+	for _, q := range s.queues {
+		for _, m := range q {
+			if m.Owner != "" && !m.LeaseUntil.After(now) && claimKey(m) > cursor {
+				out = append(out, Message{Recipient: m.Recipient, ID: m.ID, LeaseUntil: m.LeaseUntil})
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b Message) int { return strings.Compare(claimKey(a), claimKey(b)) })
+	if limit <= 0 || len(out) <= limit {
+		return out[:min(len(out), max(limit, 0))], "", nil
+	}
+	out = out[:limit]
+	return out, claimKey(out[limit-1]), nil
+}
+
+// EndClaim implements Store.
+func (s *Memory) EndClaim(_ context.Context, recipient, id string, lease, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.queues[recipient][id]
+	switch {
+	case !ok:
+		return false, fmt.Errorf("store: end claim: %w", ErrNotFound)
+	case m.Owner == "":
+		return false, nil
+	case !m.LeaseUntil.Equal(lease) || lease.After(now):
+		return false, fmt.Errorf("store: end claim: %w", ErrConflict)
+	}
+	m.Owner, m.LeaseUntil = "", time.Time{}
+	s.queues[recipient][id] = m
+	return true, nil
+}
+
+// claimKey orders claims by the end of their lease, then queue and ID.
+func claimKey(m Message) string {
+	return fmt.Sprintf("%020d\x00%s\x00%s", m.LeaseUntil.UnixNano(), m.Recipient, m.ID)
+}
+
 // RecordSent implements Store.
 func (s *Memory) RecordSent(_ context.Context, r Sent, now time.Time) error {
 	s.mu.Lock()

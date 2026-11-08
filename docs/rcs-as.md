@@ -552,6 +552,10 @@ What the last pass over a queue found decides what reads it again:
 | Messages wait for a session | is tried on its own, after a look for another task's reached mark | a leg opening, a registration on a new flow, a failed invitation that makes pager mode the way, the retry timer, another task's reached mark, a refresh (without restarting the retry timer; an invitation asked for more than `RCSAS_INVITE_TIMEOUT` ago is asked again, #632, and one that failed is asked again at once, #653), the end of a claim another task held that the last pass met (#651) |
 | The recipient was unreachable (`ErrOffline`, another pager failure, a failed leg) | waits, unless another task reached the recipient since (below); one that comes in while a pass runs is read once that pass gets through, and a pass of single messages that gets through has the whole queue read again | any registration, a leg, the retry timer, another task's reached mark, a read an earlier pass set for the end of another task's claim (the pass that found the recipient unreachable sets none, #651) |
 
+Whatever the last pass found, a sweep that finds a claim of the queue whose
+lease ended frees it and reads the whole queue
+([Claims and shutdown](#claims-and-shutdown), #663).
+
 The retry timer starts at `RCSAS_RETRY_INTERVAL` and doubles up to
 `RCSAS_MAX_RETRY_INTERVAL` while the queue stays held. A recipient that never
 comes back costs a read an hour, not one per message sent to it. The reads of
@@ -668,9 +672,39 @@ costs at most that read, and only one waits per recipient.
 This needs a pass on a surviving task to meet the claim during its lease.
 A group copy always has one, the takeover's read
 ([Which task serves a group](#which-task-serves-a-group)). A 1-to-1 queue
-has no takeover: if no surviving task reads it during the lease, its
-message, like the free messages a crashed task was retrying, waits for the
-recipient's next event on a surviving task, or `RCSAS_STORE_TTL` (#663).
+may have none, so each sweep also reads the claims index (#663). An
+attempt ends its claim, by a release or a removal, long before the lease
+does, so the index holds a claim past its lease only when its holder died,
+or its release or removal failed. The sweep frees each such claim, on the
+condition that it is still the claim it read and over, and then has the
+queue read once, however many such claims the queue had. A pass that only
+invites for a message, one waiting for a session, does not claim it: freed
+first, the message is retried and invited for as any free message is, and
+no later sweep reads its queue for it. A pager message a crashed task held
+therefore goes by the end of its lease and one `RCSAS_SWEEP_INTERVAL` after;
+a message waiting for a session is invited for then, and goes once the
+recipient answers. The index is read against the reader's clock with the
+claim's own test, so a live holder's claim is never read before its lease
+ends. When several tasks find the claim in one sweep, one frees it, each
+reads the queue, and the next claim decides which delivers.
+
+A message delivered whose removal then failed is still claimed: it now goes
+out again by the end of its lease and one sweep, where it used to wait for
+the recipient's next event. Clients drop the duplicate by Message-ID.
+
+The free messages a crashed task was retrying stay a known limit. Their
+retry timers died with it, and they wait for the recipient's next event on a
+surviving task, usually its next registration or refresh, or
+`RCSAS_STORE_TTL`. The recipient was unreachable at the dead task's last
+try, and any registration or refresh reads the queue and reaches a
+surviving task. Covering them would cost a write for every unreachable
+result, to save a wait the retry backoff, up to `RCSAS_MAX_RETRY_INTERVAL`,
+already allows. A task that dies after the sweep freed a claim and before
+it read the queue leaves the message free and out of the claims index, so
+it waits the same way for the recipient's next event; the sweep frees a
+page of claims before it reads their queues, so that window is usually
+tens of milliseconds, and at worst a page's store calls, the engine's
+`Batch` (50) times `RCSAS_STORE_TIMEOUT`.
 
 `Close` takes no new work, then lets the attempts in progress finish, for at
 most a delivery and two store calls, before it cancels the rest. The store
@@ -690,6 +724,9 @@ expired after `RCSAS_STORE_TTL` and gives up on them.
   task). Messages another task holds do not keep it from the ones after them.
 - **Partial reads.** A read that fails part-way still hands over what it
   found.
+- **Ended claims.** After the expired messages, the sweep reads the claims
+  index whole, page by page, and has the queue of each claim whose lease
+  ended read again ([Claims and shutdown](#claims-and-shutdown)).
 
 ## Group chat
 
@@ -1260,7 +1297,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_ANSWER_TIMEOUT` | `32s` | How long an offered leg waits for its answer, and how long a leg whose peer's path is known waits for msrp-relay's connection before it is closed and its session ended |
 | `RCSAS_RETRY_INTERVAL`, `RCSAS_MAX_RETRY_INTERVAL` | `1m`, `1h` | First and longest wait before a held queue is read again |
 | `RCSAS_STORE_TIMEOUT` | `5s` | Each store call |
-| `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept |
+| `RCSAS_SWEEP_INTERVAL` | `1m` | How often expired messages are swept and ended claims are freed; it bounds how long after its lease a dead task's claim waits (#663) |
 | `RCSAS_CONFERENCE_HOST` | required | Host of the conference URIs the focus allocates; must route to `rcs-as`, and must not be `RCS_IMS_DOMAIN`, whose users' requests would all be taken for a group's |
 | `RCSAS_GROUP_CHAT_ENABLED` | `false` | Group chat at the conference factory and the conference URIs; off, they are answered 404, and queued group messages wait (up to `RCSAS_STORE_TTL`) instead of being given up. On, each group is served by the task that owns it ([Which task serves a group](#which-task-serves-a-group)) |
 | `RCSAS_CONFERENCE_FACTORY_URI` | `sip:conf-factory@<RCS_IMS_DOMAIN>` | Where clients create group chats: the `ConfFctyURI` ACS provisions. A SIP URI with a user; its user is compared with escapes undone and without case, its host without case |
@@ -1290,10 +1327,16 @@ There is one table with partition key `pk` and sort key `sk` (both strings).
 | Sent-message record | `s#<len>#<sender>` | IMDN Message-ID; for a group message, one under the group and one under the author, which names the group (`group`) |
 | Reached mark (#605) | `r#<len>#<recipient>` | `t#<len>#<task>`: one per task that delivered to the recipient lately; `f#<len>#<task>`: one per task that took its registration on a new flow with something queued. Each has `task`, `reached_at` and `expires` |
 
-There is one global secondary index, `expiry`:
+There are two global secondary indexes:
 
-- partition key `xb` (string), sort key `expires` (number);
-- projection `INCLUDE` of `owner` and `lease_until`.
+- `expiry`: partition key `xb` (string), sort key `expires` (number);
+  projection `INCLUDE` of `owner` and `lease_until`;
+- `claims` (#663): partition key `xb` (string), sort key `lease_until`
+  (number); projection `KEYS_ONLY`.
+
+The infrastructure that creates the table for ECS must create both, and
+grant their queries; #694 tracks it. Create the index, and grant its query,
+before rolling out an image that reads it.
 
 The table's properties:
 
@@ -1331,6 +1374,21 @@ The table's properties:
 - **Expiry index.** Only queue items carry `xb`, one of 16 values chosen by
   recipient. The index is sparse and spreads its writes. A sweep queries it
   bucket by bucket instead of reading the table.
+- **Claims index.** Only a claim sets `lease_until`, with the owner; a
+  release removes both, and a removal deletes the item. So the index holds
+  exactly the claimed queue items. A sweep queries each of the 16 buckets
+  for `lease_until <= now`, which is a claim's own test of a free message,
+  and frees each claim it finds with a release conditional on
+  `lease_until` being the value it read and over (`EndClaim`). Cost: about 2
+  index write units per claim (the claim puts the item in, the release or
+  removal takes it out), and a sweep with nothing ended 16 queries of an
+  empty bucket, half a read unit each: about 8 read units per task per
+  `RCSAS_SWEEP_INTERVAL`. A claim left past its lease costs one more write
+  to free it, billed at the queue item's size like any release, and a read
+  of its queue on each task that finds it.
+- **Older tasks.** The claims index is keyed on attributes every image
+  writes the same way, so during a rolling update an older task's claims
+  are in it too, and found once their lease ends.
 - **Consistent reads.** Every table read is strongly consistent. Index reads
   cannot be, and need not be, since the claim checks again.
 - **Claims.** A claim is a conditional update: unclaimed, or the lease over.
@@ -1382,6 +1440,7 @@ The task role needs these IAM actions:
 | `dynamodb:ConditionCheckItem` | the `groupchats` table | the `ConditionCheck` of a group's owner inside a group message copy's enqueue (#121) |
 | `dynamodb:Query` | table | `Pending`, `PendingHeld`, `Reached`, recounts |
 | `dynamodb:Query` | `<table ARN>/index/expiry` | `Expired` |
+| `dynamodb:Query` | `<table ARN>/index/claims` | `EndedClaims` |
 | `dynamodb:DescribeTable` | table | readiness |
 
 There is no IAM action for a transaction itself. Each item inside one is
@@ -1544,6 +1603,7 @@ identifier ever appears in a metric name.
 | `delivery.refused`, `delivery.undeliverable`, `delivery.notification_too_large`, `delivery.not_participant`, `message.expired` | Messages given up on; `not_participant`: group copies for someone no longer in the group |
 | `delivery.claimed_elsewhere` | A message another task held |
 | `delivery.lease_read` | #651: reads of a queue set for when the claim of a message another task held ends |
+| `delivery.claim_recovered` | #663: queues whose ended claim this task freed, and read: once per queue, sweep and task; of tasks that find one claim at once, the one that frees it counts it |
 | `delivery.reached_marked`, `delivery.registered_marked`, `delivery.reached_elsewhere`, `delivery.registered_elsewhere` | #605: marks of a delivery and of a registration on a new flow this task stored, and other tasks' marks of each kind it acted on |
 | `imdn.generated.<status>`, `imdn.generate_failed`, `imdn.dropped.queue_full` | Notifications rcs-as generated, could not build, or could not queue |
 | `invite.sent`, `invite.failed`, `invite.failed_overtaken`, `invite.no_sessions`, `invite.untracked` | Terminating session requests; `failed_overtaken` counts failures of invitations asked before the recipient's latest registration on a new flow, here or, as its mark told, on another task, which leave no mark (the registration had the queue read already); a group's 482 is never one |

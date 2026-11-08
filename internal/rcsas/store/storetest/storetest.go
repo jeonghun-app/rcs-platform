@@ -52,6 +52,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("ALapsedLeaseCanBeClaimedAgain", func(t *testing.T) { lapsedLease(t, newStore(t)) })
 	t.Run("OnlyTheOwnerReleasesOrRemoves", func(t *testing.T) { ownership(t, newStore(t)) })
 	t.Run("ExpiredListsFreeExpiredMessagesOfEveryRecipient", func(t *testing.T) { expired(t, newStore(t)) })
+	t.Run("EndedClaimsListsClaimsWhoseLeaseIsOver", func(t *testing.T) { endedClaims(t, newStore(t)) })
 	t.Run("SentRecordsAreKeptUntilTheyExpire", func(t *testing.T) { sent(t, newStore(t)) })
 	t.Run("RepeatedWritesSucceed", func(t *testing.T) { retriedWrites(t, newStore(t)) })
 	t.Run("QueuesAreBoundedByCountAndBytes", func(t *testing.T) { limits(t, newStore(t)) })
@@ -330,6 +331,122 @@ func expired(t *testing.T, s store.Store) {
 		t.Fatalf("Expired with one claimed = %v", idsOf(got))
 	}
 	if got, _, _ := s.Expired(ctx, t0, "", 0); len(got) != 0 {
+		t.Fatalf("limit 0 returned %d", len(got))
+	}
+}
+
+// The index EndedClaims reads is read after each write that changes a
+// claim: a claim puts a message in it, and a release or removal takes it
+// out.
+func endedClaims(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	ended := func(now time.Time) []string {
+		t.Helper()
+		got, cursor, err := s.EndedClaims(ctx, now, "", 10)
+		if err != nil || cursor != "" {
+			t.Fatalf("EndedClaims = %v, %q, %v", idsOf(got), cursor, err)
+		}
+		ids := idsOf(got)
+		slices.Sort(ids)
+		return ids
+	}
+	for _, m := range []store.Message{message(bob, "0001", t0), message(bob, "0002", t0), message(carol, "0003", t0), message(bob, "0004", t0)} {
+		if err := s.Enqueue(ctx, m, none); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := ended(t0.Add(time.Hour)); len(got) != 0 {
+		t.Fatalf("unclaimed messages listed: %v", got)
+	}
+	var claimed []store.Message
+	for _, c := range []struct {
+		r, id string
+		lease time.Duration
+	}{{bob, "0001", time.Minute}, {bob, "0002", time.Minute}, {carol, "0003", 2 * time.Minute}, {bob, "0004", time.Minute}} {
+		m, err := s.Claim(ctx, c.r, c.id, "task-a", t0, t0.Add(c.lease))
+		if err != nil {
+			t.Fatal(err)
+		}
+		claimed = append(claimed, m)
+	}
+	if got := ended(t0.Add(time.Minute - time.Nanosecond)); len(got) != 0 {
+		t.Fatalf("claims within their lease listed: %v", got)
+	}
+	// A lease ends at its own instant, as Claim takes it.
+	if got := ended(t0.Add(time.Minute)); fmt.Sprint(got) != "[0001 0002 0004]" {
+		t.Fatalf("EndedClaims at the end of the first leases = %v", got)
+	}
+	if err := s.Release(ctx, bob, "0002", "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	if got := ended(t0.Add(time.Minute)); fmt.Sprint(got) != "[0001 0004]" {
+		t.Fatalf("EndedClaims after a release = %v", got)
+	}
+	if err := s.Remove(ctx, claimed[3], "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := s.EndedClaims(ctx, t0.Add(2*time.Minute), "", 10)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("EndedClaims after a removal = %v, %v", idsOf(got), err)
+	}
+	// Only the keys and the lease are promised.
+	for _, m := range got {
+		want := map[string]store.Message{"0001": claimed[0], "0003": claimed[2]}[m.ID]
+		if m.Recipient != want.Recipient || !m.LeaseUntil.Equal(want.LeaseUntil) {
+			t.Fatalf("EndedClaims = %+v, want %s's %s until %v", m, want.Recipient, want.ID, want.LeaseUntil)
+		}
+	}
+	// One at a time, as Expired pages.
+	var paged []string
+	cursor := ""
+	for page := 0; page < 4; page++ {
+		got, next, err := s.EndedClaims(ctx, t0.Add(2*time.Minute), cursor, 1)
+		if err != nil || len(got) > 1 {
+			t.Fatalf("EndedClaims page %d = %v, %v", page, idsOf(got), err)
+		}
+		paged = append(paged, idsOf(got)...)
+		if cursor = next; cursor == "" {
+			break
+		}
+	}
+	slices.Sort(paged)
+	if fmt.Sprint(paged) != "[0001 0003]" || cursor != "" {
+		t.Fatalf("EndedClaims one at a time = %v, cursor %q", paged, cursor)
+	}
+	// A claim taken again after its lease has a lease of its own.
+	if _, err := s.Claim(ctx, bob, "0001", "task-b", t0.Add(2*time.Minute), t0.Add(3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if got := ended(t0.Add(2 * time.Minute)); fmt.Sprint(got) != "[0003]" {
+		t.Fatalf("EndedClaims after a new claim = %v", got)
+	}
+	// EndClaim frees only the claim read, once over; a repeat, the message
+	// free already, is no error.
+	at := t0.Add(2 * time.Minute)
+	for _, c := range []struct {
+		r, id     string
+		lease, at time.Time
+		freed     bool
+		err       error
+	}{
+		{bob, "0001", t0.Add(time.Minute), at, false, store.ErrConflict},          // claimed again since
+		{bob, "0001", t0.Add(3 * time.Minute), at, false, store.ErrConflict},      // within its lease
+		{bob, "0004", t0.Add(time.Minute), at, false, store.ErrNotFound},          // removed
+		{carol, "0003", t0.Add(2 * time.Minute), at, true, nil},                   // ended
+		{carol, "0003", t0.Add(2 * time.Minute), at.Add(time.Second), false, nil}, // a repeat
+	} {
+		freed, err := s.EndClaim(ctx, c.r, c.id, c.lease, c.at)
+		if freed != c.freed || !errors.Is(err, c.err) || (c.err == nil) != (err == nil) {
+			t.Fatalf("EndClaim(%s until %v) = %v, %v; want %v, %v", c.id, c.lease, freed, err, c.freed, c.err)
+		}
+	}
+	if got := ended(t0.Add(time.Hour)); fmt.Sprint(got) != "[0001]" {
+		t.Fatalf("EndedClaims after EndClaim = %v", got)
+	}
+	if got, _ := s.Pending(ctx, carol, "", at, 10); len(got) != 1 || got[0].Owner != "" {
+		t.Fatalf("Pending of a freed message = %+v", got)
+	}
+	if got, _, _ := s.EndedClaims(ctx, t0.Add(time.Hour), "", 0); len(got) != 0 {
 		t.Fatalf("limit 0 returned %d", len(got))
 	}
 }
