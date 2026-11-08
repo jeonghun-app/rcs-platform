@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
@@ -113,8 +114,8 @@ func (e *Engine) lookAgain(user string, wait time.Duration) {
 // recipient unreachable holds the queue here with a retry timer of this
 // task's own, beside the holder's. A recipient has one such read waiting,
 // the earliest asked for; its pass asks for the next if a message is still
-// held. Only a pass meets the claim: a 1-to-1 queue no surviving task reads
-// during the lease still waits for the recipient's next event (#663).
+// held. Only a pass meets the claim, and a 1-to-1 queue may have none
+// during the lease: the sweep finds the rest (readEndedClaims, #663).
 
 // lostClaimEnd is when a claim another task won from this one is over at
 // the latest: that claim was made no later than now by its holder's clock,
@@ -147,4 +148,27 @@ func (e *Engine) leaseRead(user string, r *recipient, until time.Time) {
 		e.schedule(user, r)
 	})
 	r.leaseTimer, r.leaseAt = t, until
+}
+
+// readEndedClaims has the queues of the recipients of up to Batch claims
+// whose lease has ended read again, from cursor on, and returns the cursor
+// to go on from. A claim ends with its attempt, by a release or a removal,
+// long before its lease does: one the store still holds at the lease's end
+// is a dead task's, and it may be a 1-to-1 message no pass on a surviving
+// task met (#663). The read is a pass over the whole queue, as for a lease
+// a pass met, and the claim decides which of the tasks that read it at once
+// delivers. A recipient already in read, of one Run's sweep, is not read
+// again.
+func (e *Engine) readEndedClaims(ctx context.Context, cursor string, read map[string]bool) (string, error) {
+	sctx, cancel := e.withTimeout(ctx, e.cfg.StoreTimeout)
+	ended, next, err := e.store.EndedClaims(sctx, e.clock.Now(), cursor, e.cfg.Batch)
+	cancel()
+	for _, m := range ended {
+		if !read[m.Recipient] {
+			read[m.Recipient] = true
+			e.metrics.Count("delivery.claim_recovered", 1)
+			e.kickEvent(m.Recipient)
+		}
+	}
+	return next, err
 }

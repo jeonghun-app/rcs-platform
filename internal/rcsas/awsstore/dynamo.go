@@ -35,6 +35,10 @@ const ExpiryBuckets = 16
 // IndexExpiry is the expiry index's name.
 const IndexExpiry = "expiry"
 
+// IndexClaims is the claims index's name (#663): claimed queue items, by the
+// expiry index's bucket and the end of their lease.
+const IndexClaims = "claims"
+
 // Attribute names.
 const (
 	attrPK           = "pk"
@@ -61,6 +65,9 @@ const (
 	attrMarkCount    = "marks"
 	attrDateTime     = "datetime"
 	attrSummary      = "summary"
+	// attrClaimBucket is attrBucket's value, on a queue item only while it
+	// is claimed: what puts it in the claims index.
+	attrClaimBucket = "cb"
 	// The two fields of a seen entry: the token of the attempt that set
 	// it, and the status the notification reported.
 	attrMarkToken  = "t"
@@ -616,13 +623,13 @@ func (s *Store) Claim(ctx context.Context, recipient, id, owner string, now, unt
 	out, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           aws.String(s.table),
 		Key:                 k,
-		UpdateExpression:    aws.String("SET #owner = :owner, #lease = :until"),
+		UpdateExpression:    aws.String("SET #owner = :owner, #lease = :until, #cb = :cb"),
 		ConditionExpression: aws.String("attribute_exists(#pk) AND " + freeAt),
 		ExpressionAttributeNames: map[string]string{
-			"#pk": attrPK, "#owner": attrOwner, "#lease": attrLease,
+			"#pk": attrPK, "#owner": attrOwner, "#lease": attrLease, "#cb": attrClaimBucket,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{
-			":owner": str(owner), ":until": stamp(until), ":now": stamp(now),
+			":owner": str(owner), ":until": stamp(until), ":now": stamp(now), ":cb": str(bucket(recipient)),
 		},
 		ReturnValues: types.ReturnValueAllNew,
 	})
@@ -653,9 +660,9 @@ func (s *Store) Release(ctx context.Context, recipient, id, owner string) error 
 	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(s.table),
 		Key:                       k,
-		UpdateExpression:          aws.String("REMOVE #owner, #lease"),
+		UpdateExpression:          aws.String("REMOVE #owner, #lease, #cb"),
 		ConditionExpression:       aws.String("#owner = :owner"),
-		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner, "#lease": attrLease},
+		ExpressionAttributeNames:  map[string]string{"#owner": attrOwner, "#lease": attrLease, "#cb": attrClaimBucket},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":owner": str(owner)},
 	})
 	if errorCode(err) == conditionFailed {
@@ -782,66 +789,108 @@ func (s *Store) current(ctx context.Context, op string, k map[string]types.Attri
 	return out.Item, nil
 }
 
-// expiryCursor is where Expired stopped: a bucket and the index key of the
-// last message returned from it.
-type expiryCursor struct {
+// indexCursor is where a read of a bucketed index (Expired, EndedClaims)
+// stopped: a bucket and the index key of the last item returned from it.
+type indexCursor struct {
 	Bucket int               `json:"b"`
 	Key    map[string]string `json:"k,omitempty"`
 }
 
-func (c expiryCursor) startKey() map[string]types.AttributeValue {
+func (c indexCursor) encode() string {
+	b, _ := json.Marshal(c)
+	return string(b)
+}
+
+// bucketIndex is an index whose partitions are the ExpiryBuckets buckets:
+// its partition key, a string, and its sort key, a number.
+type bucketIndex struct {
+	name, bucket, sort string
+}
+
+var (
+	expiryIndex = bucketIndex{IndexExpiry, attrBucket, attrExpires}
+	claimsIndex = bucketIndex{IndexClaims, attrClaimBucket, attrLease}
+)
+
+// keyOf is an item's key in the index, as a cursor keeps it.
+func (x bucketIndex) keyOf(item map[string]types.AttributeValue) map[string]string {
+	return plainKey(map[string]types.AttributeValue{attrPK: item[attrPK], attrSK: item[attrSK], x.bucket: item[x.bucket], x.sort: item[x.sort]})
+}
+
+func (x bucketIndex) startKey(c indexCursor) map[string]types.AttributeValue {
 	if c.Key == nil {
 		return nil
 	}
 	return map[string]types.AttributeValue{
 		attrPK: str(c.Key[attrPK]), attrSK: str(c.Key[attrSK]),
-		attrBucket: str(c.Key[attrBucket]), attrExpires: &types.AttributeValueMemberN{Value: c.Key[attrExpires]},
+		x.bucket: str(c.Key[x.bucket]), x.sort: &types.AttributeValueMemberN{Value: c.Key[x.sort]},
 	}
-}
-
-func (c expiryCursor) encode() string {
-	b, _ := json.Marshal(c)
-	return string(b)
 }
 
 // Expired implements store.Store over the expiry index, bucket by bucket.
 func (s *Store) Expired(ctx context.Context, now time.Time, cursor string, limit int) ([]store.Message, string, error) {
+	return s.readBuckets(ctx, "query expired", expiryIndex, cursor, limit, func(in *dynamodb.QueryInput) {
+		in.KeyConditionExpression = aws.String("#xb = :b AND #expires <= :now")
+		in.FilterExpression = aws.String(freeAt)
+		in.ExpressionAttributeNames = map[string]string{
+			"#xb": attrBucket, "#expires": attrExpires, "#owner": attrOwner, "#lease": attrLease,
+		}
+		in.ExpressionAttributeValues[":now"] = stamp(now)
+	}, func(item map[string]types.AttributeValue, m *store.Message) error {
+		return getTime(item, attrExpires, &m.Expires)
+	})
+}
+
+// EndedClaims implements store.Store over the claims index, bucket by
+// bucket. The key condition on the lease is Claim's own test of a free
+// message, against the same clock, so it needs no margin: what it returns
+// another task may claim at now.
+func (s *Store) EndedClaims(ctx context.Context, now time.Time, cursor string, limit int) ([]store.Message, string, error) {
+	return s.readBuckets(ctx, "query ended claims", claimsIndex, cursor, limit, func(in *dynamodb.QueryInput) {
+		in.KeyConditionExpression = aws.String("#cb = :b AND #lease <= :now")
+		in.ExpressionAttributeNames = map[string]string{"#cb": attrClaimBucket, "#lease": attrLease}
+		in.ExpressionAttributeValues[":now"] = stamp(now)
+	}, func(item map[string]types.AttributeValue, m *store.Message) error {
+		return getTime(item, attrLease, &m.LeaseUntil)
+	})
+}
+
+// readBuckets reads up to limit queue items of index from cursor on,
+// bucket by bucket: where sets the query's conditions, and fill what each
+// item gives beyond its recipient and ID. When a query fails part-way it
+// returns what it found, with the cursor to resume from.
+func (s *Store) readBuckets(ctx context.Context, op string, index bucketIndex, cursor string, limit int,
+	where func(*dynamodb.QueryInput), fill func(map[string]types.AttributeValue, *store.Message) error) ([]store.Message, string, error) {
 	if limit <= 0 {
 		return nil, cursor, nil
 	}
-	var at expiryCursor
+	var at indexCursor
 	if cursor != "" {
 		if err := json.Unmarshal([]byte(cursor), &at); err != nil || at.Bucket < 0 || at.Bucket >= ExpiryBuckets {
-			at = expiryCursor{} // from a different layout: start over
+			at = indexCursor{} // from a different layout: start over
 		}
 	}
 	var out []store.Message
-	for ; at.Bucket < ExpiryBuckets; at = (expiryCursor{Bucket: at.Bucket + 1}) {
+	for ; at.Bucket < ExpiryBuckets; at = (indexCursor{Bucket: at.Bucket + 1}) {
 		in := &dynamodb.QueryInput{
-			TableName:              aws.String(s.table),
-			IndexName:              aws.String(IndexExpiry),
-			KeyConditionExpression: aws.String("#xb = :b AND #expires <= :now"),
-			FilterExpression:       aws.String(freeAt),
-			ExpressionAttributeNames: map[string]string{
-				"#xb": attrBucket, "#expires": attrExpires, "#owner": attrOwner, "#lease": attrLease,
-			},
-			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":b": str(fmt.Sprintf("x#%02d", at.Bucket)), ":now": stamp(now),
-			},
-			ExclusiveStartKey: at.startKey(),
+			TableName:                 aws.String(s.table),
+			IndexName:                 aws.String(index.name),
+			ExpressionAttributeValues: map[string]types.AttributeValue{":b": str(fmt.Sprintf("x#%02d", at.Bucket))},
+			ExclusiveStartKey:         index.startKey(at),
 		}
+		where(in)
 		for {
 			page, err := s.api.Query(ctx, in)
 			if err != nil {
-				return out, at.encode(), sanitize("query expired", err)
+				return out, at.encode(), sanitize(op, err)
 			}
 			for _, item := range page.Items {
-				m, k, err := decodeExpired(item)
+				m, err := decodeIndexed(item, index, fill)
 				if err != nil {
 					return out, at.encode(), err
 				}
 				out = append(out, m)
-				at.Key = k
+				at.Key = index.keyOf(item)
 				if len(out) == limit {
 					return out, at.encode(), nil
 				}
@@ -869,24 +918,24 @@ func plainKey(k map[string]types.AttributeValue) map[string]string {
 	return out
 }
 
-func decodeExpired(item map[string]types.AttributeValue) (store.Message, map[string]string, error) {
+func decodeIndexed(item map[string]types.AttributeValue, index bucketIndex, fill func(map[string]types.AttributeValue, *store.Message) error) (store.Message, error) {
 	var m store.Message
-	var pk, xb string
+	var pk, b string
 	err := errors.Join(
 		getString(item, attrPK, &pk, true),
 		getString(item, attrSK, &m.ID, true),
-		getString(item, attrBucket, &xb, true),
-		getTime(item, attrExpires, &m.Expires),
+		getString(item, index.bucket, &b, true),
+		fill(item, &m),
 	)
 	recipient, ok := queueRecipient(pk)
 	if !ok {
 		err = errors.Join(err, errors.New("not a queue key"))
 	}
 	if err != nil {
-		return store.Message{}, nil, fmt.Errorf("awsstore: decoding an expired message: %w", err)
+		return store.Message{}, fmt.Errorf("awsstore: decoding an item of the %s index: %w", index.name, err)
 	}
 	m.Recipient = recipient
-	return m, plainKey(map[string]types.AttributeValue{attrPK: item[attrPK], attrSK: item[attrSK], attrBucket: item[attrBucket], attrExpires: item[attrExpires]}), nil
+	return m, nil
 }
 
 // RecordSent implements store.Store. The record carries an empty map of

@@ -1138,9 +1138,11 @@ func (e *Engine) Sweep(ctx context.Context) (int, error) {
 
 // Run sweeps expired messages every SweepInterval until ctx ends; a sweep
 // that found a full batch, or stopped part-way through the store, is
-// followed by another at once.
+// followed by another at once. Each sweep then has the queues of claims
+// whose lease ended read again (readEndedClaims), all of them, page by page.
 func (e *Engine) Run(ctx context.Context) error {
 	tick := make(chan struct{}, 1)
+	claims := ""
 	for {
 		for ctx.Err() == nil {
 			n, err := e.Sweep(ctx)
@@ -1152,6 +1154,18 @@ func (e *Engine) Run(ctx context.Context) error {
 			more := e.sweepAt != ""
 			e.mu.Unlock()
 			if n < e.cfg.Batch && !more {
+				break
+			}
+		}
+		read := map[string]bool{}
+		for ctx.Err() == nil {
+			var err error
+			claims, err = e.readEndedClaims(ctx, claims, read)
+			if err != nil {
+				e.storeFailed("ended claims", "", err)
+				break
+			}
+			if claims == "" {
 				break
 			}
 		}

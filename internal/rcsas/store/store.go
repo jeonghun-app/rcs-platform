@@ -333,6 +333,12 @@ type Store interface {
 	// the rest. When it fails part-way it returns what it found, with the
 	// cursor to resume from, and the error.
 	Expired(ctx context.Context, now time.Time, cursor string, limit int) ([]Message, string, error)
+	// EndedClaims returns up to limit claimed messages, of any recipient,
+	// whose lease ended at or before now, and pages as Expired does. Only
+	// Recipient, ID and LeaseUntil are filled in. An attempt ends its claim
+	// with Release or Remove long before the lease does, so a claim left to
+	// its lease is one whose holder died with it (#663).
+	EndedClaims(ctx context.Context, now time.Time, cursor string, limit int) ([]Message, string, error)
 	// RecordSent stores s: ErrExists if the sender already has a record for
 	// the Message-ID that has not expired at now. An expired one is
 	// replaced, since a backend may keep it for a while (DynamoDB TTL).
