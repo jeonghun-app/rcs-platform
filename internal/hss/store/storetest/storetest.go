@@ -67,6 +67,16 @@ func PSI() *store.WildcardedPSI {
 	}
 }
 
+// InvalidPSIs returns wildcarded PSIs that break a structural rule of the
+// stored item, by the rule: neither backend writes or reads them.
+func InvalidPSIs() map[string]*store.WildcardedPSI {
+	empty, noServer, long := PSI(), PSI(), PSI()
+	empty.PSI = ""
+	noServer.ServerName = ""
+	long.PSI = "sip:!" + strings.Repeat("a", store.MaxPSILength) + "!@botplatform.mnc001.mcc001.3gppnetwork.org"
+	return map[string]*store.WildcardedPSI{"empty PSI": empty, "empty server name": noServer, "PSI over MaxPSILength": long}
+}
+
 // Options adapts the suite to a backend.
 type Options struct {
 	// ListingWait is how long SubscriptionsByProfile may lag a write
@@ -504,6 +514,14 @@ func testPrecompiledProfile(t *testing.T, s store.Store, _ Options) {
 func testWildcardedPSI(t *testing.T, s store.Store, _ Options) {
 	_, err := s.WildcardedPSI(ctx(t))
 	wantErr(t, err, store.ErrNotFound)
+	// A replacement of a version that is not stored is a conflict, also
+	// when nothing is stored, and stores nothing.
+	ghost := PSI()
+	ghost.Version = 1
+	_, err = s.PutWildcardedPSI(ctx(t), ghost, PSI())
+	wantErr(t, err, store.ErrConflict)
+	_, err = s.WildcardedPSI(ctx(t))
+	wantErr(t, err, store.ErrNotFound)
 	v1 := must(s.PutWildcardedPSI(ctx(t), nil, PSI()))(t)
 	want := PSI()
 	want.Version = 1
@@ -525,8 +543,12 @@ func testWildcardedPSI(t *testing.T, s store.Store, _ Options) {
 	}
 	_, err = s.PutWildcardedPSI(ctx(t), v1, PSI())
 	wantErr(t, err, store.ErrConflict)
-	_, err = s.PutWildcardedPSI(ctx(t), v2, &store.WildcardedPSI{PSI: next.PSI})
-	wantErr(t, err, store.ErrInvalid)
+	for name, bad := range InvalidPSIs() {
+		_, err = s.PutWildcardedPSI(ctx(t), v2, bad)
+		if !errors.Is(err, store.ErrInvalid) {
+			t.Errorf("%s: error = %v, want ErrInvalid", name, err)
+		}
+	}
 	got := must(s.WildcardedPSI(ctx(t)))(t)
 	if !reflect.DeepEqual(got, v2) {
 		t.Fatalf("after the refused writes: %+v, want %+v", got, v2)

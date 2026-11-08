@@ -36,7 +36,9 @@ func testChatbotRange(t testing.TB, psi string) *chatbotRange {
 
 func TestAWildcardedPSIIsAnEREAtTheChatbotDomain(t *testing.T) {
 	d := testChatbotDomain(t)
-	if _, err := parseChatbotRange(chatbotPSI, chatbot.Domain{}); err == nil {
+	// With the domain unset, "sip:!a!@" is a PSI at the (empty) domain in
+	// every other respect, so only the guard refuses it.
+	if _, err := parseChatbotRange("sip:!a!@", chatbot.Domain{}); err == nil {
 		t.Error("a PSI was accepted with RCS_CHATBOT_DOMAIN unset")
 	}
 	at := func(ere string) string { return "sip:!" + ere + "!@" + botDomain }
@@ -53,6 +55,7 @@ func TestAWildcardedPSIIsAnEREAtTheChatbotDomain(t *testing.T) {
 		"the delimiter inside the ERE": at("a!b"),
 		"white space":                  at("a b"),
 		"a control character":          at("a\nb"),
+		"DEL":                          at("a\x7fb"),
 		"not ASCII":                    at("é"),
 		"a POSIX departure":            at(`[\.]bot`),
 		"Perl syntax":                  at(`(?i)bot`),
@@ -65,10 +68,30 @@ func TestAWildcardedPSIIsAnEREAtTheChatbotDomain(t *testing.T) {
 		}
 	}
 	longest := at(strings.Repeat("a", store.MaxPSILength-len(at(""))))
-	for _, psi := range []string{chatbotPSI, longest, at("bot|news"), at(".*")} {
+	// "~" is the last printable ASCII character.
+	for _, psi := range []string{chatbotPSI, longest, at("bot|news"), at(".*"), at("a~")} {
 		if r, err := parseChatbotRange(psi, d); err != nil || r.psi != psi {
 			t.Errorf("%s: %v", psi, err)
 		}
+	}
+}
+
+// TestEveryNormalFormIsMatchedWithinTheWorkBudget pins why contains never
+// fails for want of budget: a match costs at most its program's
+// instructions a byte, a PSI's ERE compiles to at most
+// ifc.MaxPatternInstructions, and contains matches only the user part of a
+// normal form, which the longest RCS_CHATBOT_DOMAIN's room in
+// chatbot.MaxURIBytes bounds.
+func TestEveryNormalFormIsMatchedWithinTheWorkBudget(t *testing.T) {
+	longestUser := chatbot.MaxURIBytes - chatbot.MaxDomainBytes - len("sip:@")
+	if got := ifc.MaxPatternInstructions * longestUser; got > ifc.DefaultMaxWork {
+		t.Fatalf("%d instructions × %d bytes = %d, over DefaultMaxWork (%d)", ifc.MaxPatternInstructions, longestUser, got, ifc.DefaultMaxWork)
+	}
+	// The bound is the longest user part Normalise accepts: two labels of
+	// 63 and the dot.
+	user := strings.Repeat("a", 63) + "." + strings.Repeat("b", 63)
+	if _, err := testChatbotDomain(t).Normalise("sip:" + user + "@" + botDomain); err != nil || len(user) != longestUser {
+		t.Fatalf("a %d-byte user part: %v; the bound is %d", len(user), err, longestUser)
 	}
 }
 

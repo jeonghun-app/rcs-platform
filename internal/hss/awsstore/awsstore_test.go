@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -123,6 +124,25 @@ func TestCorruptItemsAreRefused(t *testing.T) {
 	} {
 		if err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+	// A stored PSI document is checked as a written one is. The valid
+	// one, written the same way, shows the documents are well formed.
+	storePSI := func(p *store.WildcardedPSI) error {
+		doc, err := json.Marshal(map[string]any{"schema": 1, "psi": p.PSI, "server_name": p.ServerName, "active": p.Active})
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.tables["subscribers"][psiPK] = map[string]types.AttributeValue{attrPK: str(psiPK), attrVersion: num(1), attrDoc: &types.AttributeValueMemberB{Value: doc}}
+		_, err = d.WildcardedPSI(ctx)
+		return err
+	}
+	if err := storePSI(storetest.PSI()); err != nil {
+		t.Fatalf("a valid stored PSI: %v", err)
+	}
+	for name, p := range storetest.InvalidPSIs() {
+		if err := storePSI(p); !errors.Is(err, store.ErrInvalid) {
+			t.Errorf("stored %s: error = %v, want ErrInvalid", name, err)
 		}
 	}
 }

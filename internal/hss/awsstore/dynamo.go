@@ -616,10 +616,14 @@ func (d *Dynamo) PutWildcardedPSI(ctx context.Context, old, p *store.WildcardedP
 		// A resent first write that had succeeded carries this write's
 		// token, as a resent update does (conflictOrGone).
 		err := d.conflictOrGone(ctx, d.subscribers, psiPK, in.Item, "put wildcarded PSI")
-		if old == nil && errors.Is(err, store.ErrConflict) {
+		switch {
+		case old == nil && errors.Is(err, store.ErrConflict):
 			return nil, fmt.Errorf("awsstore: put wildcarded PSI: %w", store.ErrExists)
-		}
-		if err != nil {
+		case old != nil && errors.Is(err, store.ErrNotFound):
+			// The version read is not stored, whatever the reason: a
+			// conflict, as Store says and the memory backend answers.
+			return nil, fmt.Errorf("awsstore: put wildcarded PSI: %w", store.ErrConflict)
+		case err != nil:
 			return nil, err
 		}
 	case raced(err):
