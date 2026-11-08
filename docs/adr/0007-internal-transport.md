@@ -44,9 +44,15 @@ traffic within an AZ is not assumed to be.
    | `msrp-relay` control HTTP | `pcscf` |
    | `pcscf` client SIP, `msrp-relay` MSRP (public) | NLB |
    | `acs`, `ft-server` HTTP (public) | ALB |
+   | `maap` chatbot API HTTP (public) | ALB |
+   | `maap` internal HTTP (operator and `rcs-as` APIs) | `rcs-as`, the operator path |
+   | `rcs-as` internal HTTP (`rcs-as`'s chatbot API) | `maap` |
    | every admin port (health) | its load balancer only, where one is attached |
 
-   `acs` and `ft-server` reach no SIP or Diameter port. `pcscf` runs **two SIP
+   `acs` and `ft-server` reach no SIP or Diameter port, and neither does `maap`,
+   which reaches no MSRP or `hss` port either; its webhook egress is
+   [ADR 0009](0009-maap-chatbot-platform.md) §8. (Amended in #671: the three
+   `maap` rows and this sentence.) `pcscf` runs **two SIP
    listeners**: the client listener behind the NLB (PROXY protocol, untrusted)
    and a core listener on another port that only the core's security groups
    reach; the core-facing `Path` and `Record-Route` name the core listener. The

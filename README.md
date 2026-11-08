@@ -34,7 +34,7 @@ Built and merged on `main` (details in [CHANGELOG.md](CHANGELOG.md)):
   `rcs-bridge` ([docs](docs/rcs-bridge.md)) gives an application an HTTP and
   WebSocket API for standalone messages through the local stack, each
   endpoint a test subscriber it registers itself.
-- **Decisions**: ADRs 0001–0007 and the [threat model](docs/threat-model.md).
+- **Decisions**: [ADRs](docs/adr/README.md) and the [threat model](docs/threat-model.md).
 
 There is no release yet.
 
