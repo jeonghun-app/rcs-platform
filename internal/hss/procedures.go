@@ -101,6 +101,16 @@ type sarOutcome struct {
 // has services for an unregistered user, so terminating requests reach the
 // S-CSCF that still holds the profile.
 func applySAR(s *store.Subscription, impus []string, r *cx.SAR, keepName bool) sarOutcome {
+	return applySARResending(s, impus, r, keepName, false)
+}
+
+// applySARResending is applySAR with resend, which treats the request's
+// set as a stale one for this request only: its User-Data goes with every
+// SAR that may carry it, whatever the S-CSCF says it holds, and nothing is
+// stored. The HSS sets it for a set that holds an identity at the chatbot
+// host, so that User-Data without it replaces what an S-CSCF was given
+// before RCS_CHATBOT_DOMAIN was set (#695).
+func applySARResending(s *store.Subscription, impus []string, r *cx.SAR, keepName, resend bool) sarOutcome {
 	before := clone(s)
 	out := sarOutcome{result: success()}
 	if s.ServerName != "" && s.ServerName != r.ServerName {
@@ -121,11 +131,13 @@ func applySAR(s *store.Subscription, impus []string, r *cx.SAR, keepName bool) s
 		// registers; it drops the User-Data of the others, and of the
 		// REGISTRATIONs it sends itself to re-assert or take over a set
 		// (#536; code review on #524).
-		if i := slices.Index(s.StaleSets, s.Identity(impus[0]).ImplicitSet); i >= 0 {
+		if i := slices.Index(s.StaleSets, s.Identity(impus[0]).ImplicitSet); i >= 0 || resend {
 			switch r.AssignmentType {
 			case cx.Registration, cx.ReRegistration:
 				wantData = true
-				s.StaleSets = slices.Delete(slices.Clone(s.StaleSets), i, i+1)
+				if i >= 0 {
+					s.StaleSets = slices.Delete(slices.Clone(s.StaleSets), i, i+1)
+				}
 			case cx.UnregisteredUser, cx.NoAssignment:
 				wantData = true
 			}

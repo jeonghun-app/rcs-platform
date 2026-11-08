@@ -479,6 +479,31 @@ func (h *HSS) pprRejected(ctx context.Context, n Notifier, s *store.Subscription
 	return true
 }
 
+// deregisterChatbotSet ends a set made only of identities at the chatbot
+// host, registered before RCS_CHATBOT_DOMAIN was set: an RTR for its
+// identities, then their state not registered, so that the HSS no longer
+// takes the set for served. A failed RTR leaves the state, and the next
+// change tries again.
+func (h *HSS) deregisterChatbotSet(ctx context.Context, n Notifier, s *store.Subscription, set int) error {
+	if err := n.Deregister(ctx, &cx.RTR{UserName: s.IMPI, PublicIdentities: impusOf(members(s, set)),
+		DeregistrationReason: cx.DeregistrationReason{Code: cx.PermanentTermination}}); err != nil {
+		return err
+	}
+	h.metrics.Count("push.chatbot_set_deregistered", 1)
+	_, err := h.update(ctx, s.IMPI, func(cur *store.Subscription) error {
+		if !h.onlyChatbotHost(cur, set) || !slices.ContainsFunc(members(cur, set), func(id store.PublicIdentity) bool { return id.State.Served() }) {
+			return errUnchanged
+		}
+		setState(cur, set, store.NotRegistered)
+		if !served(cur) {
+			cur.AuthPending = false
+		}
+		clearServerIfIdle(cur)
+		return nil
+	})
+	return err
+}
+
 func (h *HSS) send(ctx context.Context, n Notifier, s *store.Subscription, p *store.ServiceProfile, ps push) error {
 	if ps.deregister {
 		return n.Deregister(ctx, &cx.RTR{
@@ -487,11 +512,17 @@ func (h *HSS) send(ctx context.Context, n Notifier, s *store.Subscription, p *st
 		})
 	}
 	r := &cx.PPR{UserName: s.IMPI}
-	if ps.set >= 0 {
+	if ps.set >= 0 && h.onlyChatbotHost(s, ps.set) {
+		// User-Data without the chatbot host's identities would have none,
+		// which no S-CSCF can take: the set is deregistered instead (#695).
+		if err := h.deregisterChatbotSet(ctx, n, s, ps.set); err != nil {
+			return err
+		}
+	} else if ps.set >= 0 {
 		if p == nil {
 			return errors.New("hss: the service profile could not be read for User-Data")
 		}
-		data, err := userData(s, ps.set, p)
+		data, err := h.userData(s, ps.set, p)
 		if errors.Is(err, ifc.ErrTooLarge) {
 			h.metrics.Count("userdata.too_large", 1)
 		}

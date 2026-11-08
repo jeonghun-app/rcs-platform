@@ -1,13 +1,17 @@
 package hss
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 )
 
 // chatbotRange is the stored wildcarded PSI with its ERE compiled: the
@@ -78,4 +82,82 @@ func (r *chatbotRange) contains(uri string) (bool, error) {
 // upper-case user parts and three labels (#679, from the review of #686).
 func (r *chatbotRange) userMatches(user string) (bool, error) {
 	return r.user.Match(user)
+}
+
+// containsInRange is chatbotRange.contains; a variable so that a test can
+// make a match fail, which the work budget never lets a stored PSI do.
+var containsInRange = (*chatbotRange).contains
+
+// atChatbotHost reports whether impu, in the canonical form the IMPU lookup
+// uses (identity.CanonicalIMPU: the host in lower case), is a SIP or SIPS
+// URI at domain, with or without a trailing dot; never with domain unset.
+// A tel URI has no "@", so its whole text is the "host" and never matches.
+// The host is the wildcarded PSI's alone (ADR 0009 §3 as amended in #679,
+// threat model T14): no IMPU may be provisioned there, and Cx registers
+// none and answers an LIR there from the PSI only.
+func atChatbotHost(domain chatbot.Domain, impu string) bool {
+	host := impu[strings.LastIndexByte(impu, '@')+1:]
+	return domain.Name() != "" && strings.TrimSuffix(host, ".") == domain.Name()
+}
+
+// storedAtChatbotHost is atChatbotHost for an identity as stored, put in
+// canonical form first: the store keeps IMPUs canonical, but a record
+// written past the API, as a migration might, need not be.
+func storedAtChatbotHost(domain chatbot.Domain, impu string) bool {
+	if c, ok := identity.CanonicalIMPU(impu); ok {
+		impu = c
+	}
+	return atChatbotHost(domain, impu)
+}
+
+// holdsChatbotHost reports whether the implicit set holds an identity at
+// the chatbot host, and onlyChatbotHost whether it holds nothing else.
+func (h *HSS) holdsChatbotHost(s *store.Subscription, set int) bool {
+	return slices.ContainsFunc(members(s, set), func(id store.PublicIdentity) bool { return storedAtChatbotHost(h.chatbot, id.IMPU) })
+}
+
+func (h *HSS) onlyChatbotHost(s *store.Subscription, set int) bool {
+	m := members(s, set)
+	return len(m) > 0 && !slices.ContainsFunc(m, func(id store.PublicIdentity) bool { return !storedAtChatbotHost(h.chatbot, id.IMPU) })
+}
+
+// chatbotRange returns the range of the stored PSI, or nil when there is
+// none: no PSI is stored, it is not active, or it does not hold under the
+// current RCS_CHATBOT_DOMAIN. Every call reads the item, so a new version
+// is seen at once; the compiled range is kept per version, so a version is
+// checked and compiled once per task. Any other version than the cached
+// one replaces it, a lower one too: a table restored or recreated starts
+// its versions again, and its PSI, active or not, must take effect at
+// once. A read that another request's newer read overtook may so put an
+// older version back for a moment; the next read, which sees the newer
+// item, corrects it. A
+// PSI that does not hold, such as one written for a domain since changed,
+// is counted on every LIR it leaves without a range, so an alarm can see
+// it, and logged once per version, naming the rule and not the PSI.
+func (h *HSS) chatbotRange(ctx context.Context) (*chatbotRange, error) {
+	p, err := h.store.WildcardedPSI(ctx)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	h.rangeMu.Lock()
+	defer h.rangeMu.Unlock()
+	if !h.rangeRead || p.Version != h.rangeVersion {
+		r, err := parseChatbotRange(p.PSI, h.chatbot)
+		invalid := err != nil
+		if invalid {
+			h.log.Warn("the stored chatbot PSI does not hold under RCS_CHATBOT_DOMAIN, so there is no chatbot range",
+				slog.Int64("psi_version", p.Version), slog.String("reason", err.Error()))
+		}
+		if invalid || !p.Active {
+			r = nil
+		}
+		h.rangeRead, h.rangeVersion, h.rangeOf, h.rangeInvalid = true, p.Version, r, invalid
+	}
+	if h.rangeInvalid {
+		h.metrics.Count("chatbot.psi_invalid", 1)
+	}
+	return h.rangeOf, nil
 }

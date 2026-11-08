@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/keyring"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/milenage"
@@ -71,6 +72,11 @@ type Options struct {
 	Rand    io.Reader
 	Logger  *slog.Logger
 	Metrics Metrics
+	// ChatbotDomain is RCS_CHATBOT_DOMAIN and ChatbotASName the AS name an
+	// LIR in the chatbot range gets (HSS_RCS_AS_URI). With the zero Domain
+	// Cx is as without chatbots.
+	ChatbotDomain chatbot.Domain
+	ChatbotASName string
 }
 
 // HSS is the subscriber logic shared by the Cx server and the provisioning
@@ -95,6 +101,18 @@ type HSS struct {
 	// onLockWait, if set, runs when a request starts waiting for a lock
 	// another holds, with the context the wait ends with: a test hook.
 	onLockWait func(ctx context.Context)
+
+	chatbot   chatbot.Domain
+	chatbotAS string
+	// rangeMu guards the chatbot range compiled from the stored PSI of
+	// version rangeVersion (rangeRead once one was read); rangeOf is nil
+	// when that version gives no range, and rangeInvalid says it does not
+	// hold under RCS_CHATBOT_DOMAIN.
+	rangeMu      sync.Mutex
+	rangeRead    bool
+	rangeVersion int64
+	rangeOf      *chatbotRange
+	rangeInvalid bool
 }
 
 // subscriptionLock is one subscription's lock and the requests that hold it
@@ -118,7 +136,7 @@ func New(o Options) (*HSS, error) {
 	h := &HSS{
 		store: o.Store, keys: o.Keys, imsRealm: o.IMSRealm, ftRealm: o.FTRealm,
 		serverNames: o.ServerNames, maxItems: o.MaxAuthItems, rand: o.Rand,
-		log: o.Logger, metrics: o.Metrics,
+		log: o.Logger, metrics: o.Metrics, chatbot: o.ChatbotDomain, chatbotAS: o.ChatbotASName,
 	}
 	if h.maxItems <= 0 {
 		h.maxItems = DefaultMaxAuthItems

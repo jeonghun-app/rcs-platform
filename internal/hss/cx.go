@@ -101,9 +101,13 @@ func (c *CxServer) count(cmd string, r cx.Result) {
 
 // pair finds the subscription of impi and checks that impu, in canonical
 // form, is one of its identities (TS 29.228 §6.1.1.1, §6.3.1 steps 1 to 3).
-func (c *CxServer) pair(ctx context.Context, impi, impu string) (*store.Subscription, string, error) {
+// An identity at the chatbot host is unknown whatever is stored, unless
+// clearing says the request only clears state (a deregistration SAR): the
+// host is the PSI's alone, and no S-CSCF registers or authenticates it
+// (ADR 0009 §3 as amended in #679).
+func (c *CxServer) pair(ctx context.Context, impi, impu string, clearing bool) (*store.Subscription, string, error) {
 	canonical, ok := identity.CanonicalIMPU(impu)
-	if !ok {
+	if !ok || !clearing && atChatbotHost(c.h.chatbot, canonical) {
 		return nil, "", experimental(cx.ErrorUserUnknown)
 	}
 	s, err := c.h.store.Subscription(ctx, impi)
@@ -188,7 +192,7 @@ type uarAnswer struct {
 }
 
 func (c *CxServer) decideUAR(ctx context.Context, r *cx.UAR) (uarAnswer, error) {
-	s, impu, err := c.pair(ctx, r.UserName, r.PublicIdentity)
+	s, impu, err := c.pair(ctx, r.UserName, r.PublicIdentity, false)
 	if err != nil {
 		return uarAnswer{}, err
 	}
@@ -217,6 +221,7 @@ func (c *CxServer) lir(ctx context.Context, _ *diameter.Peer, req *diameter.Mess
 		a.Result = c.resultOf("lir", err)
 	} else {
 		a.Result, a.ServerName, a.ServerCapabilities = out.result, out.serverName, out.caps
+		a.WildcardedPublicIdentity = out.wildcard
 	}
 	c.count("lir", a.Result)
 	return a.Message(c.node, req)
@@ -225,9 +230,14 @@ func (c *CxServer) lir(ctx context.Context, _ *diameter.Peer, req *diameter.Mess
 type lirAnswer struct {
 	lirOutcome
 	caps *cx.ServerCapabilities
+	// wildcard is the stored wildcarded PSI, for an identity in its range.
+	wildcard string
 }
 
 func (c *CxServer) decideLIR(ctx context.Context, r *cx.LIR) (lirAnswer, error) {
+	if canonical, ok := identity.CanonicalIMPU(r.PublicIdentity); ok && atChatbotHost(c.h.chatbot, canonical) {
+		return c.decideChatbotLIR(ctx, r.PublicIdentity)
+	}
 	s, impu, err := c.byIMPU(ctx, r.PublicIdentity)
 	if err != nil {
 		return lirAnswer{}, err
@@ -245,6 +255,35 @@ func (c *CxServer) decideLIR(ctx context.Context, r *cx.LIR) (lirAnswer, error) 
 		out.caps = c.h.capabilities(p)
 	}
 	return out, nil
+}
+
+// decideChatbotLIR answers an LIR for an identity at the chatbot host from
+// the wildcarded PSI alone, whatever IMPU is stored there (ADR 0009 §3 as
+// amended in #679; docs/conformance.md records the departure from TS
+// 29.228 Table 6.1.4.2, where a distinct identity would win). In the range
+// it is DIAMETER_SUCCESS with the configured AS name, never one from the
+// store, and the PSI as Wildcarded-Public-Identity (TS 29.228 §6.1.4.1).
+// Outside it, or with no range, the identity is unknown. A match that fails
+// is DIAMETER_UNABLE_TO_COMPLY, not "unknown": an answer either way would
+// be a guess.
+func (c *CxServer) decideChatbotLIR(ctx context.Context, uri string) (lirAnswer, error) {
+	r, err := c.h.chatbotRange(ctx)
+	if err != nil {
+		return lirAnswer{}, err
+	}
+	if r == nil {
+		return lirAnswer{lirOutcome: lirOutcome{result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
+	}
+	in, err := containsInRange(r, uri)
+	if err != nil {
+		c.h.metrics.Count("cx.lir.chatbot_match_failed", 1)
+		c.h.log.Warn("a chatbot URI could not be matched against the chatbot range", slog.String("error", err.Error()))
+		return lirAnswer{}, errUnableToComply
+	}
+	if !in {
+		return lirAnswer{lirOutcome: lirOutcome{result: cx.ExperimentalResult(cx.ErrorUserUnknown)}}, nil
+	}
+	return lirAnswer{lirOutcome: lirOutcome{result: success(), serverName: c.h.chatbotAS}, wildcard: r.psi}, nil
 }
 
 func (c *CxServer) sar(ctx context.Context, _ *diameter.Peer, req *diameter.Message) (*diameter.Message, error) {
@@ -283,17 +322,21 @@ func (c *CxServer) sar(ctx context.Context, _ *diameter.Peer, req *diameter.Mess
 func (c *CxServer) applySAR(ctx context.Context, r *cx.SAR, a *cx.SAA) error {
 	var s *store.Subscription
 	var err error
+	// A deregistration only clears state, so it may name an identity at
+	// the chatbot host, as one registered before RCS_CHATBOT_DOMAIN was
+	// set; every other type is refused for one, as in pair.
+	clearing := !singleIdentityAssignment(r.AssignmentType)
 	impus := make([]string, 0, len(r.PublicIdentities))
 	for _, id := range r.PublicIdentities {
 		canonical, ok := identity.CanonicalIMPU(id)
-		if !ok {
+		if !ok || !clearing && atChatbotHost(c.h.chatbot, canonical) {
 			return experimental(cx.ErrorUserUnknown)
 		}
 		impus = append(impus, canonical)
 	}
 	if r.UserName != "" {
 		if len(impus) > 0 {
-			s, _, err = c.pair(ctx, r.UserName, r.PublicIdentities[0])
+			s, _, err = c.pair(ctx, r.UserName, r.PublicIdentities[0], clearing)
 		} else if s, err = c.h.store.Subscription(ctx, r.UserName); errors.Is(err, store.ErrNotFound) {
 			err = experimental(cx.ErrorUserUnknown)
 		}
@@ -319,19 +362,24 @@ func (c *CxServer) applySAR(ctx context.Context, r *cx.SAR, a *cx.SAA) error {
 	keep := hasUnregisteredServices(p)
 	var out sarOutcome
 	var data []byte
+	var resend bool
 	saved, err := c.h.updateFrom(ctx, s.IMPI, s, func(cur *store.Subscription) error {
 		for _, impu := range impus {
 			if cur.Identity(impu) == nil {
 				return experimental(cx.ErrorUserUnknown) // removed meanwhile
 			}
 		}
-		out = applySAR(cur, impus, r, keep)
+		// A set holding an identity at the chatbot host gets its User-Data,
+		// without that identity, even when the S-CSCF says it has it: what
+		// it has may come from before RCS_CHATBOT_DOMAIN was set (#695).
+		resend = len(impus) > 0 && c.h.holdsChatbotHost(cur, cur.Identity(impus[0]).ImplicitSet)
+		out = applySARResending(cur, impus, r, keep, resend)
 		data = nil
 		if out.userData {
 			// Built before the write, so that User-Data the HSS cannot send
 			// leaves the state as it was.
 			var err error
-			data, err = userData(cur, cur.Identity(impus[0]).ImplicitSet, p)
+			data, err = c.h.userData(cur, cur.Identity(impus[0]).ImplicitSet, p)
 			if errors.Is(err, ifc.ErrTooLarge) {
 				c.h.metrics.Count("userdata.too_large", 1)
 				return experimental(cx.ErrorTooMuchData)
@@ -351,6 +399,9 @@ func (c *CxServer) applySAR(ctx context.Context, r *cx.SAR, a *cx.SAA) error {
 	a.Result, a.ServerName = out.result, out.serverName
 	if out.userData {
 		a.UserData, a.ChargingInformation = data, charging(saved.Charging)
+		if resend && r.UserDataAlreadyAvailable == cx.UserDataAlreadyAvailable {
+			c.h.metrics.Count("chatbot.userdata_resent", 1)
+		}
 	}
 	return nil
 }
@@ -391,7 +442,7 @@ func (c *CxServer) mar(ctx context.Context, _ *diameter.Peer, req *diameter.Mess
 // the vectors in the same conditional write, so that no two MARs on any
 // tasks issue the same SQN, and then builds the vectors.
 func (c *CxServer) authenticate(ctx context.Context, r *cx.MAR) ([]cx.AuthDataItem, error) {
-	s, impu, err := c.pair(ctx, r.UserName, r.PublicIdentity)
+	s, impu, err := c.pair(ctx, r.UserName, r.PublicIdentity, false)
 	if err != nil {
 		return nil, err
 	}

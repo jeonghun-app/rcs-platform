@@ -164,18 +164,9 @@ func (a *API) apply(req *subscriptionRequest, s *store.Subscription) error {
 	return nil
 }
 
-// atChatbotHost reports whether impu, in the canonical form the IMPU
-// lookup uses (identity.CanonicalIMPU: the host in lower case), is a SIP or
-// SIPS URI at RCS_CHATBOT_DOMAIN, with or without a trailing dot; a tel
-// URI has no "@", so its whole text is the "host" and never matches. No
-// IMPU may be there: the host is the wildcarded PSI's alone, and an IMPU
-// there could register and send as a chatbot URI (ADR 0009 §3 as amended
-// in #679, threat model T14).
-func (a *API) atChatbotHost(impu string) bool {
-	name := a.chatbotDomain.Name()
-	host := impu[strings.LastIndexByte(impu, '@')+1:]
-	return name != "" && strings.TrimSuffix(host, ".") == name
-}
+// atChatbotHost reports whether impu, canonical, is at RCS_CHATBOT_DOMAIN,
+// where no IMPU may be provisioned (see the function of that name).
+func (a *API) atChatbotHost(impu string) bool { return atChatbotHost(a.chatbotDomain, impu) }
 
 // isDiameterURI checks the form of a DiameterURI (RFC 6733 §4.3.1) loosely:
 // the scheme and an FQDN, as the charging names need.

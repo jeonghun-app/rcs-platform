@@ -109,18 +109,18 @@ metric.
 Not an alarm: the steps to turn the chatbot range on (ADR 0009 §3,
 [hss](hss.md#data-model)).
 
-Not yet wired end to end: the infrastructure parameter that sets
-`RCS_CHATBOT_DOMAIN` comes with #684, and the stored PSI routes nothing until the
-Cx part of #679 lands.
+Not yet wired end to end: `hss` answers LIRs from the PSI, but `icscf` and
+`scscf` send it none until #680, and the infrastructure parameter that sets
+`RCS_CHATBOT_DOMAIN` comes with #684.
 
 1. Choose `RCS_CHATBOT_DOMAIN`, normally
    `botplatform.mnc<MNC>.mcc<MCC>.3gppnetwork.org`. It must be a **fresh**
    domain: no subscriber IMPU may ever have used it. The chatbot host is the
-   PSI's alone. `hss` refuses IMPUs at it once it is set, and the Cx part of
-   #679 refuses to register one, but `hss` does not search for IMPUs
-   provisioned before:
+   PSI's alone. `hss` refuses IMPUs at it once it is set, and Cx refuses to
+   register one, but `hss` does not search for IMPUs provisioned before:
    such a subscription keeps its other identities working and must drop the
-   chatbot-host IMPU at its next write. Do not reuse `RCS_IMS_DOMAIN` (refused at
+   chatbot-host IMPU at its next write. `chatbot.userdata_resent` counts the
+   refreshes of sets that still hold one. Do not reuse `RCS_IMS_DOMAIN` (refused at
    start) or a domain retired from subscribers.
 2. Set the same `RCS_CHATBOT_DOMAIN` on **every** service (`hss`, `icscf`,
    `scscf`, `rcs-as`, `maap`): they must agree on which URIs are chatbots
@@ -141,3 +141,7 @@ Cx part of #679 lands.
    broken, and a 409 means `RCS_CHATBOT_DOMAIN` is unset on `hss`. The audit
    line `audit: provisioning request` with operation `put_chatbot_psi` records
    the write, its value before and after masked.
+4. If `RCS_CHATBOT_DOMAIN` ever changes, the stored PSI no longer holds and
+   every LIR at the new host is 5001: each task logs "the stored chatbot PSI
+   does not hold under RCS_CHATBOT_DOMAIN" once and counts
+   `chatbot.psi_invalid`. Write the PSI again for the new domain (step 3).

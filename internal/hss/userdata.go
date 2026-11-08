@@ -1,6 +1,8 @@
 package hss
 
 import (
+	"slices"
+
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/hss/store"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
@@ -21,6 +23,22 @@ func userData(s *store.Subscription, set int, p *store.ServiceProfile) ([]byte, 
 	}
 	doc := ifc.Subscription{PrivateID: s.IMPI, ServiceProfiles: []ifc.ServiceProfile{sp}}
 	return doc.Marshal()
+}
+
+// userData is the User-Data the HSS sends to an S-CSCF: that of the free
+// function, without the set's identities at RCS_CHATBOT_DOMAIN. One left
+// from before the setting would otherwise be registered with the rest of
+// its implicit set and could be asserted as a chatbot URI (threat model
+// T13, T14); the host is the PSI's alone.
+func (h *HSS) userData(s *store.Subscription, set int, p *store.ServiceProfile) ([]byte, error) {
+	if h.chatbot.Name() == "" {
+		return userData(s, set, p)
+	}
+	c := clone(s)
+	c.PublicIdentities = slices.DeleteFunc(c.PublicIdentities, func(id store.PublicIdentity) bool {
+		return storedAtChatbotHost(h.chatbot, id.IMPU)
+	})
+	return userData(c, set, p)
 }
 
 // hasUnregisteredServices reports whether the profile has services for a
