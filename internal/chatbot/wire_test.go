@@ -32,7 +32,7 @@ type wireCase struct {
 }
 
 func wireCases() []wireCase {
-	return []wireCase{
+	cases := []wireCase{
 		{"BotMessage", MaxBotMessageBytes, `{"sender":"` + testBot + `","display_name":"My Bot","recipient":"` + testSub +
 			`","message_id":"0f1e2d3c","content_type":"text/plain;charset=utf-8","body":"hi\r\n","chip_list":"{\"suggestions\":[]}",
 			"dispositions":{"positive_delivery":true,"negative_delivery":false,"display":true},"anonymous":true}`,
@@ -44,6 +44,7 @@ func wireCases() []wireCase {
 			BotNotification{testBot, testSub, "Msg+1!x", imdn.DisplayNotification}},
 		{"BotNotificationAnswer", MaxAnswerBytes, `{}`, BotNotificationAnswer{}},
 	}
+	return append(cases, rcsWireCases()...)
 }
 
 // wireEnums lists the values of every enumerated field, for
@@ -53,7 +54,7 @@ func wireEnums() [][]string {
 	for _, k := range botNotificationKinds {
 		kinds = append(kinds, string(k))
 	}
-	return [][]string{kinds}
+	return append([][]string{kinds}, rcsWireEnums()...)
 }
 
 // fieldBounds are the bounded string fields and their bounds; the other
@@ -61,6 +62,7 @@ func wireEnums() [][]string {
 var fieldBounds = map[string]int{
 	"sender": MaxURIBytes, "recipient": MaxURIBytes, "chatbot": MaxURIBytes, "subscriber": MaxURIBytes,
 	"display_name": MaxDisplayNameBytes, "message_id": MaxMessageIDBytes, "content_type": MaxContentTypeBytes,
+	"out_of_service_text": MaxOutOfServiceTextBytes,
 }
 
 // decodeAs decodes body as a value of v's type; DecodeEnvelope validates it.
@@ -132,8 +134,21 @@ const wireContract = `BotMessage: sender display_name recipient message_id conte
 BotMessageAnswer:
 BotNotification: chatbot subscriber message_id kind
 BotNotificationAnswer:
+Admission: chatbot subscriber anonymous
+AdmissionAnswer: state,omitempty out_of_service_text,omitempty reason,omitempty
+DeliveryCheck: chatbot subscriber
+DeliveryCheckAnswer: deliver reason,omitempty
+SubscriberMessage: chatbot subscriber anonymous message_id date_time_ms,omitempty content_type body dispositions accepted_at_ms
+SubscriberMessageAnswer:
+SubscriberNotification: chatbot subscriber anonymous message_id kind status
+SubscriberNotificationAnswer:
 Dispositions: positive_delivery negative_delivery display
 bot notification kind: display-notification
+state: active suspended
+admission reason: blocked over_limit unknown
+delivery reason: suspended blocked unknown
+delivery-notification: delivered failed forbidden error
+display-notification: displayed forbidden error
 `
 
 func TestWireContractIsPinned(t *testing.T) {
@@ -199,8 +214,12 @@ func longest(v wireType) wireType {
 			v = withField(v, f, strings.Repeat(c, n))
 		}
 	}
-	if m, ok := v.(BotMessage); ok {
+	switch m := v.(type) {
+	case BotMessage:
 		m.Body, m.ChipList = ptr(strings.Repeat("<", MaxContentBytes-1)), "<"
+		v = m
+	case SubscriberMessage:
+		m.Body = ptr(strings.Repeat("<", testMaxMessageSize))
 		v = m
 	}
 	return v

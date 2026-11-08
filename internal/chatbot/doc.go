@@ -10,7 +10,7 @@
 // cross a trust boundary.
 //
 // The wire types are the bodies of rcs-as's chatbot API (/v1/chatbot/*,
-// which maap calls). Both sides decode them with [DecodeEnvelope] under the
+// which maap calls) and of maap's /v1/rcs/* (which rcs-as calls). Both sides decode them with [DecodeEnvelope] under the
 // limits here, which calls their Validate method. Validate refuses a C0
 // control or DEL in every string but the content, since those strings reach
 // SIP and CPIM headers and logs; its errors wrap ErrInvalidEnvelope (400)
