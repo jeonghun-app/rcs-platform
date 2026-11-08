@@ -191,6 +191,14 @@ func (e *endpoint) refreshLocked() {
 	e.lose(line, reason)
 }
 
+// refreshNow refreshes the registration at once, when there is a flow,
+// and times the next refresh from it.
+func (e *endpoint) refreshNow() {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	e.refreshLocked()
+}
+
 // watch waits for line to fail while it is the endpoint's flow.
 func (e *endpoint) watch(line Line) {
 	select {

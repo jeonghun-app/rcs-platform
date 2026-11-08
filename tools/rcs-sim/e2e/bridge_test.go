@@ -44,8 +44,9 @@ const (
 
 // TestE2EBridgeOnTheComposeStack (#658): two endpoints the bridge creates
 // register with IMS AKA through pcscf, icscf and scscf; a message sent
-// while no event stream is open is kept by rcs-as and comes once one is
-// open and the receiver registers again; a message from one
+// while no event stream is open is kept by rcs-as and comes within 2 s of
+// one opening, as does one sent right after, without the application
+// registering the receiver again (#664); a message from one
 // to the other goes through rcs-as and arrives as an event with its body
 // and content type, and the sender hears it was delivered; a display
 // notification sent through the API reaches the sender; and a message to
@@ -91,9 +92,12 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 	// rcs-as, and the phone put online before a stream is open, as a
 	// gateway starting up would: rcs-as delivers what it kept on the
 	// registration, and it is refused again rather than lost. Once a
-	// stream is open and the phone registers again, both come, and only
-	// then are they delivered. This assumes no other client holds a
-	// stream to the bridge, which is so for the one the test starts.
+	// stream is open, the bridge refreshes the phone's registration, so
+	// both come, and only then are they delivered, without waiting for
+	// rcs-as's retry timer (a minute); so does one sent right after the
+	// stream opened, which rcs-as would otherwise hold behind them (#664).
+	// This assumes no other client holds a stream to the bridge, which is
+	// so for the one the test starts.
 	const refused = `"msg":"message refused: no event stream is open"`
 	early, kept := id+"-early", id+"-kept"
 	if out := br.send(ctx, t, br.car, map[string]any{"to": br.phone, "body": text + " early", "message_id": early, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
@@ -107,14 +111,24 @@ func TestE2EBridgeOnTheComposeStack(t *testing.T) {
 	br.setOnline(ctx, t, br.phone, true)
 	br.awaitLog(ctx, t, refused, 2)
 	ev := br.events(t)
-	br.setOnline(ctx, t, br.phone, false)
-	br.setOnline(ctx, t, br.phone, true)
-	// The two messages and their notifications, in whatever order they
+	opened := time.Now()
+	after := id + "-after"
+	if out := br.send(ctx, t, br.car, map[string]any{"to": br.phone, "body": text + " after", "message_id": after, "imdn": []string{"delivery"}}); out["sip_status"] != float64(202) {
+		t.Fatalf("the send once the stream opened answered %v, want rcs-as's 202", out)
+	}
+	// The three messages and their notifications, in whatever order they
 	// interleave.
-	got := ev.awaitAll(t, []eventKey{
-		{"message", br.phone, early, ""}, {"message", br.phone, kept, ""},
-		{"imdn", br.car, early, "delivered"}, {"imdn", br.car, kept, "delivered"},
+	got, at := ev.awaitAll(t, []eventKey{
+		{"message", br.phone, early, ""}, {"message", br.phone, kept, ""}, {"message", br.phone, after, ""},
+		{"imdn", br.car, early, "delivered"}, {"imdn", br.car, kept, "delivered"}, {"imdn", br.car, after, "delivered"},
 	})
+	for _, m := range []string{early, kept, after} {
+		d := at[eventKey{"message", br.phone, m, ""}].Sub(opened)
+		t.Logf("message %s came %v after the stream opened", m, d.Round(time.Millisecond))
+		if d > 2*time.Second {
+			t.Errorf("message %s came %v after the stream opened, want 2 s at most", m, d.Round(time.Millisecond))
+		}
+	}
 	for k, e := range got {
 		switch {
 		case k.typ == "message" && (!strings.HasPrefix(str(e["body"]), text) || e["from_endpoint"] != br.car):
@@ -364,16 +378,17 @@ func (s *eventStream) await(t *testing.T, typ, endpoint, messageID, status strin
 type eventKey struct{ typ, endpoint, messageID, status string }
 
 // awaitAll returns the events of want, by key, in whatever order they come,
-// skipping the others.
-func (s *eventStream) awaitAll(t *testing.T, want []eventKey) map[eventKey]map[string]any {
+// skipping the others, and when each came.
+func (s *eventStream) awaitAll(t *testing.T, want []eventKey) (map[eventKey]map[string]any, map[eventKey]time.Time) {
 	t.Helper()
 	got := map[eventKey]map[string]any{}
+	at := map[eventKey]time.Time{}
 	deadline := time.Now().Add(time.Minute)
 	for len(got) < len(want) && time.Now().Before(deadline) {
 		ev := s.next(t, time.Until(deadline))
 		for _, k := range want {
 			if ev["type"] == k.typ && ev["endpoint"] == k.endpoint && ev["message_id"] == k.messageID && (k.status == "" || ev["status"] == k.status) {
-				got[k] = ev
+				got[k], at[k] = ev, time.Now()
 			}
 		}
 	}
@@ -382,7 +397,7 @@ func (s *eventStream) awaitAll(t *testing.T, want []eventKey) map[eventKey]map[s
 			t.Fatalf("no %s event for %s about %s", k.typ, k.endpoint, k.messageID)
 		}
 	}
-	return got
+	return got, at
 }
 
 func (s *eventStream) awaitState(t *testing.T, endpoint, state string) {

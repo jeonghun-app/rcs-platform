@@ -105,8 +105,9 @@ type inbound struct {
 // is 480 (TS 24.229 §5.4.3.3, RFC 3261 §21.4.18), so rcs-as keeps the
 // message and tries again when the endpoint registers again or its retry
 // timer runs, rather than taking it for delivered and dropping its copy
-// (docs/rcs-as.md, Delivery). The delivery notification goes only after
-// that, from the worker.
+// (docs/rcs-as.md, Delivery); the next stream to open has the bridge
+// refresh the registration, so that it comes then (Bridge.refreshRefused).
+// The delivery notification goes only after that, from the worker.
 func (e *endpoint) receive(in Incoming) int {
 	if in.ContentType != cpim.ContentType {
 		return 415
@@ -157,7 +158,7 @@ func (e *endpoint) receive(in Incoming) int {
 func (e *endpoint) publish(ib inbound) int {
 	from := e.b.nameOf(ib.from)
 	if n := ib.notification; n != nil {
-		return e.b.hub.publish(imdnEvent{Type: "imdn", Endpoint: e.name, FromEndpoint: from, MessageID: n.MessageID, Status: string(n.Status)})
+		return e.b.hub.publishFor(e, imdnEvent{Type: "imdn", Endpoint: e.name, FromEndpoint: from, MessageID: n.MessageID, Status: string(n.Status)})
 	}
 	at := ib.at
 	if t, err := ib.msg.DateTime(); err == nil {
@@ -167,7 +168,7 @@ func (e *endpoint) publish(ib inbound) int {
 	if ib.request.MessageID != "" {
 		undo = e.received.put(ib.request.MessageID, received{from: ib.from, msg: ib.msg, request: ib.request})
 	}
-	n := e.b.hub.publish(messageEvent{
+	n := e.b.hub.publishFor(e, messageEvent{
 		Type: "message", Endpoint: e.name, From: ib.from.String(), FromEndpoint: from,
 		MessageID: ib.request.MessageID, ContentType: ib.msg.ContentType(),
 		Body: string(ib.msg.Body.Bytes()), At: at.UTC().Format(time.RFC3339Nano),

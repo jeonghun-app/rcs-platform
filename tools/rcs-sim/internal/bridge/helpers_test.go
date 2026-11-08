@@ -131,7 +131,10 @@ func (h *fakeHSS) Provision(_ context.Context, name string) (Subscriber, error) 
 // registered number is delivered at once and answered 202, as rcs-as
 // answers what it stores; one to a number with no line is stored and
 // delivered once the number registers again, or answered offline when
-// offline is set (480, as a network without store-and-forward).
+// offline is set (480, as a network without store-and-forward). A refresh
+// delivers what is stored too, as rcs-as reads the queue of a recipient
+// that refused on any registration (docs/rcs-as.md, When a queue is read
+// again). It has no retry timer: what is stored waits for a registration.
 type fakeNet struct {
 	mu      sync.Mutex
 	lines   map[string]*fakeLine
@@ -143,6 +146,13 @@ type fakeNet struct {
 	expires      time.Duration
 	registers    int
 	refreshes    int
+	// refreshedBy counts the refreshes by number.
+	refreshedBy map[string]int
+	// holdBehind has a message to a number that has messages stored, or
+	// whose stored ones a refresh is delivering, wait behind them, as
+	// rcs-as holds a recipient's whole queue.
+	holdBehind bool
+	passing    map[string]bool
 	// sent is every MESSAGE body sent, by the sender's number.
 	sent map[string][][]byte
 	// hold, when set, holds each Send until it is closed.
@@ -158,7 +168,10 @@ type fakeNet struct {
 }
 
 func newFakeNet() *fakeNet {
-	return &fakeNet{lines: map[string]*fakeLine{}, stored: map[string][]Incoming{}, sent: map[string][][]byte{}, expires: 3600 * time.Second}
+	return &fakeNet{
+		lines: map[string]*fakeLine{}, stored: map[string][]Incoming{}, sent: map[string][][]byte{},
+		refreshedBy: map[string]int{}, passing: map[string]bool{}, expires: 3600 * time.Second,
+	}
 }
 
 func (n *fakeNet) Register(_ context.Context, s Subscriber, receive func(Incoming) int) (Line, time.Duration, error) {
@@ -216,6 +229,39 @@ func (n *fakeNet) redeliver(number string, in Incoming) bool {
 	return false
 }
 
+// pass delivers what is stored for number on l, oldest first, as rcs-as
+// reads a held queue; it stops at a message refused again, which stays
+// first.
+func (n *fakeNet) pass(number string, l *fakeLine) {
+	for {
+		n.mu.Lock()
+		q := n.stored[number]
+		if len(q) == 0 || n.lines[number] != l {
+			delete(n.passing, number)
+			n.mu.Unlock()
+			return
+		}
+		in := q[0]
+		n.stored[number] = q[1:]
+		n.mu.Unlock()
+		in.Line = l
+		if l.receive(in) == 480 {
+			n.mu.Lock()
+			n.stored[number] = append([]Incoming{in}, n.stored[number]...)
+			delete(n.passing, number)
+			n.mu.Unlock()
+			return
+		}
+	}
+}
+
+// refreshesOf is how many times number refreshed its registration.
+func (n *fakeNet) refreshesOf(number string) int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.refreshedBy[number]
+}
+
 // storedFor is how many messages wait for number.
 func (n *fakeNet) storedFor(number string) int {
 	n.mu.Lock()
@@ -267,8 +313,14 @@ func (l *fakeLine) Refresh(context.Context) (time.Duration, error) {
 	l.n.mu.Lock()
 	defer l.n.mu.Unlock()
 	l.n.refreshes++
+	l.n.refreshedBy[l.number]++
 	if l.n.failRefresh {
 		return 0, &sipua.StatusError{Method: "REGISTER", Code: 500}
+	}
+	// As rcs-as on the third-party REGISTER: after the 200.
+	if len(l.n.stored[l.number]) > 0 && !l.n.passing[l.number] {
+		l.n.passing[l.number] = true
+		go l.n.pass(l.number, l)
 	}
 	return l.n.expires, nil
 }
@@ -301,6 +353,11 @@ func (l *fakeLine) Send(ctx context.Context, target sip.URI, body []byte) (int, 
 	in := Incoming{From: l.sub.Tel, ContentType: cpim.ContentType, Body: slices.Clone(body)}
 	l.n.mu.Lock()
 	to := l.n.lines[number]
+	if to != nil && l.n.holdBehind && (len(l.n.stored[number]) > 0 || l.n.passing[number]) {
+		l.n.stored[number] = append(l.n.stored[number], in)
+		l.n.mu.Unlock()
+		return 202, nil
+	}
 	if to == nil {
 		if l.n.offline != 0 {
 			l.n.mu.Unlock()

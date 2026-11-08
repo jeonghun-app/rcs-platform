@@ -165,3 +165,44 @@ func TestARequestThatIsNotAWebSocketIsRefusedOnTheEventsPath(t *testing.T) {
 		t.Fatalf("%d streams subscribed", n)
 	}
 }
+
+// An endpoint whose event no stream took is kept for the next stream that
+// opens, once (#664); an event no endpoint answers for, a registration,
+// keeps none, and one a stream took keeps none either.
+func TestAnEndpointThatRefusedIsKeptForTheNextStreamOnce(t *testing.T) {
+	hb := newHub()
+	refused, took := &endpoint{name: "refused"}, &endpoint{name: "took"}
+	if n := hb.publish(registrationEvent{Type: "registration", Endpoint: "other"}); n != 0 {
+		t.Fatalf("published to %d streams, want none", n)
+	}
+	if n := hb.publishFor(refused, imdnEvent{Type: "imdn"}); n != 0 {
+		t.Fatalf("published to %d streams, want none", n)
+	}
+	s, _ := hb.subscribe()
+	if n := hb.publishFor(took, imdnEvent{Type: "imdn"}); n != 1 {
+		t.Fatalf("published to %d streams, want one", n)
+	}
+	if got := hb.takeRefused(s); len(got) != 1 || got[0] != refused {
+		t.Fatalf("took %v, want the endpoint that refused", got)
+	}
+	if got := hb.takeRefused(s); got != nil {
+		t.Fatalf("took %v again", got)
+	}
+}
+
+// A stream that is gone before it takes the endpoints leaves them for the
+// next: nothing it could take is lost.
+func TestAStreamGoneBeforeItTakesLeavesTheRefusedForTheNext(t *testing.T) {
+	hb := newHub()
+	e := &endpoint{name: "refused"}
+	hb.publishFor(e, imdnEvent{Type: "imdn"})
+	first, _ := hb.subscribe()
+	hb.unsubscribe(first)
+	if got := hb.takeRefused(first); got != nil {
+		t.Fatalf("a stream gone took %v", got)
+	}
+	next, _ := hb.subscribe()
+	if got := hb.takeRefused(next); len(got) != 1 || got[0] != e {
+		t.Fatalf("the next stream took %v", got)
+	}
+}
