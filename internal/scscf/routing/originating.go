@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/ifc"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/scscf/state"
@@ -165,10 +166,18 @@ func namesServedUser(u sip.URI, set *state.Registration) bool {
 // request is for (TS 24.229 §5.4.3.2). A tel URI with a global number is
 // sent as the SIP URI of the number in the home domain, as no ENUM is
 // asked; a request for another domain, or for a local number, is 404, for
-// the platform has no way to other networks.
+// the platform has no way to other networks. A chatbot URI goes to the
+// I-CSCF as it is, and a URI at the chatbot domain that is not one in
+// normal form is 404 (ADR 0009 §2).
 func (rt *Router) toTerminatingSide(req *sip.Request) func(context.Context) step {
 	return func(context.Context) step {
 		u, ok := rt.inHomeDomain(req.URI)
+		switch _, err := rt.cfg.ChatbotDomain.Normalise(req.URI.String()); {
+		case err == nil:
+			u, ok = req.URI, true
+		case !errors.Is(err, chatbot.ErrNotChatbot):
+			ok = false
+		}
 		if !ok {
 			rt.count("routing.originating.no_route")
 			return answer(404, "Not Found")

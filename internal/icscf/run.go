@@ -126,7 +126,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		HSS: hss, SCSCFs: cfg.SCSCFs, HomeDomain: cfg.HomeDomain, Resolver: dns,
 		RetryAfter: cfg.RetryAfter, RegisterTimeout: cfg.RegisterTimeout,
 		IDs: sip.IDGenerator{Rand: d.rand}, Metrics: rt.Metrics, Logger: rt.Logger,
-		Self: self,
+		Self: self, ChatbotDomain: cfg.ChatbotDomain, ASRoutes: cfg.ASRoutes,
 	})
 	if err != nil {
 		return err

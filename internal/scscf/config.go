@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
@@ -95,6 +96,8 @@ type ServiceConfig struct {
 	// realm; Namespace the Cloud Map namespace the services are found in.
 	HomeDomain string
 	Namespace  string
+	// ChatbotDomain is RCS_CHATBOT_DOMAIN (routing.Config.ChatbotDomain).
+	ChatbotDomain chatbot.Domain
 	// CoreAddr is the core listener, the only one: pcscf, icscf and the
 	// application servers reach scscf, clients never do (ADR 0007).
 	// CoreHost is this task's address on it.
@@ -214,6 +217,7 @@ func Configure(s *runtime.Settings) ServiceConfig {
 	if domain != "" && !identity.IsDomainName(domain) {
 		s.Shared.Invalid("IMS_DOMAIN", "not a domain name")
 	}
+	c.ChatbotDomain = chatbot.LoadDomain(s.Shared, domain)
 	if !identity.IsDomainName(c.Namespace) {
 		e.Invalid("NAMESPACE", "not a domain name")
 	}

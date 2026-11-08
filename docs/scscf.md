@@ -22,6 +22,13 @@ The proxy hands each request to the part that serves it:
   chain. Along a `Service-Route` (`orig`) it is originating, and when the chain
   is done it goes to the I-CSCF (`SCSCF_ICSCF_URI`). Otherwise it is
   terminating and goes to the user's contacts.
+- **At the end of an originating chain**, a request for the home domain, a
+  tel URI of a global number, or a chatbot URI at `RCS_CHATBOT_DOMAIN` goes to
+  the I-CSCF, which routes the chatbot's to the application server hosting it
+  ([icscf](icscf.md#requests-for-a-chatbot)). A URI at the chatbot domain
+  that is not a chatbot URI in normal form (ADR 0009 §2), and a request for
+  any other domain, get 404 (`routing.originating.no_route`). With
+  `RCS_CHATBOT_DOMAIN` unset a chatbot URI is another domain's: 404.
 - **A request inside a dialog** goes along its route, only to a hop the dialog
   was set up through, a P-CSCF on `RCS_PCSCF_CORE_PORT`, or an application
   server in `SCSCF_APPLICATION_SERVERS`.
@@ -66,7 +73,9 @@ the application servers reach it by security group
 The shared `RCS_` settings are in `internal/runtime`; `RCS_IMS_DOMAIN` is
 required. `RCS_PCSCF_CORE_PORT` (default `5070`) is shared with `pcscf`. It is
 the port of pcscf's core listener, the only one where `scscf` sends a P-CSCF
-the requests inside a dialog.
+the requests inside a dialog. `RCS_CHATBOT_DOMAIN` (default unset) is the host
+of chatbot URIs: a lower-case DNS name other than `RCS_IMS_DOMAIN`, or `scscf`
+refuses to start. Unset, there is no chatbot path.
 
 Keys come from Secrets Manager and are the same on every task. Each is a plain
 secret, such as CloudFormation's `GenerateSecretString` writes, used as its

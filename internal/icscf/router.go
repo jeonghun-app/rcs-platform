@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/diameter/cx"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/cxclient"
 	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
@@ -44,6 +45,9 @@ type Router struct {
 	selfURIs        []sip.URI
 	unknownLog      everyMinute
 	failed          recentFailures
+	chatbot         chatbot.Domain
+	asRoutes        []ASRoute
+	unknownASLog    everyMinute
 }
 
 // failedFor is how long an S-CSCF address a request could not be sent to
@@ -134,6 +138,8 @@ func New(cfg Config) (*Router, error) {
 		log:             cfg.Logger,
 		selfURIs:        cfg.Self,
 		now:             cfg.Now,
+		chatbot:         cfg.ChatbotDomain,
+		asRoutes:        cfg.ASRoutes,
 	}, nil
 }
 
@@ -261,7 +267,7 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 	// package documentation).
 	dsts, ok := r.destinations(ctx, scscf)
 	if !ok {
-		return r.unreachableNow(kindRegister, m)
+		return r.unreachableNow(kindRegister, peerSCSCF, m)
 	}
 	target := func(dst *transport.Destination) proxy.Target {
 		return proxy.Target{URI: scscf, Timeout: r.registerTimeout, Destination: dst}
@@ -271,15 +277,25 @@ func (r *Router) register(ctx context.Context, m *sip.Request) proxy.Decision {
 	// for a terminating request (review of #276); one that does not answer
 	// in time still gets it 504, and is not tried again, since it may have
 	// taken the REGISTER.
-	r.answerUnreachable(&d, kindRegister, rest(dsts), target)
+	r.answerUnreachable(&d, kindRegister, peerSCSCF, rest(dsts), target)
 	return d
 }
 
 // terminating applies TS 24.229 §5.3.2.1 and §5.3.2.2 to an initial request
-// for a user of the home network.
+// for a user of the home network, or for a chatbot.
 func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision {
 	uri := telForm(m.URI)
 	impu, ok := identity.CanonicalIMPU(uri.String())
+	// A chatbot URI is asked for in its normal form, and one at the chatbot
+	// domain that is not in it is 404 with no LIR (ADR 0009 §2). The
+	// Request-URI goes on as received, the text the check held for.
+	bot, err := r.chatbot.Normalise(m.URI.String())
+	switch {
+	case err == nil:
+		uri, impu, ok = m.URI, bot, true
+	case !errors.Is(err, chatbot.ErrNotChatbot):
+		return r.reject(kindTerminating, 404)
+	}
 	if !ok {
 		// No user of the network has such an identity; the HSS would
 		// answer 5001.
@@ -302,6 +318,9 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 		// §5.3.2.2: 5001 and every other negative answer.
 		return r.reject(kindTerminating, 404)
 	}
+	if bot != "" {
+		return r.toAS(ctx, m, uri, lia)
+	}
 	scscf, err := r.scscf(lia.Result, lia.ServerName, lia.ServerCapabilities)
 	switch {
 	case errors.Is(err, errBadServerName):
@@ -321,15 +340,72 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 	// stays, in tel form when it named a telephone number.
 	dsts, ok := r.destinations(ctx, scscf)
 	if !ok {
-		return r.unreachableNow(kindTerminating, m)
+		return r.unreachableNow(kindTerminating, peerSCSCF, m)
 	}
 	target := func(dst *transport.Destination) proxy.Target {
 		return proxy.Target{URI: uri, Routes: []sip.Address{{URI: looseRoute(scscf)}}, Destination: dst}
 	}
 	d := forwarding(proxy.Decision{Targets: []proxy.Target{target(first(dsts))}})
-	r.answerUnreachable(&d, kindTerminating, rest(dsts), target)
+	r.answerUnreachable(&d, kindTerminating, peerSCSCF, rest(dsts), target)
 	return d
 }
+
+// toAS sends a request for a chatbot to the AS a successful LIA names,
+// directly, with no S-CSCF (TS 23.228 §5.4.12.2 b, TS 24.229 §5.3.2.1): the
+// AS becomes the topmost Route, and the Request-URI stays. Only an AS on
+// Config.ASRoutes is sent to, at the URI listed there; any other name, or
+// none, is 500 with Retry-After, as an S-CSCF name nothing configured
+// matches is (memo H6).
+func (r *Router) toAS(ctx context.Context, m *sip.Request, uri sip.URI, lia *cx.LIA) proxy.Decision {
+	as, ok := r.asRoute(lia.ServerName)
+	if !ok {
+		r.metrics.Count("icscf.as.unknown_name", 1)
+		if r.unknownASLog.allow(r.now()) {
+			r.log.Warn("icscf: the HSS named an AS that is not on ICSCF_AS_ROUTES", slog.String("result", lia.Result.String()))
+		}
+		return r.withRetryAfter(kindTerminating, m, 500)
+	}
+	r.count(kindTerminating, "forwarded")
+	dsts, ok := r.destinations(ctx, as)
+	if !ok {
+		return r.unreachableNow(kindTerminating, peerAS, m)
+	}
+	target := func(dst *transport.Destination) proxy.Target {
+		return proxy.Target{URI: uri, Routes: []sip.Address{{URI: looseRoute(as)}}, Destination: dst}
+	}
+	d := forwarding(proxy.Decision{Targets: []proxy.Target{target(first(dsts))}})
+	// rcs-as tells a request for the chatbot it hosts from one it serves
+	// a subscriber in by the absence of P-Served-User (ADR 0009 §3), so
+	// none a sender wrote may reach it from here.
+	strip := d.Prepare
+	d.Prepare = func(ctx context.Context, t proxy.Target, req *sip.Request) error {
+		req.Header.Del("P-Served-User")
+		return strip(ctx, t, req)
+	}
+	r.answerUnreachable(&d, kindTerminating, peerAS, rest(dsts), target)
+	return d
+}
+
+// asRoute is the URI of the AS on Config.ASRoutes whose name equals name
+// (RFC 3261 §19.1.4).
+func (r *Router) asRoute(name string) (sip.URI, bool) {
+	u, err := sip.ParseURI(name)
+	if err != nil {
+		return sip.URI{}, false
+	}
+	for _, a := range r.asRoutes {
+		if a.Name.Equal(u) {
+			return a.URI, true
+		}
+	}
+	return sip.URI{}, false
+}
+
+// The next hops, as metric names know them.
+const (
+	peerSCSCF = "scscf"
+	peerAS    = "as"
+)
 
 // answerUnreachable gives the 500 the proxy ends a request in, a REGISTER or
 // a terminating one, when it could not send it to the S-CSCF, a
@@ -343,8 +419,9 @@ func (r *Router) terminating(ctx context.Context, m *sip.Request) proxy.Decision
 //
 // Before that, each further address of the S-CSCF (next) is tried in turn
 // with target, so a task that is gone does not fail the request while
-// others serve the same name.
-func (r *Router) answerUnreachable(d *proxy.Decision, kind string, next []transport.Destination, target func(*transport.Destination) proxy.Target) {
+// others serve the same name. A chatbot's AS is handled the same way; peer
+// names the next hop in the counters.
+func (r *Router) answerUnreachable(d *proxy.Decision, kind, peer string, next []transport.Destination, target func(*transport.Destination) proxy.Target) {
 	var (
 		unreachable atomic.Bool
 		mu          sync.Mutex
@@ -363,7 +440,7 @@ func (r *Router) answerUnreachable(d *proxy.Decision, kind string, next []transp
 		if len(next) > 0 {
 			dst := next[0]
 			next = next[1:]
-			r.metrics.Count("icscf.scscf.next_address", 1)
+			r.metrics.Count("icscf."+peer+".next_address", 1)
 			return []proxy.Target{target(&dst)}
 		}
 		unreachable.Store(true)
@@ -375,7 +452,7 @@ func (r *Router) answerUnreachable(d *proxy.Decision, kind string, next []transp
 		if res.StatusCode != 500 || !unreachable.Load() {
 			return
 		}
-		r.metrics.Count("icscf.scscf.unreachable", 1)
+		r.metrics.Count("icscf."+peer+".unreachable", 1)
 		r.count(kind, "500")
 		if !res.Header.Has("Retry-After") {
 			_ = res.Header.Add("Retry-After", r.retryAfter)
@@ -413,10 +490,11 @@ func rest(dsts []transport.Destination) []transport.Destination {
 	return dsts[1:]
 }
 
-// unreachableNow answers a request whose S-CSCF has no address: 500 with
-// Retry-After, as one whose every address refused it.
-func (r *Router) unreachableNow(kind string, m *sip.Request) proxy.Decision {
-	r.metrics.Count("icscf.scscf.unreachable", 1)
+// unreachableNow answers a request whose next hop, the S-CSCF or the AS
+// (peer), has no address: 500 with Retry-After, as one whose every address
+// refused it.
+func (r *Router) unreachableNow(kind, peer string, m *sip.Request) proxy.Decision {
+	r.metrics.Count("icscf."+peer+".unreachable", 1)
 	return r.withRetryAfter(kind, m, 500)
 }
 

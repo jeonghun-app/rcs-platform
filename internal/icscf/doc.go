@@ -32,6 +32,17 @@
 // 482 (#337). A pres: or im: Request-URI is refused 416 by the proxy before
 // the Router sees it.
 //
+// # Requests for a chatbot (ADR 0009 §2, §3)
+//
+// With Config.ChatbotDomain set, a terminating request whose Request-URI is
+// at that domain is for a chatbot: normalised before the LIR, which asks for
+// the normal form, and 404 with no LIR when not in it. The PSI is routed
+// directly to an AS (TS 23.228 §5.4.12.2 b): only one on Config.ASRoutes,
+// matched by RFC 3261 §19.1.4, is sent to, at the URI listed there (memo H6
+// on #671), as the topmost Route with the Request-URI as it came and without
+// P-Served-User, by whose absence rcs-as tells the PSI leg. docs/icscf.md
+// has the detail.
+//
 // # Answers
 //
 // "Success" is any 2xxx result, DIAMETER_FIRST_REGISTRATION,
@@ -62,6 +73,9 @@
 //	terminating  5003                                      480                       §5.3.2.1
 //	terminating  could not be completed                    480 + Retry-After         §5.3.1.3 by analogy
 //	terminating  (Request-URI is not an IMPU)              404, no LIR               local choice: the HSS would answer 5001
+//	chatbot      success, a Server-Name on ASRoutes        forward, Route = its URI  TS 23.228 §5.4.12.2 b, memo H6
+//	chatbot      success, any other name or none           500 + Retry-After         memo H6, as decided on #274
+//	chatbot      (not in normal form)                      404, no LIR               ADR 0009 §2
 //	any          (CANCEL while the HSS is asked)           487, CANCEL 200           §5.3.2.2
 //	ACK          (no To tag)                               dropped, no LIR           decided on #274
 //
@@ -131,6 +145,10 @@
 //	                            could not reach the S-CSCF
 //	icscf.scscf.next_address    requests sent to the next address of the
 //	                            S-CSCF after one refused (Config.Resolver)
+//	icscf.as.unknown_name       answers for a chatbot naming no AS on
+//	                            Config.ASRoutes: a configuration problem
+//	icscf.as.unreachable,       as the two above, for a chatbot's AS
+//	icscf.as.next_address
 //	icscf.routed.dropped_ack    ACKs without a To tag, dropped
 //
 // cxclient counts the Cx answers by result code, and the proxy and the
