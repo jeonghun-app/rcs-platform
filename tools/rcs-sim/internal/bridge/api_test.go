@@ -233,7 +233,8 @@ func TestTheEndpointBoundCountsTheOnesOnline(t *testing.T) {
 // With no event stream open the bridge cannot hand a message on, so it
 // answers 480: rcs-as keeps it for the endpoint's next registration
 // instead of taking it for delivered, and the sender hears nothing yet
-// (code review on #661).
+// (code review on #661). Once a stream opens, the bridge refreshes the
+// registration, and it comes with no new one (#664).
 func TestAMessageWithNoStreamOpenIs480AndComesWithItsNotificationLater(t *testing.T) {
 	h := newHarness(t)
 	h.online("car")
@@ -255,17 +256,19 @@ func TestAMessageWithNoStreamOpenIs480AndComesWithItsNotificationLater(t *testin
 		t.Fatalf("the phone sent %d notifications for messages nobody has", n)
 	}
 	// Nobody saw it, so nobody can have displayed it (QA on #661).
+	registers, _ := h.net.counts()
 	ev := h.events()
 	if status, _ := h.call(http.MethodPost, "/v1/endpoints/phone/imdn", map[string]any{"to": "car", "message_id": "direct", "status": "displayed"}); status != http.StatusNotFound {
 		t.Fatalf("a display notification for a message never shown answered %d, want 404", status)
 	}
-	h.call(http.MethodPut, "/v1/endpoints/phone", map[string]bool{"online": false})
-	h.online("phone")
 	if m := ev.await("message", "phone"); m["message_id"] != "later-1" || m["body"] != "later" {
 		t.Fatalf("message event %v", m)
 	}
 	if d := ev.await("imdn", "car"); d["message_id"] != "later-1" || d["status"] != "delivered" {
 		t.Fatalf("imdn event %v", d)
+	}
+	if again, _ := h.net.counts(); again != registers {
+		t.Fatalf("%d registrations once the stream opened, want none", again-registers)
 	}
 }
 
@@ -296,10 +299,9 @@ func TestAMessageKeptWhileOfflineSurvivesOnlineBeforeTheStream(t *testing.T) {
 	if status, _ := h.call(http.MethodPost, "/v1/endpoints/phone/imdn", map[string]any{"to": "car", "message_id": "kept-B", "status": "displayed"}); status != http.StatusNotFound {
 		t.Fatalf("a display notification for a message never shown answered %d, want 404", status)
 	}
-	// Then the stream, and a registration: it comes, and is delivered.
+	// Then the stream: the bridge refreshes the phone's registration, and
+	// the message comes, and is delivered (#664).
 	ev := h.events()
-	h.call(http.MethodPut, "/v1/endpoints/phone", map[string]bool{"online": false})
-	h.online("phone")
 	if m := ev.await("message", "phone"); m["message_id"] != "kept-B" || m["body"] != "kept" {
 		t.Fatalf("message event %v", m)
 	}
@@ -308,6 +310,149 @@ func TestAMessageKeptWhileOfflineSurvivesOnlineBeforeTheStream(t *testing.T) {
 	}
 	if status, _ := h.call(http.MethodPost, "/v1/endpoints/phone/imdn", map[string]any{"to": "car", "message_id": "kept-B", "status": "displayed"}); status != http.StatusOK {
 		t.Fatalf("a display notification for the message shown answered %d", status)
+	}
+}
+
+// A stream that opens refreshes the registration of the endpoints that
+// refused a message while none was open, and only theirs, so that rcs-as
+// sends what it kept now rather than at its retry timer, a minute or more
+// later (#664). The fake network has no retry timer, so a message that
+// comes came through the refresh; and the endpoint did not register anew.
+func TestAStreamOpeningRefreshesOnlyTheEndpointsThatRefused(t *testing.T) {
+	var log lockedLog
+	h := newHarness(t, func(c *Config) { c.Logger = slog.New(slog.NewJSONHandler(&log, nil)) })
+	h.online("car")
+	h.online("phone")
+	h.online("tablet")
+	car, phone := msisdnPrefix+"000", msisdnPrefix+"001"
+	if status, out := h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "first", "message_id": "first", "imdn": []string{"delivery"}}); status != http.StatusOK || out["sip_status"] != float64(202) {
+		t.Fatalf("send answered %d %v", status, out)
+	}
+	if n := h.net.storedFor(phone); n != 1 {
+		t.Fatalf("%d messages kept for the phone, want the one it refused", n)
+	}
+	registers, _ := h.net.counts()
+	const refreshed = `"msg":"registrations refreshed once a stream opened"`
+	ev := h.events()
+	if m := ev.await("message", "phone"); m["message_id"] != "first" {
+		t.Fatalf("message event %v", m)
+	}
+	ev.await("imdn", "car")
+	eventually(t, "the refreshes are done", func() bool { return strings.Count(log.String(), refreshed) == 1 })
+	if r, c, tab := h.net.refreshesOf(phone), h.net.refreshesOf(car), h.net.refreshesOf(msisdnPrefix+"002"); r != 1 || c != 0 || tab != 0 {
+		t.Fatalf("refreshes: phone %d, car %d, tablet %d; want the phone's only", r, c, tab)
+	}
+	if again, _ := h.net.counts(); again != registers {
+		t.Fatalf("%d registrations once the stream opened, want none", again-registers)
+	}
+
+	// The set is taken: the next stream refreshes only who refused since.
+	ev.c.Close(1000)
+	eventually(t, "the stream is gone", func() bool {
+		h.b.hub.mu.Lock()
+		defer h.b.hub.mu.Unlock()
+		return len(h.b.hub.subs) == 0
+	})
+	h.call(http.MethodPost, "/v1/endpoints/phone/messages", map[string]any{"to": "car", "body": "second", "message_id": "second"})
+	ev = h.events()
+	if m := ev.await("message", "car"); m["message_id"] != "second" {
+		t.Fatalf("message event %v", m)
+	}
+	eventually(t, "the refreshes are done", func() bool { return strings.Count(log.String(), refreshed) == 2 })
+	if r, c, tab := h.net.refreshesOf(phone), h.net.refreshesOf(car), h.net.refreshesOf(msisdnPrefix+"002"); r != 1 || c != 1 || tab != 0 {
+		t.Fatalf("refreshes: phone %d, car %d, tablet %d; want one each for the phone and the car", r, c, tab)
+	}
+}
+
+// A notification is refused as a message is, and comes the same way once
+// a stream opens.
+func TestARefusedNotificationComesOnceAStreamOpens(t *testing.T) {
+	h := newHarness(t)
+	h.online("car")
+	h.online("phone")
+	release := make(chan struct{})
+	h.net.mu.Lock()
+	h.net.onSend = func(from string, _ []byte) {
+		if from == msisdnPrefix+"001" {
+			<-release
+		}
+	}
+	h.net.mu.Unlock()
+	ev := h.events()
+	h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "x", "message_id": "n-1", "imdn": []string{"delivery"}})
+	ev.await("message", "phone")
+	// The phone's notification waits until the car has no stream left.
+	ev.c.Close(1000)
+	eventually(t, "the stream is gone", func() bool {
+		h.b.hub.mu.Lock()
+		defer h.b.hub.mu.Unlock()
+		return len(h.b.hub.subs) == 0
+	})
+	close(release)
+	eventually(t, "the car refused the notification", func() bool { return h.net.storedFor(msisdnPrefix+"000") == 1 })
+	ev = h.events()
+	if d := ev.await("imdn", "car"); d["message_id"] != "n-1" || d["status"] != "delivered" {
+		t.Fatalf("imdn event %v", d)
+	}
+}
+
+// rcs-as holds a recipient's whole queue after a refusal: what is sent
+// once the stream is open must not wait behind the refused message for
+// rcs-as's retry timer, and comes after it (#664).
+func TestMessagesSentAfterTheStreamOpensAreNotHeldBehindARefusedOne(t *testing.T) {
+	h := newHarness(t)
+	h.net.holdBehind = true
+	h.online("car")
+	h.online("phone")
+	h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "x", "message_id": "refused"})
+	if n := h.net.storedFor(msisdnPrefix + "001"); n != 1 {
+		t.Fatalf("%d messages kept for the phone, want the one it refused", n)
+	}
+	ev := h.events()
+	if status, out := h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "y", "message_id": "after"}); status != http.StatusOK || out["sip_status"] != float64(202) {
+		t.Fatalf("send answered %d %v", status, out)
+	}
+	for _, want := range []string{"refused", "after"} {
+		if m := ev.await("message", "phone"); m["message_id"] != want {
+			t.Fatalf("message event %v, want %s", m, want)
+		}
+	}
+}
+
+// A request on the events path that fails the WebSocket handshake opens no
+// stream, so it refreshes nobody: a refresh then would have rcs-as send
+// again to no stream, and cost a challenge of scscf's budget for nothing.
+// What was refused stays for the stream that does open (QA on #664).
+func TestARequestThatFailsTheHandshakeLeavesTheRefusedForTheNextStream(t *testing.T) {
+	var log lockedLog
+	h := newHarness(t, func(c *Config) { c.Logger = slog.New(slog.NewJSONHandler(&log, nil)) })
+	h.online("car")
+	h.online("phone")
+	phone := msisdnPrefix + "001"
+	h.call(http.MethodPost, "/v1/endpoints/car/messages", map[string]any{"to": "phone", "body": "x", "message_id": "kept"})
+	if n := h.net.storedFor(phone); n != 1 {
+		t.Fatalf("%d messages kept for the phone, want the one it refused", n)
+	}
+	if status, _ := h.call(http.MethodGet, "/v1/events", nil); status != http.StatusUpgradeRequired {
+		t.Fatalf("answered %d, want 426", status)
+	}
+	// The take is answered before the 426 when it is there at all, so
+	// this needs no waiting.
+	h.b.hub.mu.Lock()
+	n := len(h.b.hub.refused)
+	h.b.hub.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d endpoints kept after a failed handshake, want the phone", n)
+	}
+	ev := h.events()
+	if m := ev.await("message", "phone"); m["message_id"] != "kept" {
+		t.Fatalf("message event %v", m)
+	}
+	eventually(t, "the refreshes are done", func() bool {
+		return strings.Count(log.String(), `"msg":"registrations refreshed once a stream opened"`) == 1
+	})
+	if r := h.net.refreshesOf(phone); r != 1 {
+		t.Fatalf("the phone refreshed %d times, want once, for the stream that opened", r)
 	}
 }
 

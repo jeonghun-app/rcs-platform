@@ -367,7 +367,8 @@ func (b *Bridge) target(to string) (sip.URI, error) {
 
 // events is GET /v1/events: a WebSocket of JSON text frames, one per event
 // of any endpoint, from the moment it opens. What happens while no stream
-// is open is not kept.
+// is open is not kept; what the endpoints refused meanwhile is asked for
+// again (refreshRefused).
 func (b *Bridge) events(w http.ResponseWriter, r *http.Request) {
 	s, ok := b.hub.subscribe()
 	if !ok {
@@ -384,6 +385,11 @@ func (b *Bridge) events(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Shutdown()
+	// Only once the handshake succeeded: a request that fails it opens no
+	// stream for what is asked for again to come to.
+	if eps := b.hub.takeRefused(s); len(eps) > 0 {
+		b.refreshRefused(eps)
+	}
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)

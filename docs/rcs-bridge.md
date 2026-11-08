@@ -272,19 +272,28 @@ A message is answered 200 only once its event is in the queue of at least one
 open stream. With no stream open it is answered 480 (Temporarily Unavailable),
 and so is a notification: `rcs-as` then keeps it and sends it again when the
 endpoint next registers, or when its retry timer runs (`RCSAS_RETRY_INTERVAL`,
-1 minute, doubling; [rcs-as](rcs-as.md#when-a-queue-is-read-again)). To have
-what was kept come at once, open a stream and put the endpoint offline and
-online again. Open the stream before putting endpoints online: what `rcs-as`
-kept for an endpoint comes as soon as it registers, and with no stream open it
-is refused and kept again, to come only at the next registration. A message
-refused so is not remembered, so a display notification about it is 404 until
-it has come on a stream. Until then `rcs-as` holds that endpoint's whole
-queue, so later messages to it wait too, up to the retry interval (as long as
-`RCSAS_MAX_RETRY_INTERVAL`, 1 hour, after repeated refusals); opening the
-stream first avoids it ([#664](https://github.com/jeonghun-app/rcs-
-platform/issues/664)). A message it cannot read (not `message/cpim`, or a CPIM
-or IMDN header it cannot parse) is refused with 415 or 400, so that the
-network does not take it for delivered.
+1 minute, doubling up to `RCSAS_MAX_RETRY_INTERVAL`, 1 hour;
+[rcs-as](rcs-as.md#when-a-queue-is-read-again)). Until then `rcs-as` holds
+that endpoint's whole queue, so later messages to it would wait too. So the
+bridge remembers each endpoint that answered 480, and when a stream opens it
+refreshes their registrations at once, on their flows (#664): to `rcs-as` a
+refresh is a registration, and it sends what it kept, and what came since,
+straight away. The application does nothing for it. Only those endpoints are
+refreshed, once for all they refused while no stream was open. `scscf`
+challenges every REGISTER; a refresh on a registered flow counts against that
+flow's own budget, six a minute, not the IMPI's. An application that opens and
+closes its stream more often than that while messages are refused uses it up:
+`scscf` answers the refresh 500, the bridge loses the flow (a `registration`
+event `failed`) and registers again about 2 s later (above), and what was
+kept comes with that registration, about 2 s late. An endpoint with no flow at that
+moment, offline or between retries, gets what was kept when it next
+registers. The bridge remembers at most one entry per endpoint it holds. This
+also covers an endpoint put online before a stream is open: what `rcs-as` kept
+for it comes as soon as it registers, is refused, and comes again once a
+stream opens. A message refused so is not remembered, so a display
+notification about it is 404 until it has come on a stream. A message it
+cannot read (not `message/cpim`, or a CPIM or IMDN header it cannot parse) is
+refused with 415 or 400, so that the network does not take it for delivered.
 
 When the message asks for a delivery notification, the bridge sends it after
 the 200, once the event is queued: the bridge is the device (RFC 5438 §5.1).
@@ -330,7 +339,8 @@ keys, the tokens and Message-IDs are never logged. A request line, at
 ## Tests
 
 - `tools/rcs-sim/internal/bridge`: the API, the endpoints' lifecycle (refresh,
-  retry, lost flows, offline), the 480 with no stream open and the delivery
+  retry, lost flows, offline), the 480 with no stream open, the refresh of
+  only the endpoints that refused once a stream opens, the delivery
   notification only after the event is queued, and the event fan-out with the SIP and `hss`
   sides injected; the real SIP side against rcs-sim's in-process IMS core
   stand-in, with a network that stores (202) and one that refuses (480); the
@@ -342,8 +352,9 @@ keys, the tokens and Message-IDs are never logged. A request line, at
   the test container. Two endpoints register through the IMS core. A message
   sent while no stream is open is refused with 480 and kept by `rcs-as`; so
   is one kept while the receiver was offline when the receiver is put online
-  before a stream is open. Both come, with their delivery notifications, once
-  a stream is open and the receiver registers again. A message goes from one to the other through
+  before a stream is open. Both come, with their delivery notifications,
+  within 2 s of a stream opening, with no new registration by the test, and
+  so does one sent right after the stream opened. A message goes from one to the other through
   `rcs-as` (202) with its delivery notification, a display notification goes
   back, and a message to the receiver offline arrives once it is online
   again. The bridge's log must hold no token, body or digit run of an
@@ -362,6 +373,6 @@ keys, the tokens and Message-IDs are never logged. A request line, at
 | 401 with the token from `deploy/compose.env` | The file changed after the bridge started. `make bridge-up` recreates it. |
 | `PUT` answers 502 "provisioning the subscriber failed: hss: ... answered 401" | `HSS_ADMIN_TOKEN` changed after `hss` started. `make up` recreates the services. |
 | `"registered": false`, `reason` "REGISTER answered 500" after many runs | `scscf`'s challenge budget per IMPI. Wait a minute; the bridge tries again by itself. |
-| A message event never comes | No event stream was open when it arrived, so the bridge answered 480 and `rcs-as` kept it. With a stream open, it comes when the receiver registers again (put it offline and online) or at `rcs-as`'s next retry, a minute or more later. The sender has not been told it was delivered. |
+| A message event never comes | No event stream was open when it arrived, so the bridge answered 480 and `rcs-as` kept it. It comes once a stream is open: the bridge then refreshes the receiver's registration. If it still does not, look for `"msg":"refresh failed"` in the bridge's log: a refresh over the registered flow's challenge budget (six a minute) is answered 500, and the message comes about 2 s later, when the bridge registers the receiver again on a new flow. One that is offline gets it when it is put online. The sender has not been told it was delivered. |
 | `PUT` online answers 409 "as many endpoints as the bridge allows are online" | `RCS_BRIDGE_MAX_ENDPOINTS` endpoints are online. Put one offline first. |
 | `"sip_status": 413` | The CPIM body is over `rcs-as`'s pager limit, 1300 bytes. Large messages need MSRP, which the bridge does not do. |

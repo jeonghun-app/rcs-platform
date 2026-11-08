@@ -324,6 +324,34 @@ func (b *Bridge) nameOf(u sip.URI) string {
 	return ""
 }
 
+// refreshRefused refreshes the registration of each of eps, the endpoints
+// that refused a message or notification while no stream was open, now
+// that one is (#664). rcs-as holds a recipient's whole queue after a 480
+// until it registers again or its retry timer runs, a minute or more
+// (docs/rcs-as.md, When a queue is read again), so what was refused, and
+// all sent to it since, would wait that long; a refresh is a registration
+// to rcs-as. The others are not asked: each REGISTER is challenged, and a
+// refresh counts against its registered flow's budget in scscf
+// (registrar.DefaultRegisteredFlowChallengeLimit, six a minute). Past it
+// the refresh is answered 500 and loses the flow, and the registration
+// minRetry later reads the queue instead. An endpoint with no flow now
+// registers anew anyway, which reads the queue as well.
+func (b *Bridge) refreshRefused(eps []*endpoint) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return
+	}
+	b.wg.Go(func() {
+		var wg sync.WaitGroup
+		for _, e := range eps {
+			wg.Go(e.refreshNow)
+		}
+		wg.Wait()
+		b.log.Info("registrations refreshed once a stream opened", slog.Int("endpoints", len(eps)))
+	})
+}
+
 // opContext bounds one operation, and ends with the bridge.
 func (b *Bridge) opContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(b.ctx, b.cfg.OpTimeout)
