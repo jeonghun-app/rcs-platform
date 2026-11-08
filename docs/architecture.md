@@ -79,6 +79,9 @@ internal/
   conference/               RFC 4575 conference-info documents
   xmlsafe/                  the checks every XML document reader shares: size,
                             DTD, depth, one root, attributes, character references
+  chatbot/                  what every service applies alike to chatbots (ADR 0009):
+                            the chatbot URI normal form and RCS_CHATBOT_DOMAIN,
+                            size bounds and default content types
   ftserver/                 ft-server service logic
   ftserver/store/           ft-server storage interfaces, memory backends,
                             storetest contract

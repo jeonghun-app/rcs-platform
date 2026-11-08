@@ -220,8 +220,9 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      (253,952 bytes) of UTF-8, above the 250 KB RCC.07 v13.0 §3.6.10.1
      suggests for JSON payloads. It is one constant in `internal/chatbot`.
      `rcs-as` reserves 8 KiB for the CPIM it writes around it: the chatbot
-     URI and To at most 256 bytes each, the display name at most 128 bytes
-     before escaping (at most 896 after `EscapeDisplayName` and quoting),
+     URI and To at most 255 bytes each (`identity.MaxLength`), the display
+     name at most 128 bytes before escaping (at most 896 after
+     `EscapeDisplayName` and quoting),
      the bot tags, DateTime, NS, Message-ID (128 bytes), dispositions and the
      multipart framing come to under 4 KiB. It refuses to start with the API
      on if `RCSAS_MAX_MESSAGE_SIZE` is below 256 KiB (its default), so
