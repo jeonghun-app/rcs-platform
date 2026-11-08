@@ -330,8 +330,11 @@ func (b *Bridge) nameOf(u sip.URI) string {
 // until it registers again or its retry timer runs, a minute or more
 // (docs/rcs-as.md, When a queue is read again), so what was refused, and
 // all sent to it since, would wait that long; a refresh is a registration
-// to rcs-as. The others are not asked: each REGISTER counts against
-// scscf's challenge budget for the IMPI. An endpoint with no flow now
+// to rcs-as. The others are not asked: each REGISTER is challenged, and a
+// refresh counts against its registered flow's budget in scscf
+// (registrar.DefaultRegisteredFlowChallengeLimit, six a minute). Past it
+// the refresh is answered 500 and loses the flow, and the registration
+// minRetry later reads the queue instead. An endpoint with no flow now
 // registers anew anyway, which reads the queue as well.
 func (b *Bridge) refreshRefused(eps []*endpoint) {
 	b.mu.Lock()

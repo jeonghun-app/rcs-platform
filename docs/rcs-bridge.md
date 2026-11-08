@@ -280,10 +280,12 @@ refreshes their registrations at once, on their flows (#664): to `rcs-as` a
 refresh is a registration, and it sends what it kept, and what came since,
 straight away. The application does nothing for it. Only those endpoints are
 refreshed, once for all they refused while no stream was open. `scscf`
-challenges every REGISTER, ten a minute per IMPI, so an application that opens
-and closes its stream many times a minute while messages are refused can use
-that budget up; a refresh that fails then loses the flow, and the bridge
-registers again after its retry wait (above). An endpoint with no flow at that
+challenges every REGISTER; a refresh on a registered flow counts against that
+flow's own budget, six a minute, not the IMPI's. An application that opens and
+closes its stream more often than that while messages are refused uses it up:
+`scscf` answers the refresh 500, the bridge loses the flow (a `registration`
+event `failed`) and registers again about 2 s later (above), and what was
+kept comes with that registration, about 2 s late. An endpoint with no flow at that
 moment, offline or between retries, gets what was kept when it next
 registers. The bridge remembers at most one entry per endpoint it holds. This
 also covers an endpoint put online before a stream is open: what `rcs-as` kept
@@ -371,6 +373,6 @@ keys, the tokens and Message-IDs are never logged. A request line, at
 | 401 with the token from `deploy/compose.env` | The file changed after the bridge started. `make bridge-up` recreates it. |
 | `PUT` answers 502 "provisioning the subscriber failed: hss: ... answered 401" | `HSS_ADMIN_TOKEN` changed after `hss` started. `make up` recreates the services. |
 | `"registered": false`, `reason` "REGISTER answered 500" after many runs | `scscf`'s challenge budget per IMPI. Wait a minute; the bridge tries again by itself. |
-| A message event never comes | No event stream was open when it arrived, so the bridge answered 480 and `rcs-as` kept it. It comes once a stream is open: the bridge then refreshes the receiver's registration. If it still does not, look for `"msg":"refresh failed"` in the bridge's log (often `scscf`'s challenge budget): it comes once the receiver registers again, or at `rcs-as`'s next retry, a minute or more later. The sender has not been told it was delivered. |
+| A message event never comes | No event stream was open when it arrived, so the bridge answered 480 and `rcs-as` kept it. It comes once a stream is open: the bridge then refreshes the receiver's registration. If it still does not, look for `"msg":"refresh failed"` in the bridge's log: a refresh over the registered flow's challenge budget (six a minute) is answered 500, and the message comes about 2 s later, when the bridge registers the receiver again on a new flow. One that is offline gets it when it is put online. The sender has not been told it was delivered. |
 | `PUT` online answers 409 "as many endpoints as the bridge allows are online" | `RCS_BRIDGE_MAX_ENDPOINTS` endpoints are online. Put one offline first. |
 | `"sip_status": 413` | The CPIM body is over `rcs-as`'s pager limit, 1300 bytes. Large messages need MSRP, which the bridge does not do. |
