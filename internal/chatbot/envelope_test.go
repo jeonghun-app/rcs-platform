@@ -186,3 +186,24 @@ type selfDecoding struct {
 }
 
 func (*selfDecoding) UnmarshalJSON([]byte) error { return nil }
+
+type validated struct {
+	Body string `json:"body" maxbytes:"8"`
+}
+
+func (v validated) Validate() error {
+	if v.Body == "" {
+		return refuse(ErrInvalidEnvelope, "invalid body")
+	}
+	return nil
+}
+
+func TestDecodeEnvelopeValidatesATypeThatHasRules(t *testing.T) {
+	var v validated
+	if err := DecodeEnvelope(strings.NewReader(`{"body":"x"}`), 64, &v); err != nil || v.Body != "x" {
+		t.Errorf("valid: %v, %+v", err, v)
+	}
+	if err := DecodeEnvelope(strings.NewReader(`{}`), 64, &validated{}); !errors.Is(err, ErrInvalidEnvelope) || reasonOf(err) != "invalid body" {
+		t.Errorf("invalid: %v, want its Validate error", err)
+	}
+}
