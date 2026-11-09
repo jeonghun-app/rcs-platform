@@ -1,6 +1,8 @@
 package maap
 
 import (
+	"cmp"
+	"context"
 	"errors"
 	"net/http"
 
@@ -83,7 +85,9 @@ func (cb *chatbotAPI) remove(c *call) error {
 	if err != nil {
 		return err
 	}
-	ctx := c.r.Context()
+	budget := cmp.Or(cb.deleteBudget, deletionBudget)
+	ctx, cancel := context.WithTimeout(c.r.Context(), budget)
+	defer cancel()
 	// Read only for the audit line: a repeat finds nothing, and a record
 	// this release cannot read is deleted all the same.
 	old, err := cb.registry.Chatbot(ctx, id)

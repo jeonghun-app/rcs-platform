@@ -74,6 +74,10 @@ type Config struct {
 	CountersTable    string
 	// StatusTTL is how long a message's status is kept (ADR 0009 §10).
 	StatusTTL time.Duration
+	// StoreKey is RCS_PII_HMAC_KEY, which also keys the request digests
+	// maap-requests keeps (#749 security review): a key the platform
+	// already holds as a secret, unset only where production refuses it.
+	StoreKey secret.Key
 	// DynamoDBEndpoint replaces the AWS endpoint, for DynamoDB Local.
 	DynamoDBEndpoint string
 }
@@ -95,6 +99,7 @@ func Configure(s *runtime.Settings) Config {
 		CountersTable:    e.String("COUNTERS_TABLE", DefaultCountersTable),
 		StatusTTL:        e.Duration("STATUS_TTL", DefaultStatusTTL),
 		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
+		StoreKey:         secret.NewString(s.Shared.String("PII_HMAC_KEY", "")),
 		HTTPWebhooks:     !s.Environment.Production(),
 		InternalWebhooks: s.Environment == runtime.Dev,
 	}

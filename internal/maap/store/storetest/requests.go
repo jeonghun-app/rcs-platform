@@ -28,12 +28,11 @@ func MessageID() string {
 	return hex.EncodeToString(id)
 }
 
-// Idempotency returns a fresh record of the chatbot, with a random key,
-// digest, Message-ID and answer.
+// Idempotency returns a fresh pending record of the chatbot, with a
+// random key, digest and Message-ID.
 func Idempotency(chatbotID string) store.Idempotency {
 	return store.Idempotency{
-		Chatbot: chatbotID, Key: "k_" + rand.Text(), Digest: sha256.Sum256([]byte(rand.Text())),
-		MessageID: MessageID(), Answer: []byte(`{"message_id":"` + MessageID() + `"}`),
+		Chatbot: chatbotID, Key: "k_" + rand.Text(), Digest: sha256.Sum256([]byte(rand.Text())), MessageID: MessageID(),
 	}
 }
 
@@ -44,7 +43,8 @@ func RunRequests(t *testing.T, newRequests func(t *testing.T) store.Requests) {
 		name  string
 		check func(*testing.T, store.Requests)
 	}{
-		{"TheFirstRequestIsKeptAndReturnedToItsRepeats", remembers},
+		{"TheFirstRequestIsKeptPendingAndReturnedToItsRepeats", remembers},
+		{"OnlyTheWriterSettlesOrForgetsARecord", settles},
 		{"AKeyIsTheChatbotsOwn", keysPerChatbot},
 		{"ARecordIsKeptTwentyFourHoursJudgedAtRead", recordExpiry},
 		{"OnlyOneOfConcurrentRequestsWithAKeyIsKept", concurrentRemembers},
@@ -59,28 +59,35 @@ func RunRequests(t *testing.T, newRequests func(t *testing.T) store.Requests) {
 	}
 }
 
+// pending is rec as Remember keeps it at created.
+func pending(rec store.Idempotency, created time.Time) store.Idempotency {
+	rec.Created, rec.Pending = created, true
+	return rec
+}
+
 // remember calls Remember and checks it kept want, stored by this call
-// or not.
-func remember(t *testing.T, r store.Requests, rec store.Idempotency, now time.Time, want store.Idempotency, fresh bool) {
+// (with a writer token of its own) or not (without one); it returns the
+// record kept.
+func remember(t *testing.T, r store.Requests, rec store.Idempotency, now time.Time, want store.Idempotency, fresh bool) store.Idempotency {
 	t.Helper()
 	got, stored, err := r.Remember(context.Background(), rec, now)
 	if err != nil {
 		t.Fatalf("Remember = %v", err)
 	}
 	if stored != fresh || got.Chatbot != want.Chatbot || got.Key != want.Key || got.Digest != want.Digest ||
-		got.MessageID != want.MessageID || !bytes.Equal(got.Answer, want.Answer) || !got.Created.Equal(want.Created) ||
-		got.Created.Location() != time.UTC {
+		got.MessageID != want.MessageID || got.Pending != want.Pending || !bytes.Equal(got.Answer, want.Answer) ||
+		!got.Created.Equal(want.Created) || got.Created.Location() != time.UTC || (got.Writer != "") != fresh {
 		t.Fatalf("Remember = %+v, stored %v\nwant %+v, stored %v", got, stored, want, fresh)
 	}
+	return got
 }
 
 func remembers(t *testing.T, r store.Requests) {
 	first := Idempotency(Chatbot().ID)
-	kept := first
-	kept.Created = Now.Truncate(time.Second)
+	kept := pending(first, Now.Truncate(time.Second))
 	remember(t, r, first, Now.Add(400*time.Millisecond), kept, true)
-	// A repeat of the request, with the Message-ID and answer a retry
-	// would have made, gets the first ones.
+	// A repeat of the request, with the Message-ID a retry would have
+	// made, gets the first record, pending.
 	again := Idempotency(first.Chatbot)
 	again.Key, again.Digest = first.Key, first.Digest
 	remember(t, r, again, Now.Add(time.Minute), kept, false)
@@ -91,13 +98,70 @@ func remembers(t *testing.T, r store.Requests) {
 	}
 	// It changed nothing.
 	remember(t, r, again, Now.Add(2*time.Minute), kept, false)
-	// A record without an answer keeps none.
-	bare := Idempotency(first.Chatbot)
-	bare.Answer = nil
-	kept = bare
-	kept.Created = Now
-	remember(t, r, bare, Now, kept, true)
-	remember(t, r, bare, Now, kept, false)
+}
+
+func settles(t *testing.T, r store.Requests) {
+	ctx := context.Background()
+	rec := Idempotency(Chatbot().ID)
+	mine := remember(t, r, rec, Now, pending(rec, Now), true)
+	answer := []byte(`{"message_id":"` + rec.MessageID + `"}`)
+	// Another writer, an expired record, and no record are refused.
+	if err := r.Settle(ctx, rec.Chatbot, rec.Key, "another", answer, Now); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Settle by another writer = %v", err)
+	}
+	if err := r.Forget(ctx, rec.Chatbot, rec.Key, "another"); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Forget by another writer = %v", err)
+	}
+	if err := r.Settle(ctx, rec.Chatbot, rec.Key, mine.Writer, answer, Now.Add(store.IdempotencyTTL)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Settle of an expired record = %v", err)
+	}
+	if err := r.Settle(ctx, rec.Chatbot, "k_none", mine.Writer, answer, Now); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Settle of no record = %v", err)
+	}
+	remember(t, r, rec, Now, pending(rec, Now), false)
+	// The writer settles it, twice harmlessly; repeats get the answer.
+	for range 2 {
+		if err := r.Settle(ctx, rec.Chatbot, rec.Key, mine.Writer, answer, Now.Add(time.Second)); err != nil {
+			t.Fatalf("Settle = %v", err)
+		}
+	}
+	settled := pending(rec, Now)
+	settled.Pending, settled.Answer = false, answer
+	remember(t, r, rec, Now.Add(time.Minute), settled, false)
+	// The longest answer and an empty one settle too.
+	for _, a := range [][]byte{bytes.Repeat([]byte{0xff}, store.MaxAnswerBytes), nil} {
+		if err := r.Settle(ctx, rec.Chatbot, rec.Key, mine.Writer, a, Now); err != nil {
+			t.Fatalf("Settle of %d bytes = %v", len(a), err)
+		}
+		settled.Answer = a
+		remember(t, r, rec, Now, settled, false)
+	}
+	if err := r.Settle(ctx, rec.Chatbot, rec.Key, mine.Writer, make([]byte, store.MaxAnswerBytes+1), Now); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("Settle of an answer over its size = %v", err)
+	}
+	// Forgotten by its writer, twice harmlessly, the key takes a request
+	// again, whose writer the first no longer is.
+	for range 2 {
+		if err := r.Forget(ctx, rec.Chatbot, rec.Key, mine.Writer); err != nil {
+			t.Fatalf("Forget = %v", err)
+		}
+	}
+	next := Idempotency(rec.Chatbot)
+	next.Key = rec.Key
+	remember(t, r, next, Now, pending(next, Now), true)
+	if err := r.Forget(ctx, rec.Chatbot, rec.Key, mine.Writer); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Forget by the old writer = %v", err)
+	}
+	if err := r.Settle(ctx, rec.Chatbot, rec.Key, mine.Writer, answer, Now); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Settle by the old writer = %v", err)
+	}
+	for _, err := range []error{
+		r.Settle(ctx, "c#1", rec.Key, mine.Writer, answer, Now), r.Forget(ctx, rec.Chatbot, "a\r\nb", mine.Writer),
+	} {
+		if !errors.Is(err, store.ErrInvalid) {
+			t.Fatalf("a malformed key = %v", err)
+		}
+	}
 }
 
 func keysPerChatbot(t *testing.T, r store.Requests) {
@@ -105,24 +169,20 @@ func keysPerChatbot(t *testing.T, r store.Requests) {
 	b := Idempotency(Chatbot().ID)
 	b.Key = a.Key
 	for _, rec := range []store.Idempotency{a, b} {
-		kept := rec
-		kept.Created = Now
-		remember(t, r, rec, Now, kept, true)
+		remember(t, r, rec, Now, pending(rec, Now), true)
 	}
 }
 
 func recordExpiry(t *testing.T, r store.Requests) {
 	first := Idempotency(Chatbot().ID)
-	kept := first
-	kept.Created = Now
+	kept := pending(first, Now)
 	remember(t, r, first, Now, kept, true)
 	remember(t, r, first, Now.Add(store.IdempotencyTTL-time.Second), kept, false)
 	// At 24 hours the record is gone, whether or not the item still is,
 	// and the key takes another request.
 	later := Idempotency(first.Chatbot)
 	later.Key = first.Key
-	kept = later
-	kept.Created = Now.Add(store.IdempotencyTTL)
+	kept = pending(later, Now.Add(store.IdempotencyTTL))
 	remember(t, r, later, kept.Created, kept, true)
 	remember(t, r, later, kept.Created.Add(time.Hour), kept, false)
 }
@@ -141,7 +201,7 @@ func concurrentRemembers(t *testing.T, r store.Requests) {
 		return err
 	})
 	oneWins(t, errs, store.ErrKeyReused)
-	// Repeats of one request: all get the one kept.
+	// Repeats of one request: all get the one kept, and one writer only.
 	same := Idempotency(chatbotID)
 	ids := make([]string, 16)
 	var stored atomic.Int32
@@ -167,16 +227,16 @@ func concurrentRemembers(t *testing.T, r store.Requests) {
 
 func malformedRecords(t *testing.T, r store.Requests) {
 	cases := map[string]func(*store.Idempotency){
-		"empty key":            func(rec *store.Idempotency) { rec.Key = "" },
-		"key over 64":          func(rec *store.Idempotency) { rec.Key = strings.Repeat("k", 65) },
-		"key with a space":     func(rec *store.Idempotency) { rec.Key = "a b" },
-		"key with CR LF":       func(rec *store.Idempotency) { rec.Key = "a\r\nb" },
-		"key with a NUL":       func(rec *store.Idempotency) { rec.Key = "a\x00" },
-		"key not ASCII":        func(rec *store.Idempotency) { rec.Key = "clé" },
-		"bad chatbot ID":       func(rec *store.Idempotency) { rec.Chatbot = "c#1" },
-		"upper-case hex":       func(rec *store.Idempotency) { rec.MessageID = "A" + rec.MessageID[1:] },
-		"short Message-ID":     func(rec *store.Idempotency) { rec.MessageID = rec.MessageID[1:] },
-		"answer over its size": func(rec *store.Idempotency) { rec.Answer = make([]byte, store.MaxAnswerBytes+1) },
+		"empty key":        func(rec *store.Idempotency) { rec.Key = "" },
+		"key over 64":      func(rec *store.Idempotency) { rec.Key = strings.Repeat("k", 65) },
+		"key with a space": func(rec *store.Idempotency) { rec.Key = "a b" },
+		"key with CR LF":   func(rec *store.Idempotency) { rec.Key = "a\r\nb" },
+		"key with a NUL":   func(rec *store.Idempotency) { rec.Key = "a\x00" },
+		"key not ASCII":    func(rec *store.Idempotency) { rec.Key = "clé" },
+		"bad chatbot ID":   func(rec *store.Idempotency) { rec.Chatbot = "c#1" },
+		"upper-case hex":   func(rec *store.Idempotency) { rec.MessageID = "A" + rec.MessageID[1:] },
+		"short Message-ID": func(rec *store.Idempotency) { rec.MessageID = rec.MessageID[1:] },
+		"an answer":        func(rec *store.Idempotency) { rec.Answer = []byte("{}") },
 	}
 	for name, mutate := range cases {
 		rec := Idempotency(Chatbot().ID)
@@ -185,12 +245,10 @@ func malformedRecords(t *testing.T, r store.Requests) {
 			t.Errorf("%s: Remember = %v", name, err)
 		}
 	}
-	// The longest key and answer are stored.
+	// The longest key is stored.
 	rec := Idempotency(Chatbot().ID)
-	rec.Key, rec.Answer = strings.Repeat("-", 64), bytes.Repeat([]byte{0xff}, store.MaxAnswerBytes)
-	kept := rec
-	kept.Created = Now
-	remember(t, r, rec, Now, kept, true)
+	rec.Key = strings.Repeat("-", 64)
+	remember(t, r, rec, Now, pending(rec, Now), true)
 }
 
 func deletesRecords(t *testing.T, r store.Requests) {
@@ -222,13 +280,9 @@ func deletesRecords(t *testing.T, r store.Requests) {
 		}
 		other := Idempotency(rec.Chatbot)
 		other.Key = rec.Key
-		kept := other
-		kept.Created = Now
-		remember(t, r, other, Now, kept, true)
+		remember(t, r, other, Now, pending(other, Now), true)
 	}
-	kept := stays
-	kept.Created = Now
-	remember(t, r, stays, Now, kept, false)
+	remember(t, r, stays, Now, pending(stays, Now), false)
 	if st, err := r.Status(ctx, stays.Chatbot, stays.MessageID, Now); err != nil || st.State != store.Accepted {
 		t.Fatalf("another chatbot's status = %+v, %v", st, err)
 	}

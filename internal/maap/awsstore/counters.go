@@ -200,7 +200,7 @@ func (s *Counters) giveBack(ctx context.Context, k map[string]types.AttributeVal
 
 // DeleteChatbot implements store.ChatbotDeleter.
 func (s *Counters) DeleteChatbot(ctx context.Context, chatbotID string) error {
-	return deletePartition(ctx, s.api, s.table, "c#"+chatbotID, s.pageSize)
+	return deletePartition(ctx, s.api, s.table, "c#"+chatbotID, chatbotID, s.pageSize)
 }
 
 // Ready checks the table for /readyz, as the registry's Ready does.

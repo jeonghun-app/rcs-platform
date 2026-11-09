@@ -49,7 +49,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		}
 		r := awsstore.NewRegistry(ddb, cfg.RegistryTable)
 		registry, creds = r, r.Credentials()
-		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StatusTTL)
+		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StoreKey, cfg.StatusTTL)
 		counters = awsstore.NewCounters(ddb, cfg.CountersTable)
 	}
 	for _, t := range []struct {

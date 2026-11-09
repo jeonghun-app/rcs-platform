@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"fmt"
 	"slices"
 	"sync"
@@ -27,7 +28,7 @@ func NewMemoryRequests(statusTTL time.Duration) *MemoryRequests {
 
 // Remember implements Requests.
 func (m *MemoryRequests) Remember(_ context.Context, rec Idempotency, now time.Time) (Idempotency, bool, error) {
-	if err := CheckIdempotency(rec); err != nil {
+	if err := CheckRemember(rec); err != nil {
 		return Idempotency{}, false, err
 	}
 	m.mu.Lock()
@@ -37,12 +38,58 @@ func (m *MemoryRequests) Remember(_ context.Context, rec Idempotency, now time.T
 		if old.Digest != rec.Digest {
 			return Idempotency{}, false, fmt.Errorf("store: remember request: %w", ErrKeyReused)
 		}
-		old.Answer = append([]byte(nil), old.Answer...)
+		old.Answer, old.Writer = append([]byte(nil), old.Answer...), ""
+		if len(old.Answer) == 0 {
+			old.Answer = nil
+		}
 		return old, false, nil
 	}
-	rec.Created, rec.Answer = Seconds(now), append([]byte(nil), rec.Answer...)
+	rec.Created, rec.Pending, rec.Answer, rec.Writer = Seconds(now), true, nil, rand.Text()
 	m.records[k] = rec
 	return rec, true, nil
+}
+
+// Settle implements Requests.
+func (m *MemoryRequests) Settle(_ context.Context, chatbotID, key, writer string, answer []byte, now time.Time) error {
+	if err := CheckRecordKey(chatbotID, key); err != nil {
+		return err
+	}
+	if len(answer) > MaxAnswerBytes {
+		return fmt.Errorf("%w: an answer over %d bytes", ErrInvalid, MaxAnswerBytes)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := [2]string{chatbotID, key}
+	switch rec, ok := m.records[k]; {
+	case !ok || !Live(rec.Created, IdempotencyTTL, now):
+		return fmt.Errorf("store: settle request: %w", ErrNotFound)
+	case rec.Writer != writer:
+		return fmt.Errorf("store: settle request: %w", ErrConflict)
+	default:
+		rec.Pending, rec.Answer = false, append([]byte(nil), answer...)
+		if len(rec.Answer) == 0 {
+			rec.Answer = nil
+		}
+		m.records[k] = rec
+	}
+	return nil
+}
+
+// Forget implements Requests.
+func (m *MemoryRequests) Forget(_ context.Context, chatbotID, key, writer string) error {
+	if err := CheckRecordKey(chatbotID, key); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := [2]string{chatbotID, key}
+	if rec, ok := m.records[k]; ok {
+		if rec.Writer != writer {
+			return fmt.Errorf("store: forget request: %w", ErrConflict)
+		}
+		delete(m.records, k)
+	}
+	return nil
 }
 
 // Accept implements Requests.
