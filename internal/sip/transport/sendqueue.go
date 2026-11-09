@@ -366,7 +366,9 @@ func (t *Transport) writeLoop(f *flow) {
 // resetStalled ends a core connection whose oldest output waited longer than
 // MaxQueueAge (#623). It resets the connection rather than closing it: a FIN
 // would wait behind the output still in the kernel, which the peer is not
-// taking either. The log line names no peer, as Config.Logger requires.
+// taking either. The log line says which connection it was without naming
+// an address or anyone (Config.Logger): the listener it was accepted on, or
+// that it was dialed and for which service.
 func (t *Transport) resetStalled(f *flow) {
 	queued := f.q.size()
 	c := f.conn
@@ -383,6 +385,11 @@ func (t *Transport) resetStalled(f *flow) {
 	if t.cfg.Metrics != nil {
 		t.cfg.Metrics.Count(MetricWriteStalls, 1)
 	}
-	t.cfg.Logger.Warn("sip transport: reset a core connection whose oldest output waited longer than MaxQueueAge",
-		"queued_bytes", queued, "max_queue_age", t.cfg.MaxQueueAge)
+	attrs := []any{"queued_bytes", queued, "max_queue_age", t.cfg.MaxQueueAge.String()}
+	if f.lis != nil {
+		attrs = append(attrs, "listener", f.lis.name)
+	} else {
+		attrs = append(attrs, "dialed", true, "peer", f.peerName)
+	}
+	t.cfg.Logger.Warn("sip transport: reset a core connection whose oldest output waited longer than MaxQueueAge", attrs...)
 }

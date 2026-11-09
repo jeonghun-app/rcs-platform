@@ -52,6 +52,9 @@ type flow struct {
 	// it is part of the reuse key so a connection verified for one name is never
 	// reused for another.
 	serverName string
+	// peerName is the Destination.PeerName an outbound connection was dialed
+	// for, which its warnings show.
+	peerName string
 
 	conn net.Conn // nil for UDP
 	// q feeds the writer goroutine of a stream flow.

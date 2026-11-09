@@ -107,7 +107,8 @@ func TestTwoWayInviteBurstOutlastsAShrunkReceiveBuffer(t *testing.T) {
 // rule resets the connection once B's oldest output has waited MaxQueueAge,
 // and a second round of INVITEs both ways then completes over new
 // connections. The transactions whose messages the reset dropped are not
-// waited for: they end at Timer B or F either way. WriteTimeout stays at
+// waited for: they end at Timer B or F, or, for an INVITE that already had a
+// provisional answer and so has no Timer B, at the TU's Timer C. WriteTimeout stays at
 // the burst's 30 s, so only the queue-age rule can end the stall;
 // MaxQueueAge is 3 s rather than the default 32 s to keep the test short.
 // At the default the reset came about 35 s after the shrink.

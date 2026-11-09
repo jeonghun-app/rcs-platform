@@ -31,9 +31,9 @@ func TestTheResolverLooksUpOnlyNamesInTheNamespaceAndUsesPrivateAddresses(t *tes
 		return r.Resolve(t.Context(), u)
 	}
 	for in, want := range map[string]transport.Destination{
-		"sip:scscf.rcs.internal;transport=tcp;lr":   {Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.1.5:5060")},
-		"sip:scscf.rcs.internal:5070;transport=tcp": {Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.1.5:5070")},
-		"sips:scscf.rcs.internal":                   {Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.1.5:5061"), ServerName: "scscf.rcs.internal"},
+		"sip:scscf.rcs.internal;transport=tcp;lr":   {Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.1.5:5060"), PeerName: "scscf.rcs.internal"},
+		"sip:scscf.rcs.internal:5070;transport=tcp": {Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.1.5:5070"), PeerName: "scscf.rcs.internal"},
+		"sips:scscf.rcs.internal":                   {Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.1.5:5061"), ServerName: "scscf.rcs.internal", PeerName: "scscf.rcs.internal"},
 		"sip:10.0.2.7:5080;transport=tcp":           {Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.2.7:5080")},
 		"sip:127.0.0.1:5080;transport=tcp":          {Network: transport.TCP, Addr: netip.MustParseAddrPort("127.0.0.1:5080")},
 	} {

@@ -121,10 +121,10 @@ func (b *lockedBuffer) String() string {
 	return b.b.String()
 }
 
-// stallBound is how long a test waits for the queue-age rule to act. It is a
-// failure deadline only: the rule acts after MaxQueueAge, and the test goes
-// on as soon as it has.
-const stallBound = 30 * time.Second
+// stallBound is how long a test waits for the queue-age rule to act, or for
+// a paced burst to drain, the longest in about 45 s. It is a failure deadline
+// only: the test goes on as soon as what it waits for has happened.
+const stallBound = 2 * time.Minute
 
 func waitUntil(t *testing.T, what string, cond func() bool) {
 	t.Helper()
@@ -140,8 +140,9 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 // A core peer that takes nothing more: once the oldest message in the queue
 // has waited MaxQueueAge the connection is reset, not closed, since a FIN
 // would wait behind the output the kernel still holds. It counts as a stall,
-// in Stats and in the metric at once, with one log line that names no peer,
-// and the next send dials anew (#623). WriteTimeout is an hour, so only the
+// in Stats and in the metric at once, with one log line that says it was
+// dialed and for which service but gives no address, and the next send dials
+// anew (#623). WriteTimeout is an hour, so only the
 // queue-age rule can end the connection.
 func TestACoreConnectionWhoseOldestOutputWaitsLongerThanMaxQueueAgeIsReset(t *testing.T) {
 	peer := newStallPeer(t)
@@ -149,18 +150,11 @@ func TestACoreConnectionWhoseOldestOutputWaitsLongerThanMaxQueueAgeIsReset(t *te
 	var logs lockedBuffer
 	tr, _ := newTransport(t, Config{
 		WriteTimeout: time.Hour, MaxQueueAge: time.Second, Metrics: counts,
-		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		Logger: slog.New(slog.NewJSONHandler(&logs, nil)),
 	})
-	body := []byte(strings.Repeat("x", 32<<10))
-	// 3 MiB: more than the kernel's buffers on both ends hold, less than
-	// the queue's limit, so no send waits for room.
-	for i := range 96 {
-		req := newRequest(t, "MESSAGE", fmt.Sprintf("SIP/2.0/TCP p.invalid;branch=z9hG4bKage%d", i))
-		req.Body = body
-		if _, err := tr.SendRequest(req, peer.dst()); err != nil {
-			t.Fatal(err)
-		}
-	}
+	dst := peer.dst()
+	dst.PeerName = "scscf.rcs.internal"
+	queueThreeMiB(t, tr, dst)
 	stalled := peer.next(t) // never read until the reset
 	waitUntil(t, "the stall reset", func() bool { return tr.Stats().WriteStalls == 1 })
 
@@ -175,13 +169,7 @@ func TestACoreConnectionWhoseOldestOutputWaitsLongerThanMaxQueueAgeIsReset(t *te
 	if n := counts.get(MetricWriteStalls); n != 1 {
 		t.Errorf("%s counted %d, want 1", MetricWriteStalls, n)
 	}
-	out := logs.String()
-	if strings.Count(out, "\n") != 1 || !strings.Contains(out, "MaxQueueAge") {
-		t.Errorf("log %q, want one line about the reset", out)
-	}
-	if host := peer.dst().Addr.Addr().String(); strings.Contains(out, host) {
-		t.Errorf("log %q names the peer", out)
-	}
+	checkResetLog(t, logs.String(), stalled, `"dialed":true`, `"peer":"scscf.rcs.internal"`, `"max_queue_age":"1s"`)
 
 	req := newRequest(t, "OPTIONS", "SIP/2.0/TCP p.invalid;branch=z9hG4bKagenext")
 	if _, err := tr.SendRequest(req, peer.dst()); err != nil {
@@ -195,6 +183,60 @@ func TestACoreConnectionWhoseOldestOutputWaitsLongerThanMaxQueueAgeIsReset(t *te
 	if s := tr.Stats(); s.Dialed != 2 {
 		t.Errorf("Dialed %d, want 2", s.Dialed)
 	}
+}
+
+// queueThreeMiB queues 3 MiB for dst: more than the kernel's buffers on both
+// ends hold, less than the queue's limit, so no send waits for room.
+func queueThreeMiB(t *testing.T, tr *Transport, dst Destination) {
+	t.Helper()
+	body := []byte(strings.Repeat("x", 32<<10))
+	for i := range 96 {
+		req := newRequest(t, "MESSAGE", fmt.Sprintf("SIP/2.0/TCP p.invalid;branch=z9hG4bKage%d", i))
+		req.Body = body
+		if _, err := tr.SendRequest(req, dst); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// checkResetLog checks that out is the reset's one warning, in JSON as the
+// services log, with want in it and no address or port of conn, the peer's
+// end of the connection.
+func checkResetLog(t *testing.T, out string, conn net.Conn, want ...string) {
+	t.Helper()
+	if strings.Count(out, "\n") != 1 || !strings.Contains(out, "MaxQueueAge") {
+		t.Errorf("log %q, want one line about the reset", out)
+	}
+	for _, w := range want {
+		if !strings.Contains(out, w) {
+			t.Errorf("log %q lacks %s", out, w)
+		}
+	}
+	for _, a := range []net.Addr{conn.LocalAddr(), conn.RemoteAddr()} {
+		ap := netip.MustParseAddrPort(a.String())
+		if strings.Contains(out, ap.Addr().String()) || strings.Contains(out, fmt.Sprint(ap.Port())) {
+			t.Errorf("log %q shows %s", out, ap)
+		}
+	}
+}
+
+// A connection accepted on a core listener is reset by the same rule, and its
+// warning names the listener (#623).
+func TestAnAcceptedCoreConnectionWhoseOldestOutputWaitsTooLongIsReset(t *testing.T) {
+	var logs lockedBuffer
+	tr, rec := newTransport(t, Config{WriteTimeout: time.Hour, MaxQueueAge: time.Second, Logger: slog.New(slog.NewJSONHandler(&logs, nil))})
+	c := dialRaw(t, listen(t, tr, ListenerConfig{Name: "core", Network: TCP})) // never read until the reset
+	c.Write([]byte(rawRequest("OPTIONS", "Via: SIP/2.0/TCP scscf.example.com;branch=z9hG4bK1")))
+	queueThreeMiB(t, tr, Destination{Flow: rec.next(t).Source.Flow})
+	waitUntil(t, "the stall reset", func() bool { return tr.Stats().WriteStalls == 1 })
+	c.SetReadDeadline(time.Now().Add(stallBound))
+	if _, err := io.Copy(io.Discard, c); !errors.Is(err, syscall.ECONNRESET) {
+		t.Errorf("the peer read to %v, want a reset", err)
+	}
+	if s := tr.Stats(); s.WriteErrors != 0 || s.OpenInbound != 0 {
+		t.Errorf("WriteErrors %d, OpenInbound %d after the reset, want 0, 0", s.WriteErrors, s.OpenInbound)
+	}
+	checkResetLog(t, logs.String(), c, `"listener":"core"`)
 }
 
 // Client-facing connections keep the rules they had: a client that stops
@@ -222,19 +264,17 @@ func TestAClientFacingConnectionIsNotResetForTheAgeOfItsQueue(t *testing.T) {
 	}
 }
 
-// pacedBurst sends 4.25 MiB of 32 KiB MESSAGEs from 8 goroutines, a little
-// more than a core queue holds, to a peer that reads every connection at
-// 320 KiB/s, QA's slow core peer (#623 AC 2). The reader keeps to its rate on
-// average, catching up after a pause, so a loaded host that delays it does not
-// make the messages wait longer. Each message is written within about 0.1 s
-// of the writer starting it, but waits about 4 MiB / 320 KiB/s, 13 s, in the
-// queue first. pacedBurst watches until stop holds, then closes the transport,
-// and returns the most the queue held.
-func pacedBurst(t *testing.T, cfg Config, stop func(*Transport, bool) bool) (tr *Transport, peak int) {
+// pacedBurst sends 8*perSender 32 KiB MESSAGEs from 8 goroutines to a peer
+// that reads every connection at rate bytes a second. The reader keeps to its
+// rate on average, catching up after a pause, so a loaded host that delays it
+// does not make the messages wait longer. pacedBurst watches until stop
+// holds, then closes the transport, and returns the most the queue held. The
+// tests run in parallel, since each takes as long as its burst.
+func pacedBurst(t *testing.T, cfg Config, rate float64, perSender int, stop func(*Transport, bool) bool) (tr *Transport, peak int) {
 	t.Helper()
+	t.Parallel()
 	peer := newStallPeer(t)
 	tr, _ = newTransport(t, cfg)
-	const rate = 320 << 10 // bytes a second
 	quit := make(chan struct{})
 	t.Cleanup(func() { close(quit) })
 	go func() {
@@ -270,7 +310,7 @@ func pacedBurst(t *testing.T, cfg Config, stop func(*Transport, bool) bool) (tr 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range 17 {
+			for i := range perSender {
 				req := newRequest(t, "MESSAGE", fmt.Sprintf("SIP/2.0/TCP p.invalid;branch=z9hG4bKr%d-%d", g, i))
 				req.Body = body
 				_, _ = tr.SendRequest(req, peer.dst())
@@ -293,33 +333,46 @@ func pacedBurst(t *testing.T, cfg Config, stop func(*Transport, bool) bool) (tr 
 	return tr, peak
 }
 
-// QA's slow core peer keeps its connection at the default MaxQueueAge: its
-// messages wait about 13 s, well inside 32 s.
-func TestACorePeerReading320KiBPerSecondKeepsItsConnectionAtTheDefaultMaxQueueAge(t *testing.T) {
-	var s Stats
-	_, peak := pacedBurst(t, Config{}, func(tr *Transport, sent bool) bool {
-		s = tr.Stats()
-		return s.WriteStalls+s.WriteErrors > 0 || sent && s.QueuedBytes == 0
-	})
-	// Without a full queue no message waited long, and the test would pass
-	// without the rule being near.
-	if peak < 3<<20 {
-		t.Fatalf("the queue held at most %d bytes, want 3 MiB or more for messages to wait over 9 s", peak)
-	}
-	if s.WriteStalls != 0 || s.WriteErrors != 0 || s.Dialed != 1 || s.OpenOutbound != 1 {
-		t.Errorf("WriteStalls %d, WriteErrors %d, Dialed %d, OpenOutbound %d: the connection to a peer reading 320 KiB/s was ended",
-			s.WriteStalls, s.WriteErrors, s.Dialed, s.OpenOutbound)
+// A peer that drains each message within the default MaxQueueAge keeps its
+// connection (#623 AC 2). QA's slow core peer reads 320 KiB/s while 4.25 MiB,
+// a little more than a queue holds, arrives: its messages wait about 13 s.
+// One reading 200 KiB/s, above the documented floor of about 128 KiB/s, gets
+// 8.5 MiB, twice a queue: each message waits about 21 s, but the writer takes
+// a queue's worth at a time and spends about 40 s on two of them, so a rule
+// that dated a batch by its first message would cut it (code review of #725).
+func TestACorePeerThatDrainsEachMessageWithinTheDefaultMaxQueueAgeKeepsItsConnection(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		rate      float64
+		perSender int
+	}{{"320 KiB/s, 4.25 MiB", 320 << 10, 17}, {"200 KiB/s, 8.5 MiB", 200 << 10, 34}} {
+		t.Run(c.name, func(t *testing.T) {
+			var s Stats
+			_, peak := pacedBurst(t, Config{}, c.rate, c.perSender, func(tr *Transport, sent bool) bool {
+				s = tr.Stats()
+				return s.WriteStalls+s.WriteErrors > 0 || sent && s.QueuedBytes == 0
+			})
+			// Without a full queue no message waited long, and the test would
+			// pass without the rule being near.
+			if peak < 3<<20 {
+				t.Fatalf("the queue held at most %d bytes, want 3 MiB or more for messages to wait over 9 s", peak)
+			}
+			if s.WriteStalls != 0 || s.WriteErrors != 0 || s.Dialed != 1 || s.OpenOutbound != 1 {
+				t.Errorf("WriteStalls %d, WriteErrors %d, Dialed %d, OpenOutbound %d: the connection was ended",
+					s.WriteStalls, s.WriteErrors, s.Dialed, s.OpenOutbound)
+			}
+		})
 	}
 }
 
-// The same peer loses its connection when MaxQueueAge is 4 s, shorter than
-// its messages wait: the rule is the age of the queue, not how long one
+// QA's peer loses its connection when MaxQueueAge is 4 s, shorter than its
+// messages wait: the rule is the age of the queue, not how long one
 // message takes to write, which is a tenth of a second here. This is the
 // trade-off #623 accepts, a peer slower than SendQueueBytes / MaxQueueAge
 // with its queue full.
 func TestACorePeerWhoseMessagesWaitLongerThanMaxQueueAgeIsResetThoughItReads(t *testing.T) {
 	var s Stats
-	pacedBurst(t, Config{MaxQueueAge: 4 * time.Second}, func(tr *Transport, sent bool) bool {
+	pacedBurst(t, Config{MaxQueueAge: 4 * time.Second}, 320<<10, 17, func(tr *Transport, sent bool) bool {
 		s = tr.Stats()
 		return s.WriteStalls > 0 || sent && s.QueuedBytes == 0
 	})

@@ -75,5 +75,6 @@ func (r Resolver) Resolve(ctx context.Context, u sip.URI) (transport.Destination
 	if dst.Network == transport.TLS {
 		dst.ServerName = host
 	}
+	dst.PeerName = host
 	return dst, nil
 }
