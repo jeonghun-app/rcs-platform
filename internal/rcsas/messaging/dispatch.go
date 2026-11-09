@@ -1088,7 +1088,9 @@ func (e *Engine) release(m store.Message) {
 // before m is removed, so a failure in between repeats it rather than loses
 // it; its ID derives from m's, so the repeat is the same queue item.
 func (e *Engine) giveUp(m store.Message, metric string) bool {
-	if !m.Notification {
+	// A chatbot's negative notification goes through maap (#705), never
+	// into a queue of the chatbot's URI.
+	if !m.Notification && !m.Chatbot {
 		n, err := e.notification(m, failedDelivery, m.ID+"-f", e.clock.Now())
 		switch {
 		case err == nil:

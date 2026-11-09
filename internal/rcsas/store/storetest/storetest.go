@@ -58,6 +58,8 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("EachSenderHasAShareOfAQueue", func(t *testing.T) { senderShares(t, newStore(t)) })
 	t.Run("AGroupMessageCountsAgainstItsAuthorsShare", func(t *testing.T) { groupShares(t, newStore(t)) })
 	t.Run("RemovingAGroupNotificationFreesTheTotal", func(t *testing.T) { groupTotalFreed(t, newStore(t)) })
+	t.Run("ChatbotsHoldAShareEachAndATotalTogether", func(t *testing.T) { chatbotShares(t, newStore(t)) })
+	t.Run("AChatbotsFullShareIsToldBeforeAFullQueue", func(t *testing.T) { chatbotShareFirst(t, newStore(t)) })
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 	t.Run("ASummaryGoesOnlyOnceItsMarksAreSent", func(t *testing.T) { summaries(t, newStore(t)) })
@@ -571,6 +573,89 @@ func groupTotalFreed(t *testing.T, s store.Store) {
 		if err := s.Remove(ctx, held, "task-a"); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// chatbotShares: each chatbot holds a sender's share of a queue and all
+// of them together at most their total, past which the queue counts as
+// full; a person's message beside them goes in. No queue read returns a
+// chatbot's message; the sweep's do, marked, with the time it was
+// accepted, and its removal frees the total (#699, #738 review).
+func chatbotShares(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	l := store.Limit{Count: 20, SenderCount: 2, ChatbotCount: 3}
+	bot := func(n int, id string) store.Message {
+		m := message(alice, store.ChatbotIDPrefix+id, t0)
+		m.Sender, m.Mode, m.Chatbot = fmt.Sprintf("sip:bot%d@botplatform.example.net", n), store.Standalone, true
+		return m
+	}
+	for _, m := range []store.Message{bot(1, "0001"), bot(1, "0002"), bot(2, "0003")} {
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatalf("%s = %v", m.ID, err)
+		}
+	}
+	if err := s.Enqueue(ctx, bot(1, "0005"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("beyond a chatbot's share = %v", err)
+	}
+	if err := s.Enqueue(ctx, bot(3, "0006"), l); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("beyond the chatbots' total = %v", err)
+	}
+	if err := s.Enqueue(ctx, message(alice, "0007", t0), l); err != nil {
+		t.Fatalf("a person beside the full total = %v", err)
+	}
+	if err := s.Enqueue(ctx, message(alice, store.ChatbotIDPrefix+"0008", t0), none); err == nil {
+		t.Fatal("a person's message under a chatbot ID was taken")
+	}
+	if ms, err := s.Pending(ctx, alice, "", t0, 10); err != nil || len(ms) != 1 || ms[0].ID != "0007" {
+		t.Fatalf("Pending = %+v, %v", ms, err)
+	}
+	if ms, _, err := s.PendingHeld(ctx, alice, "", "task-a", t0, 10); err != nil || len(ms) != 1 {
+		t.Fatalf("PendingHeld = %+v, %v", ms, err)
+	}
+	ex, _, err := s.Expired(ctx, t0.Add(time.Hour), "", 10)
+	if err != nil || len(ex) != 4 {
+		t.Fatalf("Expired = %+v, %v", ex, err)
+	}
+	held, err := s.Claim(ctx, alice, store.ChatbotIDPrefix+"0003", "task-a", t0, t0.Add(time.Minute))
+	if err != nil || !held.Chatbot || held.Anonymous || !held.Enqueued.Equal(t0) {
+		t.Fatalf("Claim = %+v, %v", held, err)
+	}
+	if err := s.Remove(ctx, held, "task-a"); err != nil {
+		t.Fatal(err)
+	}
+	anonymous := bot(3, "0009")
+	anonymous.Anonymous = true
+	if err := s.Enqueue(ctx, anonymous, l); err != nil {
+		t.Fatalf("after a removal = %v", err)
+	}
+	if got, err := s.Claim(ctx, alice, anonymous.ID, "task-a", t0, t0.Add(time.Minute)); err != nil || !got.Chatbot || !got.Anonymous {
+		t.Fatalf("the anonymous one = %+v, %v", got, err)
+	}
+}
+
+// chatbotShareFirst: a chatbot whose own share is full is told so even
+// when the queue is full too, or which of the two it heard would show
+// whether persons' messages fill the queue: whether the subscriber exists
+// (#739 security review). With room in its share, a full queue is a full
+// queue.
+func chatbotShareFirst(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	l := store.Limit{Count: 3, SenderCount: 1, ChatbotCount: 3}
+	bot := func(sender, id string) store.Message {
+		m := message(alice, store.ChatbotIDPrefix+id, t0)
+		m.Sender, m.Mode, m.Chatbot = sender, store.Standalone, true
+		return m
+	}
+	for _, m := range []store.Message{bot("sip:bot1@botplatform.example.net", "0001"), message(alice, "0002", t0), message(alice, "0003", t0)} {
+		if err := s.Enqueue(ctx, m, store.Limit{Count: 3, SenderCount: 2, ChatbotCount: 3}); err != nil {
+			t.Fatalf("%s = %v", m.ID, err)
+		}
+	}
+	if err := s.Enqueue(ctx, bot("sip:bot1@botplatform.example.net", "0004"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("a full share in a full queue = %v", err)
+	}
+	if err := s.Enqueue(ctx, bot("sip:bot2@botplatform.example.net", "0005"), l); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("another chatbot in a full queue = %v", err)
 	}
 }
 

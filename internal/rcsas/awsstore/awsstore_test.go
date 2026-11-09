@@ -298,6 +298,42 @@ func TestASizeThatDriftedIsCorrectedWhenItRefuses(t *testing.T) {
 	}
 }
 
+// A chatbot's message is kept where no read of a version before #738
+// looks: a partition and expiry buckets of its own, not the queue's
+// (#738 review: a rollback delivered them as persons' messages). Its total
+// drifts and is corrected like any size, and a person's item is written as
+// before.
+func TestChatbotItemsAreKeptApartAndTheirTotalRecounted(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	l := store.Limit{Count: 10, SenderCount: 10, ChatbotCount: 2}
+	item := func(id string, bot bool) store.Message {
+		m := store.Message{Recipient: "r", ID: id, Sender: "sip:b" + id + "@bot.example.net", Mode: store.Standalone, Chatbot: bot,
+			CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
+		if bot {
+			m.ID = store.ChatbotIDPrefix + id
+		}
+		return m
+	}
+	for _, m := range []store.Message{item("0", false), item("1", true), item("2", true)} {
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	person, bot := f.rows["q#1#r\x000"], f.rows["b#1#r\x00b-1"]
+	if _, ok := person[attrAnonymous]; ok || len(person) == 0 || sOf(person[attrBucket])[:2] != "x#" || len(bot) == 0 || sOf(bot[attrBucket])[:2] != "b#" {
+		t.Fatalf("person %v, chatbot %v", person, bot)
+	}
+	delete(f.rows, "b#1#r\x00b-1") // the TTL took it
+	if err := s.Enqueue(ctx, item("3", true), l); err != nil {
+		t.Fatalf("Enqueue after drift = %v", err)
+	}
+	if err := s.Enqueue(ctx, item("4", true), l); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("beyond the total = %v", err)
+	}
+}
+
 // The total of group notifications drifts like any size, and a refusal
 // for it corrects it the same way.
 func TestADriftedGroupNotificationTotalIsCorrected(t *testing.T) {

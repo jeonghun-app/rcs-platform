@@ -489,8 +489,11 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
 	if aws.ToString(in.ProjectionExpression) == "#sender, #author, #mode, #size, #notification, #summary" {
-		// recount: the whole partition, keys and the projected attributes.
-		f.recounts++
+		// recount: the whole partition, keys and the projected attributes;
+		// counted once for the queue's and its chatbot messages'.
+		if strings.HasPrefix(sOf(vals[":pk"]), queuePrefix) {
+			f.recounts++
+		}
 		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil {
 			f.t.Errorf("recount query %+v", in)
 		}
