@@ -100,7 +100,10 @@ func TestTheStopKeepsReturnMarginForItsReturn(t *testing.T) {
 		c.CxTimeout = 25 * time.Second
 		d.dial = dprDial(hss, true, &dprs)
 		d.stopping = func(b, s time.Time) { begun, stopBy = b, s }
-		d.goodbyeAt = func(dl time.Time) { deadline = dl }
+		d.goodbyeCtx = func(dl time.Time) (context.Context, context.CancelFunc) {
+			deadline = dl
+			return context.WithDeadline(context.Background(), dl)
+		}
 	})
 	stopAfterCxOpen(t, r, hss)
 	want := testConfig().DrainTimeout + stopMargin - returnMargin
@@ -138,10 +141,16 @@ func TestTheGoodbyeHasStopByOrItsFloor(t *testing.T) {
 // TestAGoodbyeReachedLateStillSendsItsDPR (#549 code review): a stop held
 // past its deadline before the goodbye, as a host that did not run the
 // process does, still writes the DPR, in the goodbye's floor.
+//
+// The goodbye's context is the test's, open until the DPR is written: on
+// the wall clock a host that left the process less than a 25th of a CPU
+// let the floor pass before the Diameter connection had started the DPR
+// (#644). That the goodbye has its floor is read from the deadline it was
+// given, between the two clock readings around the one run takes.
 func TestAGoodbyeReachedLateStillSendsItsDPR(t *testing.T) {
 	hss := startHSS(t)
 	var dprs atomic.Int64
-	var stopBy, released, deadline time.Time
+	var stopBy, released, asked, deadline time.Time
 	r := startSCSCFWith(t, hss, state.NewMemory(), 1, func(c *ServiceConfig, d *deps) {
 		c.CxTimeout = 25 * time.Second
 		d.dial = dprDial(hss, true, &dprs)
@@ -150,13 +159,24 @@ func TestAGoodbyeReachedLateStillSendsItsDPR(t *testing.T) {
 			time.Sleep(time.Until(stopBy.Add(goodbyeFloor)))
 			released = time.Now()
 		}
-		d.goodbyeAt = func(dl time.Time) { deadline = dl }
+		d.goodbyeCtx = func(dl time.Time) (context.Context, context.CancelFunc) {
+			asked, deadline = time.Now(), dl
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				// Ended once the DPR is written, as the HSS stub never
+				// answers it, or after realWait, which fails the test.
+				for end := time.Now().Add(realWait); dprs.Load() == 0 && ctx.Err() == nil && time.Now().Before(end); {
+					time.Sleep(time.Millisecond)
+				}
+				cancel()
+			}()
+			return ctx, cancel
+		}
 	})
 	stopAfterCxOpen(t, r, hss)
-	// The floor from when the stop was let go: a host may run it later
-	// still, which only moves the deadline on, so the bound above is loose.
-	if left := deadline.Sub(released); left < goodbyeFloor || left > goodbyeFloor+time.Second {
-		t.Errorf("reached %v past the stop's deadline, the goodbye had %v, want its floor of %v", released.Sub(stopBy), left, goodbyeFloor)
+	if deadline.Before(released.Add(goodbyeFloor)) || deadline.After(asked.Add(goodbyeFloor)) {
+		t.Errorf("reached %v past the stop's deadline, the goodbye's deadline is %v after that, want its floor of %v from then",
+			released.Sub(stopBy), deadline.Sub(released), goodbyeFloor)
 	}
 	if dprs.Load() == 0 {
 		t.Errorf("no DPR was written: the goodbye had no time once reached late; %s", cxLog(r))

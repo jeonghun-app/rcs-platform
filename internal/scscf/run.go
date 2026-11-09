@@ -89,8 +89,12 @@ type deps struct {
 	// which a test may hold it past.
 	stopping func(begun, stopBy time.Time)
 	goodbye  func()
-	// goodbyeAt, if set, hears the deadline the goodbye was given.
-	goodbyeAt func(deadline time.Time)
+	// goodbyeCtx, if set, makes the goodbye's context for its deadline in
+	// place of context.WithDeadline. A test that holds the stop past its
+	// deadline reads the deadline here, and keeps the context open until
+	// the DPR is out: a loaded host may not run the process for all of
+	// goodbyeFloor (#644).
+	goodbyeCtx func(deadline time.Time) (context.Context, context.CancelFunc)
 	// transportMade, if set, hears of the transport once it is made.
 	transportMade func(*transport.Transport)
 	// now is the clock of the registrar, the notifier and the router.
@@ -332,10 +336,13 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg ServiceConfig, d deps) er
 		d.goodbye()
 	}
 	deadline := goodbyeDeadline(stopBy, time.Now())
-	if d.goodbyeAt != nil {
-		d.goodbyeAt(deadline)
+	goodbyeCtx := d.goodbyeCtx
+	if goodbyeCtx == nil {
+		goodbyeCtx = func(dl time.Time) (context.Context, context.CancelFunc) {
+			return context.WithDeadline(context.Background(), dl)
+		}
 	}
-	closeCtx, cancelClose := context.WithDeadline(context.Background(), deadline)
+	closeCtx, cancelClose := goodbyeCtx(deadline)
 	defer cancelClose()
 	closeCx(closeCtx)
 	return nil
