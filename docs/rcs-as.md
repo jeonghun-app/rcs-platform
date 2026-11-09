@@ -14,7 +14,8 @@ that it can be built and tested first.
 Chatbots (ADR 0009) are not served yet. The chatbot API that `rcs-as` will
 serve to `maap` is specified in [api/rcs-as.yaml](api/rcs-as.yaml), with its
 scope in [api/rcs-as-scopes.md](api/rcs-as-scopes.md) (#697); the listener
-comes with #698.
+comes with #698. The client of `maap`'s `/v1/rcs/*` is built, though nothing
+calls it yet ([Calls to maap](#calls-to-maap)).
 
 The code:
 
@@ -28,6 +29,7 @@ The code:
 - `internal/rcsas/awsstore`: the DynamoDB backends of both.
 - `internal/rcsas/sipas`: the SIP layer: the proxy's `Router`, which serves
   what rcs-as terminates, and the engine's `Deliverer`.
+- `internal/rcsas/maapclient`: the client of `maap`'s `/v1/rcs/*`.
 - `internal/rcsas`: the `RCSAS_` settings and the service (`cmd/rcs-as`).
 
 ## How the SIP layer drives the engine
@@ -1225,6 +1227,62 @@ Versions count per group across tasks, so a subscription that misses one sees
 the gap and refreshes for a full document. A task that stops between writing a
 change and notifying it leaves exactly such a gap.
 
+## Calls to maap
+
+`internal/rcsas/maapclient` makes `rcs-as`'s calls to `maap`
+([ADR 0009](adr/0009-maap-chatbot-platform.md) §4, §12). Each kind of call has
+its own timeout, cap and breaker, so that a queue drain cannot starve
+admissions. A task makes one client, which every caller shares: the caps and
+breakers are the client's, and are per task.
+
+| Kind | Endpoints | Timeout | Calls in flight per task |
+|---|---|---|---|
+| admission | `POST /v1/rcs/admissions` | 2 s | 64 |
+| delivery check | `POST /v1/rcs/delivery-checks` | 2 s | 64 |
+| delivery | `POST /v1/rcs/messages`, `POST /v1/rcs/notifications` | 15 s, above the webhook's 10 s and below `RCSAS_DELIVERY_TIMEOUT` | 64 |
+
+- **Breakers.** A kind's breaker opens after 5 failures in a row and answers
+  at once for 10 s. Then it lets one call through: a success closes it, a
+  failure opens it for another 10 s. Only that call decides; a call from
+  before an opening or closing changes nothing when it ends. A failure is a
+  timeout, no answer, a status the call does not expect, or an answer that
+  does not decode. A caller's deadline that passes first is a failure too,
+  so a caller that passes less time than the kind's timeout opens the
+  breaker on a busy but healthy `maap`; a context ended by cancel (as the
+  engine's timers end theirs) is a caller giving up, and is not. A full cap,
+  an open breaker and a context that had ended before the call are not
+  failures either, and the last is not sent or counted.
+- **Partial failure.** "5 in a row" turns a `maap` that fails half its calls
+  into one that is refused nearly always, the breaker opening and closing
+  about 6 times a minute per task. The metrics have no task dimension: find
+  the failing `maap` task in `maap`'s own logs, and stop it.
+- **Results, failing closed.** An admission answers a state (admitted) or a
+  reason (`blocked`, `over_limit`, `unknown`). A delivery check answers
+  deliver or not, with a reason. A delivery answers 200 (delivered), or a 503
+  (kept for retry) or 404 (undeliverable) whose body is a
+  `chatbot.DeliveryRefusal` with a reason for that status. Anything else is
+  *unavailable*: a timeout, an open breaker, a full cap, another status, a
+  bare 404 or 503 (a mux, a busy server), or an answer `chatbot.DecodeEnvelope`
+  refuses (`maap` is not trusted). Answer headers are bounded at 16 KiB. The
+  caller holds or refuses as ADR 0009 §4 says. A redirect is not followed.
+- **Counts**, per kind (`admission`, `delivery_check`, `delivery`):
+  `chatbot.<kind>_unavailable` (every call that ended unavailable, full caps
+  and open breakers included), `chatbot.<kind>_cap_full`,
+  `chatbot.<kind>_breaker_opened`, and the timing `chatbot.<kind>_latency` of
+  each call that reached `maap`, whatever its end. An opening is logged as a
+  warning with the kind (`call`) and the last failure's `cause` (`timeout`,
+  `no answer`, `status 500`, or `answer refused:` and the field or rule, never
+  a value); a closing as information.
+- **After a recovery** held chatbot messages are checked again within
+  `RCSAS_RETRY_INTERVAL`, all at once, so `_cap_full` may rise for a minute or
+  two while `maap` is healthy.
+- **Token and URL.** The `rcs-as` → `maap` token goes in an `Authorization:
+  Bearer` header. The URL is `http` or `https` with no user, path, query or
+  fragment. Unless the client's `Dev` is set (`RCS_ENV` dev or test), plain
+  `http` needs a private host and connections go only to private addresses
+  ([ADR 0007](adr/0007-internal-transport.md) §5). No body, token or identity
+  reaches a log or an error.
+
 ## Settings
 
 Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
@@ -1527,6 +1585,7 @@ identifier ever appears in a metric name.
 | `sip.refused.method`, `sip.respond_failed` | Requests of a method rcs-as does not take, and answers the transport did not take |
 | `proxy.hook_panics` | Panics recovered while rcs-as routed or served a request: it was answered 500 if it had no answer yet (#428); alarm on any |
 | `transaction.handler_panics`, `msrp.callback_panics` | Panics recovered in a response handler of rcs-as's own requests, and in MSRP: a message handler's (answered with a 403 failure report), a report's (dropped), an event's, or a connection's reading (that connection closed). Each ends only that call or connection (#445); alarm on any |
+| `chatbot.<kind>_unavailable`, `chatbot.<kind>_cap_full`, `chatbot.<kind>_breaker_opened`, `chatbot.<kind>_latency` | Calls to `maap` of each kind (`admission`, `delivery_check`, `delivery`) that ended unavailable, found the cap full, opened the breaker, and the timing of those that reached `maap` ([Calls to maap](#calls-to-maap)) |
 | `msrp.path_stalled` | MSRP connections from msrp-relay that rcs-as ended because a probe, sent once a request on them timed out, went unanswered (#517), with a warning at most once a minute and no identifier. msrp-relay counts the stalls it ends itself as `Core.Closed.PathStalled`, and one rcs-as ends as `Core.Closed.PeerGone`; see [msrp-relay](msrp-relay.md) |
 | `background.panics` | Panics recovered in the work an answer to rcs-as's own INVITE starts on goroutines of its own: that work ends, and a session whose ACK or confirmation panicked is ended with a BYE, its invitation failing as one whose session could not be kept (#445, #471); alarm on any |
 | `sip.invite.answered`, `sip.invite.offer_refused`, `sip.invite.service_refused` | Clients' INVITEs answered 200, refused for their offer (488), and refused for their service (403) |
@@ -1590,6 +1649,8 @@ Signals to alarm on (Phase 7):
 | `group.fanout_budget_exceeded` sustained | A group writing beyond its budget: a flood, or the budget is too small for real groups |
 | `group.fanout_share_exceeded` sustained | One participant writing to a large group as fast as it may: a flood |
 | `group.rejected.rate_limited` sustained | Users creating groups or adding people faster than allowed: mass-add spam |
+| `chatbot.<kind>_breaker_opened` > 0 for 3 minutes in a row, or the failure ratio (`_unavailable` − `_cap_full`) / (`_latency.count`) above a few percent for as long (`MaapAdmissionUnavailable`, `MaapDeliveryCheckUnavailable`, `MaapDeliveryUnavailable`; thresholds in #684; no data is not breaching) | `maap` fails or answers what rcs-as refuses: admissions get 500, chatbot messages wait. A normal `maap` deploy opens each breaker at most once per task for 10 s and is over within a minute. Breakers are per task, so the count sums the tasks. Logs: `msg` = `rcs-as: the maap breaker opened` or `…closed`, `call` = the kind, `cause` = why. A `cause` of `answer refused` means roll `maap` back; nothing in rcs-as is tuned at run time, so the remedies are `RCSAS_CHATBOTS=off` or rolling `maap` back |
+| `chatbot.<kind>_cap_full` sustained while `maap` is healthy | This task makes more calls of a kind than 64 at a time. Every chatbot shares the delivery cap, so first check `maap`'s per-chatbot webhook latency and `MaapWebhookFailureRatio`: slow webhooks hold the slots, and more rcs-as tasks only give them more. Otherwise scale rcs-as out |
 
 ## Assumptions and limitations
 

@@ -28,6 +28,7 @@ func rcsWireCases() []wireCase {
 			`","anonymous":true,"message_id":"0f1e2d3c","kind":"delivery-notification","status":"failed"}`,
 			SubscriberNotification{testBot, testSub, ptr(true), "0f1e2d3c", imdn.DeliveryNotification, imdn.Failed}},
 		{"SubscriberNotificationAnswer", MaxAnswerBytes, `{}`, SubscriberNotificationAnswer{}},
+		{"DeliveryRefusal", MaxAnswerBytes, `{"reason":"webhook_failed"}`, DeliveryRefusal{ReasonWebhookFailed}},
 	}
 }
 
@@ -41,6 +42,7 @@ func rcsWireEnums() [][]string {
 		append([]string{"state"}, chatbotStates...),
 		append([]string{"admission reason"}, admissionReasons...),
 		append([]string{"delivery reason"}, deliveryReasons...),
+		append([]string{"retry reason"}, retryReasons...),
 	}
 	for _, k := range []imdn.Kind{imdn.DeliveryNotification, imdn.DisplayNotification} {
 		values := []string{string(k)}
@@ -64,6 +66,19 @@ func TestTheRCSBodyLimitIsSixTimesTheMessageSizeAndNeverOverflows(t *testing.T) 
 	m.Body = ptr("a\x00\x7f")
 	if err := m.Validate(); err != nil {
 		t.Errorf("content is ValidateContent's to check, but Validate says %v", err)
+	}
+}
+
+func TestADeliveryRefusalSaysWhichStatusItGoesWith(t *testing.T) {
+	for _, r := range deliveryReasons {
+		if !(DeliveryRefusal{r}).Undeliverable() {
+			t.Errorf("%s is not a 404's", r)
+		}
+	}
+	for _, r := range retryReasons {
+		if (DeliveryRefusal{r}).Undeliverable() {
+			t.Errorf("%s is a 404's", r)
+		}
 	}
 }
 
@@ -109,6 +124,11 @@ func TestRCSEnumeratedAndNumericFieldsTakeOnlyTheirValues(t *testing.T) {
 		"no reason":               {check(false, ""), "invalid reason"},
 		"deliver with a reason":   {check(true, ReasonBlocked), "invalid reason"},
 		"over limit, no delivery": {check(false, ReasonOverLimit), "invalid reason"},
+		"webhook failed":          {DeliveryRefusal{ReasonWebhookFailed}, ""},
+		"chatbot busy":            {DeliveryRefusal{ReasonChatbotBusy}, ""},
+		"refused, blocked":        {DeliveryRefusal{ReasonBlocked}, ""},
+		"refused, no reason":      {DeliveryRefusal{""}, "invalid reason"},
+		"refused, over limit":     {DeliveryRefusal{ReasonOverLimit}, "invalid reason"},
 		"delivered":               {status(imdn.DeliveryNotification, imdn.Delivered), ""},
 		"delivery forbidden":      {status(imdn.DeliveryNotification, imdn.Forbidden), ""},
 		"delivery error":          {status(imdn.DeliveryNotification, imdn.Error), ""},

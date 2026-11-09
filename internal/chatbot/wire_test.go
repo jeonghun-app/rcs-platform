@@ -142,11 +142,13 @@ SubscriberMessage: chatbot subscriber anonymous message_id date_time_ms,omitempt
 SubscriberMessageAnswer:
 SubscriberNotification: chatbot subscriber anonymous message_id kind status
 SubscriberNotificationAnswer:
+DeliveryRefusal: reason
 Dispositions: positive_delivery negative_delivery display
 bot notification kind: display-notification
 state: active suspended
 admission reason: blocked over_limit unknown
 delivery reason: suspended blocked unknown
+retry reason: webhook_failed chatbot_busy
 delivery-notification: delivered failed forbidden error
 display-notification: displayed forbidden error
 `

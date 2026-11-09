@@ -138,7 +138,10 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
         chatbot (§12): 503, and `rcs-as` keeps it for retry until
         `RCSAS_CHATBOT_STORE_TTL` (24 hours) ends with the negative
         notification. Unknown or suspended chatbot, or blocked pair: 404,
-        undeliverable; it never reaches the webhook.
+        undeliverable; it never reaches the webhook. (Amended in #747: the
+        503 and the 404 carry a `chatbot.DeliveryRefusal` body with a reason
+        of that status; a bare 404 or 503, or a reason of the other status,
+        is `maap` unavailable, as a mux or a busy server would answer.)
    - **Chatbot → subscriber:**
      1. Chatbot → ALB (HTTPS, `MAAP_PUBLIC_HOST`) → `maap`
         `POST /v1/messages`, the recipient named by its alias ID, or its
@@ -449,7 +452,9 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
     `/v1/rcs/notifications`) has a 15 s timeout, above the webhook's 10 s and
     below `RCSAS_DELIVERY_TIMEOUT` (30 s); when a chatbot's deliveries are all
     in use, or its webhook failed 5 times in a row (that breaker holds 30 s),
-    `maap` answers 503 at once. **Delivery checks** (2 s) and **delivery calls**
+    `maap` answers 503 at once (amended in #747: with a `DeliveryRefusal`
+    of `chatbot_busy`; a bare 503 counts against `rcs-as`'s delivery
+    breaker). **Delivery checks** (2 s) and **delivery calls**
     each have their own cap of 64 at a time per task and their own breaker (5
     failures, 10 s), apart from admission, so a queue drain never starves
     subscribers' admissions; over a cap the message is held as in §4.
