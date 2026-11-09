@@ -83,10 +83,13 @@ paths:
       operationId: change_chatbot
       summary: Set the fields the body gives; the ID and URI never change.
       description: |
-        A field left out, or null, keeps its value; an object given
-        replaces the whole object. A new webhook URL is stored unverified,
-        the same one keeps its mark. A change that meets another write is
-        applied again to a fresh read, up to 3 times, then is 409.
+        A field left out, or null, keeps its value. permissions and
+        limits merge field by field (RFC 7396): a field given replaces
+        that field, one left out or null keeps it, and 0 sets a limit back
+        to its default. webhook is replaced whole. A new webhook URL is
+        stored unverified, the same one keeps its mark. A change that
+        meets another write is applied again to a fresh read, up to 3
+        times, then is 409.
       requestBody:
         required: true
         content: { application/json: { schema: { $ref: "#/components/schemas/ChatbotChange" } } }
@@ -125,6 +128,9 @@ paths:
       summary: Suspend a chatbot (ADR 0009 §11); only its state changes.
       responses:
         "200": { $ref: "#/components/responses/Chatbot" }
+        "400":
+          description: The chatbot in its new state breaks a rule of this release's registry, as a record a newer release wrote may.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -139,6 +145,9 @@ paths:
       summary: Make a suspended chatbot active again; only its state changes.
       responses:
         "200": { $ref: "#/components/responses/Chatbot" }
+        "400":
+          description: The chatbot in its new state breaks a rule of this release's registry, as a record a newer release wrote may.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -218,14 +227,35 @@ components:
     ChatbotChange:
       type: object
       additionalProperties: false
-      description: The fields to set; id and uri are refused (400).
+      description: The fields to set, each null to keep its value; id and uri are refused (400).
       properties:
-        display_name: { $ref: "#/components/schemas/DisplayName" }
-        out_of_service: { $ref: "#/components/schemas/OutOfService" }
-        webhook: { $ref: "#/components/schemas/WebhookSetting" }
-        permissions: { $ref: "#/components/schemas/Permissions" }
-        limits: { $ref: "#/components/schemas/Limits" }
-        sources: { $ref: "#/components/schemas/Sources" }
+        display_name: { anyOf: [{ $ref: "#/components/schemas/DisplayName" }, { type: "null" }] }
+        out_of_service: { anyOf: [{ $ref: "#/components/schemas/OutOfService" }, { type: "null" }] }
+        webhook: { anyOf: [{ $ref: "#/components/schemas/WebhookSetting" }, { type: "null" }] }
+        permissions: { anyOf: [{ $ref: "#/components/schemas/PermissionsChange" }, { type: "null" }] }
+        limits: { anyOf: [{ $ref: "#/components/schemas/LimitsChange" }, { type: "null" }] }
+        sources: { anyOf: [{ $ref: "#/components/schemas/Sources" }, { type: "null" }] }
+    PermissionsChange:
+      type: object
+      additionalProperties: false
+      description: Each permission given replaces that one; one left out or null keeps its value.
+      properties:
+        msisdn: { type: [boolean, "null"] }
+        start_conversations: { type: [boolean, "null"], description: Requires msisdn, as stored after the change. }
+    LimitsChange:
+      type: object
+      additionalProperties: false
+      description: Each limit given replaces that one, 0 for the default; one left out or null keeps its value.
+      properties:
+        sends_per_minute: { type: [integer, "null"], minimum: 0, maximum: 600 }
+        sends_per_day: { type: [integer, "null"], minimum: 0, maximum: 20000 }
+        starts_per_minute: { type: [integer, "null"], minimum: 0, maximum: 60 }
+        starts_per_day: { type: [integer, "null"], minimum: 0, maximum: 1000 }
+        sends_per_subscriber_per_minute: { type: [integer, "null"], minimum: 0, maximum: 20 }
+        sends_per_subscriber_per_day: { type: [integer, "null"], minimum: 0, maximum: 200 }
+        received_per_subscriber_per_minute: { type: [integer, "null"], minimum: 0, maximum: 30 }
+        received_per_minute: { type: [integer, "null"], minimum: 0, maximum: 6000 }
+        requests_per_minute: { type: [integer, "null"], minimum: 0, maximum: 1200 }
     Chatbot:
       type: object
       required: [id, uri, state]

@@ -68,7 +68,8 @@ func TestAChangeSetsTheFieldsGivenAndANewWebhookIsUnverified(t *testing.T) {
 	if rec.Code != http.StatusOK || got.DisplayName != "Acme Support" || !got.Webhook.Verified || got.Limits.SendsPerDay != 100 {
 		t.Fatalf("change = %d %s", rec.Code, rec.Body)
 	}
-	rec = operator(a, "PATCH", "/v1/chatbots/cb-1", `{"webhook":{"url":"https://bot.example.com/b"},"limits":{}}`)
+	// 0 sets a limit back to its default.
+	rec = operator(a, "PATCH", "/v1/chatbots/cb-1", `{"webhook":{"url":"https://bot.example.com/b"},"limits":{"sends_per_day":0}}`)
 	if got = decodeChatbot(t, rec); rec.Code != http.StatusOK || got.Webhook.Verified || got.Limits != (store.Limits{}) || got.DisplayName != "Acme Support" {
 		t.Fatalf("change = %d %s", rec.Code, rec.Body)
 	}
@@ -78,10 +79,10 @@ func TestAChangeSetsTheFieldsGivenAndANewWebhookIsUnverified(t *testing.T) {
 		t.Errorf("audit line %s", audit)
 	}
 	for body, want := range map[string]string{
-		`{"uri":"sip:bot-2@` + botDomain + `"}`:        "id and uri never change",
-		`{"id":"cb-2"}`:                                "id and uri never change",
-		`{"permissions":{"start_conversations":true}}`: "requires permissions.msisdn",
-		`{"display_name":"\u202e"}`:                    "display_name holds a control or format character",
+		`{"uri":"sip:bot-2@` + botDomain + `"}`: "id and uri never change",
+		`{"id":"cb-2"}`:                         "id and uri never change",
+		`{"permissions":{"msisdn":false,"start_conversations":true}}`: "requires permissions.msisdn",
+		`{"display_name":"\u202e"}`:                                   "display_name holds a control, format or invisible character",
 	} {
 		if rec := operator(a, "PATCH", "/v1/chatbots/cb-1", body); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), want) {
 			t.Errorf("%s: %d %s", body, rec.Code, rec.Body)
@@ -89,6 +90,38 @@ func TestAChangeSetsTheFieldsGivenAndANewWebhookIsUnverified(t *testing.T) {
 	}
 	if rec := operator(a, "PATCH", "/v1/chatbots/cb-2", `{}`); rec.Code != http.StatusNotFound {
 		t.Errorf("change of an unknown chatbot = %d", rec.Code)
+	}
+}
+
+// Permissions and limits merge field by field (#742 review, lead
+// decision): lowering one limit leaves the others lowered, and setting
+// msisdn leaves start_conversations on.
+func TestAChangeMergesLimitsAndPermissionsFieldByField(t *testing.T) {
+	a, _ := chatbotAPIOver(t, store.NewMemoryRegistry())
+	registered(t, a, `,"permissions":{"msisdn":true,"start_conversations":true},"limits":{"sends_per_minute":10,"starts_per_day":5}`)
+	both := store.Permissions{MSISDN: true, StartConversations: true}
+	lowered := store.Limits{SendsPerMinute: 10, SendsPerDay: 500, StartsPerDay: 5}
+	reset := store.Limits{SendsPerMinute: 10, SendsPerDay: 500}
+	for _, step := range []struct {
+		body        string
+		status      int
+		permissions store.Permissions
+		limits      store.Limits
+	}{
+		{`{"limits":{"sends_per_day":500}}`, 200, both, lowered},
+		{`{"permissions":{"msisdn":true}}`, 200, both, lowered},
+		{`{"limits":{"sends_per_minute":null,"starts_per_day":0}}`, 200, both, reset},
+		{`{"limits":{"sends_per_minute":601}}`, 400, both, reset},
+		{`{"permissions":{"msisdn":false}}`, 400, both, reset}, // start_conversations is still on
+		{`{"permissions":{"start_conversations":false}}`, 200, store.Permissions{MSISDN: true}, reset},
+	} {
+		if rec := operator(a, "PATCH", "/v1/chatbots/cb-1", step.body); rec.Code != step.status {
+			t.Fatalf("%s: %d %s", step.body, rec.Code, rec.Body)
+		}
+		got := decodeChatbot(t, operator(a, "GET", "/v1/chatbots/cb-1", ""))
+		if got.Permissions != step.permissions || got.Limits != step.limits {
+			t.Fatalf("after %s: %+v %+v, want %+v %+v", step.body, got.Permissions, got.Limits, step.permissions, step.limits)
+		}
 	}
 }
 

@@ -16,18 +16,42 @@ import (
 
 // chatbotBody is a chatbot as the operator sends it: every field to
 // register one, only those to change in a change. A field left out, or
-// null, keeps its value; an object given replaces the whole object. The
-// string bounds are the registry's (store.MaxDisplayNameBytes and the
-// rest), which DecodeEnvelope enforces.
+// null, keeps its value. Permissions and limits merge field by field, as
+// in a JSON merge patch (RFC 7396), so that lowering one limit cannot
+// raise the others to their defaults (#742 review, lead decision); the
+// webhook, one value, is replaced whole. The string bounds are the
+// registry's (store.MaxDisplayNameBytes and the rest), which
+// DecodeEnvelope enforces.
 type chatbotBody struct {
-	ID           string             `json:"id" maxbytes:"64"`
-	URI          string             `json:"uri" maxbytes:"255"`
-	DisplayName  *string            `json:"display_name" maxbytes:"128"`
-	OutOfService *string            `json:"out_of_service" maxbytes:"512"`
-	Webhook      *webhookBody       `json:"webhook"`
-	Permissions  *store.Permissions `json:"permissions"`
-	Limits       *store.Limits      `json:"limits"`
-	Sources      *[]string          `json:"sources" maxbytes:"43"`
+	ID           string           `json:"id" maxbytes:"64"`
+	URI          string           `json:"uri" maxbytes:"255"`
+	DisplayName  *string          `json:"display_name" maxbytes:"128"`
+	OutOfService *string          `json:"out_of_service" maxbytes:"512"`
+	Webhook      *webhookBody     `json:"webhook"`
+	Permissions  *permissionsBody `json:"permissions"`
+	Limits       *limitsBody      `json:"limits"`
+	Sources      *[]string        `json:"sources" maxbytes:"43"`
+}
+
+// permissionsBody is store.Permissions with each field optional.
+type permissionsBody struct {
+	MSISDN             *bool `json:"msisdn"`
+	StartConversations *bool `json:"start_conversations"`
+}
+
+// limitsBody is store.Limits with each field optional, in the same order
+// with the same names (TestTheLimitsBodyMirrorsStoreLimits); 0 sets a
+// limit back to its default.
+type limitsBody struct {
+	SendsPerMinute                 *int64 `json:"sends_per_minute"`
+	SendsPerDay                    *int64 `json:"sends_per_day"`
+	StartsPerMinute                *int64 `json:"starts_per_minute"`
+	StartsPerDay                   *int64 `json:"starts_per_day"`
+	SendsPerSubscriberPerMinute    *int64 `json:"sends_per_subscriber_per_minute"`
+	SendsPerSubscriberPerDay       *int64 `json:"sends_per_subscriber_per_day"`
+	ReceivedPerSubscriberPerMinute *int64 `json:"received_per_subscriber_per_minute"`
+	ReceivedPerMinute              *int64 `json:"received_per_minute"`
+	RequestsPerMinute              *int64 `json:"requests_per_minute"`
 }
 
 // webhookBody is the webhook as the operator sets it: whether it is
@@ -93,14 +117,18 @@ func (f fieldRules) apply(c *store.Chatbot, b chatbotBody) error {
 			c.Webhook = store.Webhook{URL: b.Webhook.URL}
 		}
 	}
-	if b.Permissions != nil {
-		c.Permissions = *b.Permissions
+	if p := b.Permissions; p != nil {
+		if p.MSISDN != nil {
+			c.Permissions.MSISDN = *p.MSISDN
+		}
+		if p.StartConversations != nil {
+			c.Permissions.StartConversations = *p.StartConversations
+		}
 	}
 	if b.Limits != nil {
-		if err := checkLimits(*b.Limits); err != nil {
+		if err := mergeLimits(&c.Limits, *b.Limits); err != nil {
 			return err
 		}
-		c.Limits = *b.Limits
 	}
 	if b.Sources != nil {
 		sources, err := sourceNetworks(*b.Sources)
@@ -235,15 +263,20 @@ func numeric(label string) bool {
 	return label != "" && strings.Trim(label, "0123456789") == ""
 }
 
-// checkLimits refuses a limit below 0 or above its default; 0 is the
-// default.
-func checkLimits(l store.Limits) error {
-	got, max := reflect.ValueOf(l), reflect.ValueOf(defaultLimits)
-	for i := range got.NumField() {
-		if v := got.Field(i).Int(); v < 0 || v > max.Field(i).Int() {
-			name, _, _ := strings.Cut(got.Type().Field(i).Tag.Get("json"), ",")
+// mergeLimits writes into l each limit b gives, refusing one below 0 or
+// above its default; 0 is the default. A limit b leaves out is not
+// checked: it keeps its stored value.
+func mergeLimits(l *store.Limits, b limitsBody) error {
+	given, to, max := reflect.ValueOf(b), reflect.ValueOf(l).Elem(), reflect.ValueOf(defaultLimits)
+	for i := range given.NumField() {
+		if given.Field(i).IsNil() {
+			continue
+		}
+		if v := given.Field(i).Elem().Int(); v < 0 || v > max.Field(i).Int() {
+			name, _, _ := strings.Cut(given.Type().Field(i).Tag.Get("json"), ",")
 			return fail(http.StatusBadRequest, "limits."+name+" is not from 0, the default, to "+strconv.FormatInt(max.Field(i).Int(), 10))
 		}
+		to.Field(i).SetInt(given.Field(i).Elem().Int())
 	}
 	return nil
 }

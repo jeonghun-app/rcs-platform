@@ -7,6 +7,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 )
 
 // numericLabel is a label inet_aton or the WHATWG URL parser reads as a
@@ -200,6 +202,20 @@ func TestTheOutOfServiceTextRefusesFormatCharactersButTheZeroWidthJoiner(t *test
 	} {
 		if err := refuseInvisible("out_of_service", tc.text); (err != nil) != tc.refused {
 			t.Errorf("%q: %v, want refused %v", tc.text, err, tc.refused)
+		}
+	}
+}
+
+// mergeLimits pairs limitsBody's fields with store.Limits' by position.
+func TestTheLimitsBodyMirrorsStoreLimits(t *testing.T) {
+	body, stored := reflect.TypeFor[limitsBody](), reflect.TypeFor[store.Limits]()
+	if body.NumField() != stored.NumField() {
+		t.Fatalf("%d fields, store.Limits has %d", body.NumField(), stored.NumField())
+	}
+	for i := range body.NumField() {
+		b, s := body.Field(i), stored.Field(i)
+		if bt, _, _ := strings.Cut(b.Tag.Get("json"), ","); b.Name != s.Name || bt+",omitempty" != s.Tag.Get("json") {
+			t.Errorf("field %d: %s %q, store.Limits has %s %q", i, b.Name, b.Tag.Get("json"), s.Name, s.Tag.Get("json"))
 		}
 	}
 }

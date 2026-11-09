@@ -129,7 +129,7 @@ the path that no chatbot can have is 404 before the registry is read.
 |---|---|
 | `POST /v1/chatbots` | registers a chatbot, `active`, with the ID the operator chose: 201 |
 | `GET /v1/chatbots/{id}` | reads it: 200 |
-| `PATCH /v1/chatbots/{id}` | sets the fields the body gives; a field left out keeps its value, and an object given (`permissions`, `limits`, `webhook`) replaces the whole object: 200 |
+| `PATCH /v1/chatbots/{id}` | sets the fields the body gives; a field left out, or null, keeps its value. `permissions` and `limits` merge field by field, as a JSON merge patch (RFC 7396): a field given replaces that one field and one left out or null keeps its value, so lowering one limit leaves the others as they are; 0 sets a limit back to its default. `webhook` is replaced whole: 200 |
 | `POST /v1/chatbots/{id}/suspend`, `.../resume` | sets the state only; a suspended chatbot keeps its record: 200 |
 | `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it: 204, also when it is gone already |
 
@@ -175,8 +175,7 @@ the path that no chatbot can have is 404 before the registry is read.
   an IPv4 address, is refused unless it is one in dotted decimal, and a `%`
   (an IPv6 zone) is refused. A URL newly set is stored unverified, and only
   its challenge (#683) marks it verified; setting the same URL keeps the
-  mark. What a host name resolves to is
-  checked when it is dialled (#683).
+  mark. What a host name resolves to is checked when it is dialled (#683).
 - `permissions`: `msisdn`, and `start_conversations`, which requires
   `msisdn` (ADR 0009 §9).
 - `limits`: each from 0, the default, up to its default in ADR 0009 §9,
