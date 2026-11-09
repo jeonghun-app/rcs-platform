@@ -294,15 +294,19 @@ func TestARequestOverTheDecodeCapIs503BeforeItsBodyIsRead(t *testing.T) {
 	e.waitSlots(t, 0)
 }
 
-// A notification's body has bodyTime(8 KiB), 1.03 s, to arrive.
+// A notification's body has bodyTime(8 KiB), 1.03 s, to arrive; one that
+// does not is 408.
 func TestASlowBodyLosesItsDecodeSlotAtItsDeadline(t *testing.T) {
 	e := newEnv(t, nil)
-	e.rawRequest(t, notesPath, currentToken, "{")
+	conn := e.rawRequest(t, notesPath, currentToken, "{")
 	e.waitSlots(t, 1)
 	held := time.Now()
 	e.waitSlots(t, 0)
 	if d := time.Since(held); d > 2500*time.Millisecond {
 		t.Fatalf("the slot was held %v", d)
+	}
+	if res := readAnswer(t, conn); res.StatusCode != http.StatusRequestTimeout || !res.Close {
+		t.Fatalf("a body past its deadline: %d, close %v", res.StatusCode, res.Close)
 	}
 }
 

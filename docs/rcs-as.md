@@ -1277,8 +1277,8 @@ is handed to an acceptor, which answers 503 until #699 (messages) and #706
   stays under half the task's memory limit (8 × 20 MB = 160 MB by default);
   #684 and #694 size the task by it. A request holding a slot must send its
   body at 256 KiB/s or faster: it gets 1 s plus 1 s per 256 KiB of its limit
-  (6.8 s for a message, 1.03 s for a notification), after which the read
-  fails and the slot is freed, so a body trickled byte by byte cannot hold a
+  (6.8 s for a message, 1.03 s for a notification), after which it is 408
+  and the slot is freed, so a body trickled byte by byte cannot hold a
   slot for long (#723 review). The slot is freed before the acceptor's store
   calls, and in any case when the request ends, panic or not.
 - **Answers.** An error is `{"error": "<reason>"}`, which names a rule,
