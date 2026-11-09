@@ -1378,8 +1378,12 @@ it on (ADR 0009 §4, chatbot → subscriber step 4).
   one share of a subscriber's queue (`1/RCSAS_QUEUE_SENDER_SHARE`, an
   eighth), and all chatbots together hold at most a quarter of its messages
   and bytes (`messaging.ChatbotsShare`), as group notifications do. A full
-  share is refused as for a person (`queue_share_full`); a full quarter is
-  `queue_full`, as a full queue, since it is no rule of the one sending.
+  share is refused as for a person (`queue_share_full`), and before a full
+  queue: otherwise a chatbot at its share would hear `queue_share_full`
+  from a queue with room and `queue_full` from one full of persons'
+  messages, which tells a subscriber (#739 security review). A full quarter
+  is `queue_full`, as a full queue, since it is no rule of the one
+  sending.
   The negative notification a person would get is not queued: a chatbot's
   goes through `maap` (#705).
 - **Held until #702.** Until the delivery check exists nothing delivers a
@@ -1395,7 +1399,8 @@ it on (ADR 0009 §4, chatbot → subscriber step 4).
     them: unseen, still counted in the queue's size, until DynamoDB's TTL
     deletes them, with no `failed` for the chatbot. Its recount of a queue
     may also drop their count, so that after a roll forward the queue holds
-    up to the chatbots' quarter more until it empties.
+    up to the chatbots' quarter more, until its size item expires: no
+    message for `RCSAS_STORE_TTL` plus a day (`retention`).
 
 ## Settings
 

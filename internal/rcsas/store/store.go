@@ -87,7 +87,9 @@ type Limit struct {
 	// sender share: without a total, enough chatbots could fill a
 	// subscriber's queue between them (ADR 0009 §9, threat model T10).
 	// Past them is ErrQueueFull, as for the queue: the chatbots' part of
-	// it is full, which is no rule of the one sending.
+	// it is full, which is no rule of the one sending. A chatbot's own full
+	// share is told before either, so that it never tells a full queue
+	// from one with room.
 	ChatbotCount int
 	ChatbotBytes int64
 }
