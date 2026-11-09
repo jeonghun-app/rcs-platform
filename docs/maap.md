@@ -37,7 +37,7 @@ reported at once at start.
 | `MAAP_OPERATOR_TOKEN`, `MAAP_OPERATOR_TOKEN_NEXT` | none | the operator's current and next tokens. *prod*: the first is required, and each must hold 256 bits (43 base64url characters or 64 hex digits). Everywhere: printable ASCII without white space, and a next token only with a current one and different from it |
 | `MAAP_DECODES` | `8` | request bodies the internal listener decodes at once (see [Memory](#memory)); at least 1 |
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
-| `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused |
+| `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | idempotency records and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
