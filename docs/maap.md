@@ -9,13 +9,14 @@ Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token; no route is mounted yet
 (#709–#713 add the operator's). The [registry](#dynamodb-maap-registry-table)
-has its store, in memory and in DynamoDB (#708), which no route uses yet.
+has its store, in memory and in DynamoDB (#708), which `maap` opens at start
+and `/readyz` checks; no route uses it yet.
 
 ## Listeners
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
-| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2) |
+| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
 | internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
@@ -36,6 +37,7 @@ reported at once at start.
 | `MAAP_OPERATOR_TOKEN`, `MAAP_OPERATOR_TOKEN_NEXT` | none | the operator's current and next tokens. *prod*: the first is required, and each must hold 256 bits (43 base64url characters or 64 hex digits). Everywhere: printable ASCII without white space, and a next token only with a current one and different from it |
 | `MAAP_DECODES` | `8` | request bodies the internal listener decodes at once (see [Memory](#memory)); at least 1 |
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
+| `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | idempotency records and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |

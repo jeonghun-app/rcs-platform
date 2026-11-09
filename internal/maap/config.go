@@ -61,6 +61,8 @@ type Config struct {
 	SubscribersTable string
 	RequestsTable    string
 	CountersTable    string
+	// DynamoDBEndpoint replaces the AWS endpoint, for DynamoDB Local.
+	DynamoDBEndpoint string
 }
 
 // Configure reads the MAAP_ settings and the shared RCS_IMS_DOMAIN and
@@ -78,6 +80,7 @@ func Configure(s *runtime.Settings) Config {
 		SubscribersTable: e.String("SUBSCRIBERS_TABLE", DefaultSubscribersTable),
 		RequestsTable:    e.String("REQUESTS_TABLE", DefaultRequestsTable),
 		CountersTable:    e.String("COUNTERS_TABLE", DefaultCountersTable),
+		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
 	}
 	if s.Shared.String("CHATBOT_DOMAIN", "") == "" {
 		// LoadDomain takes an unset domain as "no chatbots"; maap exists
@@ -98,6 +101,7 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("DECODES", "must be at least 1")
 	}
 	c.WebhookPorts = webhookPorts(e)
+	s.ForbidInProduction(c.DynamoDBEndpoint != "", "MAAP_DYNAMODB_ENDPOINT points the registry away from DynamoDB")
 	c.OperatorTokens = operatorTokens(s)
 	return c
 }

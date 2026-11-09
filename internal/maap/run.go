@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/maap/awsstore"
+	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
 
@@ -20,6 +22,9 @@ func Service() runtime.Service[Config] {
 // deps are what Run takes from the outside world, replaced in tests.
 type deps struct {
 	listen func(network, address string) (net.Listener, error)
+	// registry replaces maap-registry in DynamoDB; /readyz checks it if it
+	// has a Ready method, as the DynamoDB one does.
+	registry store.Registry
 }
 
 // Run serves the internal listener, apart from the runtime's admin port
@@ -29,6 +34,17 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
+	registry := d.registry
+	if registry == nil {
+		r, err := awsstore.New(ctx, cfg.RegistryTable, cfg.DynamoDBEndpoint)
+		if err != nil {
+			return fmt.Errorf("maap: %w", err)
+		}
+		registry = r
+	}
+	if r, ok := registry.(interface{ Ready(context.Context) error }); ok {
+		rt.Admin.AddReadinessCheck("dynamodb-registry", r.Ready)
+	}
 	// The internal listener's own decode pool: #683 gives the public
 	// listener another, so that chatbots cannot take rcs-as's slots.
 	api := newInternalAPI(cfg.OperatorTokens, newDecoder(cfg.Decodes, rt.Metrics), rt)

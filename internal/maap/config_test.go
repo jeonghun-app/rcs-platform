@@ -78,7 +78,7 @@ func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	if c.IMSDomain != imsDomain || c.ChatbotDomain.Name() != botDomain || c.AliasHost != aliasHost || c.WebhookPorts != nil ||
 		c.InternalAddr != ":8081" || c.Decodes != 8 || !c.OperatorTokens.Current.IsZero() ||
 		c.RegistryTable != "maap-registry" || c.SubscribersTable != "maap-subscribers" ||
-		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" {
+		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" || c.DynamoDBEndpoint != "" {
 		t.Fatalf("config = %+v", c)
 	}
 }
@@ -87,13 +87,15 @@ func TestEverySettingIsRead(t *testing.T) {
 	c, err := configure(with(devEnv,
 		"MAAP_WEBHOOK_PORTS", "8443, 9443", "MAAP_INTERNAL_ADDR", "127.0.0.1:9000", "MAAP_DECODES", "3",
 		"MAAP_OPERATOR_TOKEN", operatorToken, "MAAP_OPERATOR_TOKEN_NEXT", operatorToken+"-next",
-		"MAAP_REGISTRY_TABLE", "r", "MAAP_SUBSCRIBERS_TABLE", "s", "MAAP_REQUESTS_TABLE", "q", "MAAP_COUNTERS_TABLE", "c"))
+		"MAAP_REGISTRY_TABLE", "r", "MAAP_SUBSCRIBERS_TABLE", "s", "MAAP_REQUESTS_TABLE", "q", "MAAP_COUNTERS_TABLE", "c",
+		"MAAP_DYNAMODB_ENDPOINT", "http://dynamodb:8000"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(c.WebhookPorts, []uint16{8443, 9443}) || c.InternalAddr != "127.0.0.1:9000" || c.Decodes != 3 ||
 		c.OperatorTokens.Current.RevealString() != operatorToken || c.OperatorTokens.Next.RevealString() != operatorToken+"-next" ||
-		c.RegistryTable != "r" || c.SubscribersTable != "s" || c.RequestsTable != "q" || c.CountersTable != "c" {
+		c.RegistryTable != "r" || c.SubscribersTable != "s" || c.RequestsTable != "q" || c.CountersTable != "c" ||
+		c.DynamoDBEndpoint != "http://dynamodb:8000" {
 		t.Fatalf("config = %+v", c)
 	}
 }
@@ -170,6 +172,7 @@ func TestStagingAndProdRefuseTheDevelopmentDefaults(t *testing.T) {
 			{with(base, "MAAP_OPERATOR_TOKEN", strings.Repeat("z", 42)), "MAAP_OPERATOR_TOKEN holds less than 256 bits"},
 			{with(base, "MAAP_OPERATOR_TOKEN", strings.Repeat("ab", 31)+"a"), "MAAP_OPERATOR_TOKEN holds less than 256 bits"},
 			{with(base, "MAAP_OPERATOR_TOKEN_NEXT", "short"), "MAAP_OPERATOR_TOKEN_NEXT holds less than 256 bits"},
+			{with(base, "MAAP_DYNAMODB_ENDPOINT", "http://dynamodb:8000"), "MAAP_DYNAMODB_ENDPOINT points the registry away"},
 		} {
 			out := start(t, tc.env)
 			if !strings.Contains(out, "configuration rejected") || !strings.Contains(out, "refused in "+env+": "+tc.want) {
