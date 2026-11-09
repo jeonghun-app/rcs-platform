@@ -11,7 +11,6 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -45,6 +44,19 @@ func TestAChunkWriteEndsAtWriteTimeoutOrWhenItsMessageHasWaitedMaxQueueAge(t *te
 				t.Errorf("deadline %v after queueing (by age %t), want %v (by age %t)", deadline.Sub(queued), byAge, c.want, c.byAge)
 			}
 		})
+	}
+}
+
+// The floor the documentation gives for the queue-age rule (Config.MaxQueueAge,
+// docs/architecture.md §7) is computed from these defaults: a full 4 MiB queue
+// drained within 32 s is about 128 KiB/s. A change to either changes the
+// floor; update both places. An unset MaxQueueAge takes the default.
+func TestTheQueueAgeFloorIsSetByTheDefaultQueueAndAge(t *testing.T) {
+	if DefaultMaxQueueAge != 32*time.Second || DefaultSendQueueBytes != 4<<20 {
+		t.Fatalf("DefaultMaxQueueAge %v and DefaultSendQueueBytes %d, but the documented floor of about 128 KiB/s assumes 32 s and 4 MiB: update the documentation", DefaultMaxQueueAge, DefaultSendQueueBytes)
+	}
+	if got := (Config{}).withDefaults().MaxQueueAge; got != DefaultMaxQueueAge {
+		t.Fatalf("an unset MaxQueueAge is %v, want %v", got, DefaultMaxQueueAge)
 	}
 }
 
@@ -210,71 +222,108 @@ func TestAClientFacingConnectionIsNotResetForTheAgeOfItsQueue(t *testing.T) {
 	}
 }
 
-// QA's slow core peer, reading 320 KiB/s while a burst larger than the queue
-// arrives (#623 AC 2), keeps its connection at the default MaxQueueAge: each
-// message waits about 4 MiB / 320 KiB/s, 13 s, well inside 32 s. The reader
-// keeps to its rate on average, catching up after a pause, so a loaded host
-// that delays it does not make the messages wait longer.
-func TestACorePeerReading320KiBPerSecondKeepsItsConnectionAtTheDefaultMaxQueueAge(t *testing.T) {
+// pacedBurst sends 4.25 MiB of 32 KiB MESSAGEs from 8 goroutines, a little
+// more than a core queue holds, to a peer that reads every connection at
+// 320 KiB/s, QA's slow core peer (#623 AC 2). The reader keeps to its rate on
+// average, catching up after a pause, so a loaded host that delays it does not
+// make the messages wait longer. Each message is written within about 0.1 s
+// of the writer starting it, but waits about 4 MiB / 320 KiB/s, 13 s, in the
+// queue first. pacedBurst watches until stop holds, then closes the transport,
+// and returns the most the queue held.
+func pacedBurst(t *testing.T, cfg Config, stop func(*Transport, bool) bool) (tr *Transport, peak int) {
+	t.Helper()
 	peer := newStallPeer(t)
-	tr, _ := newTransport(t, Config{})
+	tr, _ = newTransport(t, cfg)
 	const rate = 320 << 10 // bytes a second
-	var read atomic.Int64
+	quit := make(chan struct{})
+	t.Cleanup(func() { close(quit) })
 	go func() {
-		c := <-peer.conns
-		buf := make([]byte, 16<<10)
-		start := time.Now()
 		for {
-			allowed := int64(time.Since(start).Seconds()*rate) - read.Load()
-			if allowed <= 0 {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			n, err := c.Read(buf[:min(int64(len(buf)), allowed)])
-			read.Add(int64(n))
-			if err != nil {
+			var c net.Conn
+			select {
+			case c = <-peer.conns:
+			case <-quit:
 				return
 			}
+			go func() {
+				var read int64
+				buf := make([]byte, 16<<10)
+				start := time.Now()
+				for {
+					allowed := int64(time.Since(start).Seconds()*rate) - read
+					if allowed <= 0 {
+						time.Sleep(10 * time.Millisecond)
+						continue
+					}
+					n, err := c.Read(buf[:min(int64(len(buf)), allowed)])
+					read += int64(n)
+					if err != nil {
+						return
+					}
+				}
+			}()
 		}
 	}()
 	body := []byte(strings.Repeat("x", 32<<10))
-	var sent, failed atomic.Int64
 	var wg sync.WaitGroup
 	for g := range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := range 17 { // 8*17*32 KiB, 4.25 MiB: a little more than the queue holds
+			for i := range 17 {
 				req := newRequest(t, "MESSAGE", fmt.Sprintf("SIP/2.0/TCP p.invalid;branch=z9hG4bKr%d-%d", g, i))
 				req.Body = body
-				if _, err := tr.SendRequest(req, peer.dst()); err != nil {
-					failed.Add(1)
-				} else {
-					sent.Add(1)
-				}
+				_, _ = tr.SendRequest(req, peer.dst())
 			}
 		}()
 	}
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
-	peak := 0
-	waitUntil(t, "the burst to drain", func() bool {
+	waitUntil(t, "the burst", func() bool {
 		peak = max(peak, tr.Stats().QueuedBytes)
 		select {
 		case <-done:
-			return tr.Stats().QueuedBytes == 0
+			return stop(tr, true)
 		default:
-			return false
+			return stop(tr, false)
 		}
+	})
+	tr.Close()
+	<-done
+	return tr, peak
+}
+
+// QA's slow core peer keeps its connection at the default MaxQueueAge: its
+// messages wait about 13 s, well inside 32 s.
+func TestACorePeerReading320KiBPerSecondKeepsItsConnectionAtTheDefaultMaxQueueAge(t *testing.T) {
+	var s Stats
+	_, peak := pacedBurst(t, Config{}, func(tr *Transport, sent bool) bool {
+		s = tr.Stats()
+		return s.WriteStalls+s.WriteErrors > 0 || sent && s.QueuedBytes == 0
 	})
 	// Without a full queue no message waited long, and the test would pass
 	// without the rule being near.
 	if peak < 3<<20 {
 		t.Fatalf("the queue held at most %d bytes, want 3 MiB or more for messages to wait over 9 s", peak)
 	}
-	s := tr.Stats()
 	if s.WriteStalls != 0 || s.WriteErrors != 0 || s.Dialed != 1 || s.OpenOutbound != 1 {
-		t.Errorf("sent %d, failed %d; WriteStalls %d, WriteErrors %d, Dialed %d, OpenOutbound %d: the connection to a peer reading 320 KiB/s was ended",
-			sent.Load(), failed.Load(), s.WriteStalls, s.WriteErrors, s.Dialed, s.OpenOutbound)
+		t.Errorf("WriteStalls %d, WriteErrors %d, Dialed %d, OpenOutbound %d: the connection to a peer reading 320 KiB/s was ended",
+			s.WriteStalls, s.WriteErrors, s.Dialed, s.OpenOutbound)
+	}
+}
+
+// The same peer loses its connection when MaxQueueAge is 4 s, shorter than
+// its messages wait: the rule is the age of the queue, not how long one
+// message takes to write, which is a tenth of a second here. This is the
+// trade-off #623 accepts, a peer slower than SendQueueBytes / MaxQueueAge
+// with its queue full.
+func TestACorePeerWhoseMessagesWaitLongerThanMaxQueueAgeIsResetThoughItReads(t *testing.T) {
+	var s Stats
+	pacedBurst(t, Config{MaxQueueAge: 4 * time.Second}, func(tr *Transport, sent bool) bool {
+		s = tr.Stats()
+		return s.WriteStalls > 0 || sent && s.QueuedBytes == 0
+	})
+	if s.WriteStalls == 0 || s.WriteErrors != 0 {
+		t.Errorf("WriteStalls %d, WriteErrors %d: a queue whose messages waited over 4 s was not reset", s.WriteStalls, s.WriteErrors)
 	}
 }
