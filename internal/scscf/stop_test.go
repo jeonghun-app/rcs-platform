@@ -100,9 +100,9 @@ func TestTheStopKeepsReturnMarginForItsReturn(t *testing.T) {
 		c.CxTimeout = 25 * time.Second
 		d.dial = dprDial(hss, true, &dprs)
 		d.stopping = func(b, s time.Time) { begun, stopBy = b, s }
-		d.goodbyeCtx = func(dl time.Time) (context.Context, context.CancelFunc) {
-			deadline = dl
-			return context.WithDeadline(context.Background(), dl)
+		d.goodbyeCtx = func(ctx context.Context) (context.Context, context.CancelFunc) {
+			deadline, _ = ctx.Deadline()
+			return ctx, func() {}
 		}
 	})
 	stopAfterCxOpen(t, r, hss)
@@ -140,13 +140,17 @@ func TestTheGoodbyeHasStopByOrItsFloor(t *testing.T) {
 
 // TestAGoodbyeReachedLateStillSendsItsDPR (#549 code review): a stop held
 // past its deadline before the goodbye, as a host that did not run the
-// process does, still writes the DPR, in the goodbye's floor.
+// process does, gives the goodbye goodbyeFloor from then as its deadline,
+// and the goodbye, given time, writes the DPR.
 //
-// The goodbye's context is the test's, open until the DPR is written: on
-// the wall clock a host that left the process less than a 25th of a CPU
-// let the floor pass before the Diameter connection had started the DPR
-// (#644). That the goodbye has its floor is read from the deadline it was
-// given, between the two clock readings around the one run takes.
+// The deadline is read from the context run made, and must lie the floor
+// after a clock reading between the two around the one run takes. The DPR
+// is waited for on a context that keeps run's values but not its end, and
+// ends once the DPR is written: on the wall clock a host that left the
+// process less than a 25th of a CPU let the floor pass before the Diameter
+// connection had started the DPR (#644). So the test does not show that a
+// late DPR goes out within the floor; whether 100 ms is enough on a
+// starved task is #644's open question.
 func TestAGoodbyeReachedLateStillSendsItsDPR(t *testing.T) {
 	hss := startHSS(t)
 	var dprs atomic.Int64
@@ -159,9 +163,10 @@ func TestAGoodbyeReachedLateStillSendsItsDPR(t *testing.T) {
 			time.Sleep(time.Until(stopBy.Add(goodbyeFloor)))
 			released = time.Now()
 		}
-		d.goodbyeCtx = func(dl time.Time) (context.Context, context.CancelFunc) {
-			asked, deadline = time.Now(), dl
-			ctx, cancel := context.WithCancel(context.Background())
+		d.goodbyeCtx = func(made context.Context) (context.Context, context.CancelFunc) {
+			asked = time.Now()
+			deadline, _ = made.Deadline()
+			ctx, cancel := context.WithCancel(context.WithoutCancel(made))
 			go func() {
 				// Ended once the DPR is written, as the HSS stub never
 				// answers it, or after realWait, which fails the test.
