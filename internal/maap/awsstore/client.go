@@ -18,22 +18,34 @@ import (
 // and returns the registry in table; endpoint, when set, replaces the AWS
 // endpoint, for DynamoDB Local. It makes no request.
 func New(ctx context.Context, table, endpoint string) (*Registry, error) {
+	ddb, err := NewClient(ctx, endpoint)
+	if err != nil {
+		return nil, err
+	}
+	return NewRegistry(ddb, table), nil
+}
+
+// NewClient returns the DynamoDB client New uses, for maap's other tables.
+func NewClient(ctx context.Context, endpoint string) (*dynamodb.Client, error) {
 	awsCfg, err := config.LoadDefaultConfig(ctx, config.WithLogger(sdkLogger{}))
 	if err != nil {
 		return nil, fmt.Errorf("awsstore: loading the AWS configuration: %w", err)
 	}
-	ddb := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) {
+	return dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) {
 		if endpoint != "" {
 			o.BaseEndpoint = aws.String(endpoint)
 		}
-	})
-	return NewRegistry(ddb, table), nil
+	}), nil
 }
 
 // Ready checks that the table can be reached and is ACTIVE, for /readyz.
 // It needs dynamodb:DescribeTable.
-func (r *Registry) Ready(ctx context.Context) error {
-	out, err := r.api.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(r.table)})
+func (r *Registry) Ready(ctx context.Context) error { return ready(ctx, r.api, r.table) }
+
+func ready(ctx context.Context, api interface {
+	DescribeTable(context.Context, *dynamodb.DescribeTableInput, ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
+}, table string) error {
+	out, err := api.DescribeTable(ctx, &dynamodb.DescribeTableInput{TableName: aws.String(table)})
 	if err != nil {
 		return sanitize("describe table", err)
 	}

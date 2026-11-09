@@ -10,14 +10,16 @@ today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token, where the operator
 registers, changes and deletes chatbots in the [registry](#registry) (#709)
 and issues and revokes their [credentials](#credentials-and-caches) (#710),
-kept in [DynamoDB](#dynamodb-maap-registry-table) (#708); #711–#713 add the
-operator's other routes.
+kept in [DynamoDB](#dynamodb-maap-registry-table) (#708). The
+[`maap-requests`](#dynamodb-maap-requests-table) table keeps the idempotency
+records #683's sends need (#713); #711–#713 add the operator's other routes
+and tables.
 
 ## Listeners
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
-| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
+| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` and `maap-requests` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
 | internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
@@ -40,7 +42,7 @@ reported at once at start.
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
 | `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
-| `MAAP_REQUESTS_TABLE` | `maap-requests` | idempotency records and message statuses (#713) |
+| `MAAP_REQUESTS_TABLE` | `maap-requests` | [idempotency records](#dynamodb-maap-requests-table) and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
 
 The operator's tokens are `maap`'s own settings: `hss`'s operator token,
@@ -318,3 +320,34 @@ operator deletes it.
 - **Errors.** A store failure is an error of its own, never "not found":
   callers answer it 503, not 404. Errors carry the operation and the AWS
   error code only.
+
+## DynamoDB `maap-requests` table
+
+`MAAP_REQUESTS_TABLE`, on demand with point-in-time recovery, written by
+`maap`'s task role only, like the registry (#684 creates it). Partition key
+`pk` and sort key `sk`, both strings; **TTL on `ttl`** (number, Unix
+seconds); no index. The send path that writes it is #683's.
+
+| `pk` | `sk` | Holds | Kept |
+|---|---|---|---|
+| `c#<chatbot ID>` | `i#<idempotency key>` | An idempotency record: `digest` (binary, the request's SHA-256), `message_id`, `answer` (binary, at most 8 KiB, absent when empty), `created`, `ttl`, `writer` | 24 hours from `created` (ADR 0009 §6) |
+
+- **Idempotency** (ADR 0009 §4 step 2, §6). The key is 1–64 characters of
+  `[A-Za-z0-9_-]`, so it holds no control character, scoped to the chatbot
+  by the partition. The record is put on the condition that no live one
+  exists: the first request with a key is kept with the Message-ID
+  generated for it (32 lower-case hex digits) and its answer; a repeat with
+  the same digest gets that record back, one with another digest is refused
+  ("key reused", which #683 answers 409). A random `writer` token tells a
+  put the SDK sent again after its answer was lost, which is then this
+  call's own, from another request's.
+- **Expiry** is judged at read, by comparing `ttl` with the time: DynamoDB's
+  TTL deletes late, and an expired item still there is written over.
+- **Per-chatbot deletion.** A chatbot's items are its partition: deleting
+  a chatbot (#709) queries it and deletes 25 items a request
+  (`BatchWriteItem`), sending again what DynamoDB leaves unprocessed. A write
+  that races the deletion can leave an item behind, under an ID the
+  registry never registers again (its tombstone), so no chatbot reads it;
+  its TTL or a repeated deletion removes it.
+- **Logs** never carry an idempotency key; errors carry the operation and
+  the AWS error code only.

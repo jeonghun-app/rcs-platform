@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
+	"github.com/jeonghun-app/rcs-platform/internal/maap/store/storetest"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 )
 
@@ -22,6 +23,20 @@ type readyRegistry struct {
 }
 
 func (r *readyRegistry) Ready(context.Context) error {
+	if !r.ready.Load() {
+		return errors.New("table not active")
+	}
+	return nil
+}
+
+// readyRequests is a requests table with the readiness check of the
+// DynamoDB one, ready with the registry.
+type readyRequests struct {
+	*store.MemoryRequests
+	ready *atomic.Bool
+}
+
+func (r readyRequests) Ready(context.Context) error {
 	if !r.ready.Load() {
 		return errors.New("table not active")
 	}
@@ -60,8 +75,9 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	done := make(chan error, 1)
 	registry := &readyRegistry{MemoryRegistry: store.NewMemoryRegistry()}
 	creds := deletions{registry.Credentials(), make(chan string, 1)}
+	requests := readyRequests{store.NewMemoryRequests(), &registry.ready}
 	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, listen: func(network, _ string) (net.Listener, error) {
+		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, requests: requests, listen: func(network, _ string) (net.Listener, error) {
 			ln, err := net.Listen(network, "127.0.0.1:0")
 			if err == nil {
 				listening <- ln
@@ -71,11 +87,12 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	}()
 	addr := (<-listening).Addr().String()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		if code, body := h.Get("/readyz"); code == http.StatusServiceUnavailable && strings.Contains(body, "dynamodb-registry") {
+		if code, body := h.Get("/readyz"); code == http.StatusServiceUnavailable &&
+			strings.Contains(body, "dynamodb-registry") && strings.Contains(body, "dynamodb-requests") {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("/readyz never reported the registry failing")
+			t.Fatal("/readyz never reported the tables failing")
 		}
 	}
 	registry.ready.Store(true)
@@ -116,7 +133,12 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 		t.Errorf("POST /v1/chatbots = %d, %v", resp.StatusCode, err)
 	}
 	// The credential routes are mounted over the credentials given, and
-	// deleting the chatbot runs their deletion and leaves none.
+	// deleting the chatbot runs their deletion and the other tables', and
+	// leaves nothing of it.
+	rec := storetest.Idempotency("cb-1")
+	if _, _, err := requests.Remember(context.Background(), rec, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	for _, step := range []struct {
 		method, path string
 		want         int
@@ -141,6 +163,10 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	}
 	if left, err := creds.ChatbotCredentials(context.Background(), "cb-1"); len(left) != 0 || err != nil {
 		t.Errorf("credentials left: %v, %v", left, err)
+	}
+	rec.Digest[0]++
+	if _, fresh, err := requests.Remember(context.Background(), rec, time.Now()); !fresh || err != nil {
+		t.Errorf("the idempotency record was left: %v", err)
 	}
 
 	cancel()
