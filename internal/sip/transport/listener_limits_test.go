@@ -144,6 +144,10 @@ func TestProxyHeaderDeadlineDoesNotCutTheTLSHandshake(t *testing.T) {
 	if s := server.Stats(); s.ProxyHeaderTimeouts != 0 {
 		t.Fatalf("the header timed out: %+v", s)
 	}
+	// The client's own deadline, set at the dial, covered the waits above,
+	// which take half of it at least and all of it on a loaded host (#638):
+	// the handshake gets a whole one from here.
+	raw.SetDeadline(time.Now().Add(waitFor))
 	c := tls.Client(raw, clientTLS)
 	if err := c.Handshake(); err != nil {
 		t.Fatalf("handshake after the PROXY deadline: %v", err)
