@@ -44,6 +44,7 @@ func Run(t *testing.T, newRegistry func(t *testing.T) store.Registry) {
 	t.Run("UpdateNeedsTheVersionRead", func(t *testing.T) { versions(t, newRegistry(t)) })
 	t.Run("OnlyOneOfConcurrentUpdatesWins", func(t *testing.T) { concurrentUpdates(t, newRegistry(t)) })
 	t.Run("DeleteFreesTheURIAndARepeatIsHarmless", func(t *testing.T) { deletes(t, newRegistry(t)) })
+	t.Run("ADeletedIDIsNeverRegisteredAgain", func(t *testing.T) { tombstone(t, newRegistry(t)) })
 }
 
 func equal(t *testing.T, got, want store.Chatbot) {
@@ -60,7 +61,10 @@ func readsBack(t *testing.T, r store.Registry) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.Version = 1
+	if got.Registration == "" {
+		t.Fatal("no registration token")
+	}
+	c.Version, c.Registration = 1, got.Registration
 	equal(t, got, c)
 	got, err = r.Chatbot(ctx, c.ID)
 	if err != nil {
@@ -72,8 +76,11 @@ func readsBack(t *testing.T, r store.Registry) {
 	if _, err := r.Register(ctx, bare); err != nil {
 		t.Fatal(err)
 	}
-	bare.Version = 1
 	got, _ = r.Chatbot(ctx, bare.ID)
+	if got.Registration == c.Registration {
+		t.Fatal("two registrations share a token")
+	}
+	bare.Version, bare.Registration = 1, got.Registration
 	equal(t, got, bare)
 	if _, err := r.Chatbot(ctx, "nobody"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("Chatbot of nobody = %v", err)
@@ -99,6 +106,10 @@ func taken(t *testing.T, r store.Registry) {
 	again.ID = c.ID
 	if _, err := r.Register(ctx, again); !errors.Is(err, store.ErrExists) {
 		t.Fatalf("Register of a taken ID = %v", err)
+	}
+	// With both taken, the ID is the answer.
+	if _, err := r.Register(ctx, c); !errors.Is(err, store.ErrExists) {
+		t.Fatalf("Register of a taken ID and URI = %v", err)
 	}
 	// again's URI is still free.
 	again.ID = Chatbot().ID
@@ -183,10 +194,27 @@ func versions(t *testing.T, r store.Registry) {
 	if _, err := r.Update(ctx, c, c); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("Update from a stale version = %v", err)
 	}
+	forged := next
+	forged.Registration = "another"
+	if _, err := r.Update(ctx, forged, forged); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Update from another registration = %v", err)
+	}
+	// The stored URI decides, not the caller's old: a URI changed on both
+	// sides is refused too, and stays free.
 	moved := next
 	moved.URI = Chatbot().URI
-	if _, err := r.Update(ctx, next, moved); !errors.Is(err, store.ErrInvalid) {
-		t.Fatalf("Update of the URI = %v", err)
+	for _, old := range []store.Chatbot{next, moved} {
+		if _, err := r.Update(ctx, old, moved); !errors.Is(err, store.ErrInvalid) {
+			t.Fatalf("Update of the URI = %v", err)
+		}
+	}
+	if stored, _ := r.Chatbot(ctx, c.ID); stored.URI != c.URI || stored.Version != 2 {
+		t.Fatalf("a refused Update changed the chatbot: %+v", stored)
+	}
+	other := Chatbot()
+	other.URI = moved.URI
+	if _, err := r.Register(ctx, other); err != nil {
+		t.Fatalf("Register of the URI an Update was refused = %v", err)
 	}
 	gone := Chatbot()
 	gone.Version = 1
@@ -237,5 +265,47 @@ func deletes(t *testing.T, r store.Registry) {
 	}
 	if err := r.DeleteChatbot(ctx, "nobody"); err != nil {
 		t.Fatalf("DeleteChatbot of nobody = %v", err)
+	}
+}
+
+// tombstone runs the sequence of the #731 review: an update read before a
+// delete never lands on a chatbot registered again under the ID, since
+// the ID is not registered again, and the old URI goes to someone else.
+func tombstone(t *testing.T, r store.Registry) {
+	ctx := context.Background()
+	x, err := r.Register(ctx, Chatbot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteChatbot(ctx, x.ID); err != nil {
+		t.Fatal(err)
+	}
+	again := Chatbot()
+	again.ID = x.ID
+	if _, err := r.Register(ctx, again); !errors.Is(err, store.ErrDeleted) {
+		t.Fatalf("Register of a deleted ID = %v", err)
+	}
+	if _, err := r.Update(ctx, x, x); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Update read before the delete = %v", err)
+	}
+	y := Chatbot()
+	y.URI = x.URI
+	if _, err := r.Register(ctx, y); err != nil {
+		t.Fatal(err)
+	}
+	// The deleted ID is the answer, though its old URI is taken too.
+	if _, err := r.Register(ctx, x); !errors.Is(err, store.ErrDeleted) {
+		t.Fatalf("Register of a deleted ID at a taken URI = %v", err)
+	}
+	if err := r.DeleteChatbot(ctx, x.ID); err != nil {
+		t.Fatalf("DeleteChatbot of a deleted ID = %v", err)
+	}
+	if got, err := r.Chatbot(ctx, y.ID); err != nil || got.URI != x.URI {
+		t.Fatalf("y after x's deletes: %+v, %v", got, err)
+	}
+	z := Chatbot()
+	z.URI = x.URI
+	if _, err := r.Register(ctx, z); !errors.Is(err, store.ErrURITaken) {
+		t.Fatalf("Register of y's URI = %v", err)
 	}
 }
