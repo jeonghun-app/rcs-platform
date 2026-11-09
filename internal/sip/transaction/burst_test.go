@@ -285,14 +285,7 @@ func twoWayBurst(t *testing.T, code, total int, dialer transport.Dialer, bound t
 			final.Add(1)
 		}
 	}
-	invite := func(side string, i int) *sip.Request {
-		req := newOutgoing(t, transport.TCP, "INVITE", fmt.Sprintf("z9hG4bK-%s-%d", side, i), "", 1)
-		req.Header.Set("Call-ID", fmt.Sprintf("%s-%d@example.com", side, i))
-		req.Header.Add("Contact", "<sip:x@127.0.0.1>")
-		req.Header.Add("Content-Type", "application/sdp")
-		req.Body = body
-		return req
-	}
+	invite := func(side string, i int) *sip.Request { return burstInvite(t, side, i, body) }
 	// The first INVITE opens the connection and tells B its flow.
 	if _, err := al.Request(invite("a", 0), transport.Destination{Network: transport.TCP, Addr: baddr}, collect); err != nil {
 		t.Fatal(err)
@@ -343,6 +336,16 @@ func twoWayBurst(t *testing.T, code, total int, dialer transport.Dialer, bound t
 		as.QueueOverflows+bs.QueueOverflows+as.WriteErrors+bs.WriteErrors > 0 {
 		t.Errorf("final=%d failed=%d of %d (%s); A %+v; B %+v", final.Load(), failed.Load(), want, &why, as, bs)
 	}
+}
+
+// burstInvite is the i-th INVITE of a burst's side, with body.
+func burstInvite(t *testing.T, side string, i int, body []byte) *sip.Request {
+	req := newOutgoing(t, transport.TCP, "INVITE", fmt.Sprintf("z9hG4bK-%s-%d", side, i), "", 1)
+	req.Header.Set("Call-ID", fmt.Sprintf("%s-%d@example.com", side, i))
+	req.Header.Add("Contact", "<sip:x@127.0.0.1>")
+	req.Header.Add("Content-Type", "application/sdp")
+	req.Body = body
+	return req
 }
 
 // wgDone is closed once wg's goroutines have returned.

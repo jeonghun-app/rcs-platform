@@ -73,6 +73,11 @@
 // whenever the transport closes one, the send fails
 // with an error that satisfies errors.Is(err, ErrNoFlow).
 //
+// A core connection is also reset once the oldest output in its queue has
+// waited longer than MaxQueueAge, however its writer is doing: one whose
+// peer's receive window has fallen below one segment still moves about a
+// message a second, so it never misses WriteTimeout (#623).
+//
 // Memory, per stream connection: a 4 KiB read buffer; while a message is being
 // read, up to Limits.MaxHeaderBytes plus the body bytes that have arrived (at
 // most Limits.MaxBodyBytes); and up to twice its send queue limit of output if

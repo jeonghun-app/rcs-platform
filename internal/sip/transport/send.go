@@ -28,6 +28,10 @@ type Destination struct {
 	// Empty takes the first listener of the network. A flow always uses its own
 	// listener.
 	Listener string
+	// PeerName names the peer in the transport's warnings about a connection
+	// it dials for this send: a service name a resolver looked up, never an
+	// address, a port or a user's name. Connections are reused regardless.
+	PeerName string
 }
 
 // SendRequest sends a request and reports the transport it actually used.
@@ -73,7 +77,7 @@ func (t *Transport) SendRequest(req *sip.Request, dst Destination, opts ...SendO
 		if len(b) <= udpMTULimit {
 			return UDP, t.sendDatagram(l, dst.Addr, b)
 		}
-		f, err := t.streamTo(TCP, dst.Addr, "")
+		f, err := t.streamTo(TCP, dst.Addr, "", dst.PeerName)
 		if errors.Is(err, ErrClosed) {
 			// Close cut the attempt: the UDP socket is closing too.
 			return "", ErrClosed
@@ -84,7 +88,7 @@ func (t *Transport) SendRequest(req *sip.Request, dst Destination, opts ...SendO
 		}
 		return TCP, t.sendStream(f, req, dst.Listener, wait)
 	case TCP, TLS:
-		f, err := t.streamTo(dst.Network, dst.Addr, dst.ServerName)
+		f, err := t.streamTo(dst.Network, dst.Addr, dst.ServerName, dst.PeerName)
 		if err != nil {
 			return "", err
 		}
@@ -219,7 +223,7 @@ func (t *Transport) SendResponse(res *sip.Response, src Source, opts ...SendOpti
 		if !n.Reliable() {
 			return fmt.Errorf("%w: connection closed and the Via names %s", ErrUnroutable, n)
 		}
-		f, err := t.streamTo(n, addr, "")
+		f, err := t.streamTo(n, addr, "", "")
 		if err != nil {
 			return err
 		}

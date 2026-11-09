@@ -223,6 +223,45 @@ Every service runs at least two tasks across two AZs in production. Losing a
 through the NLB to a surviving task. Every other service is stateless apart from
 its tables.
 
+**SIP core connections and jumbo frames.** The SIP connections between
+`pcscf`, `icscf`, `scscf` and `rcs-as` stay inside the VPC, whose network
+interfaces have an MTU of 9001 by default (MSS 8949). Linux sends nothing on a
+connection whose peer's receive window is smaller than one segment, and while
+traffic comes the other way each ACK puts off the zero-window probe. Such a
+connection moves about one message a second, so it never misses the write
+timeout (#623). With jumbo frames the receive window must stay at 16 KiB or
+more; at 8 KiB the connection all but stops. That is the floor
+[msrp-relay](msrp-relay.md)'s connection toward `rcs-as` has. With an MTU of
+1500 (MSS 1448) this cannot happen: even the smallest buffer the kernel allows
+leaves a window of several segments. No service sets `SO_RCVBUF` on these
+connections, so the kernel's autotuning sizes them. Whatever stalls one, the
+SIP transport resets a core connection once the oldest output in its send
+queue has waited longer than 32 s (`transport.Config.MaxQueueAge`, 64*T1), and
+the next send dials anew. The transactions on that connection end at Timer B
+or F, at once (`ErrFlowClosed`) if they were sent over the flow, or, for an
+INVITE that already had a provisional answer and so has no Timer B, at its
+proxy's Timer C (RFC 3261 §16.6 step 11). The reset restores the path for the
+requests that follow. The trade-off: while its 4 MiB queue is full, a core
+peer that reads slower than about 128 KiB/s loses its connection as well,
+where the write timeout alone keeps one that reads 20 KiB/s. Output that has
+waited that long belongs to transactions whose senders have already given up.
+Client-facing connections keep only the write timeout. There is no switch to
+turn the rule off: rolling back the images of the four SIP services is the
+only way, and it brings the jumbo stall back.
+
+Each reset counts in `transport.write_stalled` and logs one warning: queued
+bytes, `max_queue_age`, and the `listener` it was accepted on or `dialed=true`
+with the `peer` service it was dialed for (empty for an instance address),
+never an address, a port or an identity. Only these two reach CloudWatch; the
+transport's `WriteErrors` and `QueueWaitTimeouts` are not exported. A count
+means a peer that is slow but alive: one that stops reading altogether, or a
+task or interface that goes away, is cut by the 10 s write timeout first and
+counts in `WriteErrors`. At MSS 1448 a count always means a slow peer; at
+jumbo MSS, the VPC default, it can also be the window stall. Ticket (SEV3) on
+any count; page when above 0 in three consecutive 5-minute periods, a reset
+loop toward one slow peer (`SipCoreWriteStalled`,
+`SipCoreWriteStalledRepeated`; the alarms ship with #694).
+
 Every table has a memory backend for unit tests and local runs; the compose stack
 ([local-stack.md](local-stack.md)) uses DynamoDB Local and S3Mock.
 

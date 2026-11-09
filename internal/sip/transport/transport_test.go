@@ -769,7 +769,9 @@ func TestPeerThatNeverReadsFailsTheWaitingSendAndIsClosedByTheWriter(t *testing.
 	server, peer := net.Pipe()
 	t.Cleanup(func() { peer.Close() })
 	conn := &stalledConn{Conn: server, writing: make(chan time.Time, 1), deadline: make(chan struct{}), closed: make(chan struct{})}
-	tr, _ := newTransport(t, Config{Dialer: pipeDialer{conn}, WriteTimeout: time.Hour, SendQueueBytes: 1000})
+	// MaxQueueAge is past WriteTimeout, so the deadline is WriteTimeout's;
+	// the queue-age rule has tests of its own (queueage_test.go).
+	tr, _ := newTransport(t, Config{Dialer: pipeDialer{conn}, WriteTimeout: time.Hour, MaxQueueAge: 2 * time.Hour, SendQueueBytes: 1000})
 	// Before the transport's Close, which waits for the writer (QA of #330).
 	t.Cleanup(conn.release)
 	listen(t, tr, ListenerConfig{Network: TCP})

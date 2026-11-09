@@ -50,7 +50,13 @@ const (
 	// given up on (RFC 3261 §17.1.1.2, §17.1.2.2).
 	DefaultReadTimeout  = 32 * time.Second
 	DefaultWriteTimeout = 10 * time.Second
-	DefaultDialTimeout  = 5 * time.Second
+	// DefaultMaxQueueAge is 64*T1 with the default T1, as DefaultReadTimeout
+	// is: output that has waited longer belongs to transactions whose sender
+	// has already given up (RFC 3261 §17.1.1.2, §17.1.2.2). With a full
+	// 4 MiB queue it keeps a core peer that reads about 128 KiB/s or more
+	// (#623).
+	DefaultMaxQueueAge = 32 * time.Second
+	DefaultDialTimeout = 5 * time.Second
 	// DefaultSendQueueBytes lets a core connection absorb a burst of a
 	// thousand typical requests while its peer catches up. A peer that never
 	// reads costs at most twice this before its connection is closed.
@@ -192,6 +198,17 @@ type Config struct {
 	// listeners that are not client-facing; ListenerConfig.SendQueueBytes
 	// overrides it per listener.
 	SendQueueBytes int
+	// MaxQueueAge bounds how long output may wait in the send queue of a core
+	// connection, a dialed one or one accepted on a listener that is not
+	// client-facing. Once the oldest message there has waited longer, the
+	// connection is reset (SO_LINGER 0), counted as WriteStalls and
+	// MetricWriteStalls, and the next send dials anew. It ends a connection
+	// that moves too little to miss WriteTimeout: one whose peer's receive
+	// window has fallen below one segment moves about a message a second
+	// (#623). It also ends one to a peer that reads, but slower than
+	// SendQueueBytes divided by it, about 128 KiB/s at the defaults, while its
+	// queue is full. Client-facing connections are left to WriteTimeout.
+	MaxQueueAge time.Duration
 	// MaxQueuedBytes bounds the output every send queue holds together. When a
 	// message would take the total past it, connections whose peers have
 	// stopped reading are closed to make room: never the sender's own, never
@@ -251,15 +268,19 @@ type Config struct {
 	// flow IDs. Nil discards them.
 	Logger *slog.Logger
 	// Metrics, if set, counts the panics recovered from Admit, OnFlowClosed
-	// and OnPong as MetricCallbackPanics, at once (#445); Stats counts them
-	// too. A panic in Admit refuses the flow; one in the others ends that
-	// call only.
+	// and OnPong as MetricCallbackPanics, at once (#445), and the connections
+	// reset at MaxQueueAge as MetricWriteStalls; Stats counts both too. A
+	// panic in Admit refuses the flow; one in the others ends that call only.
 	Metrics panics.Counter
 }
 
 // MetricCallbackPanics counts the panics recovered from the service's
 // callbacks.
 const MetricCallbackPanics = "transport.callback_panics"
+
+// MetricWriteStalls counts the core connections reset because their oldest
+// output waited longer than MaxQueueAge.
+const MetricWriteStalls = "transport.write_stalled"
 
 func (c Config) withDefaults() Config {
 	setDefault(&c.MaxConnections, DefaultMaxConnections)
@@ -270,6 +291,7 @@ func (c Config) withDefaults() Config {
 	setDefault(&c.UDPFlowTimeout, DefaultUDPFlowTimeout)
 	setDefault(&c.ReadTimeout, DefaultReadTimeout)
 	setDefault(&c.WriteTimeout, DefaultWriteTimeout)
+	setDefault(&c.MaxQueueAge, DefaultMaxQueueAge)
 	setDefault(&c.DialTimeout, DefaultDialTimeout)
 	setDefault(&c.SendQueueBytes, DefaultSendQueueBytes)
 	setDefault(&c.MaxQueuedBytes, DefaultMaxQueuedBytes)
@@ -703,6 +725,7 @@ type Stats struct {
 	IdleTimeouts       uint64
 	ReadTimeouts       uint64 // stream connections closed mid-message or before their first message
 	WriteErrors        uint64
+	WriteStalls        uint64 // core connections reset because their oldest output waited longer than MaxQueueAge
 	QueueOverflows     uint64 // stream connections closed because a NoWait send overflowed their reserve
 	QueueWaitTimeouts  uint64 // sends that found no queue room within WriteTimeout; the connection stays
 	BudgetSheds        uint64 // stalled connections closed to keep all queues within MaxQueuedBytes
@@ -740,7 +763,7 @@ type Stats struct {
 type counters struct {
 	accepted, rejected, refused, dialed, dialErrors, dialLimited,
 	proxyHeaderErrors, healthChecks, tlsHandshakeErrors, framingErrors,
-	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
+	truncatedMessages, idleTimeouts, readTimeouts, writeErrors, writeStalls, queueOverflows, queueWaitTimeouts, budgetSheds, budgetRefusals, responseFlowCloses, keepAlives,
 	malformedDatagrams, invalidMessages, strayResponses,
 	clientListenerRejected, coreListenerRejected, proxyHeaderTimeouts, proxyHeaderEmpty atomic.Uint64
 }
@@ -909,6 +932,7 @@ func (t *Transport) Stats() Stats {
 		IdleTimeouts:       c.idleTimeouts.Load(),
 		ReadTimeouts:       c.readTimeouts.Load(),
 		WriteErrors:        c.writeErrors.Load(),
+		WriteStalls:        c.writeStalls.Load(),
 		QueueOverflows:     c.queueOverflows.Load(),
 		QueueWaitTimeouts:  c.queueWaitTimeouts.Load(),
 		BudgetSheds:        c.budgetSheds.Load(),

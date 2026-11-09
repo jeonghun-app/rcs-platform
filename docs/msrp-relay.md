@@ -191,7 +191,8 @@ succeeds. The task role needs
   window must stay at 16 KiB or more; at 8 KiB the connection all but stops
   (#517). Neither the relay nor `rcs-as` sets `SO_RCVBUF` on it, so the
   kernel's autotuning sizes it. A buffer set there later should be 32 KiB or
-  more.
+  more. SIP's core connections have the same floor; see
+  [architecture](architecture.md) §7.
 - **A stalled connection toward rcs-as is ended.** Whatever stalls it, a
   shrunk window as above or a path that drops everything, the relay notices
   once a request on it sent with `Failure-Report: yes` times out (one sent

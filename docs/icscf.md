@@ -106,6 +106,7 @@ Counters, by the names `internal/icscf`'s package documentation lists:
 | `icscf.routed.dropped_ack` | ACKs without a To tag, dropped |
 | `proxy.hook_panics` | panics recovered in icscf's routing: the request was answered 500 (#428); alarm on any |
 | `transaction.handler_panics` | panics recovered in a response handler; each ends only that call (#445); alarm on any |
+| `transport.write_stalled` | SIP core connections reset because a slow but live peer let their oldest output wait over 32 s. A peer that stops reading counts in the transport's `WriteErrors` after the 10 s write timeout instead, which is not exported. At MSS 1448 a count always means a slow peer; at jumbo MSS (the VPC's default MTU is 9001) it can also be the kernel window stall. This count and its warning are all that reach CloudWatch ([architecture](architecture.md) §7, #623). Ticket (SEV3) on any count; page when above 0 for three consecutive 5-minute periods, a reset loop (`SipCoreWriteStalled`, `SipCoreWriteStalledRepeated`, #694) |
 | `sip.overloaded` | requests refused as overloaded (503 with Retry-After), at the transaction layer's caps (`ICSCF_MAX_SERVER_TRANSACTIONS`, `ICSCF_MAX_SERVER_TRANSACTION_BYTES`) or at the proxy's own bound, which charges headers twice; recorded every 15 s and at the stop. #56's overload alarm reads it (#467) |
 
 `cxclient.*` counts the Cx answers by result code and their latency.

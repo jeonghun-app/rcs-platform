@@ -52,15 +52,15 @@ func TestDNSResolverResolvesNamesAndAddressesToPrivateDestinations(t *testing.T)
 		uri  string
 		want transport.Destination
 	}{
-		{"sip:icscf.rcs.internal;transport=tcp;lr", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5060")}},
-		{"sip:ICSCF.rcs.internal:5070;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5070")}},
-		{"sip:icscf.rcs.internal.:5070;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5070")}},
-		{"sips:icscf.rcs.internal", transport.Destination{Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.3.7:5061"), ServerName: "icscf.rcs.internal"}},
-		{"sip:icscf.rcs.internal;transport=tls", transport.Destination{Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.3.7:5061"), ServerName: "icscf.rcs.internal"}},
-		{"sip:v6.rcs.internal;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("[fd00::7]:5060")}},
+		{"sip:icscf.rcs.internal;transport=tcp;lr", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5060"), PeerName: "icscf.rcs.internal"}},
+		{"sip:ICSCF.rcs.internal:5070;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5070"), PeerName: "icscf.rcs.internal"}},
+		{"sip:icscf.rcs.internal.:5070;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.3.7:5070"), PeerName: "icscf.rcs.internal"}},
+		{"sips:icscf.rcs.internal", transport.Destination{Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.3.7:5061"), ServerName: "icscf.rcs.internal", PeerName: "icscf.rcs.internal"}},
+		{"sip:icscf.rcs.internal;transport=tls", transport.Destination{Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.3.7:5061"), ServerName: "icscf.rcs.internal", PeerName: "icscf.rcs.internal"}},
+		{"sip:v6.rcs.internal;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("[fd00::7]:5060"), PeerName: "v6.rcs.internal"}},
 		{"sip:10.0.4.8:5070;transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("10.0.4.8:5070")}},
 		{"sip:[fd00::8];transport=tcp", transport.Destination{Network: transport.TCP, Addr: netip.MustParseAddrPort("[fd00::8]:5060")}},
-		{"sip:icscf.rcs.internal", transport.Destination{Network: transport.UDP, Addr: netip.MustParseAddrPort("10.0.3.7:5060")}},
+		{"sip:icscf.rcs.internal", transport.Destination{Network: transport.UDP, Addr: netip.MustParseAddrPort("10.0.3.7:5060"), PeerName: "icscf.rcs.internal"}},
 		{"sips:10.0.4.8", transport.Destination{Network: transport.TLS, Addr: netip.MustParseAddrPort("10.0.4.8:5061")}},
 	} {
 		got, err := r.Resolve(context.Background(), mustURI(tt.uri))

@@ -437,7 +437,7 @@ func (t *Transport) startWriter(f *flow) {
 // streamTo returns an open connection to a peer, reusing one when there is one
 // (RFC 3261 §18.1.1) and otherwise dialing. Concurrent callers for the same peer
 // share one dial, so a burst of requests to a core node opens one connection.
-func (t *Transport) streamTo(network Network, addr netip.AddrPort, serverName string) (*flow, error) {
+func (t *Transport) streamTo(network Network, addr netip.AddrPort, serverName, peerName string) (*flow, error) {
 	k := reuseKey{network: network, remote: addr}
 	if network == TLS {
 		if serverName == "" && (t.cfg.TLSClient == nil || t.cfg.TLSClient.ServerName == "") {
@@ -482,7 +482,7 @@ func (t *Transport) streamTo(network Network, addr netip.AddrPort, serverName st
 		t.mu.Unlock()
 		close(d.done)
 	}()
-	d.f, d.err = t.dial(k)
+	d.f, d.err = t.dial(k, peerName)
 	return d.f, d.err
 }
 
@@ -508,7 +508,7 @@ func (t *Transport) waitDial(network Network, d *dialCall) (*flow, error) {
 	}
 }
 
-func (t *Transport) dial(k reuseKey) (*flow, error) {
+func (t *Transport) dial(k reuseKey, peerName string) (*flow, error) {
 	ctx, cancel := context.WithTimeout(t.dials, t.cfg.DialTimeout)
 	defer cancel()
 	c, err := t.cfg.Dialer.DialContext(ctx, "tcp", k.remote.String())
@@ -542,6 +542,7 @@ func (t *Transport) dial(k reuseKey) (*flow, error) {
 	}
 	f := t.flows.newFlow(k.network, nil, k.remote)
 	f.serverName = k.serverName
+	f.peerName = peerName
 	f.idle.Store(int64(t.cfg.IdleTimeout))
 	f.conn = c
 	t.mu.Lock()

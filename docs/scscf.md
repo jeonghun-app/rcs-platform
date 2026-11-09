@@ -149,6 +149,15 @@ Alarm on a rise of these:
   `transaction.handler_panics`, in a response handler of a request scscf
   sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
   the request or the call it was in; alarm on any;
+- `transport.write_stalled`: SIP core connections reset because a slow but
+  live peer let their oldest output wait over 32 s. A peer that stops reading
+  counts in the transport's `WriteErrors` after the 10 s write timeout
+  instead, which is not exported. At MSS 1448 a count always means a slow
+  peer; at jumbo MSS (the VPC's default MTU is 9001) it can also be the kernel
+  window stall. This count and its warning are all that reach CloudWatch
+  ([architecture](architecture.md) §7, #623). Ticket (SEV3) on any count; page
+  when above 0 for three consecutive 5-minute periods, a reset loop
+  (`SipCoreWriteStalled`, `SipCoreWriteStalledRepeated`, #694);
 - `background.panics`, panics recovered in scscf's own background work:
   the sweeps, the metrics report, a reg event task, a first NOTIFY, a
   third-party REGISTER or an identity repair (#488). Each ends only that

@@ -152,8 +152,11 @@ func (r *DNSResolver) ResolveAll(ctx context.Context, u sip.URI) ([]transport.De
 		}
 		dst := d
 		dst.Addr = netip.AddrPortFrom(a, d.Addr.Port())
-		if dst.Network == transport.TLS && named {
-			dst.ServerName = host
+		if named {
+			dst.PeerName = host
+			if dst.Network == transport.TLS {
+				dst.ServerName = host
+			}
 		}
 		out = append(out, dst)
 	}
