@@ -26,7 +26,11 @@ import (
 
 // registryTable creates maap-registry as docs/maap.md defines it and
 // returns the client.
-func registryTable(t *testing.T) (*dynamodb.Client, string) {
+func registryTable(t *testing.T) (*dynamodb.Client, string) { return table(t, "maap-registry") }
+
+// table creates a table of name's key schema, which all of maap's tables
+// share, and returns the client.
+func table(t *testing.T, name string) (*dynamodb.Client, string) {
 	t.Helper()
 	endpoint := os.Getenv("MAAP_IT_DYNAMODB_ENDPOINT")
 	if endpoint == "" {
@@ -38,7 +42,7 @@ func registryTable(t *testing.T) (*dynamodb.Client, string) {
 		t.Fatal(err)
 	}
 	ddb := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(endpoint) })
-	table := "maap-registry-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	table := name + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	attr := func(name string) types.AttributeDefinition {
 		return types.AttributeDefinition{AttributeName: aws.String(name), AttributeType: types.ScalarAttributeTypeS}
 	}
@@ -101,6 +105,30 @@ func (r resend) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWri
 	again := *in
 	again.ClientRequestToken = nil
 	return r.DynamoAPI.TransactWriteItems(ctx, &again, o...)
+}
+
+// resendTable is resend for TableAPI.
+type resendTable struct{ TableAPI }
+
+func (r resendTable) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
+	if _, err := r.TableAPI.PutItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.PutItem(ctx, in, o...)
+}
+
+func (r resendTable) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, o ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
+	if _, err := r.TableAPI.DeleteItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.DeleteItem(ctx, in, o...)
+}
+
+func (r resendTable) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	if _, err := r.TableAPI.UpdateItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.UpdateItem(ctx, in, o...)
 }
 
 func TestIntegrationAWriteSentAgainAfterItTookEffectStands(t *testing.T) {
@@ -382,5 +410,47 @@ func TestIntegrationADeletionFinishesOverADamagedKeyItem(t *testing.T) {
 	out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: slotKey(c.ID, 1), ConsistentRead: aws.Bool(true)})
 	if err != nil || len(out.Item) != 0 {
 		t.Fatalf("the slot is left: %v, %v", out.Item, err)
+	}
+}
+
+func TestIntegrationRequestsMeetTheContract(t *testing.T) {
+	storetest.RunRequests(t, func(t *testing.T) store.Requests {
+		ddb, name := table(t, "maap-requests")
+		r := NewRequests(ddb, name, testKey)
+		r.pageSize = 7 // pages that end inside a batch
+		return r
+	})
+}
+
+// A request whose put the SDK sent again after it took effect is kept by
+// this call; a repeat of it is still a repeat.
+func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
+	ddb, name := table(t, "maap-requests")
+	r := NewRequests(resendTable{ddb}, name, testKey)
+	rec := storetest.Idempotency(storetest.Chatbot().ID)
+	got, fresh, err := r.Remember(t.Context(), rec, storetest.Now)
+	if err != nil || !fresh || got.MessageID != rec.MessageID {
+		t.Fatalf("Remember = %+v, %v, %v", got, fresh, err)
+	}
+	writer := got.Writer
+	again := rec
+	again.MessageID = storetest.MessageID()
+	if got, fresh, err := r.Remember(t.Context(), again, storetest.Now); err != nil || fresh || got.MessageID != rec.MessageID {
+		t.Fatalf("repeat = %+v, %v, %v", got, fresh, err)
+	}
+	// A settle and, of another, pending record, a forget sent again stand.
+	if err := r.Settle(t.Context(), rec.Chatbot, rec.Key, writer, []byte("{}"), storetest.Now); err != nil {
+		t.Fatalf("Settle = %v", err)
+	}
+	refused := storetest.Idempotency(rec.Chatbot)
+	got, _, err = r.Remember(t.Context(), refused, storetest.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Forget(t.Context(), refused.Chatbot, refused.Key, got.Writer); err != nil {
+		t.Fatalf("Forget = %v", err)
+	}
+	if err := r.Ready(t.Context()); err != nil {
+		t.Fatalf("Ready = %v", err)
 	}
 }

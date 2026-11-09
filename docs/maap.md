@@ -10,14 +10,16 @@ today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token, where the operator
 registers, changes and deletes chatbots in the [registry](#registry) (#709)
 and issues and revokes their [credentials](#credentials-and-caches) (#710),
-kept in [DynamoDB](#dynamodb-maap-registry-table) (#708); #711–#713 add the
-operator's other routes.
+kept in [DynamoDB](#dynamodb-maap-registry-table) (#708). The
+[`maap-requests`](#dynamodb-maap-requests-table) table keeps the idempotency
+records #683's sends need (#713); #711–#713 add the operator's other routes
+and tables.
 
 ## Listeners
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
-| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
+| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` and `maap-requests` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
 | internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
@@ -40,8 +42,12 @@ reported at once at start.
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
 | `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
-| `MAAP_REQUESTS_TABLE` | `maap-requests` | idempotency records and message statuses (#713) |
+| `MAAP_REQUESTS_TABLE` | `maap-requests` | [idempotency records](#dynamodb-maap-requests-table) and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
+
+`RCS_PII_HMAC_KEY`, which keys log hints in every service, also keys the
+request digests `maap-requests` keeps, through a subkey of their own (see
+[the table](#dynamodb-maap-requests-table)).
 
 The operator's tokens are `maap`'s own settings: `hss`'s operator token,
 `HSS_ADMIN_TOKEN`, is never accepted here (ADR 0009 §7). Tokens come from
@@ -132,7 +138,7 @@ the path that no chatbot can have is 404 before the registry is read.
 | `GET /v1/chatbots/{id}` | reads it: 200 |
 | `PATCH /v1/chatbots/{id}` | sets the fields the body gives; a field left out, or null, keeps its value. `permissions` and `limits` merge field by field, as a JSON merge patch (RFC 7396): a field given replaces that one field and one left out or null keeps its value, so lowering one limit leaves the others as they are; 0 sets a limit back to its default. `webhook` is replaced whole: 200 |
 | `POST /v1/chatbots/{id}/suspend`, `.../resume` | sets the state only; a suspended chatbot keeps its record: 200 |
-| `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it: 204, also when it is gone already |
+| `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it, for at most 20 s a call: 204 once all is gone, also when it was gone already; 503 with `Retry-After: 1` while items are left. Call it again until it answers 204: a 503, a timeout or a connection closed without an answer is not done |
 
 **Fields.** Each broken rule is 400, naming the field and never the value:
 
@@ -193,7 +199,12 @@ newer release, is 500. A registry that fails is 503 with `Retry-After: 1`:
 send the request again. A deletion runs the registry's first, which frees the
 URI and keeps the ID from ever being registered again, then each table's;
 each either finishes or fails, so after a 503 sending it again finishes what
-is left.
+is left. A chatbot that sent much has more items than one call deletes at
+the paced rate below (about 180,000 at the send limits, some 36 calls), so a
+call stops after 20 s, under the listener's 30 s write timeout, and answers
+503 with `Retry-After: 1` (lead decision on #713); each table logs `awsstore:
+chatbot deletion progress` with the chatbot's ID, how many items the call
+deleted and whether it finished.
 
 **Audit.** Each request's `audit: internal request` line names the chatbot
 (`chatbot`, its ID) and, for a change that was written, the values before and
@@ -318,3 +329,52 @@ operator deletes it.
 - **Errors.** A store failure is an error of its own, never "not found":
   callers answer it 503, not 404. Errors carry the operation and the AWS
   error code only.
+
+## DynamoDB `maap-requests` table
+
+`MAAP_REQUESTS_TABLE`, on demand with point-in-time recovery, written by
+`maap`'s task role only, like the registry (#684 creates it). Partition key
+`pk` and sort key `sk`, both strings; **TTL on `ttl`** (number, Unix
+seconds); no index. The send path that writes it is #683's.
+
+| `pk` | `sk` | Holds | Kept |
+|---|---|---|---|
+| `c#<chatbot ID>` | `i#<idempotency key>` | An idempotency record: `digest` (binary, an HMAC of the request's SHA-256), `message_id`, `pending` (true until settled) or `answer` (binary, at most 8 KiB, absent when empty), `created`, `ttl`, `writer` | 24 hours from `created` (ADR 0009 §6) |
+
+- **Idempotency** (ADR 0009 §4 step 2, §6). The key is 1–64 characters of
+  `[A-Za-z0-9_-]`, so it holds no control character, scoped to the chatbot
+  by the partition. The record is put on the condition that no live one
+  exists: the first request with a key is kept, **pending**, with the
+  Message-ID generated for it (32 lower-case hex digits); a repeat with the
+  same digest gets that record back, one with another digest is refused
+  ("key reused", which #683 answers 409). A random `writer` token tells a
+  put the SDK sent again after its answer was lost, which is then this
+  call's own, from another request's.
+- **Settle and forget** (lead decision on #713, after the #749 security
+  review). Only the call that stored a record holds its writer token, and
+  only it may change the record, each by one conditional write: `Settle`
+  stores the answer once `rcs-as` has answered, which repeats then get;
+  `Forget` deletes the pending record of a request refused before it was
+  sent (never a settled one, whose request was sent), so
+  that a repeat is checked again rather than replayed. A repeat that finds
+  the record pending is neither replayed nor sent: #683 answers 409, or 503
+  to try again later. A call by any other writer is refused (a conflict).
+- **Keyed digest.** The table keeps an HMAC-SHA256 of the request's digest,
+  under a subkey of `RCS_PII_HMAC_KEY`, so that a reader of the table or of
+  a backup cannot test guesses of a request (a templated one-time code, for
+  instance) without the key (#749 security review). Rotating the key makes
+  a repeat across the rotation another request (409) for up to 24 hours.
+- **Expiry** is judged at read, by comparing `ttl` with the time: DynamoDB's
+  TTL deletes late, and an expired item still there is written over.
+- **Per-chatbot deletion.** A chatbot's items are its partition: deleting
+  a chatbot (#709) queries it and deletes 25 items a request
+  (`BatchWriteItem`), at most one request every 100 ms (250 items a second),
+  so that a large deletion leaves the partitions it shares with other
+  chatbots their capacity, and sends again what DynamoDB leaves
+  unprocessed. It stops 2 s before the call's 20 s budget ends, unfinished
+  (see the registry's errors in [Registry](#registry)). A write that races the
+  deletion can leave an item behind, under an ID the registry never
+  registers again (its tombstone), so no chatbot reads it; its TTL or a
+  repeated deletion removes it.
+- **Logs** never carry an idempotency key; errors carry the operation and
+  the AWS error code only.

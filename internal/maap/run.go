@@ -24,10 +24,12 @@ func Service() runtime.Service[Config] {
 type deps struct {
 	listen func(network, address string) (net.Listener, error)
 	// registry and credentials replace maap-registry in DynamoDB; /readyz
-	// checks the registry if it has a Ready method, as the DynamoDB one
-	// does.
+	// checks each table whose store has a Ready method, as the DynamoDB
+	// ones do.
 	registry    store.Registry
 	credentials store.Credentials
+	// requests replaces maap-requests, with the registry only.
+	requests store.Requests
 }
 
 // Run serves the internal listener, apart from the runtime's admin port
@@ -37,16 +39,23 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	registry, creds := d.registry, d.credentials
+	registry, creds, requests := d.registry, d.credentials, d.requests
 	if registry == nil {
-		r, err := awsstore.New(ctx, cfg.RegistryTable, cfg.DynamoDBEndpoint)
+		ddb, err := awsstore.NewClient(ctx, cfg.DynamoDBEndpoint)
 		if err != nil {
 			return fmt.Errorf("maap: %w", err)
 		}
+		r := awsstore.NewRegistry(ddb, cfg.RegistryTable)
 		registry, creds = r, r.Credentials()
+		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StoreKey)
 	}
-	if r, ok := registry.(interface{ Ready(context.Context) error }); ok {
-		rt.Admin.AddReadinessCheck("dynamodb-registry", r.Ready)
+	for _, t := range []struct {
+		name  string
+		table any
+	}{{"dynamodb-registry", registry}, {"dynamodb-requests", requests}} {
+		if r, ok := t.table.(interface{ Ready(context.Context) error }); ok {
+			rt.Admin.AddReadinessCheck(t.name, r.Ready)
+		}
 	}
 	// The internal listener's own decode pool: #683 gives the public
 	// listener another, so that chatbots cannot take rcs-as's slots.
@@ -57,7 +66,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		// Every store of a chatbot's items is a deleter (#742 review), the
 		// credentials too, though the registry's deletion takes them with
 		// its partition already.
-		deleters: []store.ChatbotDeleter{creds},
+		deleters: []store.ChatbotDeleter{creds, requests},
 	})
 	api.mountCredentials(&credentialAPI{registry: registry, creds: creds, random: rand.Reader, now: time.Now})
 	ln, err := d.listen("tcp", cfg.InternalAddr)
