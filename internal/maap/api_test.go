@@ -259,7 +259,23 @@ func TestASlowBodyFreesItsDecodeSlotLongBeforeTheReadTimeout(t *testing.T) {
 		}
 	}
 	wait(1, "the slow sender never took the slot")
+	held := time.Now()
 	wait(0, "the slot was still held 10 s after a trickled body took it")
+	// bodyTime(16 KiB) is 1.25 s; the margin is for a loaded host.
+	if d := time.Since(held); d > 2500*time.Millisecond {
+		t.Errorf("the slot was held %v, want about 1.25 s", d)
+	}
+}
+
+func TestABodyHas1sPlus1sPer64KiB(t *testing.T) {
+	for _, tc := range []struct {
+		max  int64
+		want time.Duration
+	}{{16 << 10, 1250 * time.Millisecond}, {64 << 10, 2 * time.Second}, {0, time.Second}} {
+		if got := bodyTime(tc.max); got != tc.want {
+			t.Errorf("bodyTime(%d) = %v, want %v", tc.max, got, tc.want)
+		}
+	}
 }
 
 func TestAPanickingHandlerFreesItsSlotAndIsAudited(t *testing.T) {

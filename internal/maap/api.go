@@ -40,6 +40,12 @@ const maxOperatorBody = 16 << 10
 // body, in bytes a second; far below any caller inside the VPC.
 const minBodyRate = 64 << 10
 
+// bodyTime is how long a request holding a decode slot has to send a body
+// of at most maxBytes: 1 s, plus 1 s for every minBodyRate bytes.
+func bodyTime(maxBytes int64) time.Duration {
+	return time.Second + time.Duration(maxBytes)*time.Second/minBodyRate
+}
+
 // apiError is an answer other than success. Messages say what is wrong
 // with the request without quoting it.
 type apiError struct {
@@ -96,7 +102,7 @@ func (d *decoder) decode(c *call, maxBytes int64, v any) error {
 	// Without a deadline of its own a body trickled byte by byte would hold
 	// the slot until the server's ReadTimeout (#723 review). A writer with
 	// no connection, a test recorder, cannot set one and has none to wait on.
-	_ = http.NewResponseController(c.w).SetReadDeadline(time.Now().Add(time.Second + time.Duration(maxBytes)*time.Second/minBodyRate))
+	_ = http.NewResponseController(c.w).SetReadDeadline(time.Now().Add(bodyTime(maxBytes)))
 	if err := chatbot.DecodeEnvelope(c.r.Body, maxBytes, v); err != nil {
 		c.releaseBody()
 		switch {

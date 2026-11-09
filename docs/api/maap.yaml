@@ -20,8 +20,8 @@ info:
     Bodies are `application/json` (415 otherwise) and strict JSON (ADR 0009
     §9): unknown fields, duplicate keys,
     keys differing only in case and trailing data are refused, and each
-    string has a bound. Operator bodies are at most 16 KiB. When the task is
-    decoding as many bodies as `MAAP_DECODES` allows, a request is 503 with
+    string has a bound. Operator bodies are at most 16 KiB. When the internal
+    listener is decoding as many bodies as `MAAP_DECODES` allows, a request is 503 with
     `Retry-After: 1` before its body is read; one that is decoded must send
     its body within 1 s plus 1 s per 64 KiB of its limit. A string that maap writes into
     a header or a log is refused if it holds a C0 control or DEL.
