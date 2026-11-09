@@ -66,6 +66,10 @@ type Config struct {
 	SubscribersTable string
 	RequestsTable    string
 	CountersTable    string
+	// StoreKey is RCS_PII_HMAC_KEY, which also keys the request digests
+	// maap-requests keeps (#749 security review): a key the platform
+	// already holds as a secret, unset only where production refuses it.
+	StoreKey secret.Key
 	// DynamoDBEndpoint replaces the AWS endpoint, for DynamoDB Local.
 	DynamoDBEndpoint string
 }
@@ -86,6 +90,7 @@ func Configure(s *runtime.Settings) Config {
 		RequestsTable:    e.String("REQUESTS_TABLE", DefaultRequestsTable),
 		CountersTable:    e.String("COUNTERS_TABLE", DefaultCountersTable),
 		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
+		StoreKey:         secret.NewString(s.Shared.String("PII_HMAC_KEY", "")),
 		HTTPWebhooks:     !s.Environment.Production(),
 		InternalWebhooks: s.Environment == runtime.Dev,
 	}

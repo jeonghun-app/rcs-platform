@@ -38,17 +38,30 @@ func ValidIdempotencyKey(key string) bool { return ValidID(key) }
 
 // Idempotency is the record of the first request a chatbot sent with an
 // idempotency key (ADR 0009 §4 step 2). The key is never logged (§10).
+//
+// A record starts pending, with the Message-ID generated for the request:
+// a repeat then is neither replayed nor sent (#683 answers 409, or 503 to
+// try again later). The writer that stored it settles it with the answer
+// once rcs-as has answered, which repeats then get, or forgets it when the
+// request was refused before it was sent (lead decision on #713).
 type Idempotency struct {
 	Chatbot string
 	Key     string
 	// Digest is the SHA-256 of the request, which #683 computes; another
-	// request with the key has another digest.
+	// request with the key has another digest. The DynamoDB backend keeps
+	// only an HMAC of it, so that a reader of the table or a backup cannot
+	// test guesses of a request (#749 security review).
 	Digest [sha256.Size]byte
 	// MessageID is the Message-ID generated for the request, which a
 	// retry after a lost answer sends again.
 	MessageID string
-	// Answer is the answer stored for the request, opaque to the store.
-	Answer []byte
+	// Pending says the record is not settled yet; Answer is the settled
+	// answer, opaque to the store.
+	Pending bool
+	Answer  []byte
+	// Writer is the token of the call that stored the record, which Settle
+	// and Forget need; Remember returns it to that call only.
+	Writer string
 	// Created is in seconds; the record is live for IdempotencyTTL after.
 	Created time.Time
 }
@@ -66,6 +79,22 @@ func CheckIdempotency(r Idempotency) error {
 	return nil
 }
 
+// CheckRemember checks a record Remember is to store, which is pending.
+func CheckRemember(r Idempotency) error {
+	if len(r.Answer) > 0 {
+		return fmt.Errorf("%w: a new record is pending, without an answer", ErrInvalid)
+	}
+	return CheckIdempotency(r)
+}
+
+// CheckRecordKey checks a chatbot ID and idempotency key before any read.
+func CheckRecordKey(chatbotID, key string) error {
+	if !ValidID(chatbotID) || !ValidIdempotencyKey(key) {
+		return fmt.Errorf("%w: a malformed chatbot ID or idempotency key", ErrInvalid)
+	}
+	return nil
+}
+
 // Live reports whether a record created at created is still kept at now:
 // expiry is judged by the times, never by an item's presence, since
 // DynamoDB's TTL deletes late (ADR 0009 §10).
@@ -76,12 +105,24 @@ func Live(created time.Time, ttl time.Duration, now time.Time) bool {
 // Requests is the maap-requests table. Every method is safe for
 // concurrent use, also across tasks sharing a backend.
 type Requests interface {
-	// Remember stores rec, with Created set to now, unless the chatbot
-	// has a live record with rec.Key. It returns the record kept and
-	// whether this call stored it: a live record with rec's digest is
-	// returned as it is, one with another digest is ErrKeyReused.
-	// ErrInvalid if rec breaks CheckIdempotency.
+	// Remember stores rec as a pending record, with Created set to now and
+	// a Writer of its own, unless the chatbot has a live record with
+	// rec.Key. It returns the record kept and whether this call stored it:
+	// a live record with rec's digest is returned as it is, pending or
+	// settled, without its writer; one with another digest is
+	// ErrKeyReused. ErrInvalid if rec breaks CheckIdempotency or has an
+	// answer.
 	Remember(ctx context.Context, rec Idempotency, now time.Time) (Idempotency, bool, error)
+	// Settle stores answer in the live record of the chatbot's key that
+	// writer stored, which is then no longer pending; settling again with
+	// the same writer stores the answer again. ErrNotFound if there is no
+	// live record, ErrConflict if another writer stored it.
+	Settle(ctx context.Context, chatbotID, key, writer string, answer []byte, now time.Time) error
+	// Forget deletes the record of the chatbot's key that writer stored,
+	// so that a repeat of a request refused before it was sent is checked
+	// again. It returns nil if there is none, ErrConflict if another
+	// writer stored the one there.
+	Forget(ctx context.Context, chatbotID, key, writer string) error
 	// DeleteChatbot deletes the chatbot's records.
 	ChatbotDeleter
 }

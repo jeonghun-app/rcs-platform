@@ -117,6 +117,13 @@ func (r resendTable) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o .
 	return r.TableAPI.PutItem(ctx, in, o...)
 }
 
+func (r resendTable) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, o ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
+	if _, err := r.TableAPI.DeleteItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.DeleteItem(ctx, in, o...)
+}
+
 func (r resendTable) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	if _, err := r.TableAPI.UpdateItem(ctx, in, o...); err != nil {
 		return nil, err
@@ -408,7 +415,8 @@ func TestIntegrationADeletionFinishesOverADamagedKeyItem(t *testing.T) {
 
 func TestIntegrationRequestsMeetTheContract(t *testing.T) {
 	storetest.RunRequests(t, func(t *testing.T) store.Requests {
-		r := NewRequests(table(t, "maap-requests"))
+		ddb, name := table(t, "maap-requests")
+		r := NewRequests(ddb, name, testKey)
 		r.pageSize = 7 // pages that end inside a batch
 		return r
 	})
@@ -418,15 +426,24 @@ func TestIntegrationRequestsMeetTheContract(t *testing.T) {
 // this call; a repeat of it is still a repeat.
 func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 	ddb, name := table(t, "maap-requests")
-	r := NewRequests(resendTable{ddb}, name)
+	r := NewRequests(resendTable{ddb}, name, testKey)
 	rec := storetest.Idempotency(storetest.Chatbot().ID)
-	if got, fresh, err := r.Remember(t.Context(), rec, storetest.Now); err != nil || !fresh || got.MessageID != rec.MessageID {
+	got, fresh, err := r.Remember(t.Context(), rec, storetest.Now)
+	if err != nil || !fresh || got.MessageID != rec.MessageID {
 		t.Fatalf("Remember = %+v, %v, %v", got, fresh, err)
 	}
+	writer := got.Writer
 	again := rec
 	again.MessageID = storetest.MessageID()
 	if got, fresh, err := r.Remember(t.Context(), again, storetest.Now); err != nil || fresh || got.MessageID != rec.MessageID {
 		t.Fatalf("repeat = %+v, %v, %v", got, fresh, err)
+	}
+	// A settle and a forget sent again stand.
+	if err := r.Settle(t.Context(), rec.Chatbot, rec.Key, writer, []byte("{}"), storetest.Now); err != nil {
+		t.Fatalf("Settle = %v", err)
+	}
+	if err := r.Forget(t.Context(), rec.Chatbot, rec.Key, writer); err != nil {
+		t.Fatalf("Forget = %v", err)
 	}
 	if err := r.Ready(t.Context()); err != nil {
 		t.Fatalf("Ready = %v", err)

@@ -47,7 +47,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		}
 		r := awsstore.NewRegistry(ddb, cfg.RegistryTable)
 		registry, creds = r, r.Credentials()
-		requests = awsstore.NewRequests(ddb, cfg.RequestsTable)
+		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StoreKey)
 	}
 	for _, t := range []struct {
 		name  string

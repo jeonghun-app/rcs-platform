@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 )
@@ -238,3 +239,38 @@ func (d deleteFake) Chatbot(ctx context.Context, id string) (store.Chatbot, erro
 }
 
 func (d deleteFake) DeleteChatbot(context.Context, string) error { return d.delete }
+
+// budgetDeleter reports the deadline it was given and is unfinished until
+// its calls run out.
+type budgetDeleter struct {
+	left      atomic.Int32
+	deadlines chan time.Duration
+}
+
+func (d *budgetDeleter) DeleteChatbot(ctx context.Context, _ string) error {
+	dl, _ := ctx.Deadline()
+	d.deadlines <- time.Until(dl)
+	if d.left.Add(-1) >= 0 {
+		return store.ErrUnfinished
+	}
+	return nil
+}
+
+// A deletion runs for its budget, under the write timeout, and answers 503
+// with Retry-After while a table has items left, until a call finishes it.
+func TestADeleteRunsForItsBudgetAndAnswers503UntilDone(t *testing.T) {
+	d := &budgetDeleter{deadlines: make(chan time.Duration, 3)}
+	d.left.Store(2)
+	a, _ := chatbotAPIOver(t, store.NewMemoryRegistry(), d)
+	registered(t, a, "")
+	for i, want := range []int{http.StatusServiceUnavailable, http.StatusServiceUnavailable, http.StatusNoContent} {
+		rec := operator(a, "DELETE", "/v1/chatbots/cb-1", "")
+		if rec.Code != want || want == http.StatusServiceUnavailable &&
+			(rec.Header().Get("Retry-After") != "1" || !strings.Contains(rec.Body.String(), "call again until it answers 204")) {
+			t.Fatalf("call %d = %d %v %s", i, rec.Code, rec.Header(), rec.Body)
+		}
+		if left := <-d.deadlines; left > deletionBudget || left < deletionBudget-5*time.Second {
+			t.Fatalf("call %d: the deleter had %v", i, left)
+		}
+	}
+}

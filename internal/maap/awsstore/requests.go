@@ -2,6 +2,7 @@ package awsstore
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // TableAPI is the part of the DynamoDB client the stores of maap-requests
@@ -21,6 +23,7 @@ import (
 type TableAPI interface {
 	PutItem(context.Context, *dynamodb.PutItemInput, ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 	UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
+	DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
 	Query(context.Context, *dynamodb.QueryInput, ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
 	BatchWriteItem(context.Context, *dynamodb.BatchWriteItemInput, ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error)
 	DescribeTable(context.Context, *dynamodb.DescribeTableInput, ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
@@ -31,12 +34,13 @@ const (
 	attrTTL       = "ttl"
 	attrMessageID = "message_id"
 	attrAnswer    = "answer"
+	attrPending   = "pending"
 )
 
 // Requests is a store.Requests in the maap-requests table: partition key
 // pk and sort key sk, both strings, TTL on ttl.
 //
-//	pk c#<chatbot ID>  sk i#<key>  an idempotency record: digest, message_id, answer, created, ttl, writer
+//	pk c#<chatbot ID>  sk i#<key>  an idempotency record: digest (an HMAC), message_id, pending or answer, created, ttl, writer
 //
 // A chatbot's items are its partition, which DeleteChatbot deletes
 // without a Scan. A write racing the deletion leaves an item under an ID
@@ -45,40 +49,48 @@ const (
 type Requests struct {
 	api   TableAPI
 	table string
+	// digestKey keys the HMAC kept in place of a request's digest.
+	digestKey []byte
 	// pageSize bounds DeleteChatbot's query pages, for tests.
 	pageSize int32
 }
 
 var _ store.Requests = (*Requests)(nil)
 
-// NewRequests returns the requests table over api.
-func NewRequests(api TableAPI, table string) *Requests {
-	return &Requests{api: api, table: table}
+// NewRequests returns the requests table over api. key (RCS_PII_HMAC_KEY)
+// keys the digests it keeps, through a subkey of their own, so that a
+// table or backup reader cannot test guesses of a request (#749 security
+// review). Rotating it makes a repeat across the rotation another request.
+func NewRequests(api TableAPI, table string, key secret.Key) *Requests {
+	sub := hmac.New(sha256.New, key.Reveal())
+	sub.Write([]byte("maap-requests digest"))
+	return &Requests{api: api, table: table, digestKey: sub.Sum(nil)}
+}
+
+func (r *Requests) keyed(digest [sha256.Size]byte) []byte {
+	mac := hmac.New(sha256.New, r.digestKey)
+	mac.Write(digest[:])
+	return mac.Sum(nil)
 }
 
 func requestKey(chatbotID, idemKey string) map[string]types.AttributeValue {
 	return key("c#"+chatbotID, "i#"+idemKey)
 }
 
-// Remember implements store.Requests. The record is put on the condition
-// that none is live, so an expired item that TTL has not deleted yet is
-// written over; a put sent again after its answer was lost finds its own
-// writer token.
+// Remember implements store.Requests. The pending record is put on the
+// condition that none is live, so an expired item that TTL has not
+// deleted yet is written over; a put sent again after its answer was lost
+// finds its own writer token.
 func (r *Requests) Remember(ctx context.Context, rec store.Idempotency, now time.Time) (store.Idempotency, bool, error) {
-	if err := store.CheckIdempotency(rec); err != nil {
+	if err := store.CheckRemember(rec); err != nil {
 		return store.Idempotency{}, false, err
 	}
-	rec.Created = store.Seconds(now)
-	writer := rand.Text()
+	rec.Created, rec.Pending, rec.Answer, rec.Writer = store.Seconds(now), true, nil, rand.Text()
 	item := requestKey(rec.Chatbot, rec.Key)
-	item[attrDigest] = &types.AttributeValueMemberB{Value: rec.Digest[:]}
+	item[attrDigest] = &types.AttributeValueMemberB{Value: r.keyed(rec.Digest)}
 	item[attrMessageID], item[attrCreated] = str(rec.MessageID), num(rec.Created.Unix())
-	item[attrTTL], item[attrWriter] = num(rec.Created.Add(store.IdempotencyTTL).Unix()), str(writer)
-	if len(rec.Answer) > 0 {
-		item[attrAnswer] = &types.AttributeValueMemberB{Value: rec.Answer}
-	} else {
-		rec.Answer = nil
-	}
+	item[attrTTL], item[attrWriter] = num(rec.Created.Add(store.IdempotencyTTL).Unix()), str(rec.Writer)
+	item[attrPending] = &types.AttributeValueMemberBOOL{Value: true}
 	_, err := r.api.PutItem(ctx, &dynamodb.PutItemInput{
 		TableName: aws.String(r.table), Item: item,
 		ConditionExpression:                 aws.String("attribute_not_exists(#pk) OR #ttl <= :now"),
@@ -88,16 +100,17 @@ func (r *Requests) Remember(ctx context.Context, rec store.Idempotency, now time
 	})
 	var ccf *types.ConditionalCheckFailedException
 	switch {
-	case errors.As(err, &ccf) && sv(ccf.Item[attrWriter]) == writer:
+	case errors.As(err, &ccf) && sv(ccf.Item[attrWriter]) == rec.Writer:
 		return rec, true, nil // the SDK sent again a put that had taken effect
 	case errors.As(err, &ccf):
-		old, err := decodeIdempotency(rec.Chatbot, rec.Key, ccf.Item)
+		old, stored, err := decodeIdempotency(rec.Chatbot, rec.Key, ccf.Item)
 		switch {
 		case err != nil:
 			return store.Idempotency{}, false, err
-		case old.Digest != rec.Digest:
+		case !hmac.Equal(stored, r.keyed(rec.Digest)):
 			return store.Idempotency{}, false, fmt.Errorf("awsstore: remember request: %w", store.ErrKeyReused)
 		}
+		old.Digest = rec.Digest
 		return old, false, nil
 	case err != nil:
 		return store.Idempotency{}, false, sanitize("remember request", err)
@@ -105,28 +118,88 @@ func (r *Requests) Remember(ctx context.Context, rec store.Idempotency, now time
 	return rec, true, nil
 }
 
-// decodeIdempotency reads a stored record strictly: one that is not
-// whole is damaged, never a record with a short digest.
-func decodeIdempotency(chatbotID, key string, item map[string]types.AttributeValue) (store.Idempotency, error) {
+// Settle implements store.Requests: an update on the condition that the
+// record is live and the writer's, which a send again repeats harmlessly.
+func (r *Requests) Settle(ctx context.Context, chatbotID, idemKey, writer string, answer []byte, now time.Time) error {
+	if err := store.CheckRecordKey(chatbotID, idemKey); err != nil {
+		return err
+	}
+	if len(answer) > store.MaxAnswerBytes {
+		return fmt.Errorf("%w: an answer over %d bytes", store.ErrInvalid, store.MaxAnswerBytes)
+	}
+	in := &dynamodb.UpdateItemInput{
+		TableName: aws.String(r.table), Key: requestKey(chatbotID, idemKey),
+		UpdateExpression:                    aws.String("SET #answer = :answer REMOVE #pending"),
+		ConditionExpression:                 aws.String("#w = :w AND #ttl > :now"),
+		ExpressionAttributeNames:            map[string]string{"#answer": attrAnswer, "#pending": attrPending, "#w": attrWriter, "#ttl": attrTTL},
+		ExpressionAttributeValues:           map[string]types.AttributeValue{":answer": &types.AttributeValueMemberB{Value: answer}, ":w": str(writer), ":now": num(now.Unix())},
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	}
+	if len(answer) == 0 {
+		in.UpdateExpression = aws.String("REMOVE #pending, #answer")
+		delete(in.ExpressionAttributeValues, ":answer")
+	}
+	_, err := r.api.UpdateItem(ctx, in)
+	var ccf *types.ConditionalCheckFailedException
+	if errors.As(err, &ccf) {
+		if ttl, _ := number(ccf.Item, attrTTL); len(ccf.Item) == 0 || ttl <= now.Unix() {
+			return fmt.Errorf("awsstore: settle request: %w", store.ErrNotFound)
+		}
+		return fmt.Errorf("awsstore: settle request: %w", store.ErrConflict)
+	}
+	if err != nil {
+		return sanitize("settle request", err)
+	}
+	return nil
+}
+
+// Forget implements store.Requests: a delete on the condition that the
+// record there, if any, is the writer's.
+func (r *Requests) Forget(ctx context.Context, chatbotID, idemKey, writer string) error {
+	if err := store.CheckRecordKey(chatbotID, idemKey); err != nil {
+		return err
+	}
+	_, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
+		TableName: aws.String(r.table), Key: requestKey(chatbotID, idemKey),
+		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #w = :w"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#w": attrWriter},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":w": str(writer)},
+	})
+	var ccf *types.ConditionalCheckFailedException
+	switch {
+	case errors.As(err, &ccf):
+		return fmt.Errorf("awsstore: forget request: %w", store.ErrConflict)
+	case err != nil:
+		return sanitize("forget request", err)
+	}
+	return nil
+}
+
+// decodeIdempotency reads a stored record strictly, without its writer,
+// and returns the HMAC of its digest: one that is not whole is damaged,
+// never a record with a short digest, or pending with an answer.
+func decodeIdempotency(chatbotID, key string, item map[string]types.AttributeValue) (store.Idempotency, []byte, error) {
 	digest, ok := item[attrDigest].(*types.AttributeValueMemberB)
 	answer, hasAnswer := item[attrAnswer].(*types.AttributeValueMemberB)
+	pending, hasPending := item[attrPending].(*types.AttributeValueMemberBOOL)
 	created, createdOK := number(item, attrCreated)
 	// A ttl that is no number would keep the record live for ever.
 	_, ttlOK := number(item, attrTTL)
-	if !ok || len(digest.Value) != sha256.Size || !createdOK || !ttlOK || item[attrAnswer] != nil && !hasAnswer {
-		return store.Idempotency{}, fmt.Errorf("%w: a damaged idempotency record", store.ErrInvalid)
+	if !ok || len(digest.Value) != sha256.Size || !createdOK || !ttlOK || item[attrAnswer] != nil && !hasAnswer ||
+		item[attrPending] != nil && (!hasPending || !pending.Value || hasAnswer) {
+		return store.Idempotency{}, nil, fmt.Errorf("%w: a damaged idempotency record", store.ErrInvalid)
 	}
 	rec := store.Idempotency{
-		Chatbot: chatbotID, Key: key, Digest: [sha256.Size]byte(digest.Value),
-		MessageID: text(item, attrMessageID), Created: time.Unix(created, 0).UTC(),
+		Chatbot: chatbotID, Key: key, MessageID: text(item, attrMessageID), Pending: hasPending,
+		Created: time.Unix(created, 0).UTC(),
 	}
 	if hasAnswer && len(answer.Value) > 0 {
 		rec.Answer = answer.Value
 	}
 	if err := store.CheckIdempotency(rec); err != nil {
-		return store.Idempotency{}, err
+		return store.Idempotency{}, nil, err
 	}
-	return rec, nil
+	return rec, digest.Value, nil
 }
 
 // text returns what an item holds in a string attribute, or "".
@@ -149,75 +222,8 @@ func number(item map[string]types.AttributeValue, name string) (int64, bool) {
 
 // DeleteChatbot implements store.ChatbotDeleter.
 func (r *Requests) DeleteChatbot(ctx context.Context, chatbotID string) error {
-	return deletePartition(ctx, r.api, r.table, "c#"+chatbotID, r.pageSize)
+	return deletePartition(ctx, r.api, r.table, "c#"+chatbotID, chatbotID, r.pageSize)
 }
 
 // Ready checks the table for /readyz, as the registry's Ready does.
 func (r *Requests) Ready(ctx context.Context) error { return ready(ctx, r.api, r.table) }
-
-// batchAttempts bounds the sends of a batch whose items DynamoDB keeps
-// leaving unprocessed (throttling); a deletion that gives up is a store
-// failure, and a repeat goes on where it stopped.
-const batchAttempts = 8
-
-// batchWait is the first pause before a batch is sent again, doubling
-// after; a variable for tests.
-var batchWait = 50 * time.Millisecond
-
-// deletePartition deletes every item of partition pk, 25 at a time, the
-// most a BatchWriteItem takes: a chatbot at its daily send limit holds
-// many thousand statuses, which one DeleteItem each would take minutes to
-// delete.
-func deletePartition(ctx context.Context, api TableAPI, table, pk string, pageSize int32) error {
-	in := &dynamodb.QueryInput{
-		TableName: aws.String(table), ConsistentRead: aws.Bool(true),
-		KeyConditionExpression:    aws.String("#pk = :pk"),
-		ProjectionExpression:      aws.String("#pk, #sk"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#sk": attrSK},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(pk)},
-	}
-	if pageSize > 0 {
-		in.Limit = aws.Int32(pageSize)
-	}
-	for {
-		out, err := api.Query(ctx, in)
-		if err != nil {
-			return sanitize("query chatbot", err)
-		}
-		for items := out.Items; len(items) > 0; {
-			n := min(len(items), 25)
-			if err := deleteBatch(ctx, api, table, items[:n]); err != nil {
-				return err
-			}
-			items = items[n:]
-		}
-		if len(out.LastEvaluatedKey) == 0 {
-			return nil
-		}
-		in.ExclusiveStartKey = out.LastEvaluatedKey
-	}
-}
-
-func deleteBatch(ctx context.Context, api TableAPI, table string, keys []map[string]types.AttributeValue) error {
-	reqs := make([]types.WriteRequest, len(keys))
-	for i, k := range keys {
-		reqs[i] = types.WriteRequest{DeleteRequest: &types.DeleteRequest{Key: key(sv(k[attrPK]), sv(k[attrSK]))}}
-	}
-	for attempt, wait := 0, batchWait; ; attempt, wait = attempt+1, 2*wait {
-		out, err := api.BatchWriteItem(ctx, &dynamodb.BatchWriteItemInput{RequestItems: map[string][]types.WriteRequest{table: reqs}})
-		if err != nil {
-			return sanitize("delete chatbot", err)
-		}
-		if reqs = out.UnprocessedItems[table]; len(reqs) == 0 {
-			return nil
-		}
-		if attempt == batchAttempts-1 {
-			return errors.New("awsstore: delete chatbot: items left unprocessed")
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("awsstore: delete chatbot: %w", ctx.Err())
-		case <-time.After(wait):
-		}
-	}
-}
