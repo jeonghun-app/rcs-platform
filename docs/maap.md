@@ -43,7 +43,7 @@ reported at once at start.
 | `MAAP_DECODES` | `8` | request bodies the internal listener decodes at once (see [Memory](#memory)); at least 1 |
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
 | `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
-| `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711); refused if it names the table of another maap setting, whose deletions would then take half of each alias |
+| `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711); refused if it names the table of another maap setting, by name or by ARN, whose deletions would then take half of each alias |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | [idempotency records](#dynamodb-maap-requests-table) and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the [shared limit counters](#dynamodb-maap-counters-table) (#713) |
 | `MAAP_STATUS_TTL` | `192h` (8 days) | how long a message's [status](#dynamodb-maap-requests-table) is kept: by default `rcs-as`'s `RCSAS_SENT_TTL` default, the longest a notification can still come (lead decision on #713; #684 sets both from one parameter); at least 24 hours, so that the answer an idempotency record replays names a status still kept |

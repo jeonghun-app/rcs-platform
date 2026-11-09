@@ -148,7 +148,8 @@ func TestInvalidSettingsAreRefusedEverywhere(t *testing.T) {
 		{"MAAP_STATUS_TTL", "23h59m", "MAAP_STATUS_TTL: shorter than the 24 hours"},
 		{"MAAP_STATUS_TTL", "8", "MAAP_STATUS_TTL"},
 		{"MAAP_SUBSCRIBERS_TABLE", DefaultRegistryTable, "MAAP_SUBSCRIBERS_TABLE: names the table of MAAP_REGISTRY_TABLE"},
-		{"MAAP_SUBSCRIBERS_TABLE", DefaultRequestsTable, "MAAP_SUBSCRIBERS_TABLE: names the table of MAAP_REQUESTS_TABLE"},
+		{"MAAP_SUBSCRIBERS_TABLE", "arn:aws:dynamodb:us-east-1:111122223333:table/" + DefaultRequestsTable,
+			"MAAP_SUBSCRIBERS_TABLE: names the table of MAAP_REQUESTS_TABLE"},
 		{"MAAP_SUBSCRIBERS_TABLE", DefaultCountersTable, "MAAP_SUBSCRIBERS_TABLE: names the table of MAAP_COUNTERS_TABLE"},
 		{"MAAP_OPERATOR_TOKEN", operatorToken + "\n", "MAAP_OPERATOR_TOKEN: has white space"},
 		{"MAAP_OPERATOR_TOKEN", strings.Repeat("é", 43), "MAAP_OPERATOR_TOKEN: has white space or characters outside printable ASCII"},
@@ -204,5 +205,21 @@ func TestOnlyDevAllowsInternalWebhookAddresses(t *testing.T) {
 	c, err := configure(with(devEnv, "RCS_ENV", "test"))
 	if err != nil || !c.HTTPWebhooks || c.InternalWebhooks {
 		t.Fatalf("test: %+v, %v", c, err)
+	}
+}
+
+// A table setting names its table by name or by ARN alike; anything else
+// is a name as written.
+func TestATableARNNamesItsTable(t *testing.T) {
+	for in, want := range map[string]string{
+		"maap-subscribers": "maap-subscribers",
+		"arn:aws:dynamodb:us-east-1:111122223333:table/maap-subscribers":     "maap-subscribers",
+		"arn:aws-cn:dynamodb:cn-north-1:111122223333:table/maap-subscribers": "maap-subscribers",
+		"arn:aws:dynamodb:us-east-1:111122223333:other/maap-subscribers":     "arn:aws:dynamodb:us-east-1:111122223333:other/maap-subscribers",
+		"table/maap-subscribers": "table/maap-subscribers",
+	} {
+		if got := tableName(in); got != want {
+			t.Errorf("tableName(%q) = %q", in, got)
+		}
 	}
 }

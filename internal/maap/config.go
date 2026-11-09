@@ -128,11 +128,12 @@ func Configure(s *runtime.Settings) Config {
 	}
 	// The tables share their key form, so with one name a chatbot's
 	// deletion in the registry would take the aliases' chatbot items and
-	// leave their subscriber items (#753 security review).
+	// leave their subscriber items (#753 security review). A table may be
+	// named by its ARN, which DynamoDB takes too.
 	for _, t := range []struct{ name, value string }{
 		{"REGISTRY_TABLE", c.RegistryTable}, {"REQUESTS_TABLE", c.RequestsTable}, {"COUNTERS_TABLE", c.CountersTable},
 	} {
-		if c.SubscribersTable == t.value {
+		if tableName(c.SubscribersTable) == tableName(t.value) {
 			e.Invalid("SUBSCRIBERS_TABLE", "names the table of MAAP_"+t.name)
 		}
 	}
@@ -167,6 +168,17 @@ func aliasHostProblem(host, imsDomain, chatbotDomain string) string {
 		}
 	}
 	return ""
+}
+
+// tableName is the table a setting names, by its name or by its ARN
+// (arn:<partition>:dynamodb:<region>:<account>:table/<name>).
+func tableName(v string) string {
+	if rest, ok := strings.CutPrefix(v, "arn:"); ok {
+		if _, name, ok := strings.Cut(rest, ":table/"); ok {
+			return name
+		}
+	}
+	return v
 }
 
 // webhookPorts reads MAAP_WEBHOOK_PORTS, a comma-separated list of ports.
