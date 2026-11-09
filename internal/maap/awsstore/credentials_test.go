@@ -175,9 +175,26 @@ func TestARevokeFinishesWhatAFailedOneLeft(t *testing.T) {
 			t.Fatalf("key gone %v: Revoke = %v, then %v; calls %q", keyGone, first, again, s.calls)
 		}
 	}
-	s := &scriptStub{keyID: storetest.Credential(storetest.Chatbot(), time.Time{}).KeyID, keyGone: true}
-	if err := NewRegistry(s, "maap-registry").Credentials().Revoke(ctx, "cb-1", keyID); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("Revoke of nothing = %v", err)
+	// A key item without a slot still authenticates, so it goes too; with
+	// neither, the answer is ErrNotFound.
+	for _, keyGone := range []bool{false, true} {
+		s := &scriptStub{keyID: storetest.Credential(storetest.Chatbot(), time.Time{}).KeyID, keyGone: keyGone}
+		err := NewRegistry(s, "maap-registry").Credentials().Revoke(ctx, "cb-1", keyID)
+		if want := []string{"query", "delete k#" + keyID + " key"}; !keyGone && (err != nil || !reflect.DeepEqual(s.calls, want)) {
+			t.Fatalf("Revoke of a key item without a slot = %v, calls %q", err, s.calls)
+		}
+		if keyGone && !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("Revoke of nothing = %v", err)
+		}
+	}
+	// A key item of another chatbot (never, key IDs being random) stops the
+	// deletion rather than leaving it half done.
+	none := types.CancellationReason{Code: aws.String("None")}
+	s := &scriptStub{keyID: keyID, txs: []func(*dynamodb.TransactWriteItemsInput) error{fails(&types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{{Code: aws.String("ConditionalCheckFailed")}, none},
+	})}}
+	if err := NewRegistry(s, "maap-registry").Credentials().Revoke(ctx, "cb-1", keyID); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("Revoke over another chatbot's key item = %v", err)
 	}
 }
 
