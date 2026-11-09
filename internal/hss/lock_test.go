@@ -901,16 +901,18 @@ func TestAPushTheBudgetCutShortIsMarkedStale(t *testing.T) {
 }
 
 // Code review on #524 (round 2): the mark of what the budget left out is
-// written with a live deadline, within the budget, which a store that
-// honours its context takes.
+// written with the budget's end as its deadline, exactly, from one reading
+// of the clock (pushTimes), which leaves it production's reserve (round
+// 3). The store records the deadline and refuses nothing: a host that
+// stalls the test past the reserve, as one at load 250 did (#619), cannot
+// fail it, and a write given any other deadline, an expired one among
+// them, still does.
 func TestTheStaleMarkIsWrittenWithinTheBudget(t *testing.T) {
 	e := newEnv(t)
 	e.fiveSets()
-	cs := &ctxStore{Store: e.store}
-	h := e.newHSS(func(o *Options) { o.Store = cs })
+	ds := &deadlineStore{Store: e.store}
+	h := e.newHSS(func(o *Options) { o.Store = ds })
 	silent := &silentNotifier{}
-	// Production's reserve, which the mark's write has (code review on
-	// #524, round 3).
 	const each, reserve = 200 * time.Millisecond, staleReserve
 	tm := pushTimes{each: each, until: time.Now().Add(each + reserve + pushFloor/2), reserve: reserve}
 	rtr := push{deregister: true, reason: cx.ServerChange, impus: []string{impu1}, set: -1, changed: 0}
@@ -918,10 +920,10 @@ func TestTheStaleMarkIsWrittenWithinTheBudget(t *testing.T) {
 	if s := e.sub(impi1); !slices.Equal(s.StaleSets, []int{0}) {
 		t.Fatalf("stale sets %v", s.StaleSets)
 	}
-	cs.mu.Lock()
-	defer cs.mu.Unlock()
-	if len(cs.writes) != 1 || cs.writes[0].After(tm.until) {
-		t.Errorf("the mark's write had deadline %v, the budget ends at %v", cs.writes, tm.until)
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	if len(ds.deadlines) != 1 || !ds.deadlines[0].Equal(tm.until) {
+		t.Errorf("the mark's write had deadline %v, want the budget's end %v", ds.deadlines, tm.until)
 	}
 }
 
