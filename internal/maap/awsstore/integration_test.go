@@ -447,11 +447,16 @@ func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 	if changed, err := r.Advance(t.Context(), rec.Chatbot, rec.MessageID, store.Delivered, storetest.Now); !changed || err != nil {
 		t.Fatalf("Advance = %v, %v", changed, err)
 	}
-	// A settle and a forget sent again stand.
+	// A settle and, of another, pending record, a forget sent again stand.
 	if err := r.Settle(t.Context(), rec.Chatbot, rec.Key, writer, []byte("{}"), storetest.Now); err != nil {
 		t.Fatalf("Settle = %v", err)
 	}
-	if err := r.Forget(t.Context(), rec.Chatbot, rec.Key, writer); err != nil {
+	refused := storetest.Idempotency(rec.Chatbot)
+	got, _, err = r.Remember(t.Context(), refused, storetest.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Forget(t.Context(), refused.Chatbot, refused.Key, got.Writer); err != nil {
 		t.Fatalf("Forget = %v", err)
 	}
 	if err := r.Ready(t.Context()); err != nil {
