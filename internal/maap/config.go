@@ -21,6 +21,12 @@ const (
 	DefaultCountersTable    = "maap-counters"
 )
 
+// maxAliasHost bounds MAAP_ALIAS_HOST so that the longest alias,
+// sip:<alias-id>@<host>;user=rcstk with an alias ID of 128 bits in 26
+// base32 characters (ADR 0009 §10), is still an identity every service
+// takes (identity.MaxLength).
+const maxAliasHost = identity.MaxLength - len("sip:") - 26 - len("@") - len(";user=rcstk")
+
 // MinTokenLength is the shortest token accepted in staging and prod: 256
 // bits as 43 base64url characters (ADR 0007 §4). Hex encodings need 64.
 const MinTokenLength = 43
@@ -46,8 +52,9 @@ type Config struct {
 	// API once #683 adds it; never on the public load balancer (§7).
 	InternalAddr   string
 	OperatorTokens TokenPair
-	// Decodes bounds the request bodies decoded at once in a task, on
-	// every listener (docs/maap.md has the memory rule).
+	// Decodes bounds the request bodies the internal listener decodes at
+	// once; #683 gives the public listener a pool of its own (docs/maap.md
+	// has the memory rule).
 	Decodes int
 
 	RegistryTable    string
@@ -82,8 +89,10 @@ func Configure(s *runtime.Settings) Config {
 			e.Invalid("ALIAS_HOST", reason)
 		}
 	}
-	if _, _, err := net.SplitHostPort(c.InternalAddr); err != nil {
+	if _, port, err := net.SplitHostPort(c.InternalAddr); err != nil {
 		e.Invalid("INTERNAL_ADDR", "not host:port")
+	} else if n, err := strconv.ParseUint(port, 10, 16); err != nil || n == 0 {
+		e.Invalid("INTERNAL_ADDR", "its port is not from 1 to 65535")
 	}
 	if c.Decodes < 1 {
 		e.Invalid("DECODES", "must be at least 1")
@@ -98,10 +107,18 @@ func Configure(s *runtime.Settings) Config {
 // and one at RCS_CHATBOT_DOMAIN or under it would fall in the chatbot range
 // (ADR 0009 §2, §13). Hosts compare without regard to case (RFC 3261
 // §19.1.4); the domains may be written in any case, and the IMS domain with
-// a trailing dot.
+// a trailing dot. As chatbot.NewDomain does for the chatbot domain, the
+// last label must start with a letter (RFC 3261 §25.1 toplabel), which
+// refuses an IP address: §13 asks for a name in the operator's domain.
 func aliasHostProblem(host, imsDomain, chatbotDomain string) string {
 	if !identity.IsDomainName(host) {
 		return "not a DNS name"
+	}
+	if top := host[strings.LastIndexByte(host, '.')+1:]; top[0] < 'a' || top[0] > 'z' {
+		return "not a host name a SIP URI can carry (the last label must start with a letter)"
+	}
+	if len(host) > maxAliasHost {
+		return "longer than " + strconv.Itoa(maxAliasHost) + " bytes, which the alias URI bound allows"
 	}
 	for _, d := range []struct{ name, value string }{{"RCS_IMS_DOMAIN", imsDomain}, {"RCS_CHATBOT_DOMAIN", chatbotDomain}} {
 		v := strings.ToLower(strings.TrimSuffix(d.value, "."))
@@ -129,9 +146,10 @@ func webhookPorts(e *runtime.Env) []uint16 {
 // operatorTokens reads the operator's two tokens and applies ADR 0007 §4,
 // as hss reads its own. Everywhere, a token must be printable ASCII
 // without white space: a trailing newline from `echo` into Secrets Manager
-// would make every request fail, since a header cannot carry it. In
-// staging and prod the current token is required and each must hold 256
-// bits. These are maap's own settings: hss's HSS_ADMIN_TOKEN is never
+// would make every request fail, since a header cannot carry it. A next
+// token without a current one, or equal to it, is a rotation gone wrong
+// and is refused everywhere, as msrp-relay refuses it. In staging and prod
+// a token is required and each must hold 256 bits. These are maap's own settings: hss's HSS_ADMIN_TOKEN is never
 // accepted here (ADR 0009 §7).
 func operatorTokens(s *runtime.Settings) TokenPair {
 	e := s.Env
@@ -147,7 +165,14 @@ func operatorTokens(s *runtime.Settings) TokenPair {
 		s.ForbidInProduction(v != "" && !strongToken(v),
 			"MAAP_"+t.name+" holds less than 256 bits (64 hex digits or 43 base64url characters)")
 	}
-	s.ForbidInProduction(p.Current.IsZero(), "MAAP_OPERATOR_TOKEN is unset: the operator API would answer 503")
+	switch {
+	case p.Current.IsZero() && !p.Next.IsZero():
+		e.Invalid("OPERATOR_TOKEN_NEXT", "set without MAAP_OPERATOR_TOKEN")
+	case !p.Current.IsZero() && p.Current.Equal(p.Next):
+		e.Invalid("OPERATOR_TOKEN_NEXT", "equal to MAAP_OPERATOR_TOKEN")
+	}
+	s.ForbidInProduction(p.Current.IsZero() && p.Next.IsZero(),
+		"MAAP_OPERATOR_TOKEN is unset: the operator API would answer 503 to every call")
 	return p
 }
 

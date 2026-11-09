@@ -27,11 +27,11 @@ reported at once at start.
 |---|---|---|
 | `RCS_IMS_DOMAIN` | required | the home domain |
 | `RCS_CHATBOT_DOMAIN` | required | host of chatbot URIs, read with `internal/chatbot`'s rules: a lower-case DNS name other than `RCS_IMS_DOMAIN` (ADR 0009 §2) |
-| `MAAP_ALIAS_HOST` | required | host of aliases (ADR 0009 §10, §13): a DNS name that is neither `RCS_IMS_DOMAIN` nor `RCS_CHATBOT_DOMAIN` nor under either, compared without regard to case; stored in lower case |
+| `MAAP_ALIAS_HOST` | required | host of aliases (ADR 0009 §10, §13): a DNS name that is neither `RCS_IMS_DOMAIN` nor `RCS_CHATBOT_DOMAIN` nor under either, compared without regard to case; stored in lower case. As for `RCS_CHATBOT_DOMAIN`, its last label starts with a letter (so no IP address), and it is at most 213 bytes, so that an alias URI stays within 255 |
 | `MAAP_WEBHOOK_PORTS` | none | ports a webhook URL may name besides 443 (ADR 0009 §8); the infrastructure parameter that sets it also sets the egress rule (#684) |
-| `MAAP_INTERNAL_ADDR` | `:8081` | the internal listener, `host:port` |
-| `MAAP_OPERATOR_TOKEN`, `MAAP_OPERATOR_TOKEN_NEXT` | none | the operator's current and next tokens. *prod*: the first is required, and each must hold 256 bits (43 base64url characters or 64 hex digits). Printable ASCII without white space everywhere |
-| `MAAP_DECODES` | `8` | request bodies decoded at once in a task, on every listener (see [Memory](#memory)); at least 1 |
+| `MAAP_INTERNAL_ADDR` | `:8081` | the internal listener, `host:port` with a port from 1 to 65535 |
+| `MAAP_OPERATOR_TOKEN`, `MAAP_OPERATOR_TOKEN_NEXT` | none | the operator's current and next tokens. *prod*: the first is required, and each must hold 256 bits (43 base64url characters or 64 hex digits). Everywhere: printable ASCII without white space, and a next token only with a current one and different from it |
+| `MAAP_DECODES` | `8` | request bodies the internal listener decodes at once (see [Memory](#memory)); at least 1 |
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | idempotency records and message statuses (#713) |
@@ -49,10 +49,13 @@ Decoding a body costs memory in proportion to its size:
 `chatbot.DecodeEnvelope` allocates about 8 bytes per input byte, and
 `chatbot.ValidateContent` up to about 30 bytes per byte of content. A send
 (#683), at most a 1,496 KiB envelope with 248 KiB of content, can so take about
-20 MB. `MAAP_DECODES` bounds the bodies decoded at once, whichever listener
-they come on, and the rule is:
+20 MB, and so can a message from `rcs-as` (#683). Each listener has a pool of
+its own, so that chatbots on the public listener cannot take the slots of
+`rcs-as` and the operator: `MAAP_DECODES` is the internal listener's, and #683
+adds the public listener's with a cap per chatbot. The rule is:
 
-> `MAAP_DECODES` × 20 MB stays under half the task's memory limit.
+> The slots of all pools together × 20 MB stay under half the task's memory
+> limit.
 
-The default, 8, needs about 160 MB, so a task of 512 MB or more (#684 sizes
-it). Raise the cap only with the memory limit.
+The internal default, 8, needs about 160 MB; #684 sizes the task with the
+public pool added. Raise a cap only with the memory limit.
