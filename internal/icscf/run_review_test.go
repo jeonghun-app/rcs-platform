@@ -148,6 +148,12 @@ func TestTheSettingsReachTheServiceTheyConfigure(t *testing.T) {
 // grows on the wall clock while the HSS is gone, a loaded host that was
 // slow to get the 480 left the next try past the 10 s wait (#606). The
 // wait for the return fails only once nothing has moved for realWait.
+//
+// The HSS stops only once its side of the connection runs. icscf is ready
+// once it has the CEA, and an HSS stopped before its side ran closed the
+// connection with no DPR: icscf took that for a failure, and its
+// reconnection to the same Origin-Host waited in REOPEN for three watchdog
+// answers, Tw apart, far past the wait (#675).
 func TestReadinessFollowsTheHSSGoingAndComing(t *testing.T) {
 	hss := startHSS(t)
 	hss.answer = func(uint32) (cx.Result, string) { return cx.ResultCode(diameter.ResultSuccess), "" }
@@ -155,6 +161,10 @@ func TestReadinessFollowsTheHSSGoingAndComing(t *testing.T) {
 		d.hssReconnect = 20 * time.Millisecond
 	})
 	r.waitReady(t)
+	waitFor(t, "the HSS's side of the connection to run", func() bool {
+		peers := hss.node.Peers()
+		return len(peers) > 0 && peers[0].Available()
+	})
 	_ = hss.node.Shutdown(context.Background())
 	r.waitReadiness(t, 503)
 	res := r.send(t, "MESSAGE", tel1, "From: <sip:+15550100002@"+home+">;tag=f1", "To: <"+tel1+">")
