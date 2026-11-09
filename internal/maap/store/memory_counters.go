@@ -9,8 +9,14 @@ import (
 // MemoryCounters is a Counters in process memory, for tests and local runs.
 type MemoryCounters struct {
 	mu      sync.Mutex
-	buckets map[Counter]time.Time // when each is full again
+	buckets map[Counter]bucket
 	days    map[dayKey]int64
+}
+
+// bucket is when a bucket is full again and what it was given back in all.
+type bucket struct {
+	full     time.Time
+	returned time.Duration
 }
 
 type dayKey struct {
@@ -22,7 +28,7 @@ var _ Counters = (*MemoryCounters)(nil)
 
 // NewMemoryCounters returns an empty table.
 func NewMemoryCounters() *MemoryCounters {
-	return &MemoryCounters{buckets: map[Counter]time.Time{}, days: map[dayKey]int64{}}
+	return &MemoryCounters{buckets: map[Counter]bucket{}, days: map[dayKey]int64{}}
 }
 
 // TakeMinute implements Counters.
@@ -33,8 +39,12 @@ func (m *MemoryCounters) TakeMinute(_ context.Context, c Counter, perMinute int6
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	// A refused take leaves the bucket's time as it was.
-	full, take := TakeBucket(m.buckets[c], perMinute, now)
-	m.buckets[c] = full
+	b := m.buckets[c]
+	full, take := TakeBucket(b.full, perMinute, now)
+	m.buckets[c] = bucket{full, b.returned}
+	if take.Taken {
+		take.Returned = b.returned
+	}
 	return take, nil
 }
 
@@ -47,54 +57,35 @@ func (m *MemoryCounters) TakeDay(_ context.Context, c Counter, perDay int64, now
 	defer m.mu.Unlock()
 	k := dayKey{c, DayEnd(now)}
 	if m.days[k] >= perDay {
-		return Take{Wait: k.day.Sub(now)}, nil
+		return Take{Wait: k.day.Sub(now), At: now}, nil
 	}
 	m.days[k]++
-	return Take{Taken: true}, nil
+	return Take{Taken: true, At: now}, nil
 }
 
 // GiveBackMinute implements Counters.
-func (m *MemoryCounters) GiveBackMinute(_ context.Context, c Counter, perMinute int64, at time.Time) error {
+func (m *MemoryCounters) GiveBackMinute(_ context.Context, c Counter, perMinute int64, taken Take, now time.Time) error {
 	if err := CheckCounter(c, perMinute); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if full, ok := m.buckets[c]; ok {
-		m.buckets[c] = GiveBackBucket(full, perMinute, at)
+	if b, ok := m.buckets[c]; ok {
+		b.full, b.returned = GiveBackBucket(b.full, b.returned, perMinute, taken, now)
+		m.buckets[c] = b
 	}
 	return nil
 }
 
 // GiveBackDay implements Counters.
-func (m *MemoryCounters) GiveBackDay(_ context.Context, c Counter, at time.Time) error {
+func (m *MemoryCounters) GiveBackDay(_ context.Context, c Counter, taken Take) error {
 	if err := CheckCounter(c, 1); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if k := (dayKey{c, DayEnd(at)}); m.days[k] > 0 {
+	if k := (dayKey{c, DayEnd(taken.At)}); taken.Taken && m.days[k] > 0 {
 		m.days[k]--
-	}
-	return nil
-}
-
-// DeleteChatbot implements ChatbotDeleter.
-func (m *MemoryCounters) DeleteChatbot(_ context.Context, chatbotID string) error {
-	if !ValidID(chatbotID) {
-		return nil // never the counters of all chatbots, which have none
-	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	for c := range m.buckets {
-		if c.Chatbot == chatbotID {
-			delete(m.buckets, c)
-		}
-	}
-	for k := range m.days {
-		if k.c.Chatbot == chatbotID {
-			delete(m.days, k)
-		}
 	}
 	return nil
 }

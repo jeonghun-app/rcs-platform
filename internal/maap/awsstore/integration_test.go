@@ -5,6 +5,7 @@ package awsstore
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"testing"
@@ -461,17 +462,15 @@ func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 func TestIntegrationCountersMeetTheContract(t *testing.T) {
 	storetest.RunCounters(t, func(t *testing.T) (store.Counters, store.Counters) {
 		ddb, name := table(t, "maap-counters")
-		a, b := NewCounters(ddb, name), NewCounters(ddb, name)
-		a.pageSize, b.pageSize = 7, 7
-		return a, b
+		return NewCounters(ddb, name, testKey), NewCounters(ddb, name, testKey)
 	})
 }
 
 // Takes the SDK sent again after they took effect count once, for an idle
-// bucket's update, a busy one's and a day's, and give-backs return one.
+// bucket's update, a busy one's and a day's.
 func TestIntegrationATakeSentAgainCountsOnce(t *testing.T) {
 	ddb, name := table(t, "maap-counters")
-	c := NewCounters(resendTable{ddb}, name)
+	c := NewCounters(resendTable{ddb}, name, testKey)
 	counter := storetest.Counter(storetest.Chatbot().ID)
 	for i := range 11 {
 		if got, err := c.TakeMinute(t.Context(), counter, 60, storetest.Now); err != nil || got.Taken != (i < 10) {
@@ -483,24 +482,72 @@ func TestIntegrationATakeSentAgainCountsOnce(t *testing.T) {
 			t.Fatalf("day take %d = %+v, %v", i, got, err)
 		}
 	}
-	// A give-back sent again returns one only.
-	if err := c.GiveBackMinute(t.Context(), counter, 60, storetest.Now); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.GiveBackDay(t.Context(), counter, storetest.Now); err != nil {
-		t.Fatal(err)
-	}
-	for _, take := range []func() (store.Take, error){
-		func() (store.Take, error) { return c.TakeMinute(t.Context(), counter, 60, storetest.Now) },
-		func() (store.Take, error) { return c.TakeDay(t.Context(), counter, 3, storetest.Now) },
-	} {
-		for i := range 2 {
-			if got, err := take(); err != nil || got.Taken != (i == 0) {
-				t.Fatalf("take %d after a give-back = %+v, %v", i, got, err)
-			}
-		}
-	}
 	if err := c.Ready(t.Context()); err != nil {
 		t.Fatalf("Ready = %v", err)
+	}
+}
+
+// The update expressions do what the memory backend's arithmetic does: one
+// seeded run of takes, give-backs of earlier takes and time steps, over
+// midnight, at rates 1 to 6,000 a minute, answers the same on both (#751
+// review), so that a change to either shows here.
+func TestIntegrationCountersAnswerAsTheMemoryBackendDoes(t *testing.T) {
+	ddb, name := table(t, "maap-counters")
+	backends := []store.Counters{store.NewMemoryCounters(), NewCounters(ddb, name, testKey)}
+	rng := rand.New(rand.NewPCG(713, 751))
+	rates := []int64{1, 5, 7, 60, 600, 6000}
+	counters := make([]store.Counter, len(rates))
+	for i := range counters {
+		counters[i] = storetest.Counter(storetest.Chatbot().ID)
+	}
+	type taken struct {
+		c     int
+		day   bool
+		takes [2]store.Take
+	}
+	var out []taken
+	now := time.Date(2026, 11, 9, 23, 58, 0, 0, time.UTC)
+	for op := range 1500 {
+		i := rng.IntN(len(rates))
+		switch r := rng.IntN(10); {
+		case r < 2:
+			now = now.Add(time.Duration(rng.Int64N(int64(2 * time.Second))))
+		case r < 4 && len(out) > 0:
+			k := rng.IntN(len(out))
+			x := out[k]
+			out = append(out[:k], out[k+1:]...)
+			for b, be := range backends {
+				var err error
+				if x.day {
+					err = be.GiveBackDay(t.Context(), counters[x.c], x.takes[b])
+				} else {
+					err = be.GiveBackMinute(t.Context(), counters[x.c], rates[x.c], x.takes[b], now)
+				}
+				if err != nil {
+					t.Fatalf("op %d: give-back = %v", op, err)
+				}
+			}
+		default:
+			day := r == 9
+			var got [2]store.Take
+			for b, be := range backends {
+				var err error
+				if day {
+					got[b], err = be.TakeDay(t.Context(), counters[i], rates[i]/2+1, now)
+				} else {
+					got[b], err = be.TakeMinute(t.Context(), counters[i], rates[i], now)
+				}
+				if err != nil {
+					t.Fatalf("op %d: take = %v", op, err)
+				}
+			}
+			m, d := got[0], got[1]
+			if m.Taken != d.Taken || m.Wait != d.Wait || !m.Full.Equal(d.Full) || m.Returned != d.Returned {
+				t.Fatalf("op %d at %v, rate %d, day %v: memory %+v, DynamoDB %+v", op, now, rates[i], day, m, d)
+			}
+			if m.Taken {
+				out = append(out, taken{i, day, got})
+			}
+		}
 	}
 }

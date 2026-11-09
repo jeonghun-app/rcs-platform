@@ -50,7 +50,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		r := awsstore.NewRegistry(ddb, cfg.RegistryTable)
 		registry, creds = r, r.Credentials()
 		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StoreKey, cfg.StatusTTL)
-		counters = awsstore.NewCounters(ddb, cfg.CountersTable)
+		counters = awsstore.NewCounters(ddb, cfg.CountersTable, cfg.StoreKey)
 	}
 	for _, t := range []struct {
 		name  string
@@ -68,8 +68,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		rules: fieldRules{ports: cfg.WebhookPorts, allowHTTP: cfg.HTTPWebhooks, allowInternal: cfg.InternalWebhooks},
 		// Every store of a chatbot's items is a deleter (#742 review), the
 		// credentials too, though the registry's deletion takes them with
-		// its partition already.
-		deleters: []store.ChatbotDeleter{creds, requests, counters},
+		// its partition already; the counters, a day long at most, go by
+		// TTL alone (lead decision on #713).
+		deleters: []store.ChatbotDeleter{creds, requests},
 	})
 	api.mountCredentials(&credentialAPI{registry: registry, creds: creds, random: rand.Reader, now: time.Now})
 	ln, err := d.listen("tcp", cfg.InternalAddr)

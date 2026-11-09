@@ -54,32 +54,83 @@ func FuzzTakeBucketIsATokenBucket(f *testing.F) {
 	})
 }
 
-// A give-back undoes the take it follows, and a bucket given back to
-// never holds more than its burst, checked against the exact integer
-// bucket of FuzzTakeBucketIsATokenBucket.
-func FuzzGiveBackBucketNeverPassesTheBurst(f *testing.F) {
-	f.Add([]byte{0, 0, 1, 1, 1, 0, 0, 200, 1, 1, 1, 1})
-	f.Fuzz(func(t *testing.T, ops []byte) {
-		const perMinute = 60 // a second a token, a burst of 10
-		unit, burst := int64(time.Minute), int64(10)
-		tokens := burst * unit
-		now, full := time.Unix(1_700_000_000, 0), time.Time{}
+// exactBucket is a token bucket in exact integers, the oracle of the fuzz
+// tests: tokens in units of a token / (a minute in nanoseconds), so that a
+// nanosecond refills perMinute of them, at rates that divide a minute.
+type exactBucket struct {
+	perMinute, tokens int64
+	at                time.Time
+}
+
+func newExact(perMinute int64, at time.Time) *exactBucket {
+	return &exactBucket{perMinute, (perMinute + 5) / 6 * int64(time.Minute), at}
+}
+
+func (b *exactBucket) refill(now time.Time) {
+	b.tokens = min((b.perMinute+5)/6*int64(time.Minute), b.tokens+int64(now.Sub(b.at))*b.perMinute)
+	b.at = now
+}
+
+// take takes one at now if the bucket holds one.
+func (b *exactBucket) take(now time.Time) bool {
+	b.refill(now)
+	if b.tokens < int64(time.Minute) {
+		return false
+	}
+	b.tokens -= int64(time.Minute)
+	return true
+}
+
+// A bucket given back to holds no more than an exact token bucket would
+// if the takes given back had never happened (lead decision on #713):
+// every take a fuzzed run of takes, give-backs of earlier takes and time
+// steps lets through, together with the takes not given back, is a run an
+// exact bucket lets through, and what the bucket holds at each step is no
+// more than that bucket holds.
+func FuzzGiveBackNeverPassesAnExactBucket(f *testing.F) {
+	f.Add(uint8(4), []byte{0, 0, 0, 2, 40, 1, 0, 3, 200, 5, 9, 0, 1})
+	f.Add(uint8(14), []byte{1, 1, 1, 1, 1, 1, 7, 7, 7, 2, 0, 0, 0, 9})
+	f.Add(uint8(0), []byte{0, 255, 2, 0, 3, 3})
+	rates := []int64{1, 2, 5, 6, 12, 60, 100, 600, 1200, 6000}
+	f.Fuzz(func(t *testing.T, r uint8, ops []byte) {
+		perMinute := rates[int(r)%len(rates)]
+		interval, _ := store.Bucket(perMinute)
+		start := time.Unix(1_700_000_000, 0)
+		now, full, returned := start, time.Time{}, time.Duration(0)
+		type took struct {
+			take  store.Take
+			given bool
+		}
+		var takes []took
 		for i, op := range ops {
-			step := time.Duration(op>>1) * 125 * time.Millisecond
-			now = now.Add(step)
-			tokens = min(burst*unit, tokens+int64(step)*perMinute)
-			if op&1 == 1 {
-				full = store.GiveBackBucket(full, perMinute, now)
-				tokens = min(burst*unit, tokens+unit)
-				continue
+			switch op % 3 {
+			case 0: // time goes on, up to about four intervals
+				now = now.Add(time.Duration(op/3) * interval / 21)
+			case 1:
+				var tk store.Take
+				full, tk = store.TakeBucket(full, perMinute, now)
+				tk.Returned = returned
+				if tk.Taken {
+					takes = append(takes, took{take: tk})
+				}
+			case 2: // give back the k-th take still counted
+				for k, n := int(op/3), 0; k < len(takes) && n <= len(takes); k = (k + 1) % len(takes) {
+					if n++; !takes[k].given {
+						full, returned = store.GiveBackBucket(full, returned, perMinute, takes[k].take, now)
+						takes[k].given = true
+						break
+					}
+				}
 			}
-			var take store.Take
-			full, take = store.TakeBucket(full, perMinute, now)
-			if want := tokens >= unit; take.Taken != want {
-				t.Fatalf("op %d: taken %v, the bucket held %d/%d", i, take.Taken, tokens, unit)
+			exact := newExact(perMinute, start)
+			for _, x := range takes {
+				if !x.given && !exact.take(x.take.At) {
+					t.Fatalf("op %d: a take at %v that an exact bucket refuses", i, x.take.At.Sub(start))
+				}
 			}
-			if take.Taken {
-				tokens -= unit
+			exact.refill(now)
+			if held := (perMinute+5)/6*int64(time.Minute) - max(0, int64(full.Sub(now)))*perMinute; held > exact.tokens {
+				t.Fatalf("op %d: the bucket holds %d, an exact one %d", i, held, exact.tokens)
 			}
 		}
 	})

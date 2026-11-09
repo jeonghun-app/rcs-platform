@@ -150,10 +150,6 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	if _, _, err := requests.Remember(context.Background(), rec, time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	counter := storetest.Counter("cb-1")
-	if took, err := counters.TakeDay(context.Background(), counter, 1, time.Now()); !took.Taken || err != nil {
-		t.Fatal(err)
-	}
 	for _, step := range []struct {
 		method, path string
 		want         int
@@ -182,9 +178,6 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	rec.Digest[0]++
 	if _, fresh, err := requests.Remember(context.Background(), rec, time.Now()); !fresh || err != nil {
 		t.Errorf("the idempotency record was left: %v", err)
-	}
-	if took, err := counters.TakeDay(context.Background(), counter, 1, time.Now()); !took.Taken || err != nil {
-		t.Errorf("the day count was left: %+v, %v", took, err)
 	}
 
 	cancel()

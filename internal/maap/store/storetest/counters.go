@@ -29,10 +29,10 @@ func RunCounters(t *testing.T, newCounters func(t *testing.T) (store.Counters, s
 		{"ADayCountsToItsLimitUntilMidnight", dayTakes},
 		{"TwoTasksTakingAtOnceNeverExceedACounter", concurrentTakes},
 		{"CountersAreApart", countersApart},
-		{"DeletingAChatbotDeletesOnlyItsCounters", deletesCounters},
 		{"AMalformedCounterOrLimitIsRefused", malformedCounters},
-		{"AGiveBackReturnsOneButNeverPastTheBurst", giveBacks},
+		{"AGiveBackReturnsOnlyWhatHasNotRefilled", giveBacks},
 		{"GiveBacksAndTakesAtOnceNeverExceedACounter", concurrentGiveBacks},
+		{"TakesAmongGiveBacksAtTheEdgeOfFullNeverFail", nearlyFull},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, b := newCounters(t)
@@ -41,13 +41,14 @@ func RunCounters(t *testing.T, newCounters func(t *testing.T) (store.Counters, s
 	}
 }
 
-// take checks what a take answers.
-func take(t *testing.T, take func(store.Counter, int64, time.Time) (store.Take, error), c store.Counter, limit int64, now time.Time, want store.Take) {
+// take checks whether a take was given and its wait, and returns it.
+func take(t *testing.T, take func(store.Counter, int64, time.Time) (store.Take, error), c store.Counter, limit int64, now time.Time, want store.Take) store.Take {
 	t.Helper()
 	got, err := take(c, limit, now)
-	if err != nil || got != want {
+	if err != nil || got.Taken != want.Taken || got.Wait != want.Wait || !got.At.Equal(now) {
 		t.Fatalf("take at %v = %+v, %v; want %+v", now.Sub(Now), got, err, want)
 	}
+	return got
 }
 
 func minute(r store.Counters) func(store.Counter, int64, time.Time) (store.Take, error) {
@@ -155,35 +156,6 @@ func countersApart(t *testing.T, a, _ store.Counters) {
 	take(t, day(a), c, 1, Now, store.Take{Wait: store.DayEnd(Now).Sub(Now)})
 }
 
-func deletesCounters(t *testing.T, a, b store.Counters) {
-	ctx := context.Background()
-	chatbotID := Chatbot().ID
-	var mine []store.Counter
-	for range 30 {
-		mine = append(mine, Counter(chatbotID))
-	}
-	other, all := Counter(Chatbot().ID), Counter("")
-	all.Name = mine[0].Name
-	for _, c := range append(mine, other, all) {
-		take(t, minute(a), c, 5, Now, granted)
-		take(t, day(a), c, 1, Now, granted)
-	}
-	// A repeat finds nothing, and no chatbot ID, not even "", deletes the
-	// counters of all chatbots.
-	for _, id := range []string{chatbotID, chatbotID, ""} {
-		if err := b.DeleteChatbot(ctx, id); err != nil {
-			t.Fatalf("DeleteChatbot(%q) = %v", id, err)
-		}
-	}
-	for _, c := range mine {
-		take(t, minute(a), c, 5, Now, granted)
-		take(t, day(a), c, 1, Now, granted)
-	}
-	for _, c := range []store.Counter{other, all} {
-		take(t, minute(a), c, 5, Now, store.Take{Wait: 12 * time.Second})
-	}
-}
-
 func malformedCounters(t *testing.T, a, _ store.Counters) {
 	good := Counter(Chatbot().ID)
 	for name, tc := range map[string]struct {
@@ -205,11 +177,11 @@ func malformedCounters(t *testing.T, a, _ store.Counters) {
 				t.Errorf("%s: take = %v", name, err)
 			}
 		}
-		if err := a.GiveBackMinute(context.Background(), tc.c, tc.limit, Now); !errors.Is(err, store.ErrInvalid) {
+		if err := a.GiveBackMinute(context.Background(), tc.c, tc.limit, granted, Now); !errors.Is(err, store.ErrInvalid) {
 			t.Errorf("%s: GiveBackMinute = %v", name, err)
 		}
 		if tc.limit == 1 {
-			if err := a.GiveBackDay(context.Background(), tc.c, Now); !errors.Is(err, store.ErrInvalid) {
+			if err := a.GiveBackDay(context.Background(), tc.c, granted); !errors.Is(err, store.ErrInvalid) {
 				t.Errorf("%s: GiveBackDay = %v", name, err)
 			}
 		}
@@ -220,78 +192,100 @@ func malformedCounters(t *testing.T, a, _ store.Counters) {
 	take(t, day(a), long, store.MaxLimit, Now, granted)
 }
 
-// drain takes from the counter at now until it refuses, and returns how
-// many it took.
-func drain(t *testing.T, take func(store.Counter, int64, time.Time) (store.Take, error), c store.Counter, limit int64, now time.Time) int {
+// drain takes from the counter at now until it refuses, and returns what
+// it took.
+func drain(t *testing.T, take func(store.Counter, int64, time.Time) (store.Take, error), c store.Counter, limit int64, now time.Time) []store.Take {
 	t.Helper()
-	for n := 0; ; n++ {
+	var took []store.Take
+	for {
 		got, err := take(c, limit, now)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !got.Taken {
-			return n
+			return took
 		}
+		took = append(took, got)
 	}
 }
 
 func giveBacks(t *testing.T, a, b store.Counters) {
 	ctx := context.Background()
 	c := Counter(Chatbot().ID)
-	// A bucket of 60 a minute: what is given back is taken again, once.
-	if n := drain(t, minute(a), c, 60, Now); n != 10 {
-		t.Fatalf("took %d, want the burst of 10", n)
+	// A bucket of 60 a minute: what is given back at once is taken again,
+	// once; a refused take gives nothing back.
+	took := drain(t, minute(a), c, 60, Now)
+	if len(took) != 10 {
+		t.Fatalf("took %d, want the burst of 10", len(took))
 	}
-	if err := b.GiveBackMinute(ctx, c, 60, Now); err != nil {
-		t.Fatal(err)
+	refused, _ := a.TakeMinute(ctx, c, 60, Now)
+	for _, x := range []store.Take{took[9], refused} {
+		if err := b.GiveBackMinute(ctx, c, 60, x, Now); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if n := drain(t, minute(a), c, 60, Now); n != 1 {
+	if n := len(drain(t, minute(a), c, 60, Now)); n != 1 {
 		t.Fatalf("took %d after a give-back", n)
 	}
-	// Give-backs to a full bucket, used or never, add nothing.
-	for _, x := range []store.Counter{c, Counter(Chatbot().ID)} {
-		later := Now.Add(time.Hour)
-		take(t, minute(a), x, 60, later, granted)
-		for range 3 {
-			if err := b.GiveBackMinute(ctx, x, 60, later); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if n := drain(t, minute(a), x, 60, later); n != 10 {
-			t.Fatalf("took %d from a full bucket given back to, want 10", n)
-		}
+	// A take whose token refilled before its give-back gets nothing back,
+	// though others took the bucket empty since (#751 review): X at t0,
+	// full again 1 s later, emptied at 1.2 s, given back at 1.2 s.
+	x := Counter(Chatbot().ID)
+	first := take(t, minute(a), x, 60, Now, granted)
+	if n := len(drain(t, minute(b), x, 60, Now.Add(1200*time.Millisecond))); n != 10 {
+		t.Fatalf("took %d of a full bucket", n)
 	}
-	// A day: the same, and never under zero.
-	d := Counter(Chatbot().ID)
-	for range 3 {
-		if err := b.GiveBackDay(ctx, d, Now); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if n := drain(t, day(a), d, 3, Now); n != 3 {
-		t.Fatalf("took %d of a day of 3 given back to while empty", n)
-	}
-	if err := b.GiveBackDay(ctx, d, Now); err != nil {
+	if err := a.GiveBackMinute(ctx, x, 60, first, Now.Add(1200*time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if n := drain(t, day(a), d, 3, Now); n != 1 {
-		t.Fatalf("took %d after a day's give-back", n)
+	take(t, minute(b), x, 60, Now.Add(1500*time.Millisecond), store.Take{Wait: 700 * time.Millisecond})
+	// One partly refilled gives back the rest: half a token at 0.5 s.
+	y := Counter(Chatbot().ID)
+	half := take(t, minute(a), y, 60, Now, granted)
+	if err := b.GiveBackMinute(ctx, y, 60, half, Now.Add(500*time.Millisecond)); err != nil {
+		t.Fatal(err)
 	}
-	// A day taken from and given back to twice is at zero, not under.
+	if n := len(drain(t, minute(a), y, 60, Now.Add(500*time.Millisecond))); n != 10 {
+		t.Fatalf("took %d after half a give-back, want the burst of 10", n)
+	}
+	// Give-backs to a full bucket add nothing.
 	z := Counter(Chatbot().ID)
-	take(t, day(a), z, 3, Now, granted)
-	for range 2 {
-		if err := b.GiveBackDay(ctx, z, Now); err != nil {
+	later := Now.Add(time.Hour)
+	used := take(t, minute(a), z, 60, later, granted)
+	for range 3 {
+		if err := b.GiveBackMinute(ctx, z, 60, used, later.Add(2*time.Second)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if n := drain(t, day(a), z, 3, Now); n != 3 {
-		t.Fatalf("took %d of a day of 3 given back to past zero", n)
+	if n := len(drain(t, minute(a), z, 60, later.Add(2*time.Second))); n != 10 {
+		t.Fatalf("took %d from a full bucket given back to, want 10", n)
 	}
-	// A give-back is to the take's day, not the next.
-	_ = b.GiveBackDay(ctx, d, Now.Add(24*time.Hour))
-	if n := drain(t, day(a), d, 3, Now); n != 0 {
+	// A day: one back, to the take's day, never under zero.
+	d := Counter(Chatbot().ID)
+	days := drain(t, day(a), d, 3, Now)
+	if len(days) != 3 {
+		t.Fatalf("took %d of a day of 3", len(days))
+	}
+	if err := b.GiveBackDay(ctx, d, days[0]); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(drain(t, day(a), d, 3, Now)); n != 1 {
+		t.Fatalf("took %d after a day's give-back", n)
+	}
+	next := take(t, day(a), d, 3, Now.Add(24*time.Hour), granted)
+	_ = b.GiveBackDay(ctx, d, next)
+	if n := len(drain(t, day(a), d, 3, Now)); n != 0 {
 		t.Fatalf("the next day's give-back returned %d to this one", n)
+	}
+	zero := Counter(Chatbot().ID)
+	once := take(t, day(a), zero, 3, Now, granted)
+	for range 2 {
+		if err := b.GiveBackDay(ctx, zero, once); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := len(drain(t, day(a), zero, 3, Now)); n != 3 {
+		t.Fatalf("took %d of a day of 3 given back to past zero", n)
 	}
 }
 
@@ -299,37 +293,73 @@ func concurrentGiveBacks(t *testing.T, a, b store.Counters) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		take     func(store.Counters) func(store.Counter, int64, time.Time) (store.Take, error)
-		giveBack func(store.Counters, store.Counter) error
+		giveBack func(store.Counters, store.Counter, store.Take) error
 		limit    int64
 		full     int // the burst, or the day's limit
 	}{
-		{minute, func(r store.Counters, c store.Counter) error { return r.GiveBackMinute(ctx, c, 60, Now) }, 60, 10},
-		{day, func(r store.Counters, c store.Counter) error { return r.GiveBackDay(ctx, c, Now) }, 7, 7},
+		{minute, func(r store.Counters, c store.Counter, x store.Take) error {
+			return r.GiveBackMinute(ctx, c, 60, x, Now)
+		}, 60, 10},
+		{day, func(r store.Counters, c store.Counter, x store.Take) error { return r.GiveBackDay(ctx, c, x) }, 7, 7},
 	} {
 		c := Counter(Chatbot().ID)
-		if n := drain(t, tc.take(a), c, tc.limit, Now); n != tc.full {
-			t.Fatalf("took %d, want %d", n, tc.full)
+		took := drain(t, tc.take(a), c, tc.limit, Now)
+		if len(took) != tc.full {
+			t.Fatalf("took %d, want %d", len(took), tc.full)
 		}
-		// Half the calls give one back, half take, from both tasks: a take
-		// wins only what a give-back returned, and every give-back, from
-		// an empty counter, returns one.
-		var took atomic.Int32
+		// Half the calls give one of those back, half take, from both
+		// tasks: a take wins only what a give-back returned, and every
+		// give-back, of a take that has not refilled, returns one.
+		var won atomic.Int32
 		errs := race(2*tc.full, func(i int) error {
 			r := []store.Counters{a, b}[i/2%2]
 			if i%2 == 0 {
-				return tc.giveBack(r, c)
+				return tc.giveBack(r, c, took[i/2])
 			}
 			got, err := tc.take(r)(c, tc.limit, Now)
 			if got.Taken {
-				took.Add(1)
+				won.Add(1)
 			}
 			return err
 		})
 		if err := errors.Join(errs...); err != nil {
 			t.Fatal(err)
 		}
-		if left := drain(t, tc.take(b), c, tc.limit, Now); int(took.Load())+left != tc.full {
-			t.Fatalf("took %d during and %d after %d give-backs", took.Load(), left, tc.full)
+		if left := len(drain(t, tc.take(b), c, tc.limit, Now)); int(won.Load())+left != tc.full {
+			t.Fatalf("took %d during and %d after %d give-backs", won.Load(), left, tc.full)
 		}
+	}
+}
+
+// nearlyFull checks takes that meet give-backs which keep a bucket at the
+// edge of full, so that it turns idle and busy between their updates:
+// none fails, and none takes more than the bucket holds (#751 review).
+func nearlyFull(t *testing.T, a, b store.Counters) {
+	ctx := context.Background()
+	c := Counter(Chatbot().ID)
+	var won atomic.Int32
+	errs := race(24, func(i int) error {
+		r := []store.Counters{a, b}[i%2]
+		for range 8 {
+			got, err := r.TakeMinute(ctx, c, 60, Now)
+			if err != nil {
+				return err
+			}
+			if i%3 != 0 {
+				// A request a later counter refused: given back at once.
+				if err := r.GiveBackMinute(ctx, c, 60, got, Now); err != nil {
+					return err
+				}
+			} else if got.Taken {
+				won.Add(1)
+			}
+		}
+		return nil
+	})
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
+	}
+	if n := int(won.Load()) + len(drain(t, minute(a), c, 60, Now)); n > 10 {
+		t.Fatalf("%d taken of a burst of 10", n)
 	}
 }
