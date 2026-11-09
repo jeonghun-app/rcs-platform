@@ -86,6 +86,7 @@ internal/
                             the internal listener's tokens, decode cap and checks
   maap/store/               interfaces of maap's tables, memory backends,
                             storetest contract
+  maap/awsstore/            maap's DynamoDB backends
   ftserver/                 ft-server service logic
   ftserver/store/           ft-server storage interfaces, memory backends,
                             storetest contract

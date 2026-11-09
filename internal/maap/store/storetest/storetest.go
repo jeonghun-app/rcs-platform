@@ -45,6 +45,7 @@ func Run(t *testing.T, newRegistry func(t *testing.T) store.Registry) {
 	t.Run("OnlyOneOfConcurrentUpdatesWins", func(t *testing.T) { concurrentUpdates(t, newRegistry(t)) })
 	t.Run("DeleteFreesTheURIAndARepeatIsHarmless", func(t *testing.T) { deletes(t, newRegistry(t)) })
 	t.Run("ADeletedIDIsNeverRegisteredAgain", func(t *testing.T) { tombstone(t, newRegistry(t)) })
+	t.Run("ADeleteRacingUpdatesStillDeletes", func(t *testing.T) { deleteRacingUpdates(t, newRegistry(t)) })
 }
 
 func equal(t *testing.T, got, want store.Chatbot) {
@@ -307,5 +308,38 @@ func tombstone(t *testing.T, r store.Registry) {
 	z.URI = x.URI
 	if _, err := r.Register(ctx, z); !errors.Is(err, store.ErrURITaken) {
 		t.Fatalf("Register of y's URI = %v", err)
+	}
+}
+
+// deleteRacingUpdates: a change at the same time does not stop a deletion,
+// and no change lands after it.
+func deleteRacingUpdates(t *testing.T, r store.Registry) {
+	ctx := context.Background()
+	c, err := r.Register(ctx, Chatbot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	errs := race(8, func(i int) error {
+		if i == 0 {
+			return r.DeleteChatbot(ctx, c.ID)
+		}
+		_, err := r.Update(ctx, c, c)
+		return err
+	})
+	if errs[0] != nil {
+		t.Fatalf("DeleteChatbot = %v", errs[0])
+	}
+	for _, err := range errs[1:] {
+		if err != nil && !errors.Is(err, store.ErrConflict) && !errors.Is(err, store.ErrNotFound) {
+			t.Errorf("Update = %v", err)
+		}
+	}
+	if _, err := r.Chatbot(ctx, c.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("chatbot after the race: %v", err)
+	}
+	next := Chatbot()
+	next.URI = c.URI
+	if _, err := r.Register(ctx, next); err != nil {
+		t.Fatalf("Register of the freed URI = %v", err)
 	}
 }

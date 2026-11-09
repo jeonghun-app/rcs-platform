@@ -9,8 +9,7 @@ Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token; no route is mounted yet
 (#709–#713 add the operator's). The [registry](#dynamodb-maap-registry-table)
-has its store and a memory backend (#708), which no route uses yet; its
-DynamoDB backend follows in the next pull request of #708.
+has its store, in memory and in DynamoDB (#708), which no route uses yet.
 
 ## Listeners
 
@@ -107,6 +106,16 @@ content is checked by `chatbot.ValidateContent` instead.
 Metrics have the `Service` dimension only (ADR 0009 §10):
 `api.<operation>.<status>` per request and `api.decode_busy`.
 
+A route that changes a chatbot (#709) adds to its audit line the values
+before and after (ADR 0009 §7) as `store.AuditChanges` writes them, a group
+per changed field named by its JSON path, as the lead decided on #709: the
+ID, permissions, limits, state, source networks and the webhook's verified
+flag in full; the URI through `pii.URI`; the webhook URL as its host only,
+without userinfo or an IPv6 zone, since the rest may hold the chatbot's
+secret; and free text, the display name and out-of-service text, only as
+changed with its new length in bytes (§10). A field added later is free
+text until it is listed.
+
 ## DynamoDB `maap-registry` table
 
 `MAAP_REGISTRY_TABLE`, on demand with point-in-time recovery (ADR 0003),
@@ -149,11 +158,13 @@ operator deletes it.
   `registration` are the ones read and its `uri` is the chatbot's, so of two
   concurrent changes one wins and the other is refused as a conflict. A random `writer` token tells a write the SDK sent again
   after its answer was lost, which then stands, from another writer's.
-- **Deleting** a chatbot deletes every item of its partition, then turns the
-  record into a tombstone, on the condition of the version read, together
-  with deleting the reservation, which frees the URI. A deletion that failed
-  part way is finished by calling it again; deleting a chatbot that is gone
-  does nothing (ADR 0009 §10). **A deleted ID is never registered again**
+- **Deleting** a chatbot first turns its record into a tombstone, on the
+  condition of the registration read, together with deleting the
+  reservation, which frees the URI; then it deletes the partition's other
+  items, its credentials among them. A change at the same time does not
+  stop it, and no credential goes from a chatbot that stays. A deletion
+  that failed part way finishes its clean-up when called again; deleting a
+  chatbot that is gone does nothing (ADR 0009 §10). **A deleted ID is never registered again**
   (lead decision on #708; `ErrDeleted`, which #709 answers 409), so nothing
   another table kept of it, or a change read before the deletion, reaches
   a new chatbot. Tombstones are kept, like the table, without TTL.
