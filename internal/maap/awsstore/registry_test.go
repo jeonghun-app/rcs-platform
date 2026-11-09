@@ -1,8 +1,10 @@
 package awsstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -10,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/logging"
 
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store/storetest"
@@ -19,8 +22,16 @@ import (
 // write's condition with the item it was sent as the stored one: what
 // DynamoDB answers the SDK's second send of a write that took effect.
 type stubDynamo struct {
-	err  error
-	echo func(map[string]types.AttributeValue) map[string]types.AttributeValue
+	err    error
+	echo   func(map[string]types.AttributeValue) map[string]types.AttributeValue
+	status types.TableStatus
+}
+
+func (s *stubDynamo) DescribeTable(context.Context, *dynamodb.DescribeTableInput, ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error) {
+	if s.err != nil {
+		return nil, s.err
+	}
+	return &dynamodb.DescribeTableOutput{Table: &types.TableDescription{TableStatus: s.status}}, nil
 }
 
 func (s *stubDynamo) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
@@ -100,5 +111,48 @@ func TestAWriteThatMetATransactionIsAConflict(t *testing.T) {
 	c.Version = 1
 	if _, err := r.Update(ctx, c, c); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("Update = %v", err)
+	}
+}
+
+func TestReadyNeedsAnActiveTable(t *testing.T) {
+	ctx := context.Background()
+	stub := &stubDynamo{status: types.TableStatusActive}
+	r := NewRegistry(stub, "maap-registry")
+	if err := r.Ready(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stub.status = types.TableStatusCreating
+	if err := r.Ready(ctx); err == nil {
+		t.Fatal("a table being created is ready")
+	}
+	stub.err = &smithy.GenericAPIError{Code: "ResourceNotFoundException", Message: "maap-registry"}
+	if err := r.Ready(ctx); err == nil || err.Error() != "awsstore: describe table: ResourceNotFoundException" {
+		t.Fatalf("Ready = %v", err)
+	}
+}
+
+func TestNewNeedsNoRequest(t *testing.T) {
+	t.Setenv("AWS_REGION", "us-east-1")
+	if r, err := New(context.Background(), "maap-registry", "http://127.0.0.1:1"); err != nil || r.table != "maap-registry" {
+		t.Fatalf("New = %v, %v", r, err)
+	}
+}
+
+// The SDK's warnings reach the service's log through pii.Redact, and its
+// debug lines, which may carry a request, never do.
+func TestSDKWarningsAreRedactedAndDebugLinesDropped(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+	uri := storetest.Chatbot().URI
+	sdkLogger{}.Logf(logging.Debug, "request for %s", uri)
+	sdkLogger{}.Logf(logging.Warn, "retrying the request for %s", uri)
+	out := buf.String()
+	if !strings.Contains(out, "aws sdk warning") || strings.Contains(out, uri) {
+		t.Fatalf("log = %s", out)
+	}
+	if n := strings.Count(out, "\n"); n != 1 {
+		t.Fatalf("%d lines, want the warning only:\n%s", n, out)
 	}
 }

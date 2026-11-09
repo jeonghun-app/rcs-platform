@@ -5,11 +5,28 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 )
+
+// readyRegistry is a registry in memory with the readiness check of the
+// DynamoDB one, failing until ready is set.
+type readyRegistry struct {
+	*store.MemoryRegistry
+	ready atomic.Bool
+}
+
+func (r *readyRegistry) Ready(context.Context) error {
+	if !r.ready.Load() {
+		return errors.New("table not active")
+	}
+	return nil
+}
 
 func TestServiceIsNamedForLogsAndMetrics(t *testing.T) {
 	if s := Service(); s.Name != "maap" || s.EnvPrefix != "MAAP_" {
@@ -17,7 +34,7 @@ func TestServiceIsNamedForLogsAndMetrics(t *testing.T) {
 	}
 }
 
-func TestRunServesTheInternalListenerAndHealthUntilStopped(t *testing.T) {
+func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	cfg, err := configure(with(devEnv, "MAAP_OPERATOR_TOKEN", operatorToken))
 	if err != nil {
 		t.Fatal(err)
@@ -29,8 +46,9 @@ func TestRunServesTheInternalListenerAndHealthUntilStopped(t *testing.T) {
 	listening := make(chan net.Listener, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	registry := &readyRegistry{MemoryRegistry: store.NewMemoryRegistry()}
 	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{listen: func(network, _ string) (net.Listener, error) {
+		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, listen: func(network, _ string) (net.Listener, error) {
 			ln, err := net.Listen(network, "127.0.0.1:0")
 			if err == nil {
 				listening <- ln
@@ -39,6 +57,16 @@ func TestRunServesTheInternalListenerAndHealthUntilStopped(t *testing.T) {
 		}})
 	}()
 	addr := (<-listening).Addr().String()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		if code, body := h.Get("/readyz"); code == http.StatusServiceUnavailable && strings.Contains(body, "dynamodb-registry") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("/readyz never reported the registry failing")
+		}
+	}
+	registry.ready.Store(true)
+	h.Advance(2 * time.Second) // past the cached answer
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
 		if code, _ := h.Get("/readyz"); code == http.StatusOK {
 			break
@@ -79,7 +107,7 @@ func TestRunFailsWhenItsListenerCannotOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := runtimetest.New(t, "maap")
-	err = run(context.Background(), h.Runtime, cfg, deps{listen: func(string, string) (net.Listener, error) {
+	err = run(context.Background(), h.Runtime, cfg, deps{registry: store.NewMemoryRegistry(), listen: func(string, string) (net.Listener, error) {
 		return nil, errors.New("address in use")
 	}})
 	if err == nil {

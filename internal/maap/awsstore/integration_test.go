@@ -59,6 +59,22 @@ func TestIntegrationRegistryMeetsTheContract(t *testing.T) {
 	storetest.Run(t, func(t *testing.T) store.Registry { return NewRegistry(registryTable(t)) })
 }
 
+// The loader maap runs with reaches the table and finds it ready.
+func TestIntegrationNewReachesAReadyTable(t *testing.T) {
+	_, table := registryTable(t)
+	r, err := New(t.Context(), table, os.Getenv("MAAP_IT_DYNAMODB_ENDPOINT"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Ready(t.Context()); err != nil {
+		t.Fatalf("Ready = %v", err)
+	}
+	c, err := r.Register(t.Context(), storetest.Chatbot())
+	if err != nil || c.Version != 1 {
+		t.Fatalf("Register = %+v, %v", c, err)
+	}
+}
+
 // resend sends every write that succeeds a second time, as the SDK does
 // when an answer is lost, without the request token, as when DynamoDB no
 // longer knows it, and answers what the second send got.
