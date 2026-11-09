@@ -472,6 +472,8 @@ credentials and webhook settings are operator-only, on a listener the public
 handler does not mount, and every change is audit-logged. URIs are unique in
 the one normal form (T14). Only the operator scope writes the PSI in `hss`.
 JSON is strict and bounded, with one recipient per send.
+Credentials, their routes and the caches are built (#710); the 401 path
+and the limits per source come with #683.
 **Residual risk:** a stolen credential works until it is revoked, and for up
 to 30 s after. Look-alike display names are not caught (verification is out of
 scope); the registry only refuses the controls and the invisible, format and

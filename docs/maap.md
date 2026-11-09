@@ -226,6 +226,27 @@ ID>.<secret>` (#683 reads it). The operator's routes, in
   tombstone; an issue that meets the deletion is refused (404), since the
   store checks the registration it read.
 
+**Lookup and caches** (for #683's bearer check). A task finds a credential
+by its key ID, compares the SHA-256 digest of the presented secret with the
+stored one in constant time (`crypto/subtle`), then reads the chatbot: a
+wrong secret, an unknown or revoked key ID, a malformed one (not read at
+all), a chatbot deleted or of another registration all give one and the
+same refusal. A credential that a deletion stopped part way left behind
+the tombstone does not authenticate. The answer carries the chatbot as
+read, whatever its state, for the caller to refuse a suspended one. A store
+that fails is an error of its own, never a refusal, and is not cached.
+
+| Cache, per task | Kept | Bound |
+|---|---|---|
+| credentials by key ID, chatbots by ID | 30 s from the read | what the registry holds; past 10,000 an insert first drops the expired |
+| unknown key IDs | 30 s | 10,000; past it the oldest is forgotten |
+| last use recorded | an hour | a credential's `last_used` is written at most hourly per task, again at the next use if the write failed |
+
+So a revocation, a suspension, a permission change or a deletion takes
+effect on every task within 30 s (T13), and a caller trying key IDs costs at
+most one read each per 30 s; #683 adds the limits per source. The unknown
+key IDs take about 1 MB at their bound.
+
 ## DynamoDB `maap-registry` table
 
 `MAAP_REGISTRY_TABLE`, on demand with point-in-time recovery (ADR 0003),
