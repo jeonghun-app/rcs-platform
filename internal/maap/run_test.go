@@ -75,7 +75,7 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	done := make(chan error, 1)
 	registry := &readyRegistry{MemoryRegistry: store.NewMemoryRegistry()}
 	creds := deletions{registry.Credentials(), make(chan string, 1)}
-	requests := readyRequests{store.NewMemoryRequests(), &registry.ready}
+	requests := readyRequests{store.NewMemoryRequests(time.Hour), &registry.ready}
 	go func() {
 		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, requests: requests, listen: func(network, _ string) (net.Listener, error) {
 			ln, err := net.Listen(network, "127.0.0.1:0")

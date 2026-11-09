@@ -12,7 +12,7 @@ registers, changes and deletes chatbots in the [registry](#registry) (#709)
 and issues and revokes their [credentials](#credentials-and-caches) (#710),
 kept in [DynamoDB](#dynamodb-maap-registry-table) (#708). The
 [`maap-requests`](#dynamodb-maap-requests-table) table keeps the idempotency
-records #683's sends need (#713); #711–#713 add the operator's other routes
+records and message statuses #683's sends need (#713); #711–#713 add the operator's other routes
 and tables.
 
 ## Listeners
@@ -44,6 +44,7 @@ reported at once at start.
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | [idempotency records](#dynamodb-maap-requests-table) and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
+| `MAAP_STATUS_TTL` | `192h` (8 days) | how long a message's [status](#dynamodb-maap-requests-table) is kept: by default `rcs-as`'s `RCSAS_SENT_TTL` default, the longest a notification can still come (lead decision on #713; #684 sets both from one parameter); at least 24 hours, so that the answer an idempotency record replays names a status still kept |
 
 The operator's tokens are `maap`'s own settings: `hss`'s operator token,
 `HSS_ADMIN_TOKEN`, is never accepted here (ADR 0009 §7). Tokens come from
@@ -331,6 +332,7 @@ seconds); no index. The send path that writes it is #683's.
 | `pk` | `sk` | Holds | Kept |
 |---|---|---|---|
 | `c#<chatbot ID>` | `i#<idempotency key>` | An idempotency record: `digest` (binary, the request's SHA-256), `message_id`, `answer` (binary, at most 8 KiB, absent when empty), `created`, `ttl`, `writer` | 24 hours from `created` (ADR 0009 §6) |
+| `c#<chatbot ID>` | `m#<Message-ID>` | A message's status: `state` (`accepted`, `delivered`, `displayed` or `failed`), `accepted`, `updated` (Unix seconds), `ttl`, `writer` | `MAAP_STATUS_TTL` from `accepted` (§10) |
 
 - **Idempotency** (ADR 0009 §4 step 2, §6). The key is 1–64 characters of
   `[A-Za-z0-9_-]`, so it holds no control character, scoped to the chatbot
@@ -341,6 +343,13 @@ seconds); no index. The send path that writes it is #683's.
   ("key reused", which #683 answers 409). A random `writer` token tells a
   put the SDK sent again after its answer was lost, which is then this
   call's own, from another request's.
+- **Statuses** (ADR 0009 §4). A status is put as `accepted` when `rcs-as`
+  accepts a send, on the condition that no live one exists, so a resend of
+  the same Message-ID leaves it as it is. Notifications move it on by a
+  conditional update: `delivered` or `failed` from `accepted`, `displayed`
+  from any other, since notifications come in any order and from any task
+  and a status never goes back. It is read by its chatbot and Message-ID,
+  so another chatbot's message is "not found" (#683 answers 404).
 - **Expiry** is judged at read, by comparing `ttl` with the time: DynamoDB's
   TTL deletes late, and an expired item still there is written over.
 - **Per-chatbot deletion.** A chatbot's items are its partition: deleting

@@ -408,17 +408,19 @@ func TestIntegrationADeletionFinishesOverADamagedKeyItem(t *testing.T) {
 
 func TestIntegrationRequestsMeetTheContract(t *testing.T) {
 	storetest.RunRequests(t, func(t *testing.T) store.Requests {
-		r := NewRequests(table(t, "maap-requests"))
+		ddb, name := table(t, "maap-requests")
+		r := NewRequests(ddb, name, storetest.StatusTTL)
 		r.pageSize = 7 // pages that end inside a batch
 		return r
 	})
 }
 
 // A request whose put the SDK sent again after it took effect is kept by
-// this call; a repeat of it is still a repeat.
+// this call, and a repeat of it is still a repeat; an advance sent again
+// still changed the status.
 func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 	ddb, name := table(t, "maap-requests")
-	r := NewRequests(resendTable{ddb}, name)
+	r := NewRequests(resendTable{ddb}, name, storetest.StatusTTL)
 	rec := storetest.Idempotency(storetest.Chatbot().ID)
 	if got, fresh, err := r.Remember(t.Context(), rec, storetest.Now); err != nil || !fresh || got.MessageID != rec.MessageID {
 		t.Fatalf("Remember = %+v, %v, %v", got, fresh, err)
@@ -427,6 +429,13 @@ func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 	again.MessageID = storetest.MessageID()
 	if got, fresh, err := r.Remember(t.Context(), again, storetest.Now); err != nil || fresh || got.MessageID != rec.MessageID {
 		t.Fatalf("repeat = %+v, %v, %v", got, fresh, err)
+	}
+	// So does a status's advance.
+	if err := r.Accept(t.Context(), rec.Chatbot, rec.MessageID, storetest.Now); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := r.Advance(t.Context(), rec.Chatbot, rec.MessageID, store.Delivered, storetest.Now); !changed || err != nil {
+		t.Fatalf("Advance = %v, %v", changed, err)
 	}
 	if err := r.Ready(t.Context()); err != nil {
 		t.Fatalf("Ready = %v", err)

@@ -9,7 +9,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
 
@@ -69,7 +71,8 @@ func start(t *testing.T, env map[string]string) string {
 
 // TestTheDefaultsAreTheDocumentedOnes compares with docs/maap.md's values,
 // not the constants: 8 decodes is what the 512 MB task of the memory rule
-// is sized for, and :8081 is the port of docs/api/maap.yaml.
+// is sized for, :8081 is the port of docs/api/maap.yaml, and a status is
+// kept as long as rcs-as's sent records by default (RCSAS_SENT_TTL).
 func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	c, err := configure(devEnv)
 	if err != nil {
@@ -78,7 +81,8 @@ func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	if c.IMSDomain != imsDomain || c.ChatbotDomain.Name() != botDomain || c.AliasHost != aliasHost || c.WebhookPorts != nil ||
 		c.InternalAddr != ":8081" || c.Decodes != 8 || !c.OperatorTokens.Current.IsZero() ||
 		c.RegistryTable != "maap-registry" || c.SubscribersTable != "maap-subscribers" ||
-		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" || c.DynamoDBEndpoint != "" || !c.HTTPWebhooks || !c.InternalWebhooks {
+		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" || c.DynamoDBEndpoint != "" || !c.HTTPWebhooks || !c.InternalWebhooks ||
+		c.StatusTTL != messaging.DefaultStoreTTL+messaging.DefaultSentMargin {
 		t.Fatalf("config = %+v", c)
 	}
 }
@@ -88,14 +92,14 @@ func TestEverySettingIsRead(t *testing.T) {
 		"MAAP_WEBHOOK_PORTS", "8443, 9443", "MAAP_INTERNAL_ADDR", "127.0.0.1:9000", "MAAP_DECODES", "3",
 		"MAAP_OPERATOR_TOKEN", operatorToken, "MAAP_OPERATOR_TOKEN_NEXT", operatorToken+"-next",
 		"MAAP_REGISTRY_TABLE", "r", "MAAP_SUBSCRIBERS_TABLE", "s", "MAAP_REQUESTS_TABLE", "q", "MAAP_COUNTERS_TABLE", "c",
-		"MAAP_DYNAMODB_ENDPOINT", "http://dynamodb:8000"))
+		"MAAP_DYNAMODB_ENDPOINT", "http://dynamodb:8000", "MAAP_STATUS_TTL", "24h"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !slices.Equal(c.WebhookPorts, []uint16{8443, 9443}) || c.InternalAddr != "127.0.0.1:9000" || c.Decodes != 3 ||
 		c.OperatorTokens.Current.RevealString() != operatorToken || c.OperatorTokens.Next.RevealString() != operatorToken+"-next" ||
 		c.RegistryTable != "r" || c.SubscribersTable != "s" || c.RequestsTable != "q" || c.CountersTable != "c" ||
-		c.DynamoDBEndpoint != "http://dynamodb:8000" {
+		c.DynamoDBEndpoint != "http://dynamodb:8000" || c.StatusTTL != 24*time.Hour {
 		t.Fatalf("config = %+v", c)
 	}
 }
@@ -141,6 +145,8 @@ func TestInvalidSettingsAreRefusedEverywhere(t *testing.T) {
 		{"MAAP_INTERNAL_ADDR", "127.0.0.1:99999", "MAAP_INTERNAL_ADDR: its port is not from 1 to 65535"},
 		{"MAAP_INTERNAL_ADDR", ":0", "MAAP_INTERNAL_ADDR: its port is not from 1 to 65535"},
 		{"MAAP_DECODES", "0", "MAAP_DECODES: must be at least 1"},
+		{"MAAP_STATUS_TTL", "23h59m", "MAAP_STATUS_TTL: shorter than the 24 hours"},
+		{"MAAP_STATUS_TTL", "8", "MAAP_STATUS_TTL"},
 		{"MAAP_OPERATOR_TOKEN", operatorToken + "\n", "MAAP_OPERATOR_TOKEN: has white space"},
 		{"MAAP_OPERATOR_TOKEN", strings.Repeat("é", 43), "MAAP_OPERATOR_TOKEN: has white space or characters outside printable ASCII"},
 		{"MAAP_OPERATOR_TOKEN", operatorToken + "\x7f", "MAAP_OPERATOR_TOKEN: has white space or characters outside printable ASCII"},

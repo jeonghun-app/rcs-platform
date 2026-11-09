@@ -30,6 +30,10 @@ type tableStub struct {
 	batches int
 }
 
+func (s *tableStub) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	return nil, s.err
+}
+
 func (s *tableStub) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
 	if s.put != nil {
 		return &dynamodb.PutItemOutput{}, s.put(in)
@@ -79,10 +83,15 @@ func captureLog(t *testing.T) *bytes.Buffer {
 func TestARequestsFailureIsNoRefusalAndNamesNoKey(t *testing.T) {
 	log := captureLog(t)
 	rec := storetest.Idempotency(storetest.Chatbot().ID)
-	r := NewRequests(&tableStub{err: &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException", Message: "key i#" + rec.Key}}, "maap-requests")
-	_, _, rememberErr := r.Remember(context.Background(), rec, storetest.Now)
-	for _, err := range []error{rememberErr, r.DeleteChatbot(context.Background(), rec.Chatbot)} {
-		if err == nil || errors.Is(err, store.ErrKeyReused) || errors.Is(err, store.ErrInvalid) ||
+	r := NewRequests(&tableStub{err: &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException", Message: "key i#" + rec.Key}}, "maap-requests", storetest.StatusTTL)
+	ctx := context.Background()
+	_, _, rememberErr := r.Remember(ctx, rec, storetest.Now)
+	_, statusErr := r.Status(ctx, rec.Chatbot, rec.MessageID, storetest.Now)
+	_, advanceErr := r.Advance(ctx, rec.Chatbot, rec.MessageID, store.Delivered, storetest.Now)
+	for _, err := range []error{
+		rememberErr, statusErr, advanceErr, r.Accept(ctx, rec.Chatbot, rec.MessageID, storetest.Now), r.DeleteChatbot(ctx, rec.Chatbot),
+	} {
+		if err == nil || errors.Is(err, store.ErrKeyReused) || errors.Is(err, store.ErrInvalid) || errors.Is(err, store.ErrNotFound) ||
 			!strings.Contains(err.Error(), "ProvisionedThroughputExceededException") || strings.Contains(err.Error(), rec.Key) {
 			t.Errorf("error = %v", err)
 		}
@@ -91,7 +100,7 @@ func TestARequestsFailureIsNoRefusalAndNamesNoKey(t *testing.T) {
 	damaged := requestKey(rec.Chatbot, rec.Key)
 	r = NewRequests(&tableStub{put: func(*dynamodb.PutItemInput) error {
 		return &types.ConditionalCheckFailedException{Item: damaged}
-	}}, "maap-requests")
+	}}, "maap-requests", storetest.StatusTTL)
 	if _, _, err := r.Remember(context.Background(), rec, storetest.Now); !errors.Is(err, store.ErrInvalid) || strings.Contains(err.Error(), rec.Key) {
 		t.Errorf("damaged record = %v", err)
 	}
@@ -113,7 +122,7 @@ func TestARememberSentAgainFindsItsOwnRecord(t *testing.T) {
 	r := NewRequests(&tableStub{put: func(in *dynamodb.PutItemInput) error {
 		sent = in.Item
 		return &types.ConditionalCheckFailedException{Item: in.Item}
-	}}, "maap-requests")
+	}}, "maap-requests", storetest.StatusTTL)
 	got, fresh, err := r.Remember(context.Background(), rec, storetest.Now)
 	if err != nil || !fresh || got.MessageID != rec.MessageID || !got.Created.Equal(storetest.Now) {
 		t.Fatalf("Remember = %+v, %v, %v", got, fresh, err)
@@ -135,13 +144,43 @@ func TestItemsCarryTheirTTL(t *testing.T) {
 		ttls = append(ttls, sv(in.Item[attrTTL]))
 		return nil
 	}}
-	r := NewRequests(s, "maap-requests")
+	r := NewRequests(s, "maap-requests", storetest.StatusTTL)
 	at := storetest.Now.Add(800 * time.Millisecond)
 	if _, _, err := r.Remember(context.Background(), storetest.Idempotency("cb-1"), at); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{strconv.FormatInt(storetest.Now.Add(store.IdempotencyTTL).Unix(), 10)}; !slices.Equal(ttls, want) {
+	if err := r.Accept(context.Background(), "cb-1", storetest.MessageID(), at); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		strconv.FormatInt(storetest.Now.Add(store.IdempotencyTTL).Unix(), 10), strconv.FormatInt(storetest.Now.Add(storetest.StatusTTL).Unix(), 10),
+	}
+	if !slices.Equal(ttls, want) {
 		t.Fatalf("ttl = %v, want %v", ttls, want)
+	}
+}
+
+// An advance the SDK sent again after it took effect changed the status;
+// one that met a status already as far is no change.
+func TestAnAdvanceSentAgainFindsItsOwnUpdate(t *testing.T) {
+	item := statusKey("cb-1", storetest.MessageID())
+	item[attrTTL] = num(storetest.Now.Add(time.Hour).Unix())
+	s := &tableStub{}
+	r := NewRequests(s, "maap-requests", storetest.StatusTTL)
+	for _, tc := range []struct {
+		writer  func(in *dynamodb.UpdateItemInput) string
+		changed bool
+	}{
+		{func(in *dynamodb.UpdateItemInput) string { return sv(in.ExpressionAttributeValues[":w"]) }, true},
+		{func(*dynamodb.UpdateItemInput) string { return "another" }, false},
+	} {
+		s.update = func(in *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+			item[attrWriter] = str(tc.writer(in))
+			return nil, &types.ConditionalCheckFailedException{Item: item}
+		}
+		if changed, err := r.Advance(context.Background(), "cb-1", sv(item[attrSK])[2:], store.Displayed, storetest.Now); err != nil || changed != tc.changed {
+			t.Errorf("Advance = %v, %v; want %v", changed, err, tc.changed)
+		}
 	}
 }
 
@@ -170,13 +209,13 @@ func TestADeletionSendsUnprocessedItemsAgain(t *testing.T) {
 		}
 		return &dynamodb.BatchWriteItemOutput{}, nil
 	}}
-	if err := NewRequests(s, "maap-requests").DeleteChatbot(context.Background(), "cb-1"); err != nil || s.batches != 4 {
+	if err := NewRequests(s, "maap-requests", storetest.StatusTTL).DeleteChatbot(context.Background(), "cb-1"); err != nil || s.batches != 4 {
 		t.Fatalf("DeleteChatbot = %v after %d batches", err, s.batches)
 	}
 	s = &tableStub{query: query, batch: func(in *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {
 		return &dynamodb.BatchWriteItemOutput{UnprocessedItems: in.RequestItems}, nil
 	}}
-	if err := NewRequests(s, "maap-requests").DeleteChatbot(context.Background(), "cb-1"); err == nil || s.batches != batchAttempts {
+	if err := NewRequests(s, "maap-requests", storetest.StatusTTL).DeleteChatbot(context.Background(), "cb-1"); err == nil || s.batches != batchAttempts {
 		t.Fatalf("DeleteChatbot = %v after %d batches", err, s.batches)
 	}
 }
@@ -204,6 +243,34 @@ func FuzzDecodeIdempotency(f *testing.F) {
 		if len(digest) != 32 || string(rec.Digest[:]) != string(digest) || rec.MessageID != messageID || !store.ValidMessageID(rec.MessageID) ||
 			len(rec.Answer) > store.MaxAnswerBytes || hasAnswer && !bytes.Equal(rec.Answer, answer) || rec.Created.Location() != time.UTC {
 			t.Fatalf("decoded %+v", rec)
+		}
+	})
+}
+
+// A stored status is read strictly: an unknown state or a time that is no
+// number is damaged.
+func FuzzDecodeStatus(f *testing.F) {
+	f.Add("accepted", "1", "2", "3")
+	f.Add("", "", "", "")
+	f.Add("Delivered", "1.5", "-1", "x")
+	f.Add("accepted", "0", "00", "0")
+	f.Fuzz(func(t *testing.T, state, accepted, updated, ttl string) {
+		item := statusKey("cb-1", "0123456789abcdef0123456789abcdef")
+		item[attrState] = str(state)
+		item[attrAccepted], item[attrUpdated] = &types.AttributeValueMemberN{Value: accepted}, &types.AttributeValueMemberN{Value: updated}
+		item[attrTTL] = &types.AttributeValueMemberN{Value: ttl}
+		st, _, err := decodeStatus("cb-1", "0123456789abcdef0123456789abcdef", item)
+		if err != nil {
+			if !errors.Is(err, store.ErrInvalid) {
+				t.Fatalf("error %v", err)
+			}
+			return
+		}
+		// Numbers compare by value: "00" is 0.
+		a, _ := strconv.ParseInt(accepted, 10, 64)
+		u, _ := strconv.ParseInt(updated, 10, 64)
+		if !st.State.Valid() || string(st.State) != state || st.Accepted.Location() != time.UTC || st.Accepted.Unix() != a || st.Updated.Unix() != u {
+			t.Fatalf("decoded %+v", st)
 		}
 	})
 }
