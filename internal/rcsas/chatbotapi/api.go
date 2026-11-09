@@ -315,12 +315,8 @@ func (a *API) message(c *call) *answer {
 	if err != nil {
 		return &answer{status: http.StatusBadRequest, reason: err.Error()}
 	}
-	if ans := a.backstop(sender, m.Recipient); ans != nil {
-		return ans
-	}
-	c.releaseSlot()
 	m.Sender, m.ContentType = sender, entry
-	return a.accept(c, func(ctx context.Context) error { return a.acceptor.AcceptMessage(ctx, m) })
+	return a.accept(c, sender, m.Recipient, func(ctx context.Context) error { return a.acceptor.AcceptMessage(ctx, m) })
 }
 
 func (a *API) notification(c *call) *answer {
@@ -332,22 +328,21 @@ func (a *API) notification(c *call) *answer {
 	if ans != nil {
 		return ans
 	}
+	n.Chatbot = bot
 	// Not the subscriber's bucket: a notification is bounded by threat
 	// model T10's once per kind (ADR 0009 §9).
-	if ans := a.backstop(bot, ""); ans != nil {
-		return ans
-	}
-	c.releaseSlot()
-	n.Chatbot = bot
-	return a.accept(c, func(ctx context.Context) error { return a.acceptor.AcceptNotification(ctx, n) })
+	return a.accept(c, bot, "", func(ctx context.Context) error { return a.acceptor.AcceptNotification(ctx, n) })
 }
 
-// accept hands the call to the acceptor, under the accept cap and
-// acceptTimeout. The decode slot is free by then, so without a cap of its
-// own a slow store would pile up requests, each holding its message,
-// behind the acceptor (#734 security review). A request past the cap is
-// 503 at once, as for the decode cap.
-func (a *API) accept(c *call, do func(context.Context) error) *answer {
+// accept takes a place under the accept cap, then the backstops' tokens
+// of sender and subscriber, and hands the call to the acceptor within
+// acceptTimeout. The decode slot is freed before the acceptor's store
+// calls, so without a cap of its own a slow store would pile up requests,
+// each holding its message, behind the acceptor (#734 security review). A
+// request past the cap is 503 at once, as for the decode cap, and spends
+// no token: otherwise maap's retries of it would empty the subscriber's
+// bucket and open RcsAsChatbotBackstopHit (#739 review).
+func (a *API) accept(c *call, sender, subscriber string, do func(context.Context) error) *answer {
 	select {
 	case a.accepts <- struct{}{}:
 		defer func() { <-a.accepts }()
@@ -355,6 +350,10 @@ func (a *API) accept(c *call, do func(context.Context) error) *answer {
 		a.metrics.Count("chatbot.api.accept_busy", 1)
 		return &answer{http.StatusServiceUnavailable, "too many requests are being accepted", retryBusy}
 	}
+	if ans := a.backstop(sender, subscriber); ans != nil {
+		return ans
+	}
+	c.releaseSlot()
 	ctx, cancel := context.WithTimeout(c.r.Context(), acceptTimeout)
 	defer cancel()
 	return accepted(do(ctx))

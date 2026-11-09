@@ -1265,10 +1265,9 @@ until #706.
 - **Order of checks:** token (401) → path (404; a method other than POST is
   405) → switch (503) → API backstop (429) → decode cap (503) → body (415,
   413, 400) → field rules (400) → scope (403, 404) → content type (415) →
-  content (400) → sender and subscriber backstops (429) → accept cap (503)
-→ the acceptor (202, 403, 503). The token comes
-  first, so that a caller without one learns nothing of the paths or the
-  switch.
+  content (400) → accept cap (503) → sender and subscriber backstops (429)
+  → the acceptor (202, 403, 503). The token comes first, so that a caller
+  without one learns nothing of the paths or the switch.
 - **Field rules and scope** (ADR 0009 §7). The subscriber (a message's
   `recipient`, a notification's `subscriber`) must be a canonical tel URI,
   `tel:+` and digits as `identity.CanonicalIMPU` writes it (400), unless it
@@ -1330,27 +1329,39 @@ until #706.
   each holding its message (#734 security review). `RCSAS_CHATBOT_ACCEPTS`
   (64) bounds the requests, messages and notifications together, that the
   acceptor works on at once; one past it is 503 with `Retry-After: 1` at
-  once and counts `chatbot.api.accept_busy`. Each has 10 s
-  (`acceptTimeout`), well within the 30 s `WriteTimeout`, after which its
-  store calls end and it is answered. **Memory rule:** a message of the
+  once and counts `chatbot.api.accept_busy`. Its place is taken before the
+  backstops' tokens, so a request refused for it spends none, and maap's
+  retries do not open `RcsAsChatbotBackstopHit` (#739 review). Each has
+  10 s (`acceptTimeout`), well within the 30 s `WriteTimeout`. A message's
+  store calls are bounded first by `RCSAS_STORE_TIMEOUT` (5 s, all of them
+  together), so with the default that fires and 10 s backs it; either way
+  the answer is 503. **Memory rule:** a message of the
   largest content holds about 1 MiB while it is accepted: the decoded
   request, the CPIM, its parsed copy and the DynamoDB request, whose body
   writes the CPIM in base64. #699 measured 910–989 KiB each, 100 at once
   held by a DynamoDB endpoint that never answers, heap in use after a
   collection, three runs; the 367 KiB of #734's security review was an
-  acceptor that held the decoded request only. `RCSAS_CHATBOT_DECODES` ×
+  acceptor that held the decoded request only. That is heap: #739's tester
+  saw about 1.2 MiB each of container memory, inside the rule's twofold
+  room. `RCSAS_CHATBOT_DECODES` ×
   27 MB plus `RCSAS_CHATBOT_ACCEPTS` × 1 MiB stays under half the task's
   memory limit: 216 MB + 64 MiB by default.
-- **Acceptor answers.** Stored is 202. A message the engine refuses is 403
-  with the rule's name, `refused: queue_full`, `refused: queue_share_full` or
-  `refused: message_id_reused`, as a person's message refused for it is 403
-  ([Answers](#answers)). A store failure is 503 with `Retry-After: 5`, which
-  `maap` retries with the same Message-ID. No answer depends on whether the
-  recipient exists: `rcs-as` cannot tell a subscriber's number from an
-  off-net or unprovisioned one at this point, and does not look, so every
-  canonical tel URI is answered alike by what its queue holds. Such a
-  number's message waits and expires as an offline subscriber's does; the
-  delivery (#702) is where it fails.
+- **Acceptor answers.** Stored is 202. A message refused for a rule of the
+  chatbot's own sending is 403, `refused: queue_share_full` (its share of
+  the queue) or `refused: message_id_reused`, as a person's message refused
+  for it is 403 ([Answers](#answers)); with the scope's, these `error`
+  strings are stable, for maap to tell them apart. A store failure is 503
+  with `Retry-After: 5`, which `maap` retries with the same Message-ID.
+- **Existence.** No answer depends on whether the recipient exists:
+  `rcs-as` cannot tell a subscriber's number from an off-net or
+  unprovisioned one here, and does not look. A full queue (`queue_full`,
+  the queue's or the chatbots' quarter) is answered 202 too and the message
+  is not stored: only a subscriber's own senders fill a queue, so a refusal
+  would tell a subscriber from a number nobody has (#739 review). #705
+  reports such a message undeliverable. The chatbot's own full share tells
+  it only of its own messages, held alike for every number until #702. A
+  number nobody has fails at delivery (#702), with no more than a generic
+  undeliverable status.
 - **Answers.** An error is `{"error": "<reason>"}`, which names a rule,
   never a value, and closes the connection: most come before the body is
   read, and the server would otherwise read up to 256 KiB of it before the

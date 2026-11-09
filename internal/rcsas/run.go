@@ -240,7 +240,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 // chatbotAcceptor stores what the chatbot API lets through: messages
 // (#699); notifications wait for #706. A store failure is 503, which maap
 // retries with the same Message-ID (ADR 0009 §4); a refusal stays the
-// engine's Rejection, 403.
+// engine's Rejection, 403, but for a full queue: that is 202, as for any
+// number, since a queue only a subscriber's own senders fill would tell a
+// subscriber from a number nobody has. The message is not stored, and #705
+// reports it undeliverable (lead decision on #739).
 type chatbotAcceptor struct {
 	engine       *messaging.Engine
 	chipListType string
@@ -248,8 +251,12 @@ type chatbotAcceptor struct {
 
 func (a chatbotAcceptor) AcceptMessage(ctx context.Context, m chatbot.BotMessage) error {
 	err := a.engine.SubmitChatbot(ctx, m, a.chipListType)
-	if _, refused := errors.AsType[*messaging.Rejection](err); err != nil && !refused {
+	r, refused := errors.AsType[*messaging.Rejection](err)
+	switch {
+	case err != nil && !refused:
 		return fmt.Errorf("%w: %w", chatbotapi.ErrUnavailable, err)
+	case refused && r.Reason == messaging.ReasonQueueFull:
+		return nil
 	}
 	return err
 }

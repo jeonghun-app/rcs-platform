@@ -40,23 +40,30 @@ func (e *env) serve(acc Acceptor) *httptest.ResponseRecorder {
 
 // The acceptor works on at most Accepts requests at once, messages and
 // notifications together; one past them is 503 at once, as for the decode
-// cap, and the cap frees when the held one ends.
+// cap, spends no backstop token (#739 review: maap's retries of it emptied
+// the subscriber's bucket), and the cap frees when the held one ends.
 func TestARequestOverTheAcceptCapIs503(t *testing.T) {
-	e := newEnv(t, func(c *Config) { c.Accepts = 1 })
+	e := newEnv(t, func(c *Config) { c.Accepts, c.SubscriberRate.Burst = 1, 1 })
 	e.acc.entered, e.acc.release = make(chan struct{}), make(chan struct{})
 	done := make(chan int, 1)
 	go func() { done <- e.post(t, messagesPath, message(nil)) }()
 	<-e.acc.entered
-	status, h, body := e.do(t, http.MethodPost, notesPath, "Bearer "+currentToken, "application/json", notification(nil))
-	if status != 503 || h.Get("Retry-After") != "1" || !strings.Contains(body, "being accepted") {
+	other := message(map[string]any{"recipient": "tel:+15550100002", "message_id": "m-2"})
+	status, h, body := e.do(t, http.MethodPost, messagesPath, "Bearer "+currentToken, "application/json", other)
+	if status != 503 || h.Get("Retry-After") != "1" || !strings.Contains(body, "being accepted") || e.post(t, notesPath, notification(nil)) != 503 {
 		t.Errorf("past the cap: %d %v %q", status, h, body)
 	}
-	if n, _ := e.h.Metric("chatbot.api.accept_busy"); n != 1 {
+	if n, _ := e.h.Metric("chatbot.api.accept_busy"); n != 2 {
 		t.Errorf("chatbot.api.accept_busy = %v", n)
 	}
 	close(e.acc.release)
 	if status := <-done; status != 202 {
 		t.Fatalf("the held message: %d", status)
+	}
+	go func() { done <- e.post(t, messagesPath, other) }()
+	<-e.acc.entered
+	if status := <-done; status != 202 {
+		t.Fatalf("the refused message again, its subscriber's bucket of one: %d", status)
 	}
 	if status := e.post(t, notesPath, notification(nil)); status != 202 {
 		t.Fatalf("after the cap freed: %d", status)
