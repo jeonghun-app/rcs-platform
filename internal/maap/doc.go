@@ -12,5 +12,6 @@
 // characters in envelope strings bound for a header or a log. On that
 // plumbing it serves the operator's registry routes, /v1/chatbots, over
 // internal/maap/store, with the field rules of ADR 0009 §7–§9 and an audit
-// line per change. docs/maap.md describes the service and its settings.
+// line per change. It maps subscribers to the aliases chatbots see of them,
+// and back (§10). docs/maap.md describes the service and its settings.
 package maap
