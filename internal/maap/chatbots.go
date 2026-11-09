@@ -22,12 +22,19 @@ type chatbotAPI struct {
 	// check.
 	domain chatbot.Domain
 	rules  fieldRules
+	// deleters are the other tables' per-chatbot deletions, which a
+	// chatbot's deletion runs after the registry's (#710–#713 add theirs).
+	deleters []store.ChatbotDeleter
 }
 
 // mountChatbots serves cb's routes on a, for the operator only.
 func (a *internalAPI) mountChatbots(cb *chatbotAPI) {
 	a.route("POST /v1/chatbots", "register_chatbot", scopeOperator, cb.register)
 	a.route("GET /v1/chatbots/{id}", "read_chatbot", scopeOperator, cb.read)
+	a.route("PATCH /v1/chatbots/{id}", "change_chatbot", scopeOperator, cb.change)
+	a.route("POST /v1/chatbots/{id}/suspend", "suspend_chatbot", scopeOperator, cb.setState(store.Suspended))
+	a.route("POST /v1/chatbots/{id}/resume", "resume_chatbot", scopeOperator, cb.setState(store.Active))
+	a.route("DELETE /v1/chatbots/{id}", "delete_chatbot", scopeOperator, cb.remove)
 }
 
 // register stores a new chatbot, active, with its URI in normal form: 201

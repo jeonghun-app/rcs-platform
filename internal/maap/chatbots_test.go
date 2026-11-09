@@ -31,16 +31,17 @@ func (f failingRegistry) Update(context.Context, store.Chatbot, store.Chatbot) (
 }
 func (f failingRegistry) DeleteChatbot(context.Context, string) error { return f.err }
 
-// chatbotAPIOver is the internal API with the registry routes over r, as
-// in staging and prod (https webhooks only), with 8443 as a webhook port.
-func chatbotAPIOver(t *testing.T, r store.Registry) (*internalAPI, *runtimetest.Harness) {
+// chatbotAPIOver is the internal API with the registry routes over r and
+// deleters, as in staging and prod (https webhooks only), with 8443 as a
+// webhook port.
+func chatbotAPIOver(t *testing.T, r store.Registry, deleters ...store.ChatbotDeleter) (*internalAPI, *runtimetest.Harness) {
 	h := runtimetest.New(t, "maap")
 	a := newInternalAPI(TokenPair{Current: secret.NewString(operatorToken)}, newDecoder(2, h.Runtime.Metrics), h.Runtime)
 	d, err := chatbot.NewDomain(botDomain, imsDomain)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a.mountChatbots(&chatbotAPI{decoder: a.decoder, registry: r, domain: d, rules: fieldRules{ports: []uint16{8443}}})
+	a.mountChatbots(&chatbotAPI{decoder: a.decoder, registry: r, domain: d, rules: fieldRules{ports: []uint16{8443}}, deleters: deleters})
 	return a, h
 }
 

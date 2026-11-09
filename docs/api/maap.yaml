@@ -79,6 +79,72 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "500": { $ref: "#/components/responses/Unreadable" }
         "503": { $ref: "#/components/responses/Busy" }
+    patch:
+      operationId: change_chatbot
+      summary: Set the fields the body gives; the ID and URI never change.
+      description: |
+        A field left out, or null, keeps its value; an object given
+        replaces the whole object. A new webhook URL is stored unverified,
+        the same one keeps its mark. A change that meets another write is
+        applied again to a fresh read, up to 3 times, then is 409.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChatbotChange" } } }
+      responses:
+        "200": { $ref: "#/components/responses/Chatbot" }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Changed" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "500": { $ref: "#/components/responses/Unreadable" }
+        "503": { $ref: "#/components/responses/Busy" }
+    delete:
+      operationId: delete_chatbot
+      summary: Delete a chatbot and every item another table keeps of it.
+      description: |
+        Frees the URI; the ID is never registered again. 204 also when the
+        chatbot is gone already. Each part either finishes or fails: after
+        a 503, send the request again, which finishes what is left.
+      responses:
+        "204": { description: Deleted, or gone already. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500":
+          description: The table is damaged (the URI's reservation names another chatbot).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503": { $ref: "#/components/responses/Busy" }
+  /v1/chatbots/{id}/suspend:
+    parameters:
+      - { $ref: "#/components/parameters/ChatbotID" }
+    post:
+      operationId: suspend_chatbot
+      summary: Suspend a chatbot (ADR 0009 §11); only its state changes.
+      responses:
+        "200": { $ref: "#/components/responses/Chatbot" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Changed" }
+        "500": { $ref: "#/components/responses/Unreadable" }
+        "503": { $ref: "#/components/responses/Busy" }
+  /v1/chatbots/{id}/resume:
+    parameters:
+      - { $ref: "#/components/parameters/ChatbotID" }
+    post:
+      operationId: resume_chatbot
+      summary: Make a suspended chatbot active again; only its state changes.
+      responses:
+        "200": { $ref: "#/components/responses/Chatbot" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Changed" }
+        "500": { $ref: "#/components/responses/Unreadable" }
+        "503": { $ref: "#/components/responses/Busy" }
 components:
   securitySchemes:
     bearer:
@@ -147,6 +213,17 @@ components:
         permissions: { $ref: "#/components/schemas/Permissions" }
         limits: { $ref: "#/components/schemas/Limits" }
         sources: { $ref: "#/components/schemas/Sources" }
+    ChatbotChange:
+      type: object
+      additionalProperties: false
+      description: The fields to set; id and uri are refused (400).
+      properties:
+        display_name: { $ref: "#/components/schemas/DisplayName" }
+        out_of_service: { $ref: "#/components/schemas/OutOfService" }
+        webhook: { $ref: "#/components/schemas/WebhookSetting" }
+        permissions: { $ref: "#/components/schemas/Permissions" }
+        limits: { $ref: "#/components/schemas/Limits" }
+        sources: { $ref: "#/components/schemas/Sources" }
     Chatbot:
       type: object
       required: [id, uri, state]
@@ -179,6 +256,9 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Taken:
       description: The ID is registered, the URI is another chatbot's, or the ID was a deleted chatbot's; the error says which.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Changed:
+      description: Other writes kept coming first; read the chatbot and try again.
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Unreadable:
       description: The stored chatbot is damaged, or was written by a newer release.
