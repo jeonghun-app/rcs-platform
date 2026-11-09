@@ -123,6 +123,7 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		"group chat yes":     {with(devEnv, "RCSAS_GROUP_CHAT_ENABLED", "yes"), "RCSAS_GROUP_CHAT_ENABLED"},
 		"chatbots yes":       {with(devEnv, "RCSAS_CHATBOTS", "yes"), "RCSAS_CHATBOTS"},
 		"chatbot listen":     {with(devEnv, "RCSAS_CHATBOT_LISTEN_ADDR", ":0"), "RCSAS_CHATBOT_LISTEN_ADDR"},
+		"zero decodes":       {with(devEnv, "RCSAS_CHATBOT_DECODES", "0"), "RCSAS_CHATBOT_DECODES"},
 		"token with newline": {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token\n"), "RCSAS_MAAP_TOKEN"},
 		"token with a space": {with(devEnv, "RCSAS_MAAP_TOKEN", "maap token"), "RCSAS_MAAP_TOKEN"},
 		"next with DEL":      {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-next\x7f"), "RCSAS_MAAP_TOKEN_NEXT"},
@@ -309,16 +310,17 @@ func TestTheChatbotSettingsAreRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := c.Chatbots
-	if c.ChatbotListenAddr != ":8081" || b.On || b.Domain.Name() != "" || !b.Tokens.Current.IsZero() {
+	if c.ChatbotListenAddr != ":8081" || b.On || b.Domain.Name() != "" || !b.Tokens.Current.IsZero() || b.Decodes != 8 {
 		t.Fatalf("defaults %+v", b)
 	}
 	c, err = configure(with(devEnv, "RCS_CHATBOT_DOMAIN", "bots.example.net", "RCSAS_CHATBOTS", "on",
-		"RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-next", "RCSAS_CHATBOT_LISTEN_ADDR", "10.0.0.7:9443"))
+		"RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-next", "RCSAS_CHATBOT_LISTEN_ADDR", "10.0.0.7:9443",
+		"RCSAS_CHATBOT_DECODES", "3"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	b = c.Chatbots
-	if c.ChatbotListenAddr != "10.0.0.7:9443" || !b.On || b.Domain.Name() != "bots.example.net" ||
+	if c.ChatbotListenAddr != "10.0.0.7:9443" || !b.On || b.Domain.Name() != "bots.example.net" || b.Decodes != 3 ||
 		b.Tokens.Current.RevealString() != "maap-token" || b.Tokens.Next.RevealString() != "maap-next" {
 		t.Fatalf("read %+v", b)
 	}

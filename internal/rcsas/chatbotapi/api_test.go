@@ -2,11 +2,14 @@ package chatbotapi
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,10 +30,42 @@ const (
 	auditMsg     = "audit: chatbot API request"
 )
 
+// recorder is an Acceptor that keeps what it is handed.
+type recorder struct {
+	mu            sync.Mutex
+	messages      []chatbot.BotMessage
+	notifications []chatbot.BotNotification
+	panics        bool
+	// entered, when set, hears each message, which then waits for release.
+	entered, release chan struct{}
+}
+
+func (r *recorder) AcceptMessage(_ context.Context, m chatbot.BotMessage) error {
+	if r.entered != nil {
+		r.entered <- struct{}{}
+		<-r.release
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.panics {
+		panic("acceptor")
+	}
+	r.messages = append(r.messages, m)
+	return nil
+}
+
+func (r *recorder) AcceptNotification(_ context.Context, n chatbot.BotNotification) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.notifications = append(r.notifications, n)
+	return nil
+}
+
 type env struct {
 	api  *API
 	addr string
 	h    *runtimetest.Harness
+	acc  *recorder
 }
 
 // newEnv serves the API with the switch on, on a real listener.
@@ -40,12 +75,12 @@ func newEnv(t *testing.T, edit func(*Config)) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{On: true, Domain: domain, Tokens: TokenPair{secret.NewString(currentToken), secret.NewString(nextToken)}}
+	cfg := Config{On: true, Domain: domain, Tokens: TokenPair{secret.NewString(currentToken), secret.NewString(nextToken)}, Decodes: 8}
 	if edit != nil {
 		edit(&cfg)
 	}
-	e := &env{h: runtimetest.New(t, "rcs-as")}
-	e.api = New(cfg, e.h.Runtime.Logger, e.h.Runtime.Metrics)
+	e := &env{h: runtimetest.New(t, "rcs-as"), acc: &recorder{}}
+	e.api = New(cfg, e.acc, e.h.Runtime.Logger, e.h.Runtime.Metrics)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +173,15 @@ func readAnswer(t *testing.T, conn net.Conn) *http.Response {
 	return res
 }
 
+func (e *env) waitSlots(t *testing.T, n int) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); len(e.api.slots) != n; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d decode slots held, want %d", len(e.api.slots), n)
+		}
+	}
+}
+
 func TestOnlyMaapsTwoTokensAreAccepted(t *testing.T) {
 	e := newEnv(t, nil)
 	for _, c := range []struct {
@@ -150,13 +194,17 @@ func TestOnlyMaapsTwoTokensAreAccepted(t *testing.T) {
 		{"POST", messagesPath, "Bearer " + currentToken + "x", 401},
 		{"POST", "/v1/elsewhere", "Bearer wrong", 401},
 		{"GET", messagesPath, "", 401},
-		{"POST", messagesPath, "Bearer " + currentToken, 503},
-		{"POST", notesPath, "bearer " + nextToken, 503},
+		{"POST", messagesPath, "Bearer " + currentToken, 202},
+		{"POST", notesPath, "bearer " + nextToken, 202},
 		{"POST", "/v1/elsewhere", "Bearer " + currentToken, 404},
 		{"POST", "/v1/chatbot/messages/", "Bearer " + currentToken, 404},
 		{"GET", messagesPath, "Bearer " + currentToken, 405},
 	} {
-		status, h, _ := e.do(t, c.method, c.path, c.auth, "application/json", message(nil))
+		body := message(nil)
+		if c.path == notesPath {
+			body = notification(nil)
+		}
+		status, h, _ := e.do(t, c.method, c.path, c.auth, "application/json", body)
 		if status != c.want || (status == 401) != (h.Get("WWW-Authenticate") != "") || h.Get("Cache-Control") != "no-store" {
 			t.Errorf("%s %s with %q: %d, headers %v; want %d", c.method, c.path, c.auth, status, h, c.want)
 		}
@@ -192,9 +240,159 @@ func TestTheSwitchOffAnswersOnlyAuthenticatedRequests503(t *testing.T) {
 // connection, the body never sent (#723 review).
 func TestAnEarlyAnswerDoesNotWaitForTheBody(t *testing.T) {
 	e := newEnv(t, nil)
-	for token, want := range map[string]int{"wrong": 401, currentToken: 503} {
-		if res := readAnswer(t, e.rawRequest(t, messagesPath, token, "")); res.StatusCode != want || !res.Close {
-			t.Errorf("token %q: %d, close %v", token, res.StatusCode, res.Close)
+	for _, c := range []struct {
+		path, token string
+		want        int
+	}{{messagesPath, "wrong", 401}, {"/v1/elsewhere", currentToken, 404}} {
+		if res := readAnswer(t, e.rawRequest(t, c.path, c.token, "")); res.StatusCode != c.want || !res.Close {
+			t.Errorf("%s with %q: %d, close %v", c.path, c.token, res.StatusCode, res.Close)
 		}
+	}
+}
+
+// pad makes body exactly n bytes with leading white space, which JSON allows.
+func pad(body string, n int) string { return strings.Repeat(" ", n-len(body)) + body }
+
+func TestBodiesAreDecodedStrictlyUnderTheirLimits(t *testing.T) {
+	e := newEnv(t, nil)
+	for _, c := range []struct {
+		name, path, contentType, body string
+		want                          int
+	}{
+		{"message at 1,496 KiB", messagesPath, "application/json", pad(message(nil), 1531904), 202},
+		{"message over it", messagesPath, "application/json", pad(message(nil), 1531905), 413},
+		{"notification at 8 KiB", notesPath, "application/json", pad(notification(nil), 8192), 202},
+		{"notification over it", notesPath, "application/json", pad(notification(nil), 8193), 413},
+		{"unknown field", messagesPath, "application/json", message(map[string]any{"priority": 1}), 400},
+		{"missing anonymous", messagesPath, "application/json", message(map[string]any{"anonymous": nil}), 400},
+		{"control in display name", messagesPath, "application/json", message(map[string]any{"display_name": "a\r\nb"}), 400},
+		{"bad kind", notesPath, "application/json", notification(map[string]any{"kind": "delivery-notification"}), 400},
+		{"not JSON", messagesPath, "text/plain", message(nil), 415},
+		{"no content type", notesPath, "", notification(nil), 415},
+		{"charset is fine", notesPath, "application/json; charset=utf-8", notification(nil), 202},
+	} {
+		if status, _, _ := e.do(t, "POST", c.path, "Bearer "+currentToken, c.contentType, c.body); status != c.want {
+			t.Errorf("%s: %d, want %d", c.name, status, c.want)
+		}
+	}
+}
+
+// The decode cap answers at once: the second request's body is never sent,
+// and its 503 still comes, closing the connection.
+func TestARequestOverTheDecodeCapIs503BeforeItsBodyIsRead(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.Decodes = 1 })
+	holder := e.rawRequest(t, messagesPath, currentToken, "{")
+	e.waitSlots(t, 1)
+	res := readAnswer(t, e.rawRequest(t, notesPath, currentToken, ""))
+	if res.StatusCode != 503 || res.Header.Get("Retry-After") != "1" || !res.Close {
+		t.Fatalf("over the cap: %d, Retry-After %q, close %v", res.StatusCode, res.Header.Get("Retry-After"), res.Close)
+	}
+	if n, _ := e.h.Metric("chatbot.api.decode_busy"); n != 1 {
+		t.Fatalf("chatbot.api.decode_busy = %v", n)
+	}
+	_ = holder.Close()
+	e.waitSlots(t, 0)
+}
+
+// A notification's body has bodyTime(8 KiB), 1.03 s, to arrive; one that
+// does not is 408.
+func TestASlowBodyLosesItsDecodeSlotAtItsDeadline(t *testing.T) {
+	e := newEnv(t, nil)
+	conn := e.rawRequest(t, notesPath, currentToken, "{")
+	e.waitSlots(t, 1)
+	held := time.Now()
+	e.waitSlots(t, 0)
+	if d := time.Since(held); d > 2500*time.Millisecond {
+		t.Fatalf("the slot was held %v", d)
+	}
+	if res := readAnswer(t, conn); res.StatusCode != http.StatusRequestTimeout || !res.Close {
+		t.Fatalf("a body past its deadline: %d, close %v", res.StatusCode, res.Close)
+	}
+}
+
+func TestWhatPassesReachesTheAcceptor(t *testing.T) {
+	e := newEnv(t, nil)
+	status, h, body := e.do(t, "POST", messagesPath, "Bearer "+currentToken, "application/json", message(nil))
+	if status != 202 || strings.TrimSpace(body) != "{}" || h.Get("Content-Type") != "application/json" || h.Get("Connection") == "close" {
+		t.Fatalf("message: %d %q, headers %v", status, body, h)
+	}
+	if status := e.post(t, notesPath, notification(nil)); status != 202 {
+		t.Fatalf("notification: %d", status)
+	}
+	if m := e.acc.messages; len(m) != 1 || m[0].MessageID != "m-1" || *m[0].Body != "hi there" {
+		t.Fatalf("messages %+v", m)
+	}
+	if n := e.acc.notifications; len(n) != 1 || n[0].MessageID != "Msg+1" {
+		t.Fatalf("notifications %+v", n)
+	}
+	if out := e.h.Output(); strings.Contains(out, "hi there") || strings.Contains(out, "0100001") {
+		t.Fatalf("the log holds part of a request:\n%s", out)
+	}
+}
+
+// A panic in the handler still frees the slot and leaves its audit line,
+// with 500 since nothing was answered.
+func TestAPanicIsAuditedAndFreesItsSlot(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.Decodes = 1 })
+	e.acc.panics = true
+	req, _ := http.NewRequest("POST", "http://"+e.addr+messagesPath, strings.NewReader(message(nil)))
+	req.Header.Set("Authorization", "Bearer "+currentToken)
+	req.Header.Set("Content-Type", "application/json")
+	if res, err := http.DefaultClient.Do(req); err == nil {
+		t.Fatalf("a panic was answered %d", res.StatusCode)
+	}
+	if a := e.h.Logs(auditMsg); len(a) != 1 || a[0]["status"] != 500.0 {
+		t.Fatalf("audit lines %v", a)
+	}
+	e.waitSlots(t, 0)
+}
+
+func TestTheDefaultAcceptorAnswers503(t *testing.T) {
+	a := New(Config{}, nil, nil, nil)
+	if err := a.acceptor.AcceptMessage(context.Background(), chatbot.BotMessage{}); err != ErrUnavailable {
+		t.Fatalf("messages: %v", err)
+	}
+	if err := a.acceptor.AcceptNotification(context.Background(), chatbot.BotNotification{}); err != ErrUnavailable {
+		t.Fatalf("notifications: %v", err)
+	}
+	if ans := accepted(ErrUnavailable); ans.status != 503 || ans.retryAfter == "" {
+		t.Fatalf("answer %+v", ans)
+	}
+}
+
+// A sender holding a slot must keep up 256 KiB/s (docs/rcs-as.md).
+func TestTheBodyDeadlinesAreTheDocumentedOnes(t *testing.T) {
+	if d := bodyTime(chatbot.MaxBotMessageBytes); d.Round(100*time.Millisecond) != 6800*time.Millisecond {
+		t.Errorf("message: %v", d)
+	}
+	if d := bodyTime(chatbot.MaxBotNotificationBytes); d.Round(10*time.Millisecond) != 1030*time.Millisecond {
+		t.Errorf("notification: %v", d)
+	}
+}
+
+// The slot is freed once the body is checked, before the acceptor's store
+// calls: a message the acceptor holds leaves the only slot to another.
+func TestTheAcceptorRunsWithoutTheDecodeSlot(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.Decodes = 1 })
+	e.acc.entered, e.acc.release = make(chan struct{}), make(chan struct{})
+	done := make(chan int, 1)
+	go func() { done <- e.post(t, messagesPath, message(nil)) }()
+	<-e.acc.entered
+	if status := e.post(t, notesPath, notification(nil)); status != 202 {
+		t.Errorf("while the acceptor holds a message: %d", status)
+	}
+	close(e.acc.release)
+	if status := <-done; status != 202 {
+		t.Fatalf("the held message: %d", status)
+	}
+}
+
+// net/http sends the first status written; the audit line must say the same.
+func TestTheRecorderKeepsTheFirstStatus(t *testing.T) {
+	rec := &statusRecorder{ResponseWriter: httptest.NewRecorder()}
+	rec.WriteHeader(http.StatusServiceUnavailable)
+	rec.WriteHeader(http.StatusOK)
+	if _, _ = rec.Write([]byte("x")); rec.status != http.StatusServiceUnavailable {
+		t.Fatalf("status %d", rec.status)
 	}
 }
