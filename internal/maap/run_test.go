@@ -35,7 +35,7 @@ func TestServiceIsNamedForLogsAndMetrics(t *testing.T) {
 }
 
 func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
-	cfg, err := configure(with(devEnv, "MAAP_OPERATOR_TOKEN", operatorToken))
+	cfg, err := configure(with(devEnv, "MAAP_OPERATOR_TOKEN", operatorToken, "MAAP_WEBHOOK_PORTS", "8080"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,13 +79,27 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 		t.Errorf("/healthz = %d", code)
 	}
 	// A transport of its own ignores any proxy in the environment.
-	resp, err := (&http.Client{Transport: &http.Transport{}}).Get("http://" + addr + "/v1/unknown")
+	client := &http.Client{Transport: &http.Transport{}}
+	resp, err := client.Get("http://" + addr + "/v1/unknown")
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound || resp.Header.Get("Cache-Control") != "no-store" {
 		t.Errorf("internal listener answered %d, Cache-Control %q", resp.StatusCode, resp.Header.Get("Cache-Control"))
+	}
+	// The registry's routes are mounted over the registry given, with the
+	// settings' domain and webhook rules: http on a listed port, in dev.
+	req, _ := http.NewRequest("POST", "http://"+addr+"/v1/chatbots", strings.NewReader(
+		`{"id":"cb-1","uri":"sip:bot-1@`+botDomain+`","webhook":{"url":"http://bot.example.com:8080/hook"}}`))
+	req.Header.Set("Authorization", "Bearer "+operatorToken)
+	req.Header.Set("Content-Type", "application/json")
+	if resp, err = client.Do(req); err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if _, err := registry.Chatbot(context.Background(), "cb-1"); resp.StatusCode != http.StatusCreated || err != nil {
+		t.Errorf("POST /v1/chatbots = %d, %v", resp.StatusCode, err)
 	}
 
 	cancel()

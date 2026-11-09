@@ -78,7 +78,7 @@ func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	if c.IMSDomain != imsDomain || c.ChatbotDomain.Name() != botDomain || c.AliasHost != aliasHost || c.WebhookPorts != nil ||
 		c.InternalAddr != ":8081" || c.Decodes != 8 || !c.OperatorTokens.Current.IsZero() ||
 		c.RegistryTable != "maap-registry" || c.SubscribersTable != "maap-subscribers" ||
-		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" || c.DynamoDBEndpoint != "" {
+		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" || c.DynamoDBEndpoint != "" || !c.HTTPWebhooks {
 		t.Fatalf("config = %+v", c)
 	}
 }
@@ -159,6 +159,9 @@ func TestInvalidSettingsAreRefusedEverywhere(t *testing.T) {
 func TestStagingAndProdRefuseTheDevelopmentDefaults(t *testing.T) {
 	for _, env := range []string{"staging", "prod"} {
 		base := with(prodEnv, "RCS_ENV", env)
+		if c, _ := configure(base); c.HTTPWebhooks {
+			t.Errorf("%s allows http webhooks", env)
+		}
 		for _, ok := range []string{operatorToken, strings.Repeat("z", 43), strings.Repeat("ab", 32)} {
 			if out := start(t, with(base, "MAAP_OPERATOR_TOKEN", ok)); strings.Contains(out, "configuration rejected") {
 				t.Errorf("%s: a token of %d characters was refused:\n%s", env, len(ok), out)

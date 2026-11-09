@@ -47,6 +47,8 @@ type Config struct {
 	AliasHost string
 	// WebhookPorts are the ports a webhook URL may name besides 443 (§8).
 	WebhookPorts []uint16
+	// HTTPWebhooks lets a webhook URL be http, in dev and test only (§8).
+	HTTPWebhooks bool
 
 	// InternalAddr is the listener of the operator API, and of rcs-as's
 	// API once #683 adds it; never on the public load balancer (§7).
@@ -81,6 +83,7 @@ func Configure(s *runtime.Settings) Config {
 		RequestsTable:    e.String("REQUESTS_TABLE", DefaultRequestsTable),
 		CountersTable:    e.String("COUNTERS_TABLE", DefaultCountersTable),
 		DynamoDBEndpoint: e.String("DYNAMODB_ENDPOINT", ""),
+		HTTPWebhooks:     !s.Environment.Production(),
 	}
 	if s.Shared.String("CHATBOT_DOMAIN", "") == "" {
 		// LoadDomain takes an unset domain as "no chatbots"; maap exists

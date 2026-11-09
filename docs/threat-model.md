@@ -474,7 +474,8 @@ the one normal form (T14). Only the operator scope writes the PSI in `hss`.
 JSON is strict and bounded, with one recipient per send.
 **Residual risk:** a stolen credential works until it is revoked, and for up
 to 30 s after. Look-alike display names are not caught (verification is out of
-scope). A compromised `maap` can send as any URI in the chatbot range,
+scope); the registry only refuses the C1 controls and format characters, such
+as bidi controls, that make one name show as another (#709). A compromised `maap` can send as any URI in the chatbot range,
 registered or not, because `rcs-as` checks the range, not the registry;
 per-sender rates do not bound that, but `rcs-as`'s caps per subscriber across
 all chatbot senders and per task in total, and the quarter of each queue, do;

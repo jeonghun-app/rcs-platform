@@ -7,10 +7,10 @@ the chatbot PSI and builds every SIP request; `maap` has no SIP, MSRP or
 Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 `internal/maap`, wired by `cmd/maap`. It is being built under epic #668:
 today it starts with checked settings, serves its health checks, and guards
-its internal listener with the operator's token; no route is mounted yet
-(#709–#713 add the operator's). The [registry](#dynamodb-maap-registry-table)
-has its store, in memory and in DynamoDB (#708), which `maap` opens at start
-and `/readyz` checks; no route uses it yet.
+its internal listener with the operator's token, where the operator
+registers and reads chatbots in the [registry](#registry) (#709),
+kept in [DynamoDB](#dynamodb-maap-registry-table) (#708); #710–#713 add the
+operator's other routes.
 
 ## Listeners
 
@@ -102,13 +102,14 @@ writes into a SIP, CPIM or HTTP header, or a log, such as a display name, an
 out-of-service text, an idempotency key or a webhook URL, is refused first if
 it holds a C0 control or DEL, tab included (400, naming the field, never the
 value): CR LF would end a header block and a NUL may cut it short. C1
-controls are not refused, as in `internal/chatbot`'s wire types (#717). The
-content is checked by `chatbot.ValidateContent` instead.
+controls are not refused, as in `internal/chatbot`'s wire types (#717),
+except in the texts the [registry](#registry) stores. The content is checked
+by `chatbot.ValidateContent` instead.
 
 Metrics have the `Service` dimension only (ADR 0009 §10):
 `api.<operation>.<status>` per request and `api.decode_busy`.
 
-A route that changes a chatbot (#709) adds to its audit line the values
+A route that changes a chatbot ([Registry](#registry)) adds to its audit line the values
 before and after (ADR 0009 §7) as `store.AuditChanges` writes them, a group
 per changed field named by its JSON path, as the lead decided on #709: the
 ID, permissions, limits, state, source networks and the webhook's verified
@@ -117,6 +118,61 @@ without userinfo or an IPv6 zone, since the rest may hold the chatbot's
 secret; and free text, the display name and out-of-service text, only as
 changed with its new length in bytes (§10). A field added later is free
 text until it is listed.
+
+## Registry
+
+The operator's routes for chatbots (ADR 0009 §7), in
+[api/maap.yaml](api/maap.yaml). Every one is the operator's alone; an ID in
+the path that no chatbot can have is 404 before the registry is read.
+
+| Route | Does |
+|---|---|
+| `POST /v1/chatbots` | registers a chatbot, `active`, with the ID the operator chose: 201 |
+| `GET /v1/chatbots/{id}` | reads it: 200 |
+
+**Fields.** Each broken rule is 400, naming the field and never the value:
+
+- `id`: 1–64 letters, digits, `-` and `_`, chosen by the operator. An ID is
+  never registered again once its chatbot is deleted (#708).
+- `uri`: read with `internal/chatbot`'s normaliser at `RCS_CHATBOT_DOMAIN`
+  and stored in its normal form (a `tk` parameter and the case of the scheme
+  and host dropped). A URI at another host is refused, even in normal form
+  there, which the registry alone would take. It never changes (#708).
+- `display_name`: at most 128 bytes, without C0 controls or DEL, tab
+  included, without C1 controls and without format characters (Unicode Cf:
+  every bidi control, such as U+202E, and zero-width characters), with which
+  a name shows as another (T13). Only the zero-width joiner, U+200D, is
+  allowed, so that emoji sequences keep working (lead decision on #709). The
+  registry is the only source of the name, so it refuses them rather than
+  every reader.
+- `out_of_service`: what subscribers of a suspended chatbot get (ADR 0009
+  §11), `text/plain` of at most 512 bytes: `chatbot.ValidateContent`'s rules
+  (no C0 control but tab, CR and LF, so no NUL or ESC), then those of the
+  display name for DEL, C1 and Cf (U+200D allowed).
+- `webhook.url`: `https` (also `http` in `dev` and `test`), with a host and
+  without userinfo, on port 443 or one on `MAAP_WEBHOOK_PORTS` (a URL without
+  a port names its scheme's), at most 512 bytes, and written as Go's
+  `net/url` writes it back. A URL newly set is stored unverified, and only
+  its challenge (#683) marks it verified. The address is checked when it is dialled (#683).
+- `permissions`: `msisdn`, and `start_conversations`, which requires
+  `msisdn` (ADR 0009 §9).
+- `limits`: each from 0, the default, up to its default in ADR 0009 §9,
+  never above.
+- `sources`: at most 8 network prefixes without host bits, stored in
+  canonical form (`2001:DB8::/32` as `2001:db8::/32`); none allows any
+  source.
+
+**Errors from the registry.** 409 when the ID is taken, the URI is held by
+another chatbot, or the ID was a deleted chatbot's (the answer names which).
+A record that cannot be read, damaged or written by a newer release, is 500.
+A registry that fails is 503 with `Retry-After: 1`: send the request again.
+
+**Audit.** Each request's `audit: internal request` line names the chatbot
+(`chatbot`, its ID) and, for a change that was written, the values before and
+after as described under [Internal API](#internal-api); a store failure adds
+`store_error`, which names the operation and an AWS error code only.
+`sources` is logged in full, as a structured field: a single `/32` or `/128`
+may be one person's address, so treat these lines as the other audit logs.
 
 ## DynamoDB `maap-registry` table
 

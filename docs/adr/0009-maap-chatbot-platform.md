@@ -297,6 +297,9 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      of them. Every change is an audit log line with the token name, the
      item, and the values before and after, without secrets. Look-alike
      names are a residual risk (T13); verification is out of scope.
+     *Amended on #709 (lead decision):* §10 comes first, so the display
+     name and out-of-service text appear only as changed with their length,
+     and the webhook URL as its host.
    - **Internal tokens** follow ADR 0007 §3–§5, two each, read by the
      execution role: operator → `maap` (not `hss`'s operator token,
      `HSS_ADMIN_TOKEN`), `rcs-as` → `maap`, `maap` → `rcs-as`. rcs-bridge's
