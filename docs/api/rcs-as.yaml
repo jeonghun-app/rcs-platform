@@ -50,6 +50,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { description: "`sender` is outside the chatbot range, or `recipient` inside it.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { description: "`sender` is at RCS_CHATBOT_DOMAIN but not in normal form (ADR 0009 §2).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "408": { description: "The body did not arrive within its deadline, 1 s plus 1 s per 256 KiB of its limit (docs/rcs-as.md).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { description: "The body is larger than 1,496 KiB.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "415": { description: "The request is not application/json, `content_type` is not on the chatbot content types, or there is a `chip_list` and no chip-list type is configured.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "429": { $ref: "#/components/responses/Backstop" }
@@ -73,6 +74,7 @@ paths:
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { description: "`chatbot` is outside the chatbot range, or `subscriber` inside it.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { description: "`chatbot` is at RCS_CHATBOT_DOMAIN but not in normal form (ADR 0009 §2), or no message with `message_id` from `subscriber` went to `chatbot` within RCSAS_SENT_TTL (T10).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "408": { description: "The body did not arrive within its deadline, 1 s plus 1 s per 256 KiB of its limit (docs/rcs-as.md).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { description: The body is larger than 8 KiB., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "415": { description: The request is not application/json., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "429": { $ref: "#/components/responses/Backstop" }

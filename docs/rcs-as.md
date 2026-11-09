@@ -1312,8 +1312,8 @@ every check is handed to an acceptor, which answers 503 until #699
   stays under half the task's memory limit (8 × 20 MB = 160 MB by default);
   #684 and #694 size the task by it. A request holding a slot must send its
   body at 256 KiB/s or faster: it gets 1 s plus 1 s per 256 KiB of its limit
-  (6.8 s for a message, 1.03 s for a notification), after which the read
-  fails and the slot is freed, so a body trickled byte by byte cannot hold a
+  (6.8 s for a message, 1.03 s for a notification), after which it is 408
+  and the slot is freed, so a body trickled byte by byte cannot hold a
   slot for long (#723 review). The slot is freed before the acceptor's store
   calls, and in any case when the request ends, panic or not.
 - **Answers.** An error is `{"error": "<reason>"}`, which names a rule,
@@ -1331,7 +1331,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 `RCS_IMS_DOMAIN`, the home domain at which a SIP URI names a telephone number
 ([Who sends, and to whom](#who-sends-and-to-whom)), and reads
 `RCS_CHATBOT_DOMAIN`, the host of chatbot URIs (`chatbot.LoadDomain`):
-unset, there are no chatbots. The `RCSAS_` settings:
+unset, there are no chatbots (see the table). The `RCSAS_` settings:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -1353,7 +1353,7 @@ unset, there are no chatbots. The `RCSAS_` settings:
 | `RCSAS_SELF_URIS` | none | URIs by which notifications are routed through rcs-as (`IMDN-Route`) |
 | `RCSAS_TRUSTED_ROUTES` | none | The URIs, compared exactly, a notification may be routed through: the platform's own application servers and CSCFs, as they write themselves into `IMDN-Record-Route`. With none, no IMDN route is followed |
 | `RCSAS_IMDN_INTERMEDIARIES` | none | Identities that may send processing and failed-delivery notifications about any message |
-| `RCSAS_MAX_MESSAGE_SIZE` | `262144` (256 KiB) | Largest CPIM body. At most 389120 with `dynamodb` (one item); at least 262144 with `RCSAS_CHATBOTS=on` |
+| `RCSAS_MAX_MESSAGE_SIZE` | `262144` (256 KiB) | Largest CPIM body. At most 389120 with `dynamodb` (one item); at least 262144 with `RCSAS_CHATBOTS=on` and `RCS_CHATBOT_DOMAIN` set, which is the switch on |
 | `RCSAS_PAGER_LIMIT` | `1300` | Largest body in pager mode, both ways, and largest notification |
 | `RCSAS_MAX_QUEUE_MESSAGES` | `1000` | Messages one recipient's queue holds |
 | `RCSAS_MAX_QUEUE_BYTES` | `16777216` (16 MiB) | Bytes one recipient's queue holds. At least `RCSAS_MAX_MESSAGE_SIZE` |
@@ -1379,8 +1379,9 @@ unset, there are no chatbots. The `RCSAS_` settings:
 | `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
 | `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121). `RCSAS_TASK_SKEW` is also the margin for another task's reached marks, with group chat on or off (#605). A task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
+| `RCS_CHATBOT_DOMAIN` | none | Shared with every service: the host of chatbot URIs, read by `chatbot.LoadDomain`, which refuses one that is not a lower-case host name or is `RCS_IMS_DOMAIN`. Unset, there are no chatbots and `RCSAS_CHATBOTS` stays off |
 | `RCSAS_CHATBOTS` | `off` | The chatbot path (ADR 0009 §12), `on` or `off`; on only with `RCS_CHATBOT_DOMAIN` set ([Chatbot API](#chatbot-api)) |
-| `RCSAS_CHATBOT_LISTEN_ADDR` | `:8081` | The chatbot API's listener (TCP), which only `maap` reaches; it serves with the switch off too |
+| `RCSAS_CHATBOT_LISTEN_ADDR` | `:8081` | The chatbot API's listener (TCP), which only `maap` reaches; it serves with the switch off too. Port 0 is refused: `maap` reaches a fixed port |
 | `RCSAS_CHATBOT_SENDER_RATE`, `RCSAS_CHATBOT_SUBSCRIBER_RATE`, `RCSAS_CHATBOT_API_RATE` | `1500`, `120`, `3000` | The chatbot API's backstops per task, a minute: each chatbot sender, one subscriber from all chatbot senders, the whole API. The burst is a sixth, rounded up; none can be turned off |
 | `RCSAS_CHATBOT_DECODES` | `8` | Chatbot API bodies a task decodes and validates at once, about 20 MB each; × 20 MB must stay under half the task's memory limit ([Chatbot API](#chatbot-api)) |
 | `RCSAS_MAAP_TOKEN`, `RCSAS_MAAP_TOKEN_NEXT` | none | `maap`'s current and next bearer token. The current one is required with the switch on; each holds 256 bits in staging and prod |

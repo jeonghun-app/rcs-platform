@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -341,6 +342,10 @@ func decode(c *call, maxBytes int64, v any) *answer {
 	case errors.Is(err, chatbot.ErrInvalidEnvelope):
 		// The package's errors name the rule broken, never the value.
 		return &answer{status: http.StatusBadRequest, reason: err.Error()}
+	}
+	if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+		// The body's own deadline (bodyTime) passed.
+		return &answer{status: http.StatusRequestTimeout, reason: "the body did not arrive in time"}
 	}
 	return &answer{status: http.StatusBadRequest, reason: "the body could not be read"}
 }
