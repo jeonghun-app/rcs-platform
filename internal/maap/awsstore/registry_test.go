@@ -1,15 +1,22 @@
 package awsstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"net"
+	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/logging"
 
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store/storetest"
@@ -132,5 +139,45 @@ func TestNewNeedsNoRequest(t *testing.T) {
 	t.Setenv("AWS_REGION", "us-east-1")
 	if r, err := New(context.Background(), "maap-registry", "http://127.0.0.1:1"); err != nil || r.table != "maap-registry" {
 		t.Fatalf("New = %v, %v", r, err)
+	}
+}
+
+// The SDK's warnings reach the service's log through pii.Redact, and its
+// debug lines, which may carry a request, never do.
+func TestSDKWarningsAreRedactedAndDebugLinesDropped(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+	uri := storetest.Chatbot().URI
+	sdkLogger{}.Logf(logging.Debug, "request for %s", uri)
+	sdkLogger{}.Logf(logging.Warn, "retrying the request for %s", uri)
+	out := buf.String()
+	if !strings.Contains(out, "aws sdk warning") || strings.Contains(out, uri) {
+		t.Fatalf("log = %s", out)
+	}
+	if n := strings.Count(out, "\n"); n != 1 {
+		t.Fatalf("%d lines, want the warning only:\n%s", n, out)
+	}
+}
+
+// A failed request names neither the endpoint's address nor a DNS
+// server's, which a 503's audit line would carry (#741 review).
+func TestATransportFailureNamesNoAddress(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{&net.OpError{Op: "dial", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 18901},
+			Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, "awsstore: get chatbot: dial tcp: connect: connection refused"},
+		{&net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "ddb.example", Server: "10.0.0.2:53", IsNotFound: true}},
+			"awsstore: get chatbot: lookup: no such host"},
+		{&net.DNSError{Err: "i/o timeout", Name: "ddb.example", Server: "10.0.0.2:53", IsTimeout: true}, "awsstore: get chatbot: lookup: timeout"},
+		{&net.DNSError{Err: "server misbehaving", Name: "ddb.example", Server: "10.0.0.2:53"}, "awsstore: get chatbot: lookup failed"},
+	} {
+		sent := &smithy.OperationError{ServiceID: "DynamoDB", OperationName: "GetItem", Err: &url.Error{Op: "Post", URL: "http://127.0.0.1:18901/", Err: tc.err}}
+		if _, err := NewRegistry(&stubDynamo{err: sent}, "maap-registry").Chatbot(context.Background(), "cb-1"); err == nil || err.Error() != tc.want {
+			t.Errorf("error %v, want %q", err, tc.want)
+		}
 	}
 }

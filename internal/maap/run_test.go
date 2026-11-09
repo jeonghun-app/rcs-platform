@@ -89,9 +89,10 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 		t.Errorf("internal listener answered %d, Cache-Control %q", resp.StatusCode, resp.Header.Get("Cache-Control"))
 	}
 	// The registry's routes are mounted over the registry given, with the
-	// settings' domain and webhook rules: http on a listed port, in dev.
+	// settings' domain and webhook rules: http on a listed port, at a
+	// private address, in dev.
 	req, _ := http.NewRequest("POST", "http://"+addr+"/v1/chatbots", strings.NewReader(
-		`{"id":"cb-1","uri":"sip:bot-1@`+botDomain+`","webhook":{"url":"http://bot.example.com:8080/hook"}}`))
+		`{"id":"cb-1","uri":"sip:bot-1@`+botDomain+`","webhook":{"url":"http://10.0.0.5:8080/hook"}}`))
 	req.Header.Set("Authorization", "Bearer "+operatorToken)
 	req.Header.Set("Content-Type", "application/json")
 	if resp, err = client.Do(req); err != nil {

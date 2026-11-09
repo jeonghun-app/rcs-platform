@@ -53,6 +53,9 @@ type fieldRules struct {
 	ports []uint16
 	// allowHTTP allows http webhooks, outside staging and prod.
 	allowHTTP bool
+	// allowInternal allows loopback and private IP addresses as a
+	// webhook's host, in dev only, for the compose stack.
+	allowInternal bool
 }
 
 // apply checks each field b sets and writes it into c, then the rules
@@ -64,14 +67,14 @@ func (f fieldRules) apply(c *store.Chatbot, b chatbotBody) error {
 		if err := refuseControls("display_name", *b.DisplayName); err != nil {
 			return err
 		}
-		if err := refuseInvisible("display_name", *b.DisplayName); err != nil {
-			return err
+		if reason := displayNameProblem(*b.DisplayName); reason != "" {
+			return fail(http.StatusBadRequest, "display_name holds "+reason)
 		}
 		c.DisplayName = *b.DisplayName
 	}
 	if b.OutOfService != nil {
 		// Subscribers get it as a message body: ADR 0009 §5's rules for
-		// text/plain content, then those of a display name.
+		// text/plain content, then refuseInvisible's.
 		if chatbot.ValidateContent("text/plain", []byte(*b.OutOfService)) != nil {
 			return fail(http.StatusBadRequest, "out_of_service is not text/plain without control characters")
 		}
@@ -81,7 +84,7 @@ func (f fieldRules) apply(c *store.Chatbot, b chatbotBody) error {
 		c.OutOfService = *b.OutOfService
 	}
 	if b.Webhook != nil {
-		if reason := webhookProblem(b.Webhook.URL, f.ports, f.allowHTTP); reason != "" {
+		if reason := webhookProblem(b.Webhook.URL, f.ports, f.allowHTTP, f.allowInternal); reason != "" {
 			return fail(http.StatusBadRequest, "webhook.url: "+reason)
 		}
 		if b.Webhook.URL != c.Webhook.URL {
@@ -114,12 +117,13 @@ func (f fieldRules) apply(c *store.Chatbot, b chatbotBody) error {
 	return nil
 }
 
-// refuseInvisible refuses DEL, the C1 controls and the format characters
-// (Unicode Cf: every bidi control, zero-width characters), with which a
-// name can show as another's (T13, #717 review). The zero-width joiner,
-// U+200D, is allowed, so that emoji sequences keep working (lead decision
-// on #709). The registry is these texts' only source, so it refuses them
-// rather than every reader.
+// refuseInvisible refuses, in the out-of-service text, DEL, the C1
+// controls and the format characters (Unicode Cf: every bidi control,
+// zero-width characters), with which a text can show as other than it is
+// (T13, #717 review). The zero-width joiner, U+200D, is allowed, so that
+// emoji sequences keep working (lead decision on #709); the display name
+// has the stricter displayNameProblem. The registry is these texts' only
+// source, so it refuses them rather than every reader.
 func refuseInvisible(field, v string) error {
 	if strings.ContainsFunc(v, func(r rune) bool {
 		return 0x7f <= r && r <= 0x9f || unicode.Is(unicode.Cf, r) && r != zeroWidthJoiner
@@ -129,17 +133,16 @@ func refuseInvisible(field, v string) error {
 	return nil
 }
 
-const zeroWidthJoiner = '\u200d'
-
 // webhookProblem says why raw cannot be a webhook URL, or returns "" (ADR
 // 0009 §8, the #682 decision): https, or http where allowed; a host, and no
 // userinfo; port 443 or one on ports, in decimal without leading zeros, the
 // scheme's default port counting as named; at most 512 bytes, without
 // control characters; and written as net/url writes it back, so that
-// #683's dialer reads the URL judged here.
-// "" itself is no webhook, which is allowed. The address is #683's to check
-// when it dials.
-func webhookProblem(raw string, ports []uint16, allowHTTP bool) string {
+// #683's dialer reads the URL judged here. The host has no "%", so no IPv6
+// zone, and hostProblem's rules for an IP address (security review of
+// #741, lead decision). "" itself is no webhook, which is allowed. What a
+// host name resolves to is #683's to check when it dials.
+func webhookProblem(raw string, ports []uint16, allowHTTP, allowInternal bool) string {
 	if raw == "" {
 		return ""
 	}
@@ -157,6 +160,11 @@ func webhookProblem(raw string, ports []uint16, allowHTTP bool) string {
 		return "userinfo"
 	case u.Opaque != "" || u.Hostname() == "":
 		return "no host"
+	case strings.Contains(u.Host, "%"):
+		return "a % in the host, such as an IPv6 zone"
+	}
+	if reason := hostProblem(u.Hostname(), allowInternal); reason != "" {
+		return reason
 	}
 	port := u.Port()
 	switch {
@@ -172,6 +180,59 @@ func webhookProblem(raw string, ports []uint16, allowHTTP bool) string {
 		return "a port other than 443 or one on MAAP_WEBHOOK_PORTS"
 	}
 	return ""
+}
+
+// nat64 is the well-known NAT64 prefix (RFC 6052), which embeds an IPv4
+// address as 4-in-6 forms do.
+var nat64 = netip.MustParsePrefix("64:ff9b::/96")
+
+// hostProblem refuses a webhook host that is an internal IP address, when
+// the operator sets it, a layer before #683's dialer, the primary control
+// (ADR 0009 §8, memo F5): an IPv4 address inside IPv6 (mapped, NAT64,
+// compatible), loopback and private (RFC 1918, ULA) unless allowInternal,
+// and anything else that is not global unicast (link-local, the metadata
+// address 169.254.169.254 among them, unspecified, multicast). A host whose
+// last label is a number, 127.1, 2130706433 or 0x7f000001, is an IPv4
+// address to some resolvers (inet_aton) and URL parsers (WHATWG): it is
+// refused unless it is one in dotted decimal, which is then judged as an
+// address.
+func hostProblem(host string, allowInternal bool) string {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		name := strings.TrimSuffix(host, ".")
+		if numeric(name[strings.LastIndexByte(name, '.')+1:]) {
+			return "an IP address in a form other than dotted decimal"
+		}
+		return ""
+	}
+	switch {
+	case addr.Is4In6() || nat64.Contains(addr) || ipv4Compatible(addr):
+		return "an IPv4 address inside IPv6"
+	case addr.IsLoopback() || addr.IsPrivate():
+		if allowInternal {
+			return ""
+		}
+		return "a loopback or private address"
+	case !addr.IsGlobalUnicast():
+		return "an address that is not global unicast"
+	}
+	return ""
+}
+
+// ipv4Compatible reports whether addr is in the deprecated ::/96 of IPv4-
+// compatible addresses (RFC 4291 §2.5.5.1), :: and ::1 apart.
+func ipv4Compatible(addr netip.Addr) bool {
+	b := addr.As16()
+	return addr.Is6() && [12]byte(b[:12]) == [12]byte{} && !addr.IsLoopback() && !addr.IsUnspecified()
+}
+
+// numeric reports whether label is a number in decimal or 0x hex, as
+// inet_aton and the WHATWG URL parser read a host's labels.
+func numeric(label string) bool {
+	if rest, ok := strings.CutPrefix(strings.ToLower(label), "0x"); ok {
+		return strings.Trim(rest, "0123456789abcdef") == ""
+	}
+	return label != "" && strings.Trim(label, "0123456789") == ""
 }
 
 // checkLimits refuses a limit below 0 or above its default; 0 is the

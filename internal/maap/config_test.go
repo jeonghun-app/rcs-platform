@@ -78,7 +78,7 @@ func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	if c.IMSDomain != imsDomain || c.ChatbotDomain.Name() != botDomain || c.AliasHost != aliasHost || c.WebhookPorts != nil ||
 		c.InternalAddr != ":8081" || c.Decodes != 8 || !c.OperatorTokens.Current.IsZero() ||
 		c.RegistryTable != "maap-registry" || c.SubscribersTable != "maap-subscribers" ||
-		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" || c.DynamoDBEndpoint != "" || !c.HTTPWebhooks {
+		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" || c.DynamoDBEndpoint != "" || !c.HTTPWebhooks || !c.InternalWebhooks {
 		t.Fatalf("config = %+v", c)
 	}
 }
@@ -159,8 +159,8 @@ func TestInvalidSettingsAreRefusedEverywhere(t *testing.T) {
 func TestStagingAndProdRefuseTheDevelopmentDefaults(t *testing.T) {
 	for _, env := range []string{"staging", "prod"} {
 		base := with(prodEnv, "RCS_ENV", env)
-		if c, _ := configure(base); c.HTTPWebhooks {
-			t.Errorf("%s allows http webhooks", env)
+		if c, _ := configure(base); c.HTTPWebhooks || c.InternalWebhooks {
+			t.Errorf("%s allows http or internal webhooks", env)
 		}
 		for _, ok := range []string{operatorToken, strings.Repeat("z", 43), strings.Repeat("ab", 32)} {
 			if out := start(t, with(base, "MAAP_OPERATOR_TOKEN", ok)); strings.Contains(out, "configuration rejected") {
@@ -186,5 +186,14 @@ func TestStagingAndProdRefuseTheDevelopmentDefaults(t *testing.T) {
 				t.Errorf("%q refused in dev:\n%s", tc.want, dev)
 			}
 		}
+	}
+}
+
+// The test environment allows http webhooks but, unlike dev, no internal
+// address: only the compose stack needs one.
+func TestOnlyDevAllowsInternalWebhookAddresses(t *testing.T) {
+	c, err := configure(with(devEnv, "RCS_ENV", "test"))
+	if err != nil || !c.HTTPWebhooks || c.InternalWebhooks {
+		t.Fatalf("test: %+v, %v", c, err)
 	}
 }

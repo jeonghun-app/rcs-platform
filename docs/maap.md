@@ -32,12 +32,12 @@ reported at once at start.
 | `RCS_IMS_DOMAIN` | required | the home domain |
 | `RCS_CHATBOT_DOMAIN` | required | host of chatbot URIs, read with `internal/chatbot`'s rules: a lower-case DNS name other than `RCS_IMS_DOMAIN` (ADR 0009 §2) |
 | `MAAP_ALIAS_HOST` | required | host of aliases (ADR 0009 §10, §13): a DNS name that is neither `RCS_IMS_DOMAIN` nor `RCS_CHATBOT_DOMAIN` nor under either, compared without regard to case; stored in lower case. As for `RCS_CHATBOT_DOMAIN`, its last label starts with a letter (so no IP address), and it is at most 213 bytes, so that an alias URI stays within 255 |
-| `MAAP_WEBHOOK_PORTS` | none | ports a webhook URL may name besides 443 (ADR 0009 §8); the infrastructure parameter that sets it also sets the egress rule (#684) |
+| `MAAP_WEBHOOK_PORTS` | none | ports a webhook URL may name besides 443 (ADR 0009 §8); the infrastructure parameter that sets it also sets the egress rule (#684). An `http` webhook in dev without a port is on 80, which must then be listed |
 | `MAAP_INTERNAL_ADDR` | `:8081` | the internal listener, `host:port` with a port from 1 to 65535 |
 | `MAAP_OPERATOR_TOKEN`, `MAAP_OPERATOR_TOKEN_NEXT` | none | the operator's current and next tokens. *prod*: the first is required, and each must hold 256 bits (43 base64url characters or 64 hex digits). Everywhere: printable ASCII without white space, and a next token only with a current one and different from it |
 | `MAAP_DECODES` | `8` | request bodies the internal listener decodes at once (see [Memory](#memory)); at least 1 |
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
-| `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused |
+| `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | idempotency records and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
@@ -143,22 +143,40 @@ the path that no chatbot can have is 404 before the registry is read.
   there, which the registry alone would take. It never changes: delete the
   chatbot and register it again.
 - `display_name`: at most 128 bytes, without C0 controls or DEL, tab
-  included, without C1 controls and without format characters (Unicode Cf:
-  every bidi control, such as U+202E, and zero-width characters), with which
-  a name shows as another (T13). Only the zero-width joiner, U+200D, is
-  allowed, so that emoji sequences keep working (lead decision on #709). The
-  registry is the only source of the name, so it refuses them rather than
-  every reader.
+  included, and without the characters with which a name shows as another
+  or as blank (T13, lead decisions on #709): C1 controls; Unicode
+  Default_Ignorable_Code_Point, which holds every format character (every
+  bidi control, such as U+202E, and the zero-width characters), the Hangul
+  fillers (U+115F, U+1160, U+3164, U+FFA0) and the variation selectors;
+  line and paragraph separators (U+2028, U+2029); U+2800, which shows blank;
+  and a name of white space only. Kept, so that emoji and real names work:
+  the zero-width joiner and VS16 (U+FE0F) inside an emoji sequence, the
+  zero-width non-joiner between letters (Persian and Indic names), and tag
+  characters in a subdivision flag. The registry is the only source of the
+  name, so it refuses them rather than every reader. Look-alike letters and
+  spellings that differ only in Unicode normalisation remain T13's residual
+  risk.
 - `out_of_service`: what subscribers of a suspended chatbot get (ADR 0009
   §11), `text/plain` of at most 512 bytes: `chatbot.ValidateContent`'s rules
-  (no C0 control but tab, CR and LF, so no NUL or ESC), then those of the
-  display name for DEL, C1 and Cf (U+200D allowed).
+  (no C0 control but tab, CR and LF, so no NUL or ESC), then no DEL, C1 or
+  format character but the zero-width joiner. It is a message body, so it
+  keeps line separators and the rest of the display name's wider rule does
+  not apply.
 - `webhook.url`: `https` (also `http` in `dev` and `test`), with a host and
   without userinfo, on port 443 or one on `MAAP_WEBHOOK_PORTS` (a URL without
-  a port names its scheme's), at most 512 bytes, and written as Go's
-  `net/url` writes it back. A URL newly set is stored unverified, and only
+  a port names its scheme's, so an `http` URL in dev on port 80 needs 80 on
+  `MAAP_WEBHOOK_PORTS`), at most 512 bytes, and written as Go's `net/url`
+  writes it back. A host that is an IP address must be global unicast: a
+  loopback, private (RFC 1918, ULA), link-local (the metadata address
+  169.254.169.254 among them), unspecified or multicast address, and an IPv4
+  address inside IPv6, are refused when the URL is set, loopback and private
+  ones apart in `dev`, for the compose stack. A host whose last label is a
+  number (`127.1`, `2130706433`, `0x7f000001`), which some resolvers read as
+  an IPv4 address, is refused unless it is one in dotted decimal, and a `%`
+  (an IPv6 zone) is refused. A URL newly set is stored unverified, and only
   its challenge (#683) marks it verified; setting the same URL keeps the
-  mark. The address is checked when it is dialled (#683).
+  mark. What a host name resolves to is
+  checked when it is dialled (#683).
 - `permissions`: `msisdn`, and `start_conversations`, which requires
   `msisdn` (ADR 0009 §9).
 - `limits`: each from 0, the default, up to its default in ADR 0009 §9,
@@ -180,7 +198,8 @@ is left.
 **Audit.** Each request's `audit: internal request` line names the chatbot
 (`chatbot`, its ID) and, for a change that was written, the values before and
 after as described under [Internal API](#internal-api); a store failure adds
-`store_error`, which names the operation and an AWS error code only.
+`store_error`, which names the operation and an AWS error code or the
+transport failure, without the endpoint's address.
 `sources` is logged in full, as a structured field: a single `/32` or `/128`
 may be one person's address, so treat these lines as the other audit logs.
 
