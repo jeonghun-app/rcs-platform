@@ -388,17 +388,20 @@ func TestAnUncontendedMARReadsTheSubscriptionOnce(t *testing.T) {
 	}
 }
 
-// deadlineStore records the deadline of each write's context.
+// deadlineStore records the deadline of each write's context, and its
+// error as the write starts.
 type deadlineStore struct {
 	store.Store
 	mu        sync.Mutex
 	deadlines []time.Time
+	errs      []error
 }
 
 func (s *deadlineStore) UpdateSubscription(ctx context.Context, old, n *store.Subscription) (*store.Subscription, error) {
 	d, _ := ctx.Deadline()
 	s.mu.Lock()
 	s.deadlines = append(s.deadlines, d)
+	s.errs = append(s.errs, ctx.Err())
 	s.mu.Unlock()
 	return s.Store.UpdateSubscription(ctx, old, n)
 }
@@ -903,10 +906,12 @@ func TestAPushTheBudgetCutShortIsMarkedStale(t *testing.T) {
 // Code review on #524 (round 2): the mark of what the budget left out is
 // written with the budget's end as its deadline, exactly, from one reading
 // of the clock (pushTimes), which leaves it production's reserve (round
-// 3). The store records the deadline and refuses nothing: a host that
-// stalls the test past the reserve, as one at load 250 did (#619), cannot
-// fail it, and a write given any other deadline, an expired one among
-// them, still does.
+// 3). The store records the deadline and the context's error and refuses
+// nothing: a host that stalls the test past the reserve, as one at load
+// 250 did (#619), ends the deadline, which is allowed, and cannot fail it.
+// A write given any other deadline, an expired one among them, still
+// does, and so does one whose context was cancelled before it, which
+// DynamoDB's client would refuse (code review on #724).
 func TestTheStaleMarkIsWrittenWithinTheBudget(t *testing.T) {
 	e := newEnv(t)
 	e.fiveSets()
@@ -924,6 +929,9 @@ func TestTheStaleMarkIsWrittenWithinTheBudget(t *testing.T) {
 	defer ds.mu.Unlock()
 	if len(ds.deadlines) != 1 || !ds.deadlines[0].Equal(tm.until) {
 		t.Errorf("the mark's write had deadline %v, want the budget's end %v", ds.deadlines, tm.until)
+	}
+	if len(ds.errs) == 1 && errors.Is(ds.errs[0], context.Canceled) {
+		t.Error("the mark's write had a cancelled context")
 	}
 }
 
