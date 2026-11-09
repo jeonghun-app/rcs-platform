@@ -24,11 +24,14 @@ func Service() runtime.Service[Config] {
 type deps struct {
 	listen func(network, address string) (net.Listener, error)
 	// registry and credentials replace maap-registry in DynamoDB; /readyz
-	// checks the registry if it has a Ready method, as the DynamoDB one
-	// does.
+	// checks each table whose store has a Ready method, as the DynamoDB
+	// ones do.
 	registry    store.Registry
 	credentials store.Credentials
-	// subscribers replaces maap-subscribers, checked as the registry is.
+	// requests, counters and subscribers replace maap-requests,
+	// maap-counters and maap-subscribers, with the registry only.
+	requests    store.Requests
+	counters    store.Counters
 	subscribers store.Subscribers
 }
 
@@ -39,19 +42,28 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	registry, creds, subs := d.registry, d.credentials, d.subscribers
+	registry, creds, requests, counters, subs := d.registry, d.credentials, d.requests, d.counters, d.subscribers
 	if registry == nil {
-		r, err := awsstore.New(ctx, cfg.RegistryTable, cfg.DynamoDBEndpoint)
+		ddb, err := awsstore.NewClient(ctx, cfg.DynamoDBEndpoint)
 		if err != nil {
 			return fmt.Errorf("maap: %w", err)
 		}
-		registry, creds, subs = r, r.Credentials(), r.Subscribers(cfg.SubscribersTable)
+		r := awsstore.NewRegistry(ddb, cfg.RegistryTable)
+		registry, creds = r, r.Credentials()
+		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StoreKey, cfg.StatusTTL)
+		counters = awsstore.NewCounters(ddb, cfg.CountersTable, cfg.StoreKey)
+		subs = awsstore.NewSubscribers(ddb, cfg.SubscribersTable)
 	}
-	if r, ok := registry.(interface{ Ready(context.Context) error }); ok {
-		rt.Admin.AddReadinessCheck("dynamodb-registry", r.Ready)
-	}
-	if s, ok := subs.(interface{ Ready(context.Context) error }); ok {
-		rt.Admin.AddReadinessCheck("dynamodb-subscribers", s.Ready)
+	for _, t := range []struct {
+		name  string
+		table any
+	}{
+		{"dynamodb-registry", registry}, {"dynamodb-requests", requests}, {"dynamodb-counters", counters},
+		{"dynamodb-subscribers", subs},
+	} {
+		if r, ok := t.table.(interface{ Ready(context.Context) error }); ok {
+			rt.Admin.AddReadinessCheck(t.name, r.Ready)
+		}
 	}
 	// The internal listener's own decode pool: #683 gives the public
 	// listener another, so that chatbots cannot take rcs-as's slots.
@@ -61,8 +73,9 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		rules: fieldRules{ports: cfg.WebhookPorts, allowHTTP: cfg.HTTPWebhooks, allowInternal: cfg.InternalWebhooks},
 		// Every store of a chatbot's items is a deleter (#742 review), the
 		// credentials too, though the registry's deletion takes them with
-		// its partition already.
-		deleters: []store.ChatbotDeleter{creds, subs},
+		// its partition already; the counters, a day long at most, go by
+		// TTL alone (lead decision on #713).
+		deleters: []store.ChatbotDeleter{creds, requests, subs},
 	})
 	api.mountCredentials(&credentialAPI{registry: registry, creds: creds, random: rand.Reader, now: time.Now})
 	ln, err := d.listen("tcp", cfg.InternalAddr)

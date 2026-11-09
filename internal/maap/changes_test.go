@@ -10,10 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
-	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
-	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
 // conflictingRegistry fails the next conflicts updates with ErrConflict,
@@ -243,49 +240,37 @@ func (d deleteFake) Chatbot(ctx context.Context, id string) (store.Chatbot, erro
 
 func (d deleteFake) DeleteChatbot(context.Context, string) error { return d.delete }
 
-// slowDeleter runs out of any budget on its first call, as a table with
-// many items does, stopping between items with the context's error; its
-// later calls find the rest and finish.
-type slowDeleter struct{ calls atomic.Int32 }
-
-func (d *slowDeleter) DeleteChatbot(ctx context.Context, _ string) error {
-	if d.calls.Add(1) > 1 {
-		return nil
-	}
-	select {
-	case <-ctx.Done():
-		return fmt.Errorf("awsstore: delete chatbot aliases: %w", ctx.Err())
-	case <-time.After(5 * time.Second): // no budget: the test fails on 204
-		return nil
-	}
+// budgetDeleter reports the deadline it was given and is unfinished until
+// its calls run out.
+type budgetDeleter struct {
+	left      atomic.Int32
+	deadlines chan time.Duration
 }
 
-// A table's deletion that outruns the budget, under the listener's write
-// timeout, is 503 with Retry-After and an audit mark, never a dropped
-// connection; sending the request again goes on and finishes (#753 review).
-func TestADeletionPastItsBudgetIs503AndARepeatFinishes(t *testing.T) {
-	h := runtimetest.New(t, "maap")
-	a := newInternalAPI(TokenPair{Current: secret.NewString(operatorToken)}, newDecoder(2, h.Runtime.Metrics), h.Runtime)
-	d, err := chatbot.NewDomain(botDomain, imsDomain)
-	if err != nil {
-		t.Fatal(err)
+func (d *budgetDeleter) DeleteChatbot(ctx context.Context, _ string) error {
+	dl, _ := ctx.Deadline()
+	d.deadlines <- time.Until(dl)
+	if d.left.Add(-1) >= 0 {
+		return store.ErrUnfinished
 	}
-	slow := &slowDeleter{}
-	a.mountChatbots(&chatbotAPI{
-		decoder: a.decoder, registry: store.NewMemoryRegistry(), domain: d, rules: fieldRules{ports: []uint16{8443}},
-		deleters: []store.ChatbotDeleter{slow}, deleteBudget: 20 * time.Millisecond,
-	})
+	return nil
+}
+
+// A deletion runs for its budget, under the write timeout, and answers 503
+// with Retry-After while a table has items left, until a call finishes it.
+func TestADeleteRunsForItsBudgetAndAnswers503UntilDone(t *testing.T) {
+	d := &budgetDeleter{deadlines: make(chan time.Duration, 3)}
+	d.left.Store(2)
+	a, _ := chatbotAPIOver(t, store.NewMemoryRegistry(), d)
 	registered(t, a, "")
-	if rec := operator(a, "DELETE", "/v1/chatbots/cb-1", ""); rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" {
-		t.Fatalf("delete past the budget = %d %v %s", rec.Code, rec.Header(), rec.Body)
-	}
-	if rec := operator(a, "DELETE", "/v1/chatbots/cb-1", ""); rec.Code != http.StatusNoContent || slow.calls.Load() != 2 {
-		t.Fatalf("repeated delete = %d after %d calls", rec.Code, slow.calls.Load())
-	}
-	if audits := h.Logs("audit: internal request"); !strings.Contains(mustJSON(t, audits[1]), `"deletion_unfinished":true`) {
-		t.Errorf("the first delete's audit line %v", audits[1])
-	}
-	if deleteBudget >= 30*time.Second {
-		t.Errorf("the budget %v is not under the internal listener's 30 s write timeout", deleteBudget)
+	for i, want := range []int{http.StatusServiceUnavailable, http.StatusServiceUnavailable, http.StatusNoContent} {
+		rec := operator(a, "DELETE", "/v1/chatbots/cb-1", "")
+		if rec.Code != want || want == http.StatusServiceUnavailable &&
+			(rec.Header().Get("Retry-After") != "1" || !strings.Contains(rec.Body.String(), "call again until it answers 204")) {
+			t.Fatalf("call %d = %d %v %s", i, rec.Code, rec.Header(), rec.Body)
+		}
+		if left := <-d.deadlines; left > deletionBudget || left < deletionBudget-5*time.Second {
+			t.Fatalf("call %d: the deleter had %v", i, left)
+		}
 	}
 }

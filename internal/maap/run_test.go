@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -32,14 +33,39 @@ func (r *readyRegistry) Ready(context.Context) error {
 	return nil
 }
 
-// readySubscribers is a table in memory with the readiness check of the
-// DynamoDB one, ready with its registry.
-type readySubscribers struct {
-	*store.MemorySubscribers
-	registry *readyRegistry
+// readyRequests is a requests table with the readiness check of the
+// DynamoDB one, ready with the registry.
+type readyRequests struct {
+	*store.MemoryRequests
+	ready *atomic.Bool
 }
 
-func (s readySubscribers) Ready(ctx context.Context) error { return s.registry.Ready(ctx) }
+func (r readyRequests) Ready(context.Context) error {
+	if !r.ready.Load() {
+		return errors.New("table not active")
+	}
+	return nil
+}
+
+// readyCounters is readyRequests for the counters table.
+type readyCounters struct {
+	*store.MemoryCounters
+	ready *atomic.Bool
+}
+
+func (r readyCounters) Ready(ctx context.Context) error {
+	return readyRequests{ready: r.ready}.Ready(ctx)
+}
+
+// readySubscribers is readyRequests for the subscribers table.
+type readySubscribers struct {
+	*store.MemorySubscribers
+	ready *atomic.Bool
+}
+
+func (r readySubscribers) Ready(ctx context.Context) error {
+	return readyRequests{ready: r.ready}.Ready(ctx)
+}
 
 // deletions records the chatbots its credentials' DeleteChatbot is called
 // for.
@@ -73,24 +99,29 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	done := make(chan error, 1)
 	registry := &readyRegistry{MemoryRegistry: store.NewMemoryRegistry()}
 	creds := deletions{registry.Credentials(), make(chan string, 1)}
-	subs := readySubscribers{store.NewMemorySubscribers(), registry}
+	requests := readyRequests{store.NewMemoryRequests(time.Hour), &registry.ready}
+	counters := readyCounters{store.NewMemoryCounters(), &registry.ready}
+	subs := readySubscribers{store.NewMemorySubscribers(), &registry.ready}
 	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, subscribers: subs, listen: func(network, _ string) (net.Listener, error) {
-			ln, err := net.Listen(network, "127.0.0.1:0")
-			if err == nil {
-				listening <- ln
-			}
-			return ln, err
-		}})
+		done <- run(ctx, h.Runtime, cfg, deps{
+			registry: registry, credentials: creds, requests: requests, counters: counters, subscribers: subs,
+			listen: func(network, _ string) (net.Listener, error) {
+				ln, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					listening <- ln
+				}
+				return ln, err
+			}})
 	}()
 	addr := (<-listening).Addr().String()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
-		if code, body := h.Get("/readyz"); code == http.StatusServiceUnavailable && strings.Contains(body, "dynamodb-registry") &&
+		if code, body := h.Get("/readyz"); code == http.StatusServiceUnavailable &&
+			strings.Contains(body, "dynamodb-registry") && strings.Contains(body, "dynamodb-requests") && strings.Contains(body, "dynamodb-counters") &&
 			strings.Contains(body, "dynamodb-subscribers") {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("/readyz never reported the registry failing")
+			t.Fatal("/readyz never reported the tables failing")
 		}
 	}
 	registry.ready.Store(true)
@@ -131,8 +162,13 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 		t.Errorf("POST /v1/chatbots = %d, %v", resp.StatusCode, err)
 	}
 	// The credential routes are mounted over the credentials given, and
-	// deleting the chatbot runs their deletion and leaves none, nor any
-	// alias of the chatbot (#742 review).
+	// deleting the chatbot runs their deletion and the other tables', and
+	// leaves nothing of it: no idempotency record, nor any alias (#742
+	// review).
+	rec := storetest.Idempotency("cb-1")
+	if _, _, err := requests.Remember(context.Background(), rec, time.Now()); err != nil {
+		t.Fatal(err)
+	}
 	alias, err := subs.Alias(context.Background(), storetest.Alias("cb-1", storetest.Subscriber, false, time.Now()))
 	if err != nil {
 		t.Fatal(err)
@@ -161,6 +197,10 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	}
 	if left, err := creds.ChatbotCredentials(context.Background(), "cb-1"); len(left) != 0 || err != nil {
 		t.Errorf("credentials left: %v, %v", left, err)
+	}
+	rec.Digest[0]++
+	if _, fresh, err := requests.Remember(context.Background(), rec, time.Now()); !fresh || err != nil {
+		t.Errorf("the idempotency record was left: %v", err)
 	}
 	if _, err := subs.Resolve(context.Background(), "cb-1", alias.ID, time.Now()); !errors.Is(err, store.ErrNotFound) {
 		t.Errorf("the alias is left: %v", err)
@@ -197,7 +237,7 @@ func TestRunFailsWhenItsListenerCannotOpen(t *testing.T) {
 	}
 }
 
-// Without stores given, Run opens both tables, by the names the settings
+// Without stores given, Run opens every table, by the names the settings
 // give, at the endpoint they give: /readyz describes each.
 func TestRunOpensTheTablesTheSettingsName(t *testing.T) {
 	for k, v := range map[string]string{
@@ -250,7 +290,7 @@ func TestRunOpensTheTablesTheSettingsName(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if !described["bots-x"] || !described["aliases-x"] || len(described) != 2 {
+	if want := map[string]bool{"bots-x": true, "aliases-x": true, DefaultRequestsTable: true, DefaultCountersTable: true}; !maps.Equal(described, want) {
 		t.Fatalf("described %v", described)
 	}
 }

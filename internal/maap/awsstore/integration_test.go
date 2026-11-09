@@ -5,6 +5,7 @@ package awsstore
 import (
 	"context"
 	"errors"
+	"math/rand/v2"
 	"os"
 	"strconv"
 	"testing"
@@ -26,7 +27,11 @@ import (
 
 // registryTable creates maap-registry as docs/maap.md defines it and
 // returns the client.
-func registryTable(t *testing.T) (*dynamodb.Client, string) {
+func registryTable(t *testing.T) (*dynamodb.Client, string) { return table(t, "maap-registry") }
+
+// table creates a table of name's key schema, which all of maap's tables
+// share, and returns the client.
+func table(t *testing.T, name string) (*dynamodb.Client, string) {
 	t.Helper()
 	endpoint := os.Getenv("MAAP_IT_DYNAMODB_ENDPOINT")
 	if endpoint == "" {
@@ -38,7 +43,7 @@ func registryTable(t *testing.T) (*dynamodb.Client, string) {
 		t.Fatal(err)
 	}
 	ddb := dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) { o.BaseEndpoint = aws.String(endpoint) })
-	table := "maap-registry-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	table := name + "-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	attr := func(name string) types.AttributeDefinition {
 		return types.AttributeDefinition{AttributeName: aws.String(name), AttributeType: types.ScalarAttributeTypeS}
 	}
@@ -101,6 +106,30 @@ func (r resend) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWri
 	again := *in
 	again.ClientRequestToken = nil
 	return r.DynamoAPI.TransactWriteItems(ctx, &again, o...)
+}
+
+// resendTable is resend for TableAPI.
+type resendTable struct{ TableAPI }
+
+func (r resendTable) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error) {
+	if _, err := r.TableAPI.PutItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.PutItem(ctx, in, o...)
+}
+
+func (r resendTable) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, o ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
+	if _, err := r.TableAPI.DeleteItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.DeleteItem(ctx, in, o...)
+}
+
+func (r resendTable) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	if _, err := r.TableAPI.UpdateItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.UpdateItem(ctx, in, o...)
 }
 
 func TestIntegrationAWriteSentAgainAfterItTookEffectStands(t *testing.T) {
@@ -382,5 +411,143 @@ func TestIntegrationADeletionFinishesOverADamagedKeyItem(t *testing.T) {
 	out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: slotKey(c.ID, 1), ConsistentRead: aws.Bool(true)})
 	if err != nil || len(out.Item) != 0 {
 		t.Fatalf("the slot is left: %v, %v", out.Item, err)
+	}
+}
+
+func TestIntegrationRequestsMeetTheContract(t *testing.T) {
+	storetest.RunRequests(t, func(t *testing.T) store.Requests {
+		ddb, name := table(t, "maap-requests")
+		r := NewRequests(ddb, name, testKey, storetest.StatusTTL)
+		r.pageSize = 7 // pages that end inside a batch
+		return r
+	})
+}
+
+// A request whose put the SDK sent again after it took effect is kept by
+// this call, and a repeat of it is still a repeat; an advance sent again
+// still changed the status.
+func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
+	ddb, name := table(t, "maap-requests")
+	r := NewRequests(resendTable{ddb}, name, testKey, storetest.StatusTTL)
+	rec := storetest.Idempotency(storetest.Chatbot().ID)
+	got, fresh, err := r.Remember(t.Context(), rec, storetest.Now)
+	if err != nil || !fresh || got.MessageID != rec.MessageID {
+		t.Fatalf("Remember = %+v, %v, %v", got, fresh, err)
+	}
+	writer := got.Writer
+	again := rec
+	again.MessageID = storetest.MessageID()
+	if got, fresh, err := r.Remember(t.Context(), again, storetest.Now); err != nil || fresh || got.MessageID != rec.MessageID {
+		t.Fatalf("repeat = %+v, %v, %v", got, fresh, err)
+	}
+	// So does a status's advance.
+	if err := r.Accept(t.Context(), rec.Chatbot, rec.MessageID, storetest.Now); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := r.Advance(t.Context(), rec.Chatbot, rec.MessageID, store.Delivered, storetest.Now); !changed || err != nil {
+		t.Fatalf("Advance = %v, %v", changed, err)
+	}
+	// A settle and a forget sent again stand.
+	if err := r.Settle(t.Context(), rec.Chatbot, rec.Key, writer, []byte("{}"), storetest.Now); err != nil {
+		t.Fatalf("Settle = %v", err)
+	}
+	if err := r.Forget(t.Context(), rec.Chatbot, rec.Key, writer); err != nil {
+		t.Fatalf("Forget = %v", err)
+	}
+	if err := r.Ready(t.Context()); err != nil {
+		t.Fatalf("Ready = %v", err)
+	}
+}
+
+func TestIntegrationCountersMeetTheContract(t *testing.T) {
+	storetest.RunCounters(t, func(t *testing.T) (store.Counters, store.Counters) {
+		ddb, name := table(t, "maap-counters")
+		return NewCounters(ddb, name, testKey), NewCounters(ddb, name, testKey)
+	})
+}
+
+// Takes the SDK sent again after they took effect count once, for an idle
+// bucket's update, a busy one's and a day's.
+func TestIntegrationATakeSentAgainCountsOnce(t *testing.T) {
+	ddb, name := table(t, "maap-counters")
+	c := NewCounters(resendTable{ddb}, name, testKey)
+	counter := storetest.Counter(storetest.Chatbot().ID)
+	for i := range 11 {
+		if got, err := c.TakeMinute(t.Context(), counter, 60, storetest.Now); err != nil || got.Taken != (i < 10) {
+			t.Fatalf("minute take %d = %+v, %v", i, got, err)
+		}
+	}
+	for i := range 4 {
+		if got, err := c.TakeDay(t.Context(), counter, 3, storetest.Now); err != nil || got.Taken != (i < 3) {
+			t.Fatalf("day take %d = %+v, %v", i, got, err)
+		}
+	}
+	if err := c.Ready(t.Context()); err != nil {
+		t.Fatalf("Ready = %v", err)
+	}
+}
+
+// The update expressions do what the memory backend's arithmetic does: one
+// seeded run of takes, give-backs of earlier takes and time steps, over
+// midnight, at rates 1 to 6,000 a minute, answers the same on both (#751
+// review), so that a change to either shows here.
+func TestIntegrationCountersAnswerAsTheMemoryBackendDoes(t *testing.T) {
+	ddb, name := table(t, "maap-counters")
+	backends := []store.Counters{store.NewMemoryCounters(), NewCounters(ddb, name, testKey)}
+	rng := rand.New(rand.NewPCG(713, 751))
+	rates := []int64{1, 5, 7, 60, 600, 6000}
+	counters := make([]store.Counter, len(rates))
+	for i := range counters {
+		counters[i] = storetest.Counter(storetest.Chatbot().ID)
+	}
+	type taken struct {
+		c     int
+		day   bool
+		takes [2]store.Take
+	}
+	var out []taken
+	now := time.Date(2026, 11, 9, 23, 58, 0, 0, time.UTC)
+	for op := range 1500 {
+		i := rng.IntN(len(rates))
+		switch r := rng.IntN(10); {
+		case r < 2:
+			now = now.Add(time.Duration(rng.Int64N(int64(2 * time.Second))))
+		case r < 4 && len(out) > 0:
+			k := rng.IntN(len(out))
+			x := out[k]
+			out = append(out[:k], out[k+1:]...)
+			for b, be := range backends {
+				var err error
+				if x.day {
+					err = be.GiveBackDay(t.Context(), counters[x.c], x.takes[b])
+				} else {
+					err = be.GiveBackMinute(t.Context(), counters[x.c], rates[x.c], x.takes[b], now)
+				}
+				if err != nil {
+					t.Fatalf("op %d: give-back = %v", op, err)
+				}
+			}
+		default:
+			day := r == 9
+			var got [2]store.Take
+			for b, be := range backends {
+				var err error
+				if day {
+					got[b], err = be.TakeDay(t.Context(), counters[i], rates[i]/2+1, now)
+				} else {
+					got[b], err = be.TakeMinute(t.Context(), counters[i], rates[i], now)
+				}
+				if err != nil {
+					t.Fatalf("op %d: take = %v", op, err)
+				}
+			}
+			m, d := got[0], got[1]
+			if m.Taken != d.Taken || m.Wait != d.Wait || !m.Full.Equal(d.Full) || m.Returned != d.Returned {
+				t.Fatalf("op %d at %v, rate %d, day %v: memory %+v, DynamoDB %+v", op, now, rates[i], day, m, d)
+			}
+			if m.Taken {
+				out = append(out, taken{i, day, got})
+			}
+		}
 	}
 }

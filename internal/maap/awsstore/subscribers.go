@@ -29,11 +29,12 @@ type Subscribers struct {
 	pace time.Duration
 }
 
-// deletePace spaces a chatbot's alias deletions: at most 100 a second,
-// about 200 write units on the chatbot's partition and 400 on the table,
-// so that a large deletion does not throttle the lookups and writes of
-// other chatbots (#753 review). A 20 s request (#709's deleteBudget)
-// deletes about 2,000.
+// deletePace spaces a chatbot's alias deletions: at most 100 a second, two
+// items each, about 200 write units on the chatbot's partition and 400 on
+// the table (deletePartition's 250 items a second, in transactions), so
+// that a large deletion does not throttle the lookups and writes of other
+// chatbots (#753 review). A call of the DELETE's 20 s deletes at most
+// about 2,000.
 const deletePace = 10 * time.Millisecond
 
 var _ store.Subscribers = (*Subscribers)(nil)
@@ -43,11 +44,8 @@ func NewSubscribers(api DynamoAPI, table string) *Subscribers {
 	return &Subscribers{api: api, table: table, pace: deletePace}
 }
 
-// Subscribers returns the subscribers' table over r's client.
-func (r *Registry) Subscribers(table string) *Subscribers { return NewSubscribers(r.api, table) }
-
 // Ready checks the table as Registry.Ready does its own.
-func (s *Subscribers) Ready(ctx context.Context) error { return NewRegistry(s.api, s.table).Ready(ctx) }
+func (s *Subscribers) Ready(ctx context.Context) error { return ready(ctx, s.api, s.table) }
 
 // Attribute names of alias items.
 const (
@@ -230,17 +228,14 @@ func (s *Subscribers) Used(ctx context.Context, a store.Alias, at time.Time) err
 // DeleteChatbot implements store.ChatbotDeleter. Each of the chatbot's
 // items goes with its subscriber's item, whose key names the chatbot too:
 // that item is the chatbot's whatever alias it names. A damaged one goes
-// alone, logged without its value. The transactions are spaced by pace;
-// when ctx ends first, it stops between two of them and logs how many it
-// deleted, and a later call deletes the rest.
-func (s *Subscribers) DeleteChatbot(ctx context.Context, chatbotID string) error {
+// alone, logged without its value. As deletePartition does for the other
+// tables, the transactions are spaced by pace, the deletion stops with
+// store.ErrUnfinished before the context's deadline, and its progress is
+// logged in items; a later call deletes the rest.
+func (s *Subscribers) DeleteChatbot(ctx context.Context, chatbotID string) (err error) {
 	deleted := 0
-	err := s.deleteAliases(ctx, chatbotID, &deleted)
-	if err != nil && ctx.Err() != nil {
-		slog.Info("awsstore: a chatbot's alias deletion stopped before the end",
-			slog.String("chatbot", chatbotID), slog.Int("aliases_deleted", deleted))
-	}
-	return err
+	defer func() { logProgress(s.table, chatbotID, deleted, err) }()
+	return unfinished(ctx, s.deleteAliases(ctx, chatbotID, &deleted))
 }
 
 func (s *Subscribers) deleteAliases(ctx context.Context, chatbotID string, deleted *int) error {
@@ -253,19 +248,22 @@ func (s *Subscribers) deleteAliases(ctx context.Context, chatbotID string, delet
 	if s.pageSize > 0 {
 		in.Limit = aws.Int32(s.pageSize)
 	}
+	var last time.Time
 	for {
 		out, err := s.api.Query(ctx, in)
 		if err != nil {
 			return sanitize("query chatbot aliases", err)
 		}
 		for _, it := range out.Items {
-			if err := pause(ctx, *deleted, s.pace); err != nil {
-				return fmt.Errorf("awsstore: delete chatbot aliases: %w", err)
-			}
-			if err := s.deleteAlias(ctx, chatbotID, it); err != nil {
+			if err := paceEvery(ctx, last, s.pace); err != nil {
 				return err
 			}
-			*deleted++
+			last = time.Now()
+			n, err := s.deleteAlias(ctx, chatbotID, it)
+			if err != nil {
+				return err
+			}
+			*deleted += n
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			return nil
@@ -274,16 +272,18 @@ func (s *Subscribers) deleteAliases(ctx context.Context, chatbotID string, delet
 	}
 }
 
-func (s *Subscribers) deleteAlias(ctx context.Context, chatbotID string, item map[string]types.AttributeValue) error {
+// deleteAlias deletes one alias of the chatbot and returns how many items
+// went: its two, or a damaged one alone.
+func (s *Subscribers) deleteAlias(ctx context.Context, chatbotID string, item map[string]types.AttributeValue) (int, error) {
 	mine := key(sv(item[attrPK]), sv(item[attrSK]))
 	aliasID := sv(item[attrSK])[len("a#"):]
 	a, err := decodeChatbotAlias(chatbotID, aliasID, item)
 	if err != nil {
 		slog.Warn("awsstore: a damaged alias item was deleted alone", slog.String("chatbot", chatbotID))
 		if _, err := s.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(s.table), Key: mine}); err != nil {
-			return sanitize("delete alias", err)
+			return 0, sanitize("delete alias", err)
 		}
-		return nil
+		return 1, nil
 	}
 	for attempt := 0; ; attempt++ {
 		_, err = s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
@@ -297,8 +297,8 @@ func (s *Subscribers) deleteAlias(ctx context.Context, chatbotID string, item ma
 		case raced(err) && attempt < conflictAttempts-1:
 			continue // a use or a replacement at the same time
 		case err != nil:
-			return sanitize("delete alias", err)
+			return 0, sanitize("delete alias", err)
 		}
-		return nil
+		return 2, nil
 	}
 }

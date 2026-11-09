@@ -26,9 +26,16 @@ type chatbotAPI struct {
 	// deleters are the other tables' per-chatbot deletions, which a
 	// chatbot's deletion runs after the registry's (#710–#713 add theirs).
 	deleters []store.ChatbotDeleter
-	// deleteBudget replaces the package's deleteBudget, in tests.
+	// deleteBudget bounds one call's deletion (deletionBudget when zero).
 	deleteBudget time.Duration
 }
+
+// deletionBudget is how long one DELETE of a chatbot deletes for, under
+// the internal listener's 30 s write timeout, so that the operator always
+// gets an answer: 204 when everything is gone, 503 with Retry-After while
+// items are left, which the next call goes on deleting (lead decision on
+// #713).
+const deletionBudget = 20 * time.Second
 
 // mountChatbots serves cb's routes on a, for the operator only.
 func (a *internalAPI) mountChatbots(cb *chatbotAPI) {
@@ -125,6 +132,8 @@ func (c *call) storeError(err error, write bool) error {
 		return fail(http.StatusBadRequest, "the chatbot breaks a rule of the registry")
 	case errors.Is(err, store.ErrInvalid):
 		ae = &apiError{status: http.StatusInternalServerError, message: "the stored chatbot cannot be read"}
+	case errors.Is(err, store.ErrUnfinished):
+		ae = &apiError{http.StatusServiceUnavailable, "the deletion is not finished; call again until it answers 204", "1"}
 	default:
 		ae = &apiError{http.StatusServiceUnavailable, "the registry is unavailable; try again", "1"}
 	}

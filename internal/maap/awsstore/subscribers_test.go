@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"testing"
@@ -74,15 +75,13 @@ func FuzzDecodeAlias(f *testing.F) {
 }
 
 // aliasesStub answers DeleteChatbot's query with n aliases of cb-1 in one
-// page, counts reads, and records when each transaction came; after, if
-// set, runs after each.
+// page, counts reads, and records when each transaction came.
 type aliasesStub struct {
 	stubDynamo
-	n     int
-	gets  int
-	txAt  []time.Time
-	ids   []string
-	after func(int)
+	n    int
+	gets int
+	txAt []time.Time
+	ids  []string
 }
 
 func (s *aliasesStub) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
@@ -104,9 +103,6 @@ func (s *aliasesStub) Query(context.Context, *dynamodb.QueryInput, ...func(*dyna
 
 func (s *aliasesStub) TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
 	s.txAt = append(s.txAt, time.Now())
-	if s.after != nil {
-		s.after(len(s.txAt))
-	}
 	return &dynamodb.TransactWriteItemsOutput{}, nil
 }
 
@@ -149,25 +145,25 @@ func TestADeletionSpacesItsTransactions(t *testing.T) {
 	}
 }
 
-// When its context ends, a deletion stops between two transactions and
-// logs how many it deleted, counts only, with the context's error, which
-// the operator API answers 503 (#753 review).
-func TestADeletionStopsBetweenTransactionsAndLogsItsCount(t *testing.T) {
+// With its context's deadline near, a deletion stops before the next
+// transaction with store.ErrUnfinished, which the operator API answers
+// 503, and logs its progress in items as the other tables' deletions do,
+// counts only (#753 review, the mechanism of #713).
+func TestADeletionStopsBeforeItsDeadlineAndLogsItsProgress(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
 	defer slog.SetDefault(prev)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), deadlineMargin+100*time.Millisecond)
 	defer cancel()
-	st := &aliasesStub{n: 5, after: func(n int) {
-		if n == 2 {
-			cancel()
-		}
-	}}
-	err := NewSubscribers(st, "maap-subscribers").DeleteChatbot(ctx, "cb-1")
-	out := buf.String()
-	if !errors.Is(err, context.Canceled) || len(st.txAt) != 2 || !strings.Contains(out, `"aliases_deleted":2`) || !strings.Contains(out, `"chatbot":"cb-1"`) {
-		t.Fatalf("DeleteChatbot = %v after %d transactions, log %s", err, len(st.txAt), out)
+	st := &aliasesStub{n: 50}
+	s := NewSubscribers(st, "maap-subscribers")
+	s.pace = 20 * time.Millisecond
+	err := s.DeleteChatbot(ctx, "cb-1")
+	out, n := buf.String(), len(st.txAt)
+	if !errors.Is(err, store.ErrUnfinished) || n == 0 || n >= st.n || !strings.Contains(out, fmt.Sprintf(`"deleted":%d`, 2*n)) ||
+		!strings.Contains(out, `"finished":false`) || !strings.Contains(out, `"table":"maap-subscribers"`) || !strings.Contains(out, "chatbot deletion progress") {
+		t.Fatalf("DeleteChatbot = %v after %d transactions, log %s", err, n, out)
 	}
 	for _, id := range st.ids {
 		if strings.Contains(out, id) {
