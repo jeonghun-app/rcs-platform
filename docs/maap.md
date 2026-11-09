@@ -9,8 +9,7 @@ Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token; no route is mounted yet
 (#709–#713 add the operator's). The [registry](#dynamodb-maap-registry-table)
-has its store and a memory backend (#708), which no route uses yet; its
-DynamoDB backend follows in the next pull request of #708.
+has its store, in memory and in DynamoDB (#708), which no route uses yet.
 
 ## Listeners
 
@@ -106,6 +105,13 @@ content is checked by `chatbot.ValidateContent` instead.
 
 Metrics have the `Service` dimension only (ADR 0009 §10):
 `api.<operation>.<status>` per request and `api.decode_busy`.
+
+A route that changes a chatbot (#709) adds to its audit line the values
+before and after (ADR 0009 §7) as `store.AuditChanges` writes them, never
+the values themselves (§10): each changed field by its JSON path, with its
+length in bytes and the first 8 hex digits of its SHA-256; the webhook URL
+by its host only, since its path or query may hold the chatbot's secret;
+the URI through `pii.URI`.
 
 ## DynamoDB `maap-registry` table
 

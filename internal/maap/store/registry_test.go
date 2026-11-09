@@ -1,7 +1,9 @@
 package store_test
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -80,6 +82,44 @@ func TestAStoredChatbotIsDecodedStrictly(t *testing.T) {
 		if _, err := store.DecodeChatbot([]byte(bad), 1); !errors.Is(err, store.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+}
+
+func TestAuditChangesNameFieldsWithoutTheirValues(t *testing.T) {
+	before := storetest.Chatbot()
+	after := before
+	after.DisplayName = "Acme Secret Name"
+	after.Webhook.URL = "https://hooks.example.org/path-secret?q=query-secret"
+	after.Limits.SendsPerDay = 500
+	var buf bytes.Buffer
+	log := func(attrs []slog.Attr) string {
+		buf.Reset()
+		slog.New(slog.NewJSONHandler(&buf, nil)).LogAttrs(t.Context(), slog.LevelInfo, "audit", attrs...)
+		return buf.String()
+	}
+	line := log(store.AuditChanges(before, after))
+	for _, want := range []string{
+		`"display_name":{"before":{"len":14,"sha256":"`, `"after":{"len":16,`,
+		`"webhook.url":{"before":"bot.example.com","after":"hooks.example.org"}`,
+		`"limits.sends_per_day":{"before":{"len":4,`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Errorf("missing %s in %s", want, line)
+		}
+	}
+	for _, leak := range []string{"Acme", "Secret", "secret", "/hook", "state", "uri", "sources"} {
+		if strings.Contains(line, leak) {
+			t.Errorf("%q in %s", leak, line)
+		}
+	}
+	// Registering is a change of every field set, the URI through pii.
+	line = log(store.AuditChanges(store.Chatbot{}, before))
+	if strings.Contains(line, "bot-") || strings.Contains(line, "Back soon") || !strings.Contains(line, `"uri":{`) ||
+		!strings.Contains(line, `"sources":{`) || !strings.Contains(line, `"permissions.msisdn":{`) {
+		t.Errorf("registration: %s", line)
+	}
+	if got := store.AuditChanges(before, before); len(got) != 0 {
+		t.Errorf("no change: %v", got)
 	}
 }
 
