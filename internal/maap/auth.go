@@ -163,13 +163,38 @@ func (a *authenticator) credential(ctx context.Context, keyID string, now time.T
 	r := &read{done: make(chan struct{})}
 	a.reads[keyID] = r
 	a.mu.Unlock()
-	defer close(r.done)
+	a.fill(ctx, keyID, now, r)
+	return r.cred, r.known, r.err
+}
+
+// errReadPanicked is what lookups get from a credential read that
+// panicked: the store failing, never a refusal.
+var errReadPanicked = errors.New("maap: the credential read failed")
+
+// fill reads keyID's credential into r, caching what it learnt. r leaves
+// the reads in progress whatever happens, a panic included, which is
+// logged and answered as a store failure: left there, it would refuse the
+// key ID on this task until a restart (#746 round 2).
+func (a *authenticator) fill(ctx context.Context, keyID string, now time.Time, r *read) {
+	defer func() {
+		p := recover()
+		a.mu.Lock()
+		delete(a.reads, keyID)
+		if p != nil {
+			r.cred, r.known, r.err = store.Credential{}, false, errReadPanicked
+		}
+		a.mu.Unlock()
+		close(r.done)
+		if p != nil {
+			// The panic's value may hold what the store read: it is not logged.
+			a.log.Error("a credential read panicked", slog.String("key_id", keyID))
+		}
+	}()
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readTimeout)
 	defer cancel()
 	cred, err := a.creds.Credential(rctx, keyID)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	delete(a.reads, keyID)
 	switch {
 	case errors.Is(err, store.ErrNotFound):
 		delete(a.keys, keyID)
@@ -182,7 +207,6 @@ func (a *authenticator) credential(ctx context.Context, keyID string, now time.T
 		a.keys[keyID] = cached[store.Credential]{cred, now.Add(cacheTTL)}
 		r.cred, r.known = cred, true
 	}
-	return r.cred, r.known, r.err
 }
 
 // chatbot returns the chatbot with id, nil if it is gone, from the cache

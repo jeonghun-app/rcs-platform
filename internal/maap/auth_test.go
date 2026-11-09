@@ -25,6 +25,8 @@ type counted struct {
 	failUse                error
 	hold, holdUse          chan struct{}
 	readDetached, detached atomic.Bool
+	// panics makes the next read panic.
+	panics atomic.Bool
 }
 
 // live reports whether ctx is not done and has a deadline.
@@ -36,6 +38,9 @@ func live(ctx context.Context) bool {
 func (c *counted) Credential(ctx context.Context, keyID string) (store.Credential, error) {
 	c.reads.Add(1)
 	c.readDetached.Store(live(ctx))
+	if c.panics.CompareAndSwap(true, false) {
+		panic("store bug")
+	}
 	if c.hold != nil {
 		<-c.hold
 	}
@@ -299,6 +304,24 @@ func TestConcurrentLookupsOfAKeyIDShareOneRead(t *testing.T) {
 	f.now = f.now.Add(cacheTTL)
 	if _, _ = f.a.authenticate(ctx, unknown, secret); f.creds.reads.Load() != 3 {
 		t.Fatalf("%d reads after 30 s, the other key ID's one included", f.creds.reads.Load())
+	}
+}
+
+// A shared read that panics is a store failure, logged, and leaves the
+// reads in progress: the next lookup reads again (#746 round 2).
+func TestAPanickingReadIsAStoreFailureAndTheNextLookupReadsAgain(t *testing.T) {
+	ctx := context.Background()
+	f := newAuthFixture(t)
+	_, keyID, secret := f.chatbot(t)
+	f.creds.panics.Store(true)
+	if _, err := f.a.authenticate(ctx, keyID, secret); !errors.Is(err, errReadPanicked) {
+		t.Fatalf("authenticate over a panicking read = %v", err)
+	}
+	if len(f.a.reads) != 0 || len(f.h.Logs("a credential read panicked")) != 1 || strings.Contains(f.h.Output(), "store bug") {
+		t.Fatalf("%d reads left; log:\n%s", len(f.a.reads), f.h.Output())
+	}
+	if got, err := f.a.authenticate(ctx, keyID, secret); err != nil || f.creds.reads.Load() != 2 {
+		t.Fatalf("the next lookup = %+v, %v after %d reads", got, err, f.creds.reads.Load())
 	}
 }
 
