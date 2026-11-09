@@ -49,7 +49,12 @@ func TestAChatbotBreakingTheRulesIsNotStored(t *testing.T) {
 		"long text":       func(c *store.Chatbot) { c.OutOfService = strings.Repeat("a", store.MaxOutOfServiceText+1) },
 		"long webhook":    func(c *store.Chatbot) { c.Webhook.URL = strings.Repeat("a", store.MaxWebhookBytes+1) },
 		"no state":        func(c *store.Chatbot) { c.State = "" },
-		"negative limit":  func(c *store.Chatbot) { c.Limits.ReceivedPerMinute = -1 },
+		"name not UTF-8":  func(c *store.Chatbot) { c.DisplayName = "a\xffb" },
+		"text not UTF-8":  func(c *store.Chatbot) { c.OutOfService = "a\xffb" },
+		"URL not UTF-8":   func(c *store.Chatbot) { c.Webhook.URL += "\xff" },
+		"CR LF in name":   func(c *store.Chatbot) { c.DisplayName = "Acme\r\nInjected: 1" },
+		"DEL in name":     func(c *store.Chatbot) { c.DisplayName = "Acme\x7f" },
+		"tab in URL":      func(c *store.Chatbot) { c.Webhook.URL += "\t" },
 		"host bits":       func(c *store.Chatbot) { c.Sources = []string{"192.0.2.1/24"} },
 		"not a prefix":    func(c *store.Chatbot) { c.Sources = []string{"192.0.2.1"} },
 		"long IPv6 form":  func(c *store.Chatbot) { c.Sources = []string{"2001:0db8::/32"} },
@@ -62,6 +67,13 @@ func TestAChatbotBreakingTheRulesIsNotStored(t *testing.T) {
 		change(&c)
 		if _, err := store.EncodeChatbot(c); !errors.Is(err, store.ErrInvalid) {
 			t.Errorf("%s: %v", name, err)
+		}
+	}
+	for i := range reflect.TypeFor[store.Limits]().NumField() {
+		c := storetest.Chatbot()
+		reflect.ValueOf(&c.Limits).Elem().Field(i).SetInt(-1)
+		if _, err := store.EncodeChatbot(c); !errors.Is(err, store.ErrInvalid) {
+			t.Errorf("negative limit %d: %v", i, err)
 		}
 	}
 }
@@ -145,6 +157,26 @@ func FuzzDecodeChatbot(f *testing.F) {
 		back, err := store.DecodeChatbot(again, 1)
 		if err != nil || !reflect.DeepEqual(back, got) {
 			t.Fatalf("round trip changed the chatbot: %v\n%+v\n%+v", err, got, back)
+		}
+	})
+}
+
+// FuzzEncodeChatbot builds chatbots from arbitrary fields: whatever
+// EncodeChatbot accepts must decode to the same chatbot, so that no record
+// is stored that its readers refuse.
+func FuzzEncodeChatbot(f *testing.F) {
+	c := storetest.Chatbot()
+	f.Add(c.ID, c.URI, c.DisplayName, c.OutOfService, c.Webhook.URL, c.Sources[0], string(c.State), int64(60))
+	f.Fuzz(func(t *testing.T, id, uri, name, text, url, source, state string, limit int64) {
+		c := store.Chatbot{ID: id, URI: uri, DisplayName: name, OutOfService: text, Webhook: store.Webhook{URL: url},
+			Sources: []string{source}, State: store.State(state), Limits: store.Limits{SendsPerDay: limit}}
+		doc, err := store.EncodeChatbot(c)
+		if err != nil {
+			return
+		}
+		got, err := store.DecodeChatbot(doc, 0)
+		if err != nil || !reflect.DeepEqual(got, c) {
+			t.Fatalf("an accepted chatbot does not round-trip: %v\n%+v\n%+v", err, c, got)
 		}
 	})
 }

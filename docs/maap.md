@@ -123,7 +123,7 @@ operator deletes it.
 
 | `pk` | `sk` | Holds |
 |---|---|---|
-| `c#<chatbot ID>` | `chatbot` | The chatbot: `version` (number), `doc` (binary, the record as `internal/maap/store` encodes it), `writer` |
+| `c#<chatbot ID>` | `chatbot` | The chatbot: `version` (number), `registration` (random, per registration), `uri`, `doc` (binary, the record as `internal/maap/store` encodes it), `writer`; once deleted, a tombstone holding `deleted` only |
 | `u#<chatbot URI>` | `uri` | The URI's reservation: `chatbot` (the ID), `writer` |
 | `c#<chatbot ID>` | `k#<key ID>` | Reserved for the chatbot's credentials (#710) |
 
@@ -151,14 +151,18 @@ operator deletes it.
   the reservation in one transaction, each on the condition that it does not
   exist yet, so a second chatbot with the same URI is refused ("taken", which
   #709 answers 409).
-- **Changes** rewrite the record on the condition that its `version` is the
-  one read, so of two concurrent changes one wins and the other is refused
-  as a conflict. A random `writer` token tells a write the SDK sent again
+- **Changes** rewrite the record on the condition that its `version` and
+  `registration` are the ones read and its `uri` is the chatbot's, so of two
+  concurrent changes one wins and the other is refused as a conflict. A random `writer` token tells a write the SDK sent again
   after its answer was lost, which then stands, from another writer's.
-- **Deleting** a chatbot deletes every item of its partition, the record
-  last, together with the reservation, which frees the URI. A deletion that
-  failed part way is finished by calling it again; deleting a chatbot that
-  is gone does nothing (ADR 0009 §10).
+- **Deleting** a chatbot deletes every item of its partition, then turns the
+  record into a tombstone, on the condition of the version read, together
+  with deleting the reservation, which frees the URI. A deletion that failed
+  part way is finished by calling it again; deleting a chatbot that is gone
+  does nothing (ADR 0009 §10). **A deleted ID is never registered again**
+  (lead decision on #708; `ErrDeleted`, which #709 answers 409), so nothing
+  another table kept of it, or a change read before the deletion, reaches
+  a new chatbot. Tombstones are kept, like the table, without TTL.
 - **Errors.** A store failure is an error of its own, never "not found":
   callers answer it 503, not 404. Errors carry the operation and the AWS
   error code only.

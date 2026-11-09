@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/netip"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 )
@@ -16,8 +17,13 @@ import (
 // is the store failing, which callers answer 503, never 404.
 var (
 	ErrNotFound = errors.New("store: not found")
-	// ErrExists means Register found the chatbot ID taken.
+	// ErrExists means Register found the chatbot ID taken. When the URI is
+	// taken too, ErrExists is the answer.
 	ErrExists = errors.New("store: chatbot ID already registered")
+	// ErrDeleted means Register found the ID of a deleted chatbot: an ID is
+	// never used again, so that nothing another table kept of the deleted
+	// chatbot passes to a new one (#709 answers 409).
+	ErrDeleted = errors.New("store: chatbot ID deleted")
 	// ErrURITaken means another chatbot holds the URI (#709 answers 409).
 	ErrURITaken = errors.New("store: chatbot URI taken")
 	// ErrConflict means the chatbot changed since it was read.
@@ -68,9 +74,11 @@ type Chatbot struct {
 	// come from, in canonical prefix form; empty allows any (ADR 0009 §7).
 	Sources []string `json:"sources,omitempty" maxbytes:"43"`
 	State   State    `json:"state" maxbytes:"9"`
-	// Version is the stored version, which Update is conditional on; the
-	// store sets it, outside the stored document.
-	Version int64 `json:"-"`
+	// Version and Registration, which Register draws at random, are what
+	// Update and DeleteChatbot are conditional on, together with the stored
+	// URI; the store sets them, outside the stored document.
+	Version      int64  `json:"-"`
+	Registration string `json:"-"`
 }
 
 // Webhook is where maap delivers the chatbot's events (ADR 0009 §8).
@@ -114,12 +122,13 @@ type Registry interface {
 	// Chatbot returns the chatbot with the given ID, ErrNotFound if none.
 	Chatbot(ctx context.Context, id string) (Chatbot, error)
 	// Update replaces old, as read, with c at old.Version+1, if the stored
-	// version is still old.Version: ErrConflict if another write came
-	// first, ErrNotFound if the chatbot is gone, ErrInvalid if c has
-	// another ID or URI than old.
+	// version and registration are still old's: ErrConflict if another
+	// write came first, ErrNotFound if the chatbot is gone or deleted,
+	// ErrInvalid if c's ID or URI is not the stored one.
 	Update(ctx context.Context, old, c Chatbot) (Chatbot, error)
 	// DeleteChatbot deletes the chatbot and every item of it, its URI's
-	// included, which another chatbot may then register.
+	// included, which another chatbot may then register; it leaves a
+	// tombstone, so that the ID is never registered again (ErrDeleted).
 	ChatbotDeleter
 }
 
@@ -136,6 +145,13 @@ func CheckChatbot(c Chatbot) error {
 	case len(c.DisplayName) > MaxDisplayNameBytes || len(c.OutOfService) > MaxOutOfServiceText ||
 		len(c.Webhook.URL) > MaxWebhookBytes:
 		return fail("a text over its bound")
+	case !utf8.ValidString(c.DisplayName) || !utf8.ValidString(c.OutOfService) || !utf8.ValidString(c.Webhook.URL):
+		// JSON would write U+FFFD for each bad byte: another value, which
+		// may then be over its bound.
+		return fail("a text not in UTF-8")
+	case strings.ContainsFunc(c.DisplayName+c.Webhook.URL, func(r rune) bool { return r < 0x20 || r == 0x7f }):
+		// Both reach SIP, CPIM or HTTP headers (#723).
+		return fail("a control character in the display name or webhook URL")
 	case len(c.Sources) > MaxSources:
 		return fail("too many source networks")
 	case c.State != Active && c.State != Suspended:
