@@ -18,7 +18,7 @@ the operator's other routes.
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
-| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
+| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` and `maap-subscribers` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` on both for (#684) |
 | internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
@@ -288,6 +288,8 @@ sends; nothing calls it yet):
   minute. Each alias used in the last hour takes one entry, about 100 bytes,
   in the task's memory. An absolute lifetime is not decided (held for the
   product owner, lead decision C on PR #674).
+- **Deletion.** Deleting a chatbot deletes its aliases, [in
+  DynamoDB](#dynamodb-maap-subscribers-table) as in memory.
 - **Logs** carry an alias only through `pii.Identity`, as `alias`.
 
 ## DynamoDB `maap-registry` table
@@ -358,3 +360,42 @@ operator deletes it.
 - **Errors.** A store failure is an error of its own, never "not found":
   callers answer it 503, not 404. Errors carry the operation and the AWS
   error code only.
+
+## DynamoDB `maap-subscribers` table
+
+`MAAP_SUBSCRIBERS_TABLE`, on demand with point-in-time recovery (ADR 0003),
+written by `maap`'s task role only (ADR 0009 §12), from the infrastructure
+(#684) like `maap-registry`. Partition key `pk` and sort key `sk`, both
+strings; no index. **TTL attribute `expires`** (Unix seconds). It maps
+subscribers' numbers to aliases, so it is personal data (T15), as
+sensitive as the numbers.
+
+| `pk` | `sk` | Holds |
+|---|---|---|
+| `s#<tel URI>` | `a#0#<chatbot ID>`, `a#1#<chatbot ID>` | The subscriber's alias at the chatbot, normal (`0`) or anonymous (`1`): `alias` (its ID), `created`, `last_used`, `expires` |
+| `c#<chatbot ID>` | `a#<alias ID>` | The same alias by its ID: `subscriber` (the tel URI), `anonymous` (boolean), `created`, `last_used`, `expires` |
+
+- **Keys.** A subscriber is its canonical tel URI, `tel:+` and 1–15 digits
+  as `rcs-as` names a global number, so all of one number's items are in
+  its partition and recycling a number (#712) finds them without a scan;
+  #712 adds conversations and blocks there. A chatbot's aliases are in its
+  partition, which its deletion queries and a lookup by alias ID reads,
+  with the chatbot ID always given.
+- **Both items at once.** An alias's two items are written, used and
+  deleted in one transaction each. Storing writes both on the condition
+  that neither exists, or, over an expired alias, that the subscriber's
+  item still holds the alias and last use read, deleting the old alias's
+  other item in the same transaction. A write that fails its condition
+  reads again and answers what it finds, so one the SDK sent again after
+  its answer was lost gets its own alias.
+- **Retention.** `last_used` moves only forward, on both items together,
+  and `expires` is `last_used` plus 180 days. Reads judge expiry by
+  `last_used`; TTL only removes an expired alias's items later, each in its
+  own time.
+- **Deletion.** Deleting a chatbot deletes each of its aliases' two items
+  together, after the registry's tombstone. A write
+  that raced the deletion leaves at most an alias of a tombstoned ID, which
+  no chatbot reads (an ID is never registered again, #708) and a repeated
+  deletion removes. A damaged item goes alone, logged with the chatbot only.
+- **Errors.** As for the registry: a store failure is never "no alias", and
+  errors carry the operation and the AWS error code only.

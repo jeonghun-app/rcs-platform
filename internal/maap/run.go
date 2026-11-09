@@ -28,6 +28,8 @@ type deps struct {
 	// does.
 	registry    store.Registry
 	credentials store.Credentials
+	// subscribers replaces maap-subscribers, checked as the registry is.
+	subscribers store.Subscribers
 }
 
 // Run serves the internal listener, apart from the runtime's admin port
@@ -37,16 +39,19 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	registry, creds := d.registry, d.credentials
+	registry, creds, subs := d.registry, d.credentials, d.subscribers
 	if registry == nil {
 		r, err := awsstore.New(ctx, cfg.RegistryTable, cfg.DynamoDBEndpoint)
 		if err != nil {
 			return fmt.Errorf("maap: %w", err)
 		}
-		registry, creds = r, r.Credentials()
+		registry, creds, subs = r, r.Credentials(), r.Subscribers(cfg.SubscribersTable)
 	}
 	if r, ok := registry.(interface{ Ready(context.Context) error }); ok {
 		rt.Admin.AddReadinessCheck("dynamodb-registry", r.Ready)
+	}
+	if s, ok := subs.(interface{ Ready(context.Context) error }); ok {
+		rt.Admin.AddReadinessCheck("dynamodb-subscribers", s.Ready)
 	}
 	// The internal listener's own decode pool: #683 gives the public
 	// listener another, so that chatbots cannot take rcs-as's slots.
@@ -57,7 +62,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		// Every store of a chatbot's items is a deleter (#742 review), the
 		// credentials too, though the registry's deletion takes them with
 		// its partition already.
-		deleters: []store.ChatbotDeleter{creds},
+		deleters: []store.ChatbotDeleter{creds, subs},
 	})
 	api.mountCredentials(&credentialAPI{registry: registry, creds: creds, random: rand.Reader, now: time.Now})
 	ln, err := d.listen("tcp", cfg.InternalAddr)
