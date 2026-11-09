@@ -97,7 +97,7 @@ func (ca *credentialAPI) list(c *call) error {
 	}
 	creds, err := ca.creds.ChatbotCredentials(ctx, id)
 	if err != nil {
-		return c.storeError(err, false)
+		return c.credentialError(err)
 	}
 	out := make([]listed, 0, len(creds))
 	for _, cr := range creds {
@@ -107,9 +107,11 @@ func (ca *credentialAPI) list(c *call) error {
 	return nil
 }
 
-// revoke deletes the credential at once in the store: 204, or 404 when the
-// chatbot has none with the key ID. It does not read the chatbot, so that
-// what a deletion left can be revoked too.
+// revoke deletes the credential at once in the store: 204, also for a
+// slot a revoke cut short left, or 404 when the chatbot has none with the
+// key ID, which a repeat of a revoke whose answer was lost gets too. It
+// does not read the chatbot, so that what a deletion left can be revoked
+// too.
 func (ca *credentialAPI) revoke(c *call) error {
 	id, err := c.chatbotID()
 	if err != nil {
@@ -125,8 +127,20 @@ func (ca *credentialAPI) revoke(c *call) error {
 		return fail(http.StatusNotFound, "the chatbot has no credential with this key ID")
 	}
 	if err != nil {
-		return c.storeError(err, true)
+		return c.credentialError(err)
 	}
 	c.w.WriteHeader(http.StatusNoContent)
 	return nil
+}
+
+// credentialError answers an error of the credentials store. Its
+// ErrInvalid is a stored credential this release cannot read, damaged or
+// written by a newer one: maap's fault, 500, never the request's (#745
+// review). The rest is answered as for the registry.
+func (c *call) credentialError(err error) error {
+	if !errors.Is(err, store.ErrInvalid) {
+		return c.storeError(err, false)
+	}
+	c.audit = append(c.audit, slog.String("store_error", err.Error()))
+	return &apiError{status: http.StatusInternalServerError, message: "a stored credential cannot be read"}
 }

@@ -214,8 +214,10 @@ ID>.<secret>` (#683 reads it). The operator's routes, in
 |---|---|
 | `POST /v1/chatbots/{id}/credentials` | issues one: 201 with `key_id` and `token`, the only time the secret is shown; 409 with two live |
 | `GET /v1/chatbots/{id}/credentials` | lists the live ones by key ID, oldest first, with when each was created and last used |
-| `DELETE /v1/chatbots/{id}/credentials/{key_id}` | revokes one at once in the registry: 204, or 404 when the chatbot has none with the key ID |
+| `DELETE /v1/chatbots/{id}/credentials/{key_id}` | revokes one at once in the registry, in one write: 204, also for a place a revoke cut short left; 404 when the chatbot has none with the key ID, which a repeat of a revoke whose answer was lost gets too |
 
+- **Errors.** A stored credential this release cannot read is 500; a
+  registry or table that fails is 503 with `Retry-After: 1`.
 - **Stored.** Only the secret's SHA-256 digest, never the secret; neither
   is in any later answer or log line. The key ID is 26 characters of
   base32 (128 random bits), with no `.` and no control character (the

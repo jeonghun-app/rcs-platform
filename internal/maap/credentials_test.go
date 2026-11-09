@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -121,7 +122,7 @@ func TestAThirdCredentialIs409UntilOneIsRevoked(t *testing.T) {
 	}
 }
 
-func TestCredentialsOfAGoneChatbotAre404AndStoreFailures503(t *testing.T) {
+func TestCredentialsOfAGoneChatbotAre404AndStoreFailures5xx(t *testing.T) {
 	r := store.NewMemoryRegistry()
 	a, _ := credentialAPIOver(t, r, randomBytes)
 	issue(t, a, http.StatusNotFound)
@@ -161,6 +162,18 @@ func TestCredentialsOfAGoneChatbotAre404AndStoreFailures503(t *testing.T) {
 	if rec := operator(a, "POST", "/v1/chatbots/cb-2/credentials", ""); rec.Code != http.StatusInternalServerError || !bytes.Contains(rec.Body.Bytes(), []byte("random")) {
 		t.Fatalf("issue without randomness = %d %s", rec.Code, rec.Body)
 	}
+	// A stored credential this release cannot read is maap's fault: 500 on
+	// the list and on a revoke, not the request's 400.
+	a = bare(&credentialAPI{registry: r, creds: damaged{r.Credentials()}})
+	for _, method := range []string{"GET", "DELETE"} {
+		path := "/v1/chatbots/cb-2/credentials"
+		if method == "DELETE" {
+			path += "/" + strings.Repeat("A", store.KeyIDBytes)
+		}
+		if rec := operator(a, method, path, ""); rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "credential cannot be read") {
+			t.Errorf("%s over a damaged credential = %d %s", method, rec.Code, rec.Body)
+		}
+	}
 }
 
 // staleRegistry answers the chatbot as read before a deletion.
@@ -170,3 +183,14 @@ type staleRegistry struct {
 }
 
 func (s staleRegistry) Chatbot(context.Context, string) (store.Chatbot, error) { return s.read, nil }
+
+// damaged answers the list and revokes as over a damaged credential.
+type damaged struct{ store.Credentials }
+
+func (damaged) ChatbotCredentials(context.Context, string) ([]store.Credential, error) {
+	return nil, fmt.Errorf("%w: a damaged credential", store.ErrInvalid)
+}
+
+func (damaged) Revoke(context.Context, string, string) error {
+	return fmt.Errorf("%w: a key item of another chatbot", store.ErrInvalid)
+}
