@@ -82,6 +82,8 @@ type aliasesStub struct {
 	gets int
 	txAt []time.Time
 	ids  []string
+	// block holds each transaction until its context ends.
+	block bool
 }
 
 func (s *aliasesStub) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
@@ -101,8 +103,12 @@ func (s *aliasesStub) Query(context.Context, *dynamodb.QueryInput, ...func(*dyna
 	return out, nil
 }
 
-func (s *aliasesStub) TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+func (s *aliasesStub) TransactWriteItems(ctx context.Context, _ *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
 	s.txAt = append(s.txAt, time.Now())
+	if s.block {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	return &dynamodb.TransactWriteItemsOutput{}, nil
 }
 
@@ -169,5 +175,16 @@ func TestADeletionStopsBeforeItsDeadlineAndLogsItsProgress(t *testing.T) {
 		if strings.Contains(out, id) {
 			t.Fatalf("the log names an alias: %s", out)
 		}
+	}
+}
+
+// A transaction cut short by the deadline is unfinished too, never a store
+// failure: the operator calls again (#713's mechanism).
+func TestADeletionCutAtItsDeadlineIsUnfinished(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := NewSubscribers(&aliasesStub{n: 3, block: true}, "maap-subscribers").DeleteChatbot(ctx, "cb-1")
+	if !errors.Is(err, store.ErrUnfinished) {
+		t.Fatalf("DeleteChatbot = %v", err)
 	}
 }
