@@ -331,6 +331,8 @@ func queueLimit(c Config) store.Limit {
 		GroupBytes:   c.MaxQueueBytes / GroupNotificationsShare,
 		SummaryCount: (c.MaxQueueMessages + GroupSummariesShare - 1) / GroupSummariesShare,
 		SummaryBytes: c.MaxQueueBytes / GroupSummariesShare,
+		ChatbotCount: (c.MaxQueueMessages + ChatbotsShare - 1) / ChatbotsShare,
+		ChatbotBytes: c.MaxQueueBytes / ChatbotsShare,
 	}
 	if c.QueueSenderShare > 1 {
 		l.SenderCount = (c.MaxQueueMessages + c.QueueSenderShare - 1) / c.QueueSenderShare
@@ -440,6 +442,10 @@ type Origin struct {
 	// CPIM is the message/cpim body as received: chat content, held where
 	// no verb or encoder shows it (#547).
 	CPIM content.Body
+
+	// chatbot and anonymous are set by SubmitChatbot alone, never by the
+	// SIP layer (store.Message.Chatbot).
+	chatbot, anonymous bool
 }
 
 // Submit runs a message through the pipeline and queues it for delivery.
@@ -456,6 +462,13 @@ func (e *Engine) Submit(ctx context.Context, o Origin) error {
 		return errors.New("messaging: Origin.Mode must be Chat or Standalone")
 	}
 	err := e.submit(ctx, o)
+	e.counted(err, o.Recipient)
+	return err
+}
+
+// counted counts what Submit or SubmitChatbot returned for a message to
+// recipient.
+func (e *Engine) counted(err error, recipient string) {
 	var r *Rejection
 	if errors.As(err, &r) {
 		e.metrics.Count("message.rejected."+string(r.Reason), 1)
@@ -464,9 +477,8 @@ func (e *Engine) Submit(ctx context.Context, o Origin) error {
 		}
 	} else if err != nil {
 		e.metrics.Count("store.failed", 1)
-		e.log.Warn("message not stored", pii.URI("recipient", o.Recipient), slog.String("error", err.Error()))
+		e.log.Warn("message not stored", pii.URI("recipient", recipient), slog.String("error", err.Error()))
 	}
-	return err
 }
 
 func (e *Engine) submit(ctx context.Context, o Origin) error {
@@ -547,8 +559,9 @@ func (e *Engine) submitMessage(ctx context.Context, o Origin, m *Message, now ti
 	if errors.Is(err, store.ErrQueueFull) || errors.Is(err, store.ErrSenderShareFull) {
 		// The sender learns of it twice, as a refusal and, if it asked,
 		// as the negative delivery notification a store-and-forward
-		// server sends for a message it cannot keep.
-		if n, err := e.notification(q, failedDelivery, q.ID+"-f", now); err == nil {
+		// server sends for a message it cannot keep. A chatbot's goes
+		// through maap (#705), never into a queue of the chatbot's URI.
+		if n, err := e.notification(q, failedDelivery, q.ID+"-f", now); err == nil && !q.Chatbot {
 			_ = e.enqueueNotification(ctx, n, failedDelivery.status)
 		}
 		if errors.Is(err, store.ErrSenderShareFull) {
@@ -566,6 +579,7 @@ func queued(o Origin, id string, body []byte, notification bool, messageID strin
 		Conversation: o.Conversation.ID, Contribution: o.Conversation.Contribution, InReplyTo: o.Conversation.InReplyTo,
 		Mode: o.Mode, Notification: notification, MessageID: messageID,
 		CPIM: content.BodyOf(body), Enqueued: now, Expires: now.Add(ttl),
+		Chatbot: o.chatbot, Anonymous: o.anonymous,
 	}
 }
 

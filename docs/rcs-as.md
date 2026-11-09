@@ -434,7 +434,8 @@ session, a large-mode MSRP session or a pager-mode MESSAGE:
    - Beyond these bounds the message is refused as `queue_full` or
      `queue_share_full`, and the sender gets the negative delivery
      notification it asked for. A refusal from a full share affects that
-     sender only.
+     sender only. Chatbots have a share each and a quarter together
+     ([A chatbot's message](#a-chatbots-message)).
 
 A refused message is answered with a `Rejection`. Over MSRP its code is:
 
@@ -1328,6 +1329,59 @@ every check is handed to an acceptor, which answers 503 until #699
   its operation (`messages`, `notifications`, or `other`), its status, and
   the token it used (`current`, `next` or `none`); it is written even when
   the handler panics. Nothing of the body, the path or the token is logged.
+
+### A chatbot's message
+
+`Engine.SubmitChatbot` stores a chatbot's message as the chatbot API hands
+it on (ADR 0009 §4, chatbot → subscriber step 4).
+
+- **CPIM.** `rcs-as` writes every header itself, from the request's fields
+  only (RCC.07 v13.0 §3.6.8.1.2, §3.6.10.1, *confirmed* for v13.0, *to
+  confirm* for the target edition):
+  - `From`: the chatbot's URI in normal form with the isbot and Chatbot
+    application version (`#=1,#=2`) feature tags in a `Contact` URI header
+    escaped as §3.2.2.6 has it (§3.6.8.1.2 item 1, §3.6.2.2), and the
+    registry display name through `EscapeDisplayName`, so that a CR, LF or
+    NUL in it never ends a header line in the CPIM or in the SIP `From`
+    made from it;
+  - `To`: the subscriber's canonical tel URI;
+  - `DateTime`: `rcs-as`'s clock when it accepts the message;
+  - `NS: imdn` and `imdn.Message-ID`: the ID `maap` generated, also without
+    notifications, so that a client drops a copy `maap` sent again after a
+    lost answer;
+  - `imdn.Disposition-Notification`: the notifications asked for, if any;
+  - `Content-Type`: the entry of `FromChatbots` the request matched, never
+    `maap`'s string. With a chip list it is `multipart/mixed`: the message
+    first, then the chip list with the configured `ChipList` type, each
+    inline with a filename of its own and a `Content-Length`. The boundary
+    is 128 random bits; content holding it is refused, never split.
+- **Store.** It goes through the pipeline's own steps from the sent record
+  on ([The pipeline](#the-pipeline) steps 5–6): the sent record when
+  notifications are asked for (T10), a resend of the same Message-ID to the
+  same subscriber taken again, the same ID to another refused. The item is
+  marked as a chatbot's (`chatbot`, and `anonymous` for an anonymous
+  conversation, ADR 0009 §10), and its `enqueued` time is when `rcs-as`
+  accepted it, from which `chatbot.queue_age` (#702, #705) is measured. It
+  expires after `RCSAS_STORE_TTL`, its sent record after `RCSAS_SENT_TTL`.
+- **Queue shares** (ADR 0009 §9, T10, memo D3). A chatbot is a sender with
+  one share of a subscriber's queue (`1/RCSAS_QUEUE_SENDER_SHARE`, an
+  eighth), and all chatbots together hold at most a quarter of its messages
+  and bytes (`messaging.ChatbotsShare`), as group notifications do. A full
+  share or queue is refused as for a person. The negative notification a
+  person would get is not queued: a chatbot's goes through `maap` (#705).
+- **Held until #702.** Until the delivery check exists, every delivery
+  leaves a chatbot's message queued, with the switch on or off: the
+  messages after it, a person's included, go on, it sets no retry timer,
+  and it expires under its TTL as undeliverable, counted in
+  `message.expired`, without a notification queued for the chatbot.
+- **Rolling update.** A task of a version without the delivery check
+  (#702) would deliver a queued chatbot message as a person's: it reads the
+  item without the `chatbot` attribute. So `RCSAS_CHATBOTS=on` needs every
+  task on a version that has the delivery check (#702); #684's runbook
+  carries it. A person's item is written as before, without the two new
+  attributes. An older task that removes a chatbot's item leaves its count
+  in the chatbots' total, which the next refusal's recount corrects, as for
+  any size.
 
 ## Settings
 

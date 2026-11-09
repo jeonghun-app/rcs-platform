@@ -81,6 +81,12 @@ type Limit struct {
 	// most of a queue to everyone else.
 	SummaryCount int
 	SummaryBytes int64
+	// ChatbotCount and ChatbotBytes bound the messages of all chatbots in
+	// a queue together (Message.InChatbotTotal), beside each chatbot's
+	// sender share: without a total, enough chatbots could fill a
+	// subscriber's queue between them (ADR 0009 §9, threat model T10).
+	ChatbotCount int
+	ChatbotBytes int64
 }
 
 // Mode is how a message was sent, which decides how it may be delivered.
@@ -157,6 +163,14 @@ type Message struct {
 	Owner      string
 	LeaseUntil time.Time
 
+	// Chatbot marks a message a chatbot sent through maap (ADR 0009 §4):
+	// Sender is the chatbot's URI in normal form, and Enqueued the time
+	// rcs-as accepted it, from which its queue age is measured (#702).
+	// Anonymous is the conversation's anonymity flag (§10), which the
+	// delivery's tk parameter follows.
+	Chatbot   bool
+	Anonymous bool
+
 	// Fence, for a group message's copy, is the group's owner the copy is
 	// queued under (#121): Enqueue queues it only while the groups table
 	// still names that owner, in the same write, so that a task that lost
@@ -182,6 +196,14 @@ const GroupNotifications = "#group-notifications"
 // GroupSummaries names the total of a queue's group notification
 // summaries (Limit.SummaryCount). It is not an identity, which is a URI.
 const GroupSummaries = "#group-summaries"
+
+// ChatbotMessages names the total of all chatbots' messages in a queue
+// (Limit.ChatbotCount). It is not an identity, which is a URI.
+const ChatbotMessages = "#chatbot-messages"
+
+// InChatbotTotal reports whether m counts toward ChatbotMessages: a
+// chatbot sent it.
+func (m Message) InChatbotTotal() bool { return m.Chatbot }
 
 // InSummaryTotal reports whether m counts toward GroupSummaries: it is a
 // summary.
@@ -292,8 +314,8 @@ type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
 	// queue already holds m.ID, ErrQueueFull if the queue would then be
 	// beyond l, ErrSenderShareFull if what counts against m's share
-	// (Message.ShareKey), or the total of group notifications or of
-	// summaries for one, would.
+	// (Message.ShareKey), or the total of group notifications, of
+	// summaries or of chatbots' messages for one, would.
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
 	// free at now and not expired, oldest first, starting after the ID

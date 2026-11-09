@@ -58,6 +58,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("EachSenderHasAShareOfAQueue", func(t *testing.T) { senderShares(t, newStore(t)) })
 	t.Run("AGroupMessageCountsAgainstItsAuthorsShare", func(t *testing.T) { groupShares(t, newStore(t)) })
 	t.Run("RemovingAGroupNotificationFreesTheTotal", func(t *testing.T) { groupTotalFreed(t, newStore(t)) })
+	t.Run("ChatbotsHoldAShareEachAndATotalTogether", func(t *testing.T) { chatbotShares(t, newStore(t)) })
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 	t.Run("ASummaryGoesOnlyOnceItsMarksAreSent", func(t *testing.T) { summaries(t, newStore(t)) })
@@ -571,6 +572,62 @@ func groupTotalFreed(t *testing.T, s store.Store) {
 		if err := s.Remove(ctx, held, "task-a"); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// chatbotShares: each chatbot holds a sender's share of a queue and all
+// of them together at most their total, which a person's message does not
+// use; a chatbot's message comes back marked as one, with the time it was
+// accepted, and its removal frees the total (#699).
+func chatbotShares(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	l := store.Limit{Count: 20, SenderCount: 2, ChatbotCount: 3}
+	bot := func(n int, id string) store.Message {
+		m := message(alice, id, t0)
+		m.Sender, m.Mode, m.Chatbot = fmt.Sprintf("sip:bot%d@botplatform.example.net", n), store.Standalone, true
+		return m
+	}
+	for _, m := range []store.Message{bot(1, "0001"), bot(1, "0002"), bot(2, "0003")} {
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatalf("%s = %v", m.ID, err)
+		}
+	}
+	if err := s.Enqueue(ctx, bot(2, "0004"), store.Limit{Count: 20, SenderCount: 2}); err != nil {
+		t.Fatalf("a fourth chatbot message without a total = %v", err)
+	}
+	for _, m := range []store.Message{bot(1, "0005"), bot(3, "0006")} {
+		if err := s.Enqueue(ctx, m, l); !errors.Is(err, store.ErrSenderShareFull) {
+			t.Fatalf("%s beyond a share or the total = %v", m.ID, err)
+		}
+	}
+	person := message(alice, "0007", t0)
+	person.Sender, person.Mode = bob, store.Standalone
+	if err := s.Enqueue(ctx, person, l); err != nil {
+		t.Fatalf("a person beside the full total = %v", err)
+	}
+	for _, id := range []string{"0003", "0004"} {
+		held, err := s.Claim(ctx, alice, id, "task-a", t0, t0.Add(time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !held.Chatbot || held.Anonymous || !held.Enqueued.Equal(t0) {
+			t.Fatalf("Claim = %+v", held)
+		}
+		if err := s.Remove(ctx, held, "task-a"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	anonymous := bot(3, "0008")
+	anonymous.Anonymous = true
+	if err := s.Enqueue(ctx, anonymous, l); err != nil {
+		t.Fatalf("after a removal = %v", err)
+	}
+	ms, err := s.Pending(ctx, alice, "0007", t0, 10)
+	if err != nil || len(ms) != 1 || !ms[0].Chatbot || !ms[0].Anonymous {
+		t.Fatalf("Pending = %+v, %v", ms, err)
+	}
+	if got, err := s.Claim(ctx, alice, "0007", "task-a", t0, t0.Add(time.Minute)); err != nil || got.Chatbot || got.Anonymous {
+		t.Fatalf("the person's message = %+v, %v", got, err)
 	}
 }
 

@@ -298,6 +298,39 @@ func TestASizeThatDriftedIsCorrectedWhenItRefuses(t *testing.T) {
 	}
 }
 
+// A chatbot's item is marked, and its total of chatbots' messages drifts
+// and is corrected like any size; a person's item is written as it was
+// before chatbots, which every task of a rolling update reads (#699).
+func TestChatbotItemsAreMarkedAndTheirTotalRecounted(t *testing.T) {
+	f := newFakeDynamo(t)
+	s := NewWithClient("messages", f)
+	ctx := context.Background()
+	l := store.Limit{Count: 10, SenderCount: 10, ChatbotCount: 2}
+	item := func(id string, bot bool) store.Message {
+		return store.Message{Recipient: "r", ID: id, Sender: "sip:b" + id + "@bot.example.net", Mode: store.Standalone, Chatbot: bot,
+			CPIM: content.BodyOf([]byte("x")), Enqueued: t0, Expires: t0.Add(time.Hour)}
+	}
+	for _, m := range []store.Message{item("0", false), item("1", true), item("2", true)} {
+		if err := s.Enqueue(ctx, m, l); err != nil {
+			t.Fatal(err)
+		}
+	}
+	person := f.rows["q#1#r\x000"]
+	if _, ok := person[attrChatbot]; ok {
+		t.Fatalf("a person's item = %v", person)
+	}
+	if _, ok := person[attrAnonymous]; ok || !flag(f.rows["q#1#r\x001"], attrChatbot) {
+		t.Fatal("items not marked as written")
+	}
+	delete(f.rows, "q#1#r\x001") // the TTL took it
+	if err := s.Enqueue(ctx, item("3", true), l); err != nil {
+		t.Fatalf("Enqueue after drift = %v", err)
+	}
+	if err := s.Enqueue(ctx, item("4", true), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("beyond the total = %v", err)
+	}
+}
+
 // The total of group notifications drifts like any size, and a refusal
 // for it corrects it the same way.
 func TestADriftedGroupNotificationTotalIsCorrected(t *testing.T) {

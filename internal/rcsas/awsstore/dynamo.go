@@ -61,6 +61,10 @@ const (
 	attrMarkCount    = "marks"
 	attrDateTime     = "datetime"
 	attrSummary      = "summary"
+	// attrChatbot and attrAnonymous are written only when true, so that a
+	// person's message is the item it was before chatbots (#699).
+	attrChatbot   = "chatbot"
+	attrAnonymous = "anonymous"
 	// The two fields of a seen entry: the token of the attempt that set
 	// it, and the status the notification reported.
 	attrMarkToken  = "t"
@@ -277,6 +281,9 @@ func (s *Store) Enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if m.InSummaryTotal() {
 		shares = append(shares, store.GroupSummaries)
 	}
+	if m.InChatbotTotal() {
+		shares = append(shares, store.ChatbotMessages)
+	}
 	fixed, cerr := s.recount(ctx, m.Recipient, shares...)
 	if cerr != nil || !fixed {
 		return err
@@ -319,6 +326,11 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		}
 		item[attrCPIM] = &types.AttributeValueMemberB{Value: cpim}
 	}
+	for name, v := range map[string]bool{attrChatbot: m.Chatbot, attrAnonymous: m.Anonymous} {
+		if v {
+			item[name] = &types.AttributeValueMemberBOOL{Value: true}
+		}
+	}
 	for name, v := range map[string]string{
 		attrConversation: m.Conversation, attrContribution: m.Contribution,
 		attrInReplyTo: m.InReplyTo, attrMessageID: m.MessageID, attrAuthor: m.Author,
@@ -344,6 +356,9 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	}
 	if m.InSummaryTotal() {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), 1, m.Size(), l.SummaryCount, l.SummaryBytes, ttl)})
+	}
+	if m.InChatbotTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.ChatbotMessages), 1, m.Size(), l.ChatbotCount, l.ChatbotBytes, ttl)})
 	}
 	if f := m.Fence; f != nil {
 		if s.groups == "" {
@@ -418,6 +433,9 @@ func sharesOf(item map[string]types.AttributeValue) []string {
 	if m.InSummaryTotal() {
 		out = append(out, store.GroupSummaries)
 	}
+	if m.InChatbotTotal() {
+		out = append(out, store.ChatbotMessages)
+	}
 	return out
 }
 
@@ -434,6 +452,7 @@ func projected(item map[string]types.AttributeValue) store.Message {
 	if b, ok := item[attrSummary].(*types.AttributeValueMemberBOOL); ok {
 		m.Summary = b.Value
 	}
+	m.Chatbot = flag(item, attrChatbot)
 	m.Mode = store.Mode(mode)
 	return m
 }
@@ -477,10 +496,10 @@ func (s *Store) recount(ctx context.Context, recipient string, shares ...string)
 		TableName:              aws.String(s.table),
 		ConsistentRead:         aws.Bool(true),
 		KeyConditionExpression: aws.String("#pk = :pk"),
-		ProjectionExpression:   aws.String("#sender, #author, #mode, #size, #notification, #summary"),
+		ProjectionExpression:   aws.String("#sender, #author, #mode, #size, #notification, #summary, #chatbot"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk": attrPK, "#sender": attrSender, "#author": attrAuthor, "#mode": attrMode, "#size": attrSize, "#notification": attrNotification,
-			"#summary": attrSummary,
+			"#summary": attrSummary, "#chatbot": attrChatbot,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(identityKey(queuePrefix, recipient))},
 	}
@@ -699,6 +718,9 @@ func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error
 	}
 	if m.InSummaryTotal() {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), -1, -m.Size(), 0, 0, time.Time{})})
+	}
+	if m.InChatbotTotal() {
+		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.ChatbotMessages), -1, -m.Size(), 0, 0, time.Time{})})
 	}
 	_, err := s.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{TransactItems: items})
 	if failed, ok := canceled(err); ok && len(failed) > 0 && failed[0] {
@@ -1067,6 +1089,12 @@ func queueRecipient(pk string) (string, bool) {
 	return recipient, true
 }
 
+// flag reads a BOOL attribute that is absent when false.
+func flag(item map[string]types.AttributeValue, name string) bool {
+	b, ok := item[name].(*types.AttributeValueMemberBOOL)
+	return ok && b.Value
+}
+
 func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) {
 	var m store.Message
 	var pk string
@@ -1094,6 +1122,7 @@ func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) 
 	if b, ok := item[attrSummary].(*types.AttributeValueMemberBOOL); ok {
 		m.Summary = b.Value
 	}
+	m.Chatbot, m.Anonymous = flag(item, attrChatbot), flag(item, attrAnonymous)
 	if b, ok := item[attrCPIM].(*types.AttributeValueMemberB); ok {
 		m.CPIM = content.BodyOf(b.Value)
 	} else if !m.Summary {

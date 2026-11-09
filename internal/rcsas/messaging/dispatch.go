@@ -518,6 +518,11 @@ const (
 	// taken: as done, but m could not be claimed: another task held it,
 	// it was gone, or the store failed.
 	taken
+	// held: m stays queued on no timer of its queue's, until it expires: a
+	// chatbot's message, until #702 brings the delivery check that alone
+	// may let one go (ADR 0009 §4 step 5). It says nothing about the
+	// messages after it.
+	held
 )
 
 // drain delivers recipient's queue, oldest first, until a message finds the
@@ -614,6 +619,9 @@ func (e *Engine) trySingles(ctx context.Context, ms []store.Message, waiting map
 // behind says older messages from m's sender wait for a chat leg: if one
 // is open now, m is not sent ahead of them (whole).
 func (e *Engine) deliver(ctx context.Context, m store.Message, behind bool) outcome {
+	if m.Chatbot {
+		return held
+	}
 	if m.Mode == store.Group {
 		return e.deliverGroup(ctx, m, behind)
 	}
@@ -1088,7 +1096,9 @@ func (e *Engine) release(m store.Message) {
 // before m is removed, so a failure in between repeats it rather than loses
 // it; its ID derives from m's, so the repeat is the same queue item.
 func (e *Engine) giveUp(m store.Message, metric string) bool {
-	if !m.Notification {
+	// A chatbot's negative notification goes through maap (#705), never
+	// into a queue of the chatbot's URI.
+	if !m.Notification && !m.Chatbot {
 		n, err := e.notification(m, failedDelivery, m.ID+"-f", e.clock.Now())
 		switch {
 		case err == nil:
