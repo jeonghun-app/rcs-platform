@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
@@ -114,8 +115,11 @@ type API struct {
 	// slots holds a token for each body being decoded (RCSAS_CHATBOT_DECODES).
 	slots                       chan struct{}
 	senders, subscribers, calls *messaging.Limiter
-	log                         *slog.Logger
-	metrics                     *runtime.Metrics
+	// bucketsMu makes a message's check of the sender's and the
+	// subscriber's buckets one step (backstop).
+	bucketsMu sync.Mutex
+	log       *slog.Logger
+	metrics   *runtime.Metrics
 }
 
 type acceptedToken struct {
@@ -376,9 +380,13 @@ func (a *API) parties(bot, botField, subscriber, subscriberField string) (string
 }
 
 // backstop takes a token from the sender's bucket and, for a message, from
-// the subscriber's. A request one bucket refuses takes none from the other,
-// as far as two buckets checked apart allow.
+// the subscriber's. A request one bucket refuses takes none from the other:
+// under bucketsMu nothing takes the subscriber's token between Would and
+// Allow, so a message the subscriber's bucket refuses never spends the
+// sender's (security review on #735).
 func (a *API) backstop(sender, subscriber string) *answer {
+	a.bucketsMu.Lock()
+	defer a.bucketsMu.Unlock()
 	now := a.cfg.Now()
 	ok := subscriber == "" || a.subscribers.Would(subscriber, now, 1)
 	ok = ok && a.senders.Allow(sender, now, 1)

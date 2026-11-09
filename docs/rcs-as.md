@@ -1294,8 +1294,10 @@ every check is handed to an acceptor, which answers 503 until #699
   `RCSAS_CHATBOT_API_RATE` (3,000 a minute), which counts every
   authenticated request with the switch on, refused later or not. Each
   burst is a sixth of its rate, rounded up (250, 20, 500), as §9 sets every
-  bucket; there is no burst setting, and a backstop cannot be turned off. A
-  message the subscriber's bucket refuses takes no token from the sender's.
+  bucket; there is no burst setting, and a backstop cannot be turned off:
+  `0` is refused, and so is a rate above 100 times its default. A message
+  the subscriber's bucket refuses takes no token from the sender's: one
+  lock holds the two buckets' checks together.
   A refusal is 429 with `Retry-After: 1`, which `maap` answers the chatbot
   as 503, and counts `chatbot.backstop_refused`, the alarm
   `RcsAsChatbotBackstopHit` (#684): usually a sign to add capacity.
@@ -1305,11 +1307,13 @@ every check is handed to an acceptor, which answers 503 until #699
   (400). The answer names the rule broken, never the value.
 - **Decode cap.** `chatbot.DecodeEnvelope` allocates about 8 bytes per input
   byte, and content validation up to about 30, so one message may take about
-  20 MB (#687). `RCSAS_CHATBOT_DECODES` (8) bounds the bodies a task decodes
+  27 MB: the worst case the security review on #735 measured, a rich card
+  of tens of thousands of short keys with every character a `\u` escape,
+  allocated 26.7 MB, decoding and content validation together. `RCSAS_CHATBOT_DECODES` (8) bounds the bodies a task decodes
   and validates at once; a request that finds no free slot is 503 with
   `Retry-After: 1` at once, before its body is read, and counts
-  `chatbot.api.decode_busy`. **Memory rule:** `RCSAS_CHATBOT_DECODES` × 20 MB
-  stays under half the task's memory limit (8 × 20 MB = 160 MB by default);
+  `chatbot.api.decode_busy`. **Memory rule:** `RCSAS_CHATBOT_DECODES` × 27 MB
+  stays under half the task's memory limit (8 × 27 MB = 216 MB by default);
   #684 and #694 size the task by it. A request holding a slot must send its
   body at 256 KiB/s or faster: it gets 1 s plus 1 s per 256 KiB of its limit
   (6.8 s for a message, 1.03 s for a notification), after which it is 408
@@ -1382,11 +1386,13 @@ unset, there are no chatbots (see the table). The `RCSAS_` settings:
 | `RCS_CHATBOT_DOMAIN` | none | Shared with every service: the host of chatbot URIs, read by `chatbot.LoadDomain`, which refuses one that is not a lower-case host name or is `RCS_IMS_DOMAIN`. Unset, there are no chatbots and `RCSAS_CHATBOTS` stays off |
 | `RCSAS_CHATBOTS` | `off` | The chatbot path (ADR 0009 §12), `on` or `off`; on only with `RCS_CHATBOT_DOMAIN` set ([Chatbot API](#chatbot-api)) |
 | `RCSAS_CHATBOT_LISTEN_ADDR` | `:8081` | The chatbot API's listener (TCP), which only `maap` reaches; it serves with the switch off too. Port 0 is refused: `maap` reaches a fixed port |
-| `RCSAS_CHATBOT_SENDER_RATE`, `RCSAS_CHATBOT_SUBSCRIBER_RATE`, `RCSAS_CHATBOT_API_RATE` | `1500`, `120`, `3000` | The chatbot API's backstops per task, a minute: each chatbot sender, one subscriber from all chatbot senders, the whole API. The burst is a sixth, rounded up; none can be turned off |
-| `RCSAS_CHATBOT_DECODES` | `8` | Chatbot API bodies a task decodes and validates at once, about 20 MB each; × 20 MB must stay under half the task's memory limit ([Chatbot API](#chatbot-api)) |
+| `RCSAS_CHATBOT_SENDER_RATE`, `RCSAS_CHATBOT_SUBSCRIBER_RATE`, `RCSAS_CHATBOT_API_RATE` | `1500`, `120`, `3000` | The chatbot API's backstops per task, a minute: each chatbot sender, one subscriber from all chatbot senders, the whole API. The burst is a sixth, rounded up; none can be turned off: `0`, and a rate above 100 times the default, are refused |
+| `RCSAS_CHATBOT_DECODES` | `8` | Chatbot API bodies a task decodes and validates at once, about 27 MB each at worst; × 27 MB must stay under half the task's memory limit ([Chatbot API](#chatbot-api)) |
 | `RCSAS_MAAP_TOKEN`, `RCSAS_MAAP_TOKEN_NEXT` | none | `maap`'s current and next bearer token. The current one is required with the switch on; each holds 256 bits in staging and prod |
 
-A rate of `0` turns that limit off.
+A rate of `0` turns that limit off, except the chatbot API's backstops
+(`RCSAS_CHATBOT_*_RATE`), which refuse it, and a rate above 100 times their
+default.
 
 Durations use Go syntax (`168h`, not `7d`).
 

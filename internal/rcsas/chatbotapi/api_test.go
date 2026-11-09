@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -526,6 +527,36 @@ func TestTheSubscribersBucketCountsAcceptedMessagesOnly(t *testing.T) {
 	} {
 		if status := e.post(t, c.path, c.body); status != c.want {
 			t.Fatalf("request %d: %d, want %d", i, status, c.want)
+		}
+	}
+}
+
+// Under concurrent messages to one subscriber, the ones its bucket refuses
+// spend nothing of the sender's: with a sender burst of 2 and a subscriber
+// burst of 1, one message passes and the sender still has a token left.
+func TestConcurrentRefusalsLeaveTheSendersBucketAlone(t *testing.T) {
+	h := runtimetest.New(t, "rcs-as")
+	cfg := Config{
+		SenderRate: messaging.Rate{PerMinute: 60, Burst: 2}, SubscriberRate: messaging.Rate{PerMinute: 60, Burst: 1},
+		Now: func() time.Time { return runtimetest.Start },
+	}
+	for round := range 200 {
+		a := New(cfg, nil, h.Runtime.Logger, h.Runtime.Metrics)
+		start := make(chan struct{})
+		var passed atomic.Int32
+		var wg sync.WaitGroup
+		for range 16 {
+			wg.Go(func() {
+				<-start
+				if a.backstop(testBot, testSub) == nil {
+					passed.Add(1)
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+		if n := passed.Load(); n != 1 || a.backstop(testBot, "tel:+15550100002") != nil {
+			t.Fatalf("round %d: %d passed, or the sender's bucket was spent by refusals", round, n)
 		}
 	}
 }

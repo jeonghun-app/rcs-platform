@@ -128,6 +128,9 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		"chatbot listen":     {with(devEnv, "RCSAS_CHATBOT_LISTEN_ADDR", ":0"), "RCSAS_CHATBOT_LISTEN_ADDR"},
 		"zero decodes":       {with(devEnv, "RCSAS_CHATBOT_DECODES", "0"), "RCSAS_CHATBOT_DECODES"},
 		"zero backstop":      {with(devEnv, "RCSAS_CHATBOT_API_RATE", "0"), "RCSAS_CHATBOT_API_RATE"},
+		"sender rate high":   {with(devEnv, "RCSAS_CHATBOT_SENDER_RATE", "150001"), "RCSAS_CHATBOT_SENDER_RATE"},
+		"subscriber high":    {with(devEnv, "RCSAS_CHATBOT_SUBSCRIBER_RATE", "12001"), "RCSAS_CHATBOT_SUBSCRIBER_RATE"},
+		"api rate high":      {with(devEnv, "RCSAS_CHATBOT_API_RATE", "300001"), "RCSAS_CHATBOT_API_RATE"},
 		"token with newline": {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token\n"), "RCSAS_MAAP_TOKEN"},
 		"token with a space": {with(devEnv, "RCSAS_MAAP_TOKEN", "maap token"), "RCSAS_MAAP_TOKEN"},
 		"next with DEL":      {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-next\x7f"), "RCSAS_MAAP_TOKEN_NEXT"},
@@ -396,5 +399,15 @@ func TestProductionRefusesAWeakMaapToken(t *testing.T) {
 		if got != c.refused {
 			t.Errorf("current %d, next %d bytes: refused %q, want %q:\n%s", len(c.current), len(c.next), got, c.refused, out.String())
 		}
+	}
+}
+
+// A backstop may be raised to 100 times its default and no further.
+func TestABackstopTakesUpTo100TimesItsDefault(t *testing.T) {
+	c, err := configure(with(devEnv, "RCSAS_CHATBOT_SENDER_RATE", "150000", "RCSAS_CHATBOT_SUBSCRIBER_RATE", "12000",
+		"RCSAS_CHATBOT_API_RATE", "300000"))
+	if err != nil || c.Chatbots.SenderRate.PerMinute != 150000 || c.Chatbots.SubscriberRate.PerMinute != 12000 ||
+		c.Chatbots.APIRate != (messaging.Rate{PerMinute: 300000, Burst: 50000}) {
+		t.Fatalf("%+v, %v", c.Chatbots, err)
 	}
 }

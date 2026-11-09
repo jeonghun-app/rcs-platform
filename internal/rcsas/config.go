@@ -53,6 +53,9 @@ const (
 	DefaultChatbotSenderRate     = 1500
 	DefaultChatbotSubscriberRate = 120
 	DefaultChatbotAPIRate        = 3000
+	// maxBackstopFactor bounds each backstop at that many times its
+	// default.
+	maxBackstopFactor = 100
 )
 
 // MinTokenLength is the shortest maap token accepted in staging and prod:
@@ -368,10 +371,15 @@ func configureChatbots(s *runtime.Settings, c *Config) {
 
 // backstopRate reads a backstop as a rate a minute, with a burst of a
 // sixth of it, rounded up, as ADR 0009 §9 sets every bucket (1,500 and 250,
-// 120 and 20, 3,000 and 500). A backstop cannot be turned off.
+// 120 and 20, 3,000 and 500). A backstop cannot be turned off, by 0 or by a
+// rate so high that it holds nothing: at most maxBackstopFactor times the
+// default (lead decision on #735).
 func backstopRate(e *runtime.Env, name string, def int) messaging.Rate {
 	n := e.Int(name, def)
 	positive(e, name, n)
+	if n > maxBackstopFactor*def {
+		e.Invalid(name, "above "+strconv.Itoa(maxBackstopFactor*def)+", "+strconv.Itoa(maxBackstopFactor)+" times its default")
+	}
 	return messaging.Rate{PerMinute: n, Burst: (n + 5) / 6}
 }
 
