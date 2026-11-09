@@ -60,36 +60,60 @@ func (c Credentials) Issue(ctx context.Context, cred store.Credential) error {
 	keyItem[attrDigest] = &types.AttributeValueMemberB{Value: cred.Digest[:]}
 	keyItem[attrCreated], keyItem[attrWriter] = num(cred.Created.Unix()), str(writer)
 	absent, names := aws.String("attribute_not_exists(#pk)"), map[string]string{"#pk": attrPK}
-	for slot, attempts := 1, 0; slot <= store.MaxCredentials; attempts++ {
+	// stale is the key ID a slot names whose key item is gone: the issue
+	// takes the slot over, on the condition that it still names it.
+	for slot, attempts, stale := 1, 0, ""; slot <= store.MaxCredentials; attempts++ {
 		slotItem := slotKey(cred.Chatbot, slot)
 		slotItem[attrKey], slotItem[attrWriter] = str(cred.KeyID), str(writer)
+		take := &types.Put{
+			TableName: aws.String(c.r.table), Item: slotItem, ConditionExpression: absent, ExpressionAttributeNames: names,
+			ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+		}
+		items := []types.TransactWriteItem{
+			{ConditionCheck: &types.ConditionCheck{
+				TableName: aws.String(c.r.table), Key: chatbotKey(cred.Chatbot),
+				ConditionExpression:       aws.String("#reg = :reg"),
+				ExpressionAttributeNames:  map[string]string{"#reg": attrRegistration},
+				ExpressionAttributeValues: map[string]types.AttributeValue{":reg": str(cred.Registration)},
+			}},
+			{Put: take},
+			{Put: &types.Put{TableName: aws.String(c.r.table), Item: keyItem, ConditionExpression: absent, ExpressionAttributeNames: names}},
+		}
+		if stale != "" {
+			take.ConditionExpression = aws.String("attribute_not_exists(#pk) OR #key = :stale")
+			take.ExpressionAttributeNames = map[string]string{"#pk": attrPK, "#key": attrKey}
+			take.ExpressionAttributeValues = map[string]types.AttributeValue{":stale": str(stale)}
+			items = append(items, types.TransactWriteItem{ConditionCheck: &types.ConditionCheck{
+				TableName: aws.String(c.r.table), Key: keyKey(stale), ConditionExpression: absent, ExpressionAttributeNames: names,
+			}})
+		}
 		_, err := c.r.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-			ClientRequestToken: aws.String(rand.Text()),
-			TransactItems: []types.TransactWriteItem{
-				{ConditionCheck: &types.ConditionCheck{
-					TableName: aws.String(c.r.table), Key: chatbotKey(cred.Chatbot),
-					ConditionExpression:       aws.String("#reg = :reg"),
-					ExpressionAttributeNames:  map[string]string{"#reg": attrRegistration},
-					ExpressionAttributeValues: map[string]types.AttributeValue{":reg": str(cred.Registration)},
-				}},
-				{Put: &types.Put{
-					TableName: aws.String(c.r.table), Item: slotItem, ConditionExpression: absent, ExpressionAttributeNames: names,
-					ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
-				}},
-				{Put: &types.Put{TableName: aws.String(c.r.table), Item: keyItem, ConditionExpression: absent, ExpressionAttributeNames: names}},
-			},
+			ClientRequestToken: aws.String(rand.Text()), TransactItems: items,
 		})
 		reasons := cancelled(err)
 		switch {
-		case len(reasons) == 3 && failed(reasons[0]):
+		case len(reasons) >= 3 && failed(reasons[0]):
 			// No record, a tombstone, or (never, as IDs are not used
 			// again) another registration.
 			return fmt.Errorf("awsstore: issue credential: %w", store.ErrNotFound)
-		case len(reasons) == 3 && failed(reasons[1]) && sv(reasons[1].Item[attrWriter]) == writer:
+		case len(reasons) >= 3 && failed(reasons[1]) && sv(reasons[1].Item[attrWriter]) == writer:
 			return nil // the SDK sent again an issue that had taken effect
-		case len(reasons) == 3 && failed(reasons[1]):
-			slot++
-		case len(reasons) == 3 && failed(reasons[2]):
+		case len(reasons) >= 3 && failed(reasons[1]):
+			held := sv(reasons[1].Item[attrKey])
+			if held != stale && store.ValidKeyID(held) {
+				gone, err := c.r.keyGone(ctx, held)
+				if err != nil {
+					return err
+				}
+				if gone {
+					stale = held
+					continue
+				}
+			}
+			slot, stale = slot+1, ""
+		case len(reasons) == 4 && failed(reasons[3]):
+			slot, stale = slot+1, ""
+		case len(reasons) >= 3 && failed(reasons[2]):
 			return fmt.Errorf("%w: the key ID is taken", store.ErrInvalid)
 		case raced(err) && attempts < conflictAttempts-1:
 			// Another write on the record or the slot: the same slot again.
@@ -154,23 +178,61 @@ func (c Credentials) ChatbotCredentials(ctx context.Context, chatbotID string) (
 	return creds, err
 }
 
-// Revoke implements store.Credentials: the key item first, which ends
-// every lookup at once, then the slot, each on the condition that it is
-// still this credential's.
+// Revoke implements store.Credentials. It reads the key item's chatbot
+// only, so a damaged credential can be revoked too, then deletes every slot
+// of the chatbot naming the key ID with its key item. A slot whose key item
+// is gone is deleted too, and the answer is nil, so a revoke can always
+// finish; ErrNotFound only when neither is there.
 func (c Credentials) Revoke(ctx context.Context, chatbotID, keyID string) error {
-	cred, err := c.Credential(ctx, keyID)
-	if err != nil || cred.Chatbot != chatbotID {
-		if err == nil || errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("awsstore: revoke credential: %w", store.ErrNotFound)
-		}
-		return err
+	notFound := fmt.Errorf("awsstore: revoke credential: %w", store.ErrNotFound)
+	if !store.ValidKeyID(keyID) {
+		return notFound
 	}
-	return c.r.eachItem(ctx, chatbotID, skSlot, func(slot map[string]types.AttributeValue) error {
+	out, err := c.r.api.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(c.r.table), Key: keyKey(keyID), ConsistentRead: aws.Bool(true),
+		ProjectionExpression: aws.String("#chatbot"), ExpressionAttributeNames: map[string]string{"#chatbot": attrChatbot},
+	})
+	if err != nil {
+		return sanitize("revoke credential", err)
+	}
+	if len(out.Item) != 0 && sv(out.Item[attrChatbot]) != chatbotID {
+		return notFound
+	}
+	found := false
+	err = c.r.eachItem(ctx, chatbotID, skSlot, func(slot map[string]types.AttributeValue) error {
 		if sv(slot[attrKey]) != keyID {
 			return nil
 		}
+		found = true
 		return c.r.deleteSlot(ctx, chatbotID, slot)
 	})
+	switch {
+	case err != nil:
+		return err
+	case found:
+		return nil
+	case len(out.Item) != 0:
+		// A key item without a slot, which no write leaves, still
+		// authenticates: it goes all the same.
+		_, err := c.r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(c.r.table), Key: keyKey(keyID)})
+		if err != nil {
+			return sanitize("revoke credential", err)
+		}
+		return nil
+	}
+	return notFound
+}
+
+// keyGone reports whether the key item of keyID is absent.
+func (r *Registry) keyGone(ctx context.Context, keyID string) (bool, error) {
+	out, err := r.api.GetItem(ctx, &dynamodb.GetItemInput{
+		TableName: aws.String(r.table), Key: keyKey(keyID), ConsistentRead: aws.Bool(true),
+		ProjectionExpression: aws.String("#pk"), ExpressionAttributeNames: map[string]string{"#pk": attrPK},
+	})
+	if err != nil {
+		return false, sanitize("issue credential", err)
+	}
+	return len(out.Item) == 0, nil
 }
 
 // Used implements store.Credentials.
@@ -201,41 +263,50 @@ func (c Credentials) DeleteChatbot(ctx context.Context, chatbotID string) error 
 	})
 }
 
-// deleteSlot deletes a credential: its key item, unless another chatbot's
-// (never, as key IDs are random), then the slot, unless it names another
-// key meanwhile. A slot without a key ID is deleted as it is.
+// deleteSlot deletes a credential: its key item and its slot in one
+// transaction (#744 review: two steps could leave a slot naming no key),
+// on the conditions that the key item is not another chatbot's (never, as
+// key IDs are random) and that the slot still names the key ID. A slot
+// without a key ID is deleted as it is.
 func (r *Registry) deleteSlot(ctx context.Context, chatbotID string, slot map[string]types.AttributeValue) error {
-	keyID := sv(slot[attrKey])
+	keyID, slotKey := sv(slot[attrKey]), key(sv(slot[attrPK]), sv(slot[attrSK]))
 	if keyID == "" {
-		_, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(r.table), Key: key(sv(slot[attrPK]), sv(slot[attrSK]))})
-		if err != nil {
+		if _, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(r.table), Key: slotKey}); err != nil {
 			return sanitize("delete chatbot", err)
 		}
 		return nil
 	}
-	if store.ValidKeyID(keyID) {
-		_, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-			TableName: aws.String(r.table), Key: keyKey(keyID),
-			ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #chatbot = :id"),
-			ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#chatbot": attrChatbot},
-			ExpressionAttributeValues: map[string]types.AttributeValue{":id": str(chatbotID)},
+	for attempt := 0; ; attempt++ {
+		_, err := r.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+			ClientRequestToken: aws.String(rand.Text()),
+			TransactItems: []types.TransactWriteItem{
+				{Delete: &types.Delete{
+					TableName: aws.String(r.table), Key: keyKey(keyID),
+					ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #chatbot = :id"),
+					ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#chatbot": attrChatbot},
+					ExpressionAttributeValues: map[string]types.AttributeValue{":id": str(chatbotID)},
+				}},
+				{Delete: &types.Delete{
+					TableName: aws.String(r.table), Key: slotKey,
+					ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #key = :key"),
+					ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#key": attrKey},
+					ExpressionAttributeValues: map[string]types.AttributeValue{":key": str(keyID)},
+				}},
+			},
 		})
-		var ccf *types.ConditionalCheckFailedException
-		if err != nil && !errors.As(err, &ccf) {
+		switch reasons := cancelled(err); {
+		case len(reasons) == 2 && failed(reasons[0]):
+			return fmt.Errorf("%w: a key item of another chatbot", store.ErrInvalid)
+		case len(reasons) == 2 && failed(reasons[1]):
+			// The slot names another key since: this one went with its slot.
+			return nil
+		case raced(err) && attempt < conflictAttempts-1:
+			continue
+		case err != nil:
 			return sanitize("delete credential", err)
 		}
+		return nil
 	}
-	_, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
-		TableName: aws.String(r.table), Key: key(sv(slot[attrPK]), sv(slot[attrSK])),
-		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #key = :key"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#key": attrKey},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":key": str(keyID)},
-	})
-	var ccf *types.ConditionalCheckFailedException
-	if err != nil && !errors.As(err, &ccf) {
-		return sanitize("delete credential", err)
-	}
-	return nil
 }
 
 // eachItem calls f on each item of the chatbot's partition whose sort key

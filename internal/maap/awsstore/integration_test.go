@@ -249,3 +249,73 @@ func TestIntegrationADeletionThatMeetsAnUpdateStillDeletesEverything(t *testing.
 	deleted()
 	deleted()
 }
+
+// failTx fails the first transaction it is sent, as a 5xx past the SDK's
+// retries or a cancelled request would.
+type failTx struct {
+	DynamoAPI
+	failed bool
+}
+
+func (f *failTx) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	if !f.failed {
+		f.failed = true
+		return nil, context.Canceled
+	}
+	return f.DynamoAPI.TransactWriteItems(ctx, in, o...)
+}
+
+// The #744 review: a revoke that failed, or a slot the earlier two-step
+// revoke left naming a key item that is gone, never keeps a chatbot from
+// its two credentials.
+func TestIntegrationAHalfDoneRevokeNeverHoldsASlot(t *testing.T) {
+	ddb, table := registryTable(t)
+	ctx := t.Context()
+	cs := NewRegistry(ddb, table).Credentials()
+	c, err := NewRegistry(ddb, table).Register(ctx, storetest.Chatbot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds := []store.Credential{storetest.Credential(c, time.Unix(1, 0)), storetest.Credential(c, time.Unix(2, 0))}
+	issue := func(want error) {
+		t.Helper()
+		cred := storetest.Credential(c, time.Unix(3, 0))
+		if err := cs.Issue(ctx, cred); !errors.Is(err, want) || (err == nil) != (want == nil) {
+			t.Fatalf("Issue = %v, want %v", err, want)
+		}
+		creds = append(creds, cred)
+	}
+	for _, cred := range creds {
+		if err := cs.Issue(ctx, cred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := NewRegistry(&failTx{DynamoAPI: ddb}, table).Credentials().Revoke(ctx, c.ID, creds[0].KeyID); err == nil {
+		t.Fatal("the failed revoke succeeded")
+	}
+	if err := cs.Revoke(ctx, c.ID, creds[0].KeyID); err != nil {
+		t.Fatalf("Revoke again = %v", err)
+	}
+	issue(nil)
+	issue(store.ErrTooMany)
+	// Both key items gone behind their slots' backs: the next issue takes
+	// a slot over (slot 1, creds[2]'s), and a revoke of the other key ID
+	// (creds[1], slot 2) clears its slot and succeeds.
+	for _, cred := range creds[1:3] {
+		if _, err := ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(table), Key: keyKey(cred.KeyID)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	issue(nil)
+	if err := cs.Revoke(ctx, c.ID, creds[1].KeyID); err != nil {
+		t.Fatalf("Revoke of a slot without its key item = %v", err)
+	}
+	if err := cs.Revoke(ctx, c.ID, creds[1].KeyID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Revoke of nothing = %v", err)
+	}
+	issue(nil)
+	issue(store.ErrTooMany)
+	if got, err := cs.ChatbotCredentials(ctx, c.ID); len(got) != store.MaxCredentials || err != nil {
+		t.Fatalf("%d live, %v", len(got), err)
+	}
+}
