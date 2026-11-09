@@ -50,7 +50,7 @@ func TestRcsAsCountsItsMSRPPanics(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := deps{}
+	d := deps{chatbot: listenLocal(t)}
 	cfg.Messaging.MSRPPort, d.msrp = ml.Addr().(*net.TCPAddr).Port, &panicOnceListener{Listener: ml}
 	h := runtimetest.New(t, "rcs-as")
 	ctx, cancel := context.WithCancel(context.Background())
