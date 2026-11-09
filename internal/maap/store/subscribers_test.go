@@ -25,6 +25,10 @@ func TestOnlyTheOneFormOfAnAliasIDOrSubscriberIsValid(t *testing.T) {
 		{id + "a", false},
 		{id[1:] + "1", false},
 		{id[1:] + "=", false},
+		// 128 bits end in one of a, e, i, m, q, u, y, 4 only.
+		{id[:25] + "4", true},
+		{id[:25] + "b", false},
+		{id[:25] + "7", false},
 		{"", false},
 	} {
 		if got := store.ValidAliasID(tc.id); got != tc.want {

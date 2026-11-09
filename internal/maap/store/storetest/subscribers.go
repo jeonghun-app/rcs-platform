@@ -187,6 +187,15 @@ func aliasExpires(t *testing.T, s store.Subscribers) {
 	if !resolves(t, s, old, last.Add(time.Second)) || resolves(t, s, old, used.Add(store.AliasLifetime)) {
 		t.Fatal("the use did not move the expiry to 180 days after it")
 	}
+	// A use written after the expiry, by a late or slow writer, does not
+	// bring the alias back.
+	late := used.Add(store.AliasLifetime + time.Hour)
+	if err := s.Used(ctx, old, late); err != nil {
+		t.Fatal(err)
+	}
+	if resolves(t, s, old, late) || !resolves(t, s, old, used) {
+		t.Fatal("a use after the expiry changed the alias")
+	}
 	// Past it, a new alias replaces the old, which never resolves again.
 	now := used.Add(store.AliasLifetime)
 	fresh := alias(t, s, Alias(old.Chatbot, Subscriber, true, now))

@@ -264,10 +264,15 @@ sends; nothing calls it yet):
 | no MSISDN permission | its alias | its anonymous alias |
 | the MSISDN permission | the number, `tel:+<E.164>` | its anonymous alias |
 
+Granting the MSISDN permission to a chatbot that had aliases lets it link
+the normal alias of each subscriber who writes again to the number; the
+anonymous alias stays apart. Grant it knowing that.
+
 - **Alias ID.** 128 bits from `crypto/rand` in base32 (RFC 4648), lower
   case, without padding: 26 characters (the lead's decision on #711, the
-  form `internal/pii` masks, #714). An alias ID in another case or of
-  another length is refused before any read, with a message that names
+  form `internal/pii` masks, #714), whose last character can only be one
+  of `a e i m q u y 4`. An alias ID in another case, of another length or
+  with another last character is refused before any read, with a message that names
   the rule and never the value (#683 and #712 answer it 400), and is never
   logged: `pii.Redact` masks an ID written in one case only (#721).
 - **Nothing shared.** One subscriber has one alias per chatbot and kind of
@@ -279,8 +284,13 @@ sends; nothing calls it yet):
   caller (#683, #712) passes the chatbot ID. It is stored by a
   conditional write, so of two tasks that store one at once, one alias
   wins and both get it.
-- **Retention.** An alias unused for 180 days expires: it no longer
-  resolves, and the subscriber's next message gets a new one. Expiry is
+- **Retention.** An alias the subscriber has not used for 180 days
+  expires: it no longer resolves, and the subscriber's next message gets a
+  new one. Only the subscriber's messages are uses; a chatbot's sends to
+  the alias are not, or a chatbot alone could keep a number's alias past
+  180 days (#752 review). A reply needs a message of the subscriber in the
+  last 24 hours (ADR 0009 §9), so no conversation outlives its alias. A use
+  written after the expiry, by a slow writer, never brings an alias back. Expiry is
   judged by comparing times at each read, never by the item's presence,
   since DynamoDB's TTL deletes late. A task writes an alias's last use at
   most hourly, off the request's path (its own context, 5 s); a write that

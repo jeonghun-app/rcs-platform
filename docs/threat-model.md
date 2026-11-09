@@ -529,14 +529,16 @@ Webhook deliveries are signed with Ed25519 over the audience, timestamp,
 delivery ID and body. Events carry a minimal set of fields, never SIP, CPIM or
 IMDN text. By default a chatbot sees a random per-chatbot alias. It sees the
 MSISDN only with the operator's permission, and a client's request for
-privacy always gets the alias. Retention is bounded, recycled numbers are
+privacy always gets the alias. Retention is bounded: an alias expires 180
+days after the subscriber's last message to the chatbot, and the chatbot's
+own sends never extend it (#711). Recycled numbers are
 dropped through the operator API, and logs and metrics follow T8 for aliases
 too.
 **Residual risk:** aliases, conversations and blocks are keyed by the
 subscriber's tel URI, not the HSS subscription. If the recycling step is
 skipped, a number reassigned within 180 days of its last use with a chatbot
 inherits the alias, and keeps it for as long as the new holder goes on
-using it. The anonymous alias is distinct from the normal one, but stays
+writing to that chatbot. The anonymous alias is distinct from the normal one, but stays
 the same across one subscriber's anonymous conversations with a chatbot. A
 client that did not ask for privacy is shown `tk=off` while the chatbot sees
 an alias. A chatbot allowed the MSISDN may misuse it outside the platform. A

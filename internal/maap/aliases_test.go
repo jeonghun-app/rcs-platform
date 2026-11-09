@@ -190,9 +190,9 @@ func TestRememberedUsesAreDroppedOnceAnHourOld(t *testing.T) {
 	}
 }
 
-// A chatbot's sends to an alias are its uses too, not only the
-// subscriber's messages.
-func TestAResolveRecordsTheAliasUse(t *testing.T) {
+// A chatbot's sends to an alias are no use of it (#752 security review):
+// only the subscriber's messages keep an alias alive.
+func TestAResolveRecordsNoUse(t *testing.T) {
 	a, subs, c, _ := newTestAliases(t)
 	ctx := context.Background()
 	if _, err := a.identifier(ctx, store.Chatbot{ID: "cb-1"}, storetest.Subscriber, false); err != nil {
@@ -203,7 +203,31 @@ func TestAResolveRecordsTheAliasUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.writes.Wait()
-	if len(subs.uses) != 1 || !subs.uses[0].Equal(c.t) {
+	if len(subs.uses) != 0 {
 		t.Fatalf("use writes %v", subs.uses)
+	}
+}
+
+// A chatbot that resolves an alias every 179 days, with no message from the
+// subscriber, cannot hold it past 180 days from the subscriber's last use.
+func TestAnAliasResolvedEvery179DaysStillExpiresAt180(t *testing.T) {
+	a, _, c, _ := newTestAliases(t)
+	ctx := context.Background()
+	uri, err := a.identifier(ctx, store.Chatbot{ID: "cb-1"}, storetest.Subscriber, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := c.t
+	c.t = created.Add(179 * 24 * time.Hour)
+	if _, err := a.resolve(ctx, "cb-1", strings.Repeat("a", 26)); err != nil {
+		t.Fatalf("resolve on day 179 = %v", err)
+	}
+	a.writes.Wait()
+	c.t = created.Add(store.AliasLifetime)
+	if _, err := a.resolve(ctx, "cb-1", strings.Repeat("a", 26)); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("resolve on day 180 = %v", err)
+	}
+	if again, err := a.identifier(ctx, store.Chatbot{ID: "cb-1"}, storetest.Subscriber, false); err != nil || again == uri {
+		t.Fatalf("the subscriber's next message got %q, %v", again, err)
 	}
 }
