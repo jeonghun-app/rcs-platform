@@ -601,8 +601,8 @@ func listenLocal(t *testing.T) net.Listener {
 }
 
 // Run serves the chatbot API on a listener of its own: maap's token is
-// checked, and a message that decodes meets the acceptor, which answers 503
-// until #699 brings its own.
+// checked, and a message that passes every check meets the acceptor, which
+// answers 503 until #699 brings its own.
 func TestRunServesTheChatbotAPIOnItsOwnListener(t *testing.T) {
 	cfg, err := configure(with(devEnv, "RCS_CHATBOT_DOMAIN", "botplatform.mnc001.mcc001.3gppnetwork.org",
 		"RCSAS_CHATBOTS", "on", "RCSAS_MAAP_TOKEN", "maap-token"))

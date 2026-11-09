@@ -10,8 +10,9 @@ info:
     §7). The listener is apart from SIP and admin, inside the VPC only; its
     address and token settings are in docs/rcs-as.md. The token is checked
     first, then the path (404) and the method (405), then RCSAS_CHATBOTS
-    (503), then the decode cap (503, before the body is read), then the
-    body. Every error answer closes the connection.
+    (503), the API backstop (429), the decode cap (503, before the body is
+    read), the body, and then the rules of each operation in the order of
+    docs/rcs-as.md. Every error answer closes the connection.
 
     Bodies are strict JSON (ADR 0009 §9): UTF-8, one value, at most 4 deep,
     arrays of at most 8, every string bounded as below; unknown fields,
@@ -45,12 +46,12 @@ paths:
             schema: { $ref: "#/components/schemas/BotMessage" }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
-        "400": { description: "The body breaks a rule above, or `recipient` is not a canonical tel URI.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "The body breaks a rule above, `recipient` is neither a canonical tel URI nor in the chatbot range, or the content breaks ADR 0009 §5.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { description: "`sender` is outside the chatbot range, or `recipient` inside it.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { description: "`sender` is at RCS_CHATBOT_DOMAIN but not in normal form (ADR 0009 §2).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { description: "The body is larger than 1,496 KiB.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "415": { description: "The request is not application/json, or `content_type` is not on the chatbot content types.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "415": { description: "The request is not application/json, `content_type` is not on the chatbot content types, or there is a `chip_list` and no chip-list type is configured.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "429": { $ref: "#/components/responses/Backstop" }
         "503": { $ref: "#/components/responses/Unavailable" }
   /v1/chatbot/notifications:
@@ -68,10 +69,10 @@ paths:
             schema: { $ref: "#/components/schemas/BotNotification" }
       responses:
         "202": { $ref: "#/components/responses/Accepted" }
-        "400": { description: The body breaks a rule above., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "400": { description: "The body breaks a rule above, or `subscriber` is neither a canonical tel URI nor in the chatbot range.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthenticated" }
         "403": { description: "`chatbot` is outside the chatbot range, or `subscriber` inside it.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
-        "404": { description: "No message with `message_id` from `subscriber` went to `chatbot` within RCSAS_SENT_TTL (T10).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "404": { description: "`chatbot` is at RCS_CHATBOT_DOMAIN but not in normal form (ADR 0009 §2), or no message with `message_id` from `subscriber` went to `chatbot` within RCSAS_SENT_TTL (T10).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { description: The body is larger than 8 KiB., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "415": { description: The request is not application/json., content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "429": { $ref: "#/components/responses/Backstop" }
@@ -127,7 +128,7 @@ components:
       description: No bearer token, or not one of maap's (`WWW-Authenticate`).
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Backstop:
-      description: Over a backstop of ADR 0009 §9 (a chatbot sender, one subscriber, or the whole API), with `Retry-After`.
+      description: "Over a backstop of ADR 0009 §9 (a chatbot sender, one subscriber for messages, or the whole API), with `Retry-After: 1`."
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Unavailable:
       description: "RCSAS_CHATBOTS is off, RCSAS_CHATBOT_DECODES bodies are being decoded, or the store failed, with `Retry-After`."

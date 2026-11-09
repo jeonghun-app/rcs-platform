@@ -11,9 +11,8 @@ focus (sessions, the conference event package and REFER) are served. The core
 is driven through interfaces so
 that it can be built and tested first.
 
-Chatbots (ADR 0009) are served in part: the chatbot API's listener, token,
-switch and strict bodies ([Chatbot API](#chatbot-api), #698), with nothing
-yet behind it.
+Chatbots (ADR 0009) are served in part: the chatbot API with its checks
+([Chatbot API](#chatbot-api), #698), with nothing yet behind it.
 
 The code:
 
@@ -1232,11 +1231,10 @@ change and notifying it leaves exactly such a gap.
 §12), specified in [api/rcs-as.yaml](api/rcs-as.yaml) with its scope in
 [api/rcs-as-scopes.md](api/rcs-as-scopes.md). `maap` faces the internet and
 the core does not trust it ([threat model](threat-model.md) T4), so this is
-where whatever it asks is bounded. #698 builds the API in three steps. The
-first two serve the listener, the token, the switch and strict bodies; the
-scope refusals and the backstops come with the third. A request that passes
-is handed to an acceptor, which answers 503 until #699 (messages) and #706
-(notifications) bring theirs.
+where whatever it asks is bounded (#698): a compromised `maap` can speak for
+chatbots only, to subscribers only, and only so fast. A request that passes
+every check is handed to an acceptor, which answers 503 until #699
+(messages) and #706 (notifications) bring theirs.
 
 - **Listener.** `RCSAS_CHATBOT_LISTEN_ADDR` (`:8081`), plain HTTP inside the
   VPC, apart from the SIP listener and the admin port; only `maap` reaches it
@@ -1261,9 +1259,46 @@ is handed to an acceptor, which answers 503 until #699 (messages) and #706
   `RCSAS_MAAP_TOKEN` and clear the next one. The audit line tells which of
   the two a request used.
 - **Order of checks:** token (401) → path (404; a method other than POST is
-  405) → switch (503) → decode cap (503) → body (415, 413, 400). The token
-  comes first, so that a caller without one learns nothing of the paths or
-  the switch.
+  405) → switch (503) → API backstop (429) → decode cap (503) → body (415,
+  413, 400) → field rules (400) → scope (403, 404) → content type (415) →
+  content (400) → sender and subscriber backstops (429). The token comes
+  first, so that a caller without one learns nothing of the paths or the
+  switch.
+- **Field rules and scope** (ADR 0009 §7). The subscriber (a message's
+  `recipient`, a notification's `subscriber`) must be a canonical tel URI,
+  `tel:+` and digits as `identity.CanonicalIMPU` writes it (400), unless it
+  is in the chatbot range: a chatbot URI is never a tel URI, so it is
+  refused as a scope violation, 403, rather than 400. The chatbot (`sender`,
+  `chatbot`) must be in the chatbot range (403); one at
+  `RCS_CHATBOT_DOMAIN` but not in normal form is 404, as at every service
+  (§2). The acceptor gets the chatbot URI in normal form
+  (`chatbot.Domain.Normalise`), never `maap`'s text.
+- **Content types** are RCC.07 v13.0 §3.6.10.2's defaults
+  (`chatbot.DefaultContentTypes`); no setting changes them. `content_type`
+  must match an entry of `FromChatbots` through `chatbot.MatchContentType`
+  (415), even though `maap` checked it: `maap` may be the one that lies
+  (threat model T4, T13). The acceptor gets the entry, never `maap`'s
+  string. A chip list (`chip_list`) is 415 when no chip-list type is
+  configured: the wire carries no type of its own for it, since `rcs-as`
+  writes the configured `ChipList` type.
+- **Content** is checked by `chatbot.ValidateContent` against the matched
+  type, and a chip list against the chip-list type (400, ADR 0009 §5),
+  under the decode slot, since on content of many keys it allocates more
+  than the decoding does.
+- **Backstops** (ADR 0009 §9) hold whatever `maap` asks, as token buckets
+  per task (`messaging.NewLimiter`) with at most 100,000 keys each: each
+  chatbot sender `RCSAS_CHATBOT_SENDER_RATE` (1,500 a minute), messages and
+  notifications together; one subscriber `RCSAS_CHATBOT_SUBSCRIBER_RATE`
+  (120 a minute) from all chatbot senders, messages only, since a
+  notification is bounded by T10's once per kind; and the whole API
+  `RCSAS_CHATBOT_API_RATE` (3,000 a minute), which counts every
+  authenticated request with the switch on, refused later or not. Each
+  burst is a sixth of its rate, rounded up (250, 20, 500), as §9 sets every
+  bucket; there is no burst setting, and a backstop cannot be turned off. A
+  message the subscriber's bucket refuses takes no token from the sender's.
+  A refusal is 429 with `Retry-After: 1`, which `maap` answers the chatbot
+  as 503, and counts `chatbot.backstop_refused`, the alarm
+  `RcsAsChatbotBackstopHit` (#684): usually a sign to add capacity.
 - **Bodies.** A body must be `application/json` (415) and goes through
   `chatbot.DecodeEnvelope` under #697's limits: 1,496 KiB for a message and
   8 KiB for a notification (413 above), then the wire type's `Validate`
@@ -1346,6 +1381,7 @@ unset, there are no chatbots. The `RCSAS_` settings:
 | `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121). `RCSAS_TASK_SKEW` is also the margin for another task's reached marks, with group chat on or off (#605). A task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
 | `RCSAS_CHATBOTS` | `off` | The chatbot path (ADR 0009 §12), `on` or `off`; on only with `RCS_CHATBOT_DOMAIN` set ([Chatbot API](#chatbot-api)) |
 | `RCSAS_CHATBOT_LISTEN_ADDR` | `:8081` | The chatbot API's listener (TCP), which only `maap` reaches; it serves with the switch off too |
+| `RCSAS_CHATBOT_SENDER_RATE`, `RCSAS_CHATBOT_SUBSCRIBER_RATE`, `RCSAS_CHATBOT_API_RATE` | `1500`, `120`, `3000` | The chatbot API's backstops per task, a minute: each chatbot sender, one subscriber from all chatbot senders, the whole API. The burst is a sixth, rounded up; none can be turned off |
 | `RCSAS_CHATBOT_DECODES` | `8` | Chatbot API bodies a task decodes and validates at once, about 20 MB each; × 20 MB must stay under half the task's memory limit ([Chatbot API](#chatbot-api)) |
 | `RCSAS_MAAP_TOKEN`, `RCSAS_MAAP_TOKEN_NEXT` | none | `maap`'s current and next bearer token. The current one is required with the switch on; each holds 256 bits in staging and prod |
 
@@ -1629,6 +1665,7 @@ identifier ever appears in a metric name.
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
 | `chatbot.api.<operation>.<status>` | Requests to the chatbot API by operation (`messages`, `notifications`, `other`) and status |
+| `chatbot.backstop_refused` | Chatbot API requests refused 429 by a backstop; alarm `RcsAsChatbotBackstopHit` |
 | `chatbot.api.decode_busy` | Chatbot API requests answered 503 at once because `RCSAS_CHATBOT_DECODES` bodies were being decoded |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.owner_takeover`, `group.fenced`, `group.owner_lapsed`, `task.heartbeat_failed` | Ownership (#121): groups this task took over, writes the store refused because another task had taken the group (which this task then gives up), writes refused because this task's own heartbeat had lapsed, and heartbeats that failed |
@@ -1662,6 +1699,7 @@ Signals to alarm on (Phase 7):
 | `invite.untracked` > 0 | More pending invitations than a task tracks (100 000); messages wait for the retry timer instead of an invitation |
 | `group.fanout_budget_exceeded` sustained | A group writing beyond its budget: a flood, or the budget is too small for real groups |
 | `group.fanout_share_exceeded` sustained | One participant writing to a large group as fast as it may: a flood |
+| `chatbot.backstop_refused` > 0 | `maap` sends past a backstop of `rcs-as`: add capacity, or `maap` is compromised |
 | `group.rejected.rate_limited` sustained | Users creating groups or adding people faster than allowed: mass-add spam |
 
 ## Assumptions and limitations

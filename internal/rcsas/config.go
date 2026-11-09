@@ -48,6 +48,13 @@ const (
 	DefaultChatbotDecodes    = 8
 )
 
+// The backstops of ADR 0009 §9, per task, in requests a minute.
+const (
+	DefaultChatbotSenderRate     = 1500
+	DefaultChatbotSubscriberRate = 120
+	DefaultChatbotAPIRate        = 3000
+)
+
 // MinTokenLength is the shortest maap token accepted in staging and prod:
 // 256 bits as 43 base64url characters (ADR 0007 §4). Hex needs 64.
 const MinTokenLength = 43
@@ -322,7 +329,8 @@ func Configure(s *runtime.Settings) Config {
 // only with RCSAS_CHATBOTS=on and RCS_CHATBOT_DOMAIN set: without the
 // domain there are no chatbots (#681). On, it needs maap's token, and room
 // in RCSAS_MAX_MESSAGE_SIZE for a chatbot's largest content and its CPIM
-// (ADR 0009 §5).
+// (ADR 0009 §5). Content types are RCC.07's defaults; no setting changes
+// them.
 func configureChatbots(s *runtime.Settings, c *Config) {
 	e := s.Env
 	domain := chatbot.LoadDomain(s.Shared, c.HomeDomain)
@@ -337,10 +345,14 @@ func configureChatbots(s *runtime.Settings, c *Config) {
 		e.Invalid("CHATBOT_LISTEN_ADDR", "needs a port")
 	}
 	c.Chatbots = chatbotapi.Config{
-		On:      sw == "on" && domain.Name() != "",
-		Domain:  domain,
-		Tokens:  maapTokens(s),
-		Decodes: e.Int("CHATBOT_DECODES", DefaultChatbotDecodes),
+		On:             sw == "on" && domain.Name() != "",
+		Domain:         domain,
+		Tokens:         maapTokens(s),
+		ContentTypes:   chatbot.DefaultContentTypes(),
+		SenderRate:     backstopRate(e, "CHATBOT_SENDER_RATE", DefaultChatbotSenderRate),
+		SubscriberRate: backstopRate(e, "CHATBOT_SUBSCRIBER_RATE", DefaultChatbotSubscriberRate),
+		APIRate:        backstopRate(e, "CHATBOT_API_RATE", DefaultChatbotAPIRate),
+		Decodes:        e.Int("CHATBOT_DECODES", DefaultChatbotDecodes),
 	}
 	positive(e, "CHATBOT_DECODES", c.Chatbots.Decodes)
 	if !c.Chatbots.On {
@@ -352,6 +364,15 @@ func configureChatbots(s *runtime.Settings, c *Config) {
 	if c.Chatbots.Tokens.Current.IsZero() {
 		e.Invalid("MAAP_TOKEN", "required with RCSAS_CHATBOTS=on")
 	}
+}
+
+// backstopRate reads a backstop as a rate a minute, with a burst of a
+// sixth of it, rounded up, as ADR 0009 §9 sets every bucket (1,500 and 250,
+// 120 and 20, 3,000 and 500). A backstop cannot be turned off.
+func backstopRate(e *runtime.Env, name string, def int) messaging.Rate {
+	n := e.Int(name, def)
+	positive(e, name, n)
+	return messaging.Rate{PerMinute: n, Burst: (n + 5) / 6}
 }
 
 // maapTokens reads maap's two tokens and applies ADR 0007 §4, as maap and
