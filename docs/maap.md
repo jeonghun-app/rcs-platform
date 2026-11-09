@@ -12,14 +12,15 @@ registers, changes and deletes chatbots in the [registry](#registry) (#709)
 and issues and revokes their [credentials](#credentials-and-caches) (#710),
 kept in [DynamoDB](#dynamodb-maap-registry-table) (#708). The
 [`maap-requests`](#dynamodb-maap-requests-table) table keeps the idempotency
-records and message statuses #683's sends need (#713); #711–#713 add the operator's other routes
-and tables.
+records and message statuses #683's sends need, and
+[`maap-counters`](#dynamodb-maap-counters-table) its shared limits (#713);
+#711 and #712 add the operator's other routes and tables.
 
 ## Listeners
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
-| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` and `maap-requests` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
+| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry`, `maap-requests` and `maap-counters` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
 | internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
@@ -43,7 +44,7 @@ reported at once at start.
 | `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | [idempotency records](#dynamodb-maap-requests-table) and message statuses (#713) |
-| `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
+| `MAAP_COUNTERS_TABLE` | `maap-counters` | the [shared limit counters](#dynamodb-maap-counters-table) (#713) |
 | `MAAP_STATUS_TTL` | `192h` (8 days) | how long a message's [status](#dynamodb-maap-requests-table) is kept: by default `rcs-as`'s `RCSAS_SENT_TTL` default, the longest a notification can still come (lead decision on #713; #684 sets both from one parameter); at least 24 hours, so that the answer an idempotency record replays names a status still kept |
 
 `RCS_PII_HMAC_KEY`, which keys log hints in every service, also keys the
@@ -139,7 +140,7 @@ the path that no chatbot can have is 404 before the registry is read.
 | `GET /v1/chatbots/{id}` | reads it: 200 |
 | `PATCH /v1/chatbots/{id}` | sets the fields the body gives; a field left out, or null, keeps its value. `permissions` and `limits` merge field by field, as a JSON merge patch (RFC 7396): a field given replaces that one field and one left out or null keeps its value, so lowering one limit leaves the others as they are; 0 sets a limit back to its default. `webhook` is replaced whole: 200 |
 | `POST /v1/chatbots/{id}/suspend`, `.../resume` | sets the state only; a suspended chatbot keeps its record: 200 |
-| `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it, for at most 20 s a call: 204 once all is gone, also when it was gone already; 503 with `Retry-After: 1` while items are left. Call it again until it answers 204: a 503, a timeout or a connection closed without an answer is not done |
+| `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it but its counters, which go by their TTL within a day, for at most 20 s a call: 204 once all is gone, also when it was gone already; 503 with `Retry-After: 1` while items are left. Call it again until it answers 204: a 503, a timeout or a connection closed without an answer is not done |
 
 **Fields.** Each broken rule is 400, naming the field and never the value:
 
@@ -387,3 +388,100 @@ seconds); no index. The send path that writes it is #683's.
   repeated deletion removes it.
 - **Logs** never carry an idempotency key; errors carry the operation and
   the AWS error code only.
+
+## DynamoDB `maap-counters` table
+
+`MAAP_COUNTERS_TABLE`, **on demand** with point-in-time recovery, written by
+`maap`'s task role only, like the other tables (#684 creates it). Partition
+key `pk` and sort key `sk`, both strings; **TTL on `ttl`** (number, Unix
+seconds); no index. The limits of ADR 0009 §9 live here, shared by every
+task; which counters a request takes is #683's.
+
+| `pk` | `sk` | Holds | Kept |
+|---|---|---|---|
+| `c#<chatbot ID>#m#<HMAC of the name>` | `c` | A chatbot's per-minute bucket: `full` and `returned` (nanoseconds), `ttl`, `writer` | until the bucket is full again |
+| `c#<chatbot ID>#d#<YYYY-MM-DD>#<HMAC of the name>` | `c` | A chatbot's count of a UTC day: `n`, `ttl`, `writer` | the day and an hour |
+| `n#m#<HMAC>`, `n#d#<YYYY-MM-DD>#<HMAC>` | `c` | The same, for a counter of all chatbots (a subscriber's from all chatbots) | the same |
+
+- **Keys** (lead decision on #713, after the operations review of #751).
+  Every counter has a partition key of its own, so no chatbot's counters
+  share a hot key and DynamoDB spreads them by hash from the first write. A
+  counter's name may name a subscriber, so the key holds only an
+  HMAC-SHA256 of it (base64url) under a subkey of `RCS_PII_HMAC_KEY`, and
+  no raw identifier reaches a key, CloudTrail data events or Contributor
+  Insights; the chatbot ID, which is no subscriber's, stays readable for
+  them. Rotating the key starts every counter again.
+- **Buckets.** A per-minute bound of rate *r* is a token bucket with a burst
+  of ⌈*r*/6⌉, refilled continuously at *r* (one token every 60/*r* seconds,
+  rounded up to the nanosecond). The item holds the time `full` at which the
+  bucket is full again, so a take is one conditional update and never a
+  read followed by a write: of concurrent takes, from any task, none is lost
+  and none exceeds the bucket. A take sets an idle bucket (absent, or full
+  by now) to now plus an interval, or adds an interval to a busy one while
+  it holds a token (`full` at most now plus burst − 1 intervals); a refused
+  take writes nothing and answers the time until the next token, for
+  `Retry-After`. An absent item is a full bucket, so TTL may delete it once
+  it is full again.
+- **Days.** A daily bound counts in an item per UTC day, which adds one on
+  the condition that the count is under the limit; a refused take changes
+  nothing and waits until midnight UTC, **09:00 in Korea (KST)**, when every
+  daily limit starts again.
+- **Give-back** (lead decisions on #713). A request takes several counters
+  in turn; when a later one refuses, #683 gives back what the earlier ones
+  took, once each, so that refused requests are not counted (§9). A day's
+  give-back takes one from the count of the take's day while it is above
+  zero. A bucket's returns only the part of the take that has not refilled
+  since, at most an interval, so that a bucket never holds more than an
+  exact token bucket would had the take never happened (#751 review): what
+  the take left missing (its `full` less its time), less the refill since,
+  less what `returned` (all ever given back to the bucket) says older
+  takes were given back since, which may have refilled it in their stead;
+  `full` never moves before now. It is a strongly consistent read and one
+  update conditional on `full` and `returned` read. A fuzz test checks
+  every run of takes, give-backs and time steps against an exact integer
+  token bucket, and a seeded run checks that the DynamoDB backend answers
+  as the memory one does. Given back 2 to 50 ms after their takes on a 10 ms
+  bucket (6,000 a minute) at half to twice its rate, give-backs return at
+  least 80 % of what a token bucket would (a simulation on #751): only
+  takes from a bucket near full lose part of theirs.
+- **The requests counter is never given back.** "Requests per chatbot, all
+  endpoints" counts refused requests too: it is the ceiling of a chatbot's
+  request rate, which give-backs would otherwise lift once a daily limit is
+  reached. "Refused requests are not counted" holds for the send and
+  conversation limits. #683 also keeps, per task, the refusals it has seen
+  until their wait ends, so that a chatbot over a limit costs no write.
+- **Retries.** A random `writer` token tells a take the SDK sent again after
+  its answer was lost, so it counts once. A give-back is sent once, without
+  the SDK's retries: one sent again after another writer's update would
+  return a token twice, and a token per take on the item to tell it would
+  grow a hot item. One lost counts the refused request, the safe side. A
+  take that meets give-backs at the edge of full may find the bucket idle
+  and busy in turn; each turn follows another writer's success, and it
+  gives up after 64 only if others keep changing the bucket, a store
+  failure. Every error is a store failure, which #683 answers 503, never
+  429 (§9).
+- **No per-chatbot deletion.** Counters last a day and an hour at most,
+  under a chatbot ID never registered again, so deleting a chatbot leaves
+  them to their TTL (lead decision on #713) and costs nothing here.
+  Counter names are never logged.
+
+**Write units and cost** (the operations review of #751, Seoul on-demand
+prices of 2026-11-09: $0.68 per million write request units). A counter
+item is under 1 KB, so one write is 1 WRU, a failed conditional write too.
+A take costs about 1 + its bucket's load: one write when idle, two near the
+rate, one for a refusal; a give-back one write and one read.
+
+| Case | WRU | Cost |
+|---|---|---|
+| Hottest item: a chatbot's received messages at 6,000 a minute | about 200 a second on one key (1.99 a take at the rate) | under the 1,000 one key takes |
+| One send (in the reply window, with an idempotency key, delivered and displayed): 7 counter takes (4 buckets, 3 days) and 4 request writes | 11–13; +8 when the answer is near 8 KiB | $7.5–8.8 a million |
+| One received message | 2–3 | $1.4–2.0 a million |
+| A chatbot at its send limit for a day (20,000 sends) | about 260,000 | about $5.3 a month |
+| Abuse, refused at the first counter, no refusal cache | 1 a refusal | about $70 a month per source the WAF lets through at 40 a second |
+| Abuse after a daily limit, with the requests counter never given back and #683's refusal cache | at most 20 a second per task | about $70 a month for two tasks |
+
+On demand rather than provisioned: provisioned capacity is cheaper only
+above about 29 % average use of its peak, and chatbot traffic comes in
+campaigns; counters fail closed, so too little provisioned capacity would
+turn into 503s for every chatbot before auto scaling reacts. To be looked
+at again after a month of `ConsumedWriteCapacityUnits` (#684).

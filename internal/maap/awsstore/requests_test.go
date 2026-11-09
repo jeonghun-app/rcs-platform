@@ -30,10 +30,16 @@ type tableStub struct {
 	update  func(*dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error)
 	query   func(*dynamodb.QueryInput) (*dynamodb.QueryOutput, error)
 	batch   func(*dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error)
+	get     func(*dynamodb.GetItemInput) (*dynamodb.GetItemOutput, error)
 	batches int
+	// onUpdate sees the options of each update.
+	onUpdate func([]func(*dynamodb.Options))
 }
 
-func (s *tableStub) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+func (s *tableStub) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	if s.get != nil {
+		return s.get(in)
+	}
 	return nil, s.err
 }
 
@@ -48,7 +54,10 @@ func (s *tableStub) PutItem(_ context.Context, in *dynamodb.PutItemInput, _ ...f
 	return nil, s.err
 }
 
-func (s *tableStub) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+func (s *tableStub) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	if s.onUpdate != nil {
+		s.onUpdate(opts)
+	}
 	if s.update != nil {
 		return s.update(in)
 	}
