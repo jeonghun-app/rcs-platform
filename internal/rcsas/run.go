@@ -191,7 +191,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 			return fmt.Errorf("rcs-as: chatbot API listener: %w", err)
 		}
 	}
-	api := chatbotapi.New(cfg.Chatbots, rt.Logger, rt.Metrics).Server()
+	api := chatbotapi.New(cfg.Chatbots, nil, rt.Logger, rt.Metrics).Server()
 	apiFailed := make(chan error, 1)
 	go func() {
 		if err := api.Serve(cl); !errors.Is(err, http.ErrServerClosed) {

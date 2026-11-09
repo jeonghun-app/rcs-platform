@@ -11,8 +11,9 @@ focus (sessions, the conference event package and REFER) are served. The core
 is driven through interfaces so
 that it can be built and tested first.
 
-Chatbots (ADR 0009) are served in part: the chatbot API's listener, token
-and switch ([Chatbot API](#chatbot-api), #698), with nothing yet behind it.
+Chatbots (ADR 0009) are served in part: the chatbot API's listener, token,
+switch and strict bodies ([Chatbot API](#chatbot-api), #698), with nothing
+yet behind it.
 
 The code:
 
@@ -1231,9 +1232,11 @@ change and notifying it leaves exactly such a gap.
 §12), specified in [api/rcs-as.yaml](api/rcs-as.yaml) with its scope in
 [api/rcs-as-scopes.md](api/rcs-as-scopes.md). `maap` faces the internet and
 the core does not trust it ([threat model](threat-model.md) T4), so this is
-where whatever it asks is bounded. #698 builds the API in three steps. This
-one serves the listener, the token and the switch; until bodies are decoded,
-an authenticated request with the switch on is 503.
+where whatever it asks is bounded. #698 builds the API in three steps. The
+first two serve the listener, the token, the switch and strict bodies; the
+scope refusals and the backstops come with the third. A request that passes
+is handed to an acceptor, which answers 503 until #699 (messages) and #706
+(notifications) bring theirs.
 
 - **Listener.** `RCSAS_CHATBOT_LISTEN_ADDR` (`:8081`), plain HTTP inside the
   VPC, apart from the SIP listener and the admin port; only `maap` reaches it
@@ -1258,8 +1261,26 @@ an authenticated request with the switch on is 503.
   `RCSAS_MAAP_TOKEN` and clear the next one. The audit line tells which of
   the two a request used.
 - **Order of checks:** token (401) → path (404; a method other than POST is
-  405) → switch (503). The token comes first, so that a caller without one
-  learns nothing of the paths or the switch.
+  405) → switch (503) → decode cap (503) → body (415, 413, 400). The token
+  comes first, so that a caller without one learns nothing of the paths or
+  the switch.
+- **Bodies.** A body must be `application/json` (415) and goes through
+  `chatbot.DecodeEnvelope` under #697's limits: 1,496 KiB for a message and
+  8 KiB for a notification (413 above), then the wire type's `Validate`
+  (400). The answer names the rule broken, never the value.
+- **Decode cap.** `chatbot.DecodeEnvelope` allocates about 8 bytes per input
+  byte, and content validation up to about 30, so one message may take about
+  20 MB (#687). `RCSAS_CHATBOT_DECODES` (8) bounds the bodies a task decodes
+  and validates at once; a request that finds no free slot is 503 with
+  `Retry-After: 1` at once, before its body is read, and counts
+  `chatbot.api.decode_busy`. **Memory rule:** `RCSAS_CHATBOT_DECODES` × 20 MB
+  stays under half the task's memory limit (8 × 20 MB = 160 MB by default);
+  #684 and #694 size the task by it. A request holding a slot must send its
+  body at 256 KiB/s or faster: it gets 1 s plus 1 s per 256 KiB of its limit
+  (6.8 s for a message, 1.03 s for a notification), after which the read
+  fails and the slot is freed, so a body trickled byte by byte cannot hold a
+  slot for long (#723 review). The slot is freed before the acceptor's store
+  calls, and in any case when the request ends, panic or not.
 - **Answers.** An error is `{"error": "<reason>"}`, which names a rule,
   never a value, and closes the connection: most come before the body is
   read, and the server would otherwise read up to 256 KiB of it before the
@@ -1325,6 +1346,7 @@ unset, there are no chatbots. The `RCSAS_` settings:
 | `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121). `RCSAS_TASK_SKEW` is also the margin for another task's reached marks, with group chat on or off (#605). A task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
 | `RCSAS_CHATBOTS` | `off` | The chatbot path (ADR 0009 §12), `on` or `off`; on only with `RCS_CHATBOT_DOMAIN` set ([Chatbot API](#chatbot-api)) |
 | `RCSAS_CHATBOT_LISTEN_ADDR` | `:8081` | The chatbot API's listener (TCP), which only `maap` reaches; it serves with the switch off too |
+| `RCSAS_CHATBOT_DECODES` | `8` | Chatbot API bodies a task decodes and validates at once, about 20 MB each; × 20 MB must stay under half the task's memory limit ([Chatbot API](#chatbot-api)) |
 | `RCSAS_MAAP_TOKEN`, `RCSAS_MAAP_TOKEN_NEXT` | none | `maap`'s current and next bearer token. The current one is required with the switch on; each holds 256 bits in staging and prod |
 
 A rate of `0` turns that limit off.
@@ -1607,6 +1629,7 @@ identifier ever appears in a metric name.
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
 | `chatbot.api.<operation>.<status>` | Requests to the chatbot API by operation (`messages`, `notifications`, `other`) and status |
+| `chatbot.api.decode_busy` | Chatbot API requests answered 503 at once because `RCSAS_CHATBOT_DECODES` bodies were being decoded |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.owner_takeover`, `group.fenced`, `group.owner_lapsed`, `task.heartbeat_failed` | Ownership (#121): groups this task took over, writes the store refused because another task had taken the group (which this task then gives up), writes refused because this task's own heartbeat had lapsed, and heartbeats that failed |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |

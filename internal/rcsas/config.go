@@ -45,6 +45,7 @@ const (
 	// DefaultChatbotListenAddr is the chatbot API, which only maap reaches
 	// (ADR 0007 §2).
 	DefaultChatbotListenAddr = ":8081"
+	DefaultChatbotDecodes    = 8
 )
 
 // MinTokenLength is the shortest maap token accepted in staging and prod:
@@ -336,10 +337,12 @@ func configureChatbots(s *runtime.Settings, c *Config) {
 		e.Invalid("CHATBOT_LISTEN_ADDR", "needs a port")
 	}
 	c.Chatbots = chatbotapi.Config{
-		On:     sw == "on" && domain.Name() != "",
-		Domain: domain,
-		Tokens: maapTokens(s),
+		On:      sw == "on" && domain.Name() != "",
+		Domain:  domain,
+		Tokens:  maapTokens(s),
+		Decodes: e.Int("CHATBOT_DECODES", DefaultChatbotDecodes),
 	}
+	positive(e, "CHATBOT_DECODES", c.Chatbots.Decodes)
 	if !c.Chatbots.On {
 		return
 	}

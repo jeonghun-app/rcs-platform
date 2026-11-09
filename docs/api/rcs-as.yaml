@@ -10,7 +10,8 @@ info:
     §7). The listener is apart from SIP and admin, inside the VPC only; its
     address and token settings are in docs/rcs-as.md. The token is checked
     first, then the path (404) and the method (405), then RCSAS_CHATBOTS
-    (503). Every error answer closes the connection.
+    (503), then the decode cap (503, before the body is read), then the
+    body. Every error answer closes the connection.
 
     Bodies are strict JSON (ADR 0009 §9): UTF-8, one value, at most 4 deep,
     arrays of at most 8, every string bounded as below; unknown fields,
@@ -129,5 +130,5 @@ components:
       description: Over a backstop of ADR 0009 §9 (a chatbot sender, one subscriber, or the whole API), with `Retry-After`.
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Unavailable:
-      description: RCSAS_CHATBOTS is off, or the store failed, with `Retry-After`.
+      description: "RCSAS_CHATBOTS is off, RCSAS_CHATBOT_DECODES bodies are being decoded, or the store failed, with `Retry-After`."
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
