@@ -17,18 +17,25 @@ import (
 
 // counted counts the reads and recorded uses of a memory registry's
 // credentials, and the reads of the registry.
-// A read waits for hold to close, if set; a write records whether its
-// context was live and bounded.
+// A read waits for hold to close, if set, and a write for holdUse; each
+// records whether its context was live and bounded.
 type counted struct {
 	store.Credentials
-	reads, uses atomic.Int64
-	failUse     error
-	hold        chan struct{}
-	detached    atomic.Bool
+	reads, uses            atomic.Int64
+	failUse                error
+	hold, holdUse          chan struct{}
+	readDetached, detached atomic.Bool
+}
+
+// live reports whether ctx is not done and has a deadline.
+func live(ctx context.Context) bool {
+	_, bounded := ctx.Deadline()
+	return ctx.Err() == nil && bounded
 }
 
 func (c *counted) Credential(ctx context.Context, keyID string) (store.Credential, error) {
 	c.reads.Add(1)
+	c.readDetached.Store(live(ctx))
 	if c.hold != nil {
 		<-c.hold
 	}
@@ -37,8 +44,10 @@ func (c *counted) Credential(ctx context.Context, keyID string) (store.Credentia
 
 func (c *counted) Used(ctx context.Context, keyID string, at time.Time) error {
 	c.uses.Add(1)
-	_, bounded := ctx.Deadline()
-	c.detached.Store(ctx.Err() == nil && bounded)
+	c.detached.Store(live(ctx))
+	if c.holdUse != nil {
+		<-c.holdUse
+	}
 	if c.failUse != nil {
 		return c.failUse
 	}
@@ -260,6 +269,12 @@ func TestConcurrentLookupsOfAKeyIDShareOneRead(t *testing.T) {
 				t.Fatal("the lookups never met on one read")
 			}
 		}
+		// A lookup whose request ended meanwhile stops waiting at once.
+		cancelled, cancel := context.WithCancel(ctx)
+		cancel()
+		if _, err := f.a.authenticate(cancelled, id, secret); !errors.Is(err, context.Canceled) {
+			t.Fatalf("a cancelled lookup waiting on the read = %v", err)
+		}
 		close(f.creds.hold)
 		for range 8 {
 			if err := <-errs; (err == nil) != (id == keyID) {
@@ -274,9 +289,16 @@ func TestConcurrentLookupsOfAKeyIDShareOneRead(t *testing.T) {
 	if len(f.a.unknownOrder) != 1 || len(f.a.reads) != 0 {
 		t.Fatalf("%d unknown, %d reads left", len(f.a.unknownOrder), len(f.a.reads))
 	}
+	// The shared read has a context of its own, which the first request
+	// ending does not end.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _ = f.a.authenticate(cancelled, storetest.Credential(c, f.now).KeyID, secret); !f.creds.readDetached.Load() {
+		t.Fatal("the read ran on the request's context, or without a timeout")
+	}
 	f.now = f.now.Add(cacheTTL)
-	if _, _ = f.a.authenticate(ctx, unknown, secret); f.creds.reads.Load() != 2 {
-		t.Fatalf("%d reads after 30 s", f.creds.reads.Load())
+	if _, _ = f.a.authenticate(ctx, unknown, secret); f.creds.reads.Load() != 3 {
+		t.Fatalf("%d reads after 30 s, the other key ID's one included", f.creds.reads.Load())
 	}
 }
 
@@ -314,6 +336,22 @@ func TestTheLastUseIsRecordedAtMostHourlyPerTask(t *testing.T) {
 	if f.a.writes.Wait(); !f.creds.detached.Load() {
 		t.Fatal("the write ran on the request's context, or without a timeout")
 	}
+	// The lookup does not wait for the write.
+	f.creds.holdUse = make(chan struct{})
+	f.now = f.now.Add(useInterval)
+	returned := make(chan error, 1)
+	go func() { _, err := f.a.authenticate(ctx, keyID, secret); returned <- err }()
+	select {
+	case err := <-returned:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the lookup waited for its last-use write")
+	}
+	close(f.creds.holdUse)
+	f.a.writes.Wait()
+	f.creds.holdUse = nil
 	// A failed write waits for the next hour (#746 review), and the
 	// warnings are one a minute, without the secret.
 	_, other, otherSecret := f.chatbot(t)
@@ -323,7 +361,7 @@ func TestTheLastUseIsRecordedAtMostHourlyPerTask(t *testing.T) {
 		after time.Duration
 		uses  int64
 		warns int
-	}{{0, 6, 1}, {time.Second, 6, 1}, {useInterval - time.Second - time.Nanosecond, 6, 1}, {time.Nanosecond, 8, 2}} {
+	}{{0, 7, 1}, {time.Second, 7, 1}, {useInterval - time.Second - time.Nanosecond, 7, 1}, {time.Nanosecond, 9, 2}} {
 		f.now = f.now.Add(step.after)
 		for range 3 {
 			for _, k := range [][2]string{{keyID, secret}, {other, otherSecret}} {
@@ -350,6 +388,7 @@ func TestLargeCachesDropWhatExpiredOncePer30s(t *testing.T) {
 	ctx := context.Background()
 	f := newAuthFixture(t)
 	_, keyID, secret := f.chatbot(t)
+	_, laterKey, laterSecret := f.chatbot(t)
 	fill := func() {
 		for i := range sweepAt {
 			f.a.keys[fmt.Sprint("k", i)] = cached[store.Credential]{expires: f.now}
@@ -362,14 +401,15 @@ func TestLargeCachesDropWhatExpiredOncePer30s(t *testing.T) {
 	if _, err := f.a.authenticate(ctx, keyID, secret); err != nil || sizes() != [3]int{1, 1, 1} {
 		t.Fatalf("after the first sweep: %v, %v", sizes(), err)
 	}
-	// Within 30 s of it no insert sweeps, however large the caches.
+	// Within 30 s of it no insert sweeps, however large the caches: the
+	// later key's credential, chatbot and use are inserts each.
 	fill()
 	f.now = f.now.Add(cacheTTL - time.Nanosecond)
-	if _, err := f.a.authenticate(ctx, keyID, secret); err != nil || sizes() != [3]int{sweepAt + 1, sweepAt + 1, sweepAt + 1} {
+	if _, err := f.a.authenticate(ctx, laterKey, laterSecret); err != nil || sizes() != [3]int{sweepAt + 2, sweepAt + 2, sweepAt + 2} {
 		t.Fatalf("within 30 s: %v, %v", sizes(), err)
 	}
 	f.now = f.now.Add(time.Nanosecond)
-	if _, err := f.a.authenticate(ctx, keyID, secret); err != nil || sizes() != [3]int{1, 1, 1} {
+	if _, err := f.a.authenticate(ctx, keyID, secret); err != nil || sizes() != [3]int{2, 2, 2} {
 		t.Fatalf("at 30 s: %v, %v", sizes(), err)
 	}
 }
