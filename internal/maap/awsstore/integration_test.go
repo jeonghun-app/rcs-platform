@@ -97,9 +97,52 @@ func TestIntegrationAWriteSentAgainAfterItTookEffectStands(t *testing.T) {
 	if _, err := r.Update(ctx, stale, stale); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("stale Update = %v", err)
 	}
+	if err := r.DeleteChatbot(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteChatbot = %v", err)
+	}
+}
+
+// put writes item behind the store's back.
+func put(t *testing.T, ddb *dynamodb.Client, table string, item map[string]types.AttributeValue) {
+	t.Helper()
+	if _, err := ddb.PutItem(t.Context(), &dynamodb.PutItemInput{TableName: aws.String(table), Item: item}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestIntegrationDeleteChatbotDeletesEveryItemOfItsPartition(t *testing.T) {
+	ddb, table := registryTable(t)
+	r := NewRegistry(ddb, table)
+	r.pageSize = 1 // every item a page of its own
+	ctx := t.Context()
+	c, err := r.Register(ctx, storetest.Chatbot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Items #710 will keep there, and a record a newer release wrote,
+	// whose document this one cannot read.
+	for _, sk := range []string{"k#one", "k#two", "k#three"} {
+		put(t, ddb, table, key("c#"+c.ID, sk))
+	}
+	newer, _ := r.item(c, c.Version, c.Registration)
+	newer[attrDoc] = &types.AttributeValueMemberB{Value: []byte(`{"schema":2}`)}
+	put(t, ddb, table, newer)
+	if err := r.DeleteChatbot(ctx, c.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []map[string]types.AttributeValue{key("c#"+c.ID, "k#one"), key("c#"+c.ID, "k#three"), uriKey(c.URI)} {
+		out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: k, ConsistentRead: aws.Bool(true)})
+		if err != nil || len(out.Item) != 0 {
+			t.Errorf("%v left: %v, %v", k[attrSK], out, err)
+		}
+	}
+	out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: chatbotKey(c.ID), ConsistentRead: aws.Bool(true)})
+	if err != nil || len(out.Item) != 3 || out.Item[attrDeleted] == nil {
+		t.Fatalf("not a tombstone: %v, %v", out, err)
+	}
+}
+
+func TestIntegrationDeleteChatbotLeavesAnotherChatbotsReservation(t *testing.T) {
 	ddb, table := registryTable(t)
 	r := NewRegistry(ddb, table)
 	ctx := t.Context()
@@ -107,19 +150,57 @@ func TestIntegrationDeleteChatbotDeletesEveryItemOfItsPartition(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Items #710 will keep there, written behind the store's back.
-	for _, sk := range []string{"k#one", "k#two"} {
-		if _, err := ddb.PutItem(ctx, &dynamodb.PutItemInput{TableName: aws.String(table), Item: key("c#"+c.ID, sk)}); err != nil {
-			t.Fatal(err)
-		}
+	theirs := uriKey(c.URI)
+	theirs[attrChatbot] = str("another")
+	put(t, ddb, table, theirs)
+	if err := r.DeleteChatbot(ctx, c.ID); !errors.Is(err, store.ErrInvalid) {
+		t.Fatalf("DeleteChatbot = %v", err)
 	}
-	if err := r.DeleteChatbot(ctx, c.ID); err != nil {
+	out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: uriKey(c.URI), ConsistentRead: aws.Bool(true)})
+	if err != nil || sv(out.Item[attrChatbot]) != "another" {
+		t.Fatalf("the other chatbot's reservation: %v, %v", out, err)
+	}
+	if _, err := r.Chatbot(ctx, c.ID); err != nil {
+		t.Fatalf("the refused deletion changed the chatbot: %v", err)
+	}
+}
+
+// meddle runs change once, after the first read that names attributes, as
+// DeleteChatbot's read of the record does.
+type meddle struct {
+	DynamoAPI
+	change func()
+}
+
+func (m *meddle) GetItem(ctx context.Context, in *dynamodb.GetItemInput, o ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	out, err := m.DynamoAPI.GetItem(ctx, in, o...)
+	if f := m.change; in.ProjectionExpression != nil && f != nil {
+		m.change = nil
+		f()
+	}
+	return out, err
+}
+
+func TestIntegrationADeletionThatMetAChangeIsAConflict(t *testing.T) {
+	ddb, table := registryTable(t)
+	r := NewRegistry(ddb, table)
+	ctx := t.Context()
+	c, err := r.Register(ctx, storetest.Chatbot())
+	if err != nil {
 		t.Fatal(err)
 	}
-	for _, k := range []map[string]types.AttributeValue{key("c#"+c.ID, "k#one"), chatbotKey(c.ID), uriKey(c.URI)} {
-		out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: k, ConsistentRead: aws.Bool(true)})
-		if err != nil || len(out.Item) != 0 {
-			t.Errorf("%v left: %v, %v", k[attrSK], out, err)
+	m := &meddle{DynamoAPI: ddb, change: func() {
+		if _, err := r.Update(ctx, c, c); err != nil {
+			t.Error(err)
 		}
+	}}
+	if err := NewRegistry(m, table).DeleteChatbot(ctx, c.ID); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("DeleteChatbot = %v", err)
+	}
+	if got, err := r.Chatbot(ctx, c.ID); err != nil || got.Version != 2 {
+		t.Fatalf("the change was lost: %+v, %v", got, err)
+	}
+	if err := r.DeleteChatbot(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteChatbot again = %v", err)
 	}
 }

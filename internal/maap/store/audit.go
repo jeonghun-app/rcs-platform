@@ -1,25 +1,28 @@
 package store
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/url"
 	"slices"
+	"strings"
 
 	"github.com/jeonghun-app/rcs-platform/internal/pii"
 )
 
 // AuditChanges returns what an audit line says of a change from before to
-// after (ADR 0009 §7): a group per changed field, named by its JSON path
-// (webhook.url, limits.sends_per_day), with a before and an after. No value
-// is written (§10): a field shows its length in bytes and the first 8 hex
-// digits of its SHA-256, which tells two values apart; the webhook URL
-// shows its host only, since its path may hold the chatbot's secret; the
-// URI goes through pii.URI. A field not set has length 0. Registering is a
-// change from the zero Chatbot. Walking the encoded record, rather than a
-// list of fields, keeps a field added later from being missed.
+// after (ADR 0009 §7, as the lead decided on #709): a group per changed
+// field, named by its JSON path (webhook.url, limits.sends_per_day).
+// Structured fields (the ID, permissions, limits, state, source networks,
+// the webhook's verified flag) carry their values before and after. The
+// webhook URL carries its host only, without userinfo or an IPv6 zone,
+// since the rest may hold the chatbot's secret; the URI goes through
+// pii.URI. Any other field, the display name and out-of-service text
+// among them, is free text (§10): it says it changed, and its new length
+// in bytes. Registering is a change from the zero Chatbot. Walking the
+// encoded record, rather than a list of fields, keeps a field added later
+// from being missed, and logs it as free text until it is listed here.
 func AuditChanges(before, after Chatbot) []slog.Attr {
 	b, a := map[string]json.RawMessage{}, map[string]json.RawMessage{}
 	flatten(b, "", before)
@@ -35,7 +38,7 @@ func AuditChanges(before, after Chatbot) []slog.Attr {
 	slices.Sort(names)
 	attrs := make([]slog.Attr, 0, len(names))
 	for _, name := range names {
-		attrs = append(attrs, slog.Group(name, describe("before", name, b[name]), describe("after", name, a[name])))
+		attrs = append(attrs, change(name, b[name], a[name]))
 	}
 	return attrs
 }
@@ -54,21 +57,50 @@ func flatten(out map[string]json.RawMessage, prefix string, v any) {
 	}
 }
 
-func describe(key, name string, raw json.RawMessage) slog.Attr {
+func change(name string, before, after json.RawMessage) slog.Attr {
+	switch {
+	case name == "id" || name == "state" || name == "sources" || name == "webhook.verified" ||
+		strings.HasPrefix(name, "permissions.") || strings.HasPrefix(name, "limits."):
+		return slog.Group(name, slog.Any("before", value(before)), slog.Any("after", value(after)))
+	case name == "uri":
+		return slog.Group(name, uri("before", text(before)), uri("after", text(after)))
+	case name == "webhook.url":
+		return slog.Group(name, slog.String("before", host(text(before))), slog.String("after", host(text(after))))
+	}
+	return slog.Group(name, slog.Bool("changed", true), slog.Int("len", len(text(after))))
+}
+
+// value is a structured field's value, nil when it is not set; numbers
+// stay exact.
+func value(raw json.RawMessage) any {
+	var v any
+	d := json.NewDecoder(bytes.NewReader(raw))
+	d.UseNumber()
+	_ = d.Decode(&v)
+	return v
+}
+
+// text is a string field's value, "" when it is not set.
+func text(raw json.RawMessage) string {
 	var s string
-	if raw != nil && json.Unmarshal(raw, &s) != nil {
-		s = string(raw) // a number, a flag or a list: its JSON
+	_ = json.Unmarshal(raw, &s)
+	return s
+}
+
+func host(webhook string) string {
+	u, err := url.Parse(webhook)
+	if err != nil {
+		return ""
 	}
-	switch name {
-	case "uri":
-		return pii.URI(key, s)
-	case "webhook.url":
-		host := ""
-		if u, err := url.Parse(s); err == nil {
-			host = u.Hostname()
-		}
-		return slog.String(key, host)
+	h, _, _ := strings.Cut(u.Hostname(), "%")
+	return h
+}
+
+// uri is a URI through pii.URI, or "" when it is not set, which pii would
+// mask as if it were one.
+func uri(key, v string) slog.Attr {
+	if v == "" {
+		return slog.String(key, "")
 	}
-	sum := sha256.Sum256([]byte(s))
-	return slog.Group(key, slog.Int("len", len(s)), slog.String("sha256", hex.EncodeToString(sum[:4])))
+	return pii.URI(key, v)
 }

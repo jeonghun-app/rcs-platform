@@ -92,3 +92,13 @@ func TestAWriteSentAgainAfterItTookEffectStands(t *testing.T) {
 		t.Fatalf("Update = %v", err)
 	}
 }
+
+func TestAWriteThatMetATransactionIsAConflict(t *testing.T) {
+	ctx := context.Background()
+	r := NewRegistry(&stubDynamo{err: &types.TransactionConflictException{}}, "maap-registry")
+	c := storetest.Chatbot()
+	c.Version = 1
+	if _, err := r.Update(ctx, c, c); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Update = %v", err)
+	}
+}

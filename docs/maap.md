@@ -107,11 +107,14 @@ Metrics have the `Service` dimension only (ADR 0009 §10):
 `api.<operation>.<status>` per request and `api.decode_busy`.
 
 A route that changes a chatbot (#709) adds to its audit line the values
-before and after (ADR 0009 §7) as `store.AuditChanges` writes them, never
-the values themselves (§10): each changed field by its JSON path, with its
-length in bytes and the first 8 hex digits of its SHA-256; the webhook URL
-by its host only, since its path or query may hold the chatbot's secret;
-the URI through `pii.URI`.
+before and after (ADR 0009 §7) as `store.AuditChanges` writes them, a group
+per changed field named by its JSON path, as the lead decided on #709: the
+ID, permissions, limits, state, source networks and the webhook's verified
+flag in full; the URI through `pii.URI`; the webhook URL as its host only,
+without userinfo or an IPv6 zone, since the rest may hold the chatbot's
+secret; and free text, the display name and out-of-service text, only as
+changed with its new length in bytes (§10). A field added later is free
+text until it is listed.
 
 ## DynamoDB `maap-registry` table
 

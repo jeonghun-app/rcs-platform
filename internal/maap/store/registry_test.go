@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"reflect"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store/storetest"
+	"github.com/jeonghun-app/rcs-platform/internal/pii"
 )
 
 func TestMemoryRegistryMeetsTheContract(t *testing.T) {
@@ -97,12 +99,15 @@ func TestAStoredChatbotIsDecodedStrictly(t *testing.T) {
 	}
 }
 
-func TestAuditChangesNameFieldsWithoutTheirValues(t *testing.T) {
+func TestAuditChangesShowStructuredFieldsAndOnlyTheLengthOfText(t *testing.T) {
 	before := storetest.Chatbot()
 	after := before
 	after.DisplayName = "Acme Secret Name"
-	after.Webhook.URL = "https://hooks.example.org/path-secret?q=query-secret"
-	after.Limits.SendsPerDay = 500
+	after.OutOfService = "Closed secret."
+	after.Webhook.URL = "https://user:pw-secret@[fe80::1%25zone-secret]:8443/path-secret?q=query-secret#frag-secret"
+	after.Limits.SendsPerDay = 1 << 62
+	after.Sources = []string{"198.51.100.0/24"}
+	after.State = store.Suspended
 	var buf bytes.Buffer
 	log := func(attrs []slog.Attr) string {
 		buf.Reset()
@@ -111,23 +116,26 @@ func TestAuditChangesNameFieldsWithoutTheirValues(t *testing.T) {
 	}
 	line := log(store.AuditChanges(before, after))
 	for _, want := range []string{
-		`"display_name":{"before":{"len":14,"sha256":"`, `"after":{"len":16,`,
-		`"webhook.url":{"before":"bot.example.com","after":"hooks.example.org"}`,
-		`"limits.sends_per_day":{"before":{"len":4,`,
+		`"display_name":{"changed":true,"len":16}`, `"out_of_service":{"changed":true,"len":14}`,
+		`"webhook.url":{"before":"bot.example.com","after":"fe80::1"}`,
+		`"limits.sends_per_day":{"before":1000,"after":4611686018427387904}`,
+		`"sources":{"before":["192.0.2.0/24","2001:db8::/32"],"after":["198.51.100.0/24"]}`,
+		`"state":{"before":"active","after":"suspended"}`,
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %s in %s", want, line)
 		}
 	}
-	for _, leak := range []string{"Acme", "Secret", "secret", "/hook", "state", "uri", "sources"} {
+	for _, leak := range []string{"Acme", "Secret", "secret", "Closed", "Back soon", "/hook", "zone", "user", "8443", `"uri"`, "permissions"} {
 		if strings.Contains(line, leak) {
 			t.Errorf("%q in %s", leak, line)
 		}
 	}
 	// Registering is a change of every field set, the URI through pii.
 	line = log(store.AuditChanges(store.Chatbot{}, before))
-	if strings.Contains(line, "bot-") || strings.Contains(line, "Back soon") || !strings.Contains(line, `"uri":{`) ||
-		!strings.Contains(line, `"sources":{`) || !strings.Contains(line, `"permissions.msisdn":{`) {
+	uri, _ := json.Marshal(pii.URI("after", before.URI).Value.String())
+	if !strings.Contains(line, `"uri":{"before":"","after":`+string(uri)+`}`) || strings.Contains(line, "bot-") ||
+		!strings.Contains(line, `"permissions.msisdn":{"before":null,"after":true}`) {
 		t.Errorf("registration: %s", line)
 	}
 	if got := store.AuditChanges(before, before); len(got) != 0 {
