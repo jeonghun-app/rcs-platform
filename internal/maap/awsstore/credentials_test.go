@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,24 +17,40 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store/storetest"
 )
 
-// scriptStub holds a chatbot's record with one credential in slot 1,
-// answers each transaction with the next of txs (then success), and
-// records the calls that write or list, in order.
+// scriptStub holds a chatbot's record with one credential in slot 1, its
+// key item unless keyGone, answers each transaction with the next of txs
+// (then success), and records the calls that write or list, in order: a
+// transaction of deletes only with what it deletes.
 type scriptStub struct {
 	stubDynamo
-	keyID string
-	txs   []func(*dynamodb.TransactWriteItemsInput) error
-	calls []string
+	keyID   string
+	keyGone bool
+	txs     []func(*dynamodb.TransactWriteItemsInput) error
+	calls   []string
 }
 
 func (s *scriptStub) GetItem(_ context.Context, in *dynamodb.GetItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	if pk := sv(in.Key[attrPK]); strings.HasPrefix(pk, "k#") {
+		if s.keyGone {
+			return &dynamodb.GetItemOutput{}, nil
+		}
+		return &dynamodb.GetItemOutput{Item: map[string]types.AttributeValue{attrPK: str(pk), attrChatbot: str("cb-1")}}, nil
+	}
 	item := chatbotKey("cb-1")
 	item[attrRegistration], item[attrURI] = str("reg"), str("sip:bot@"+storetest.Domain)
 	return &dynamodb.GetItemOutput{Item: item}, nil
 }
 
 func (s *scriptStub) TransactWriteItems(_ context.Context, in *dynamodb.TransactWriteItemsInput, _ ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
-	s.calls = append(s.calls, "transaction")
+	call := "transaction"
+	for _, it := range in.TransactItems {
+		if it.Delete == nil {
+			call = "transaction"
+			break
+		}
+		call += " delete " + sv(it.Delete.Key[attrPK]) + " " + sv(it.Delete.Key[attrSK])
+	}
+	s.calls = append(s.calls, call)
 	if len(s.txs) > 0 {
 		tx := s.txs[0]
 		s.txs = s.txs[1:]
@@ -75,7 +92,7 @@ func TestCredentialsGoOnlyAfterTheTombstone(t *testing.T) {
 		{"FailedOnce", &smithy.GenericAPIError{Code: "InternalServerError"}, []string{"transaction"}},
 		{"RefusedOnce", &types.TransactionCanceledException{CancellationReasons: []types.CancellationReason{ccf, {Code: aws.String("None")}}}, []string{"transaction"}},
 		{"ConflictOnce", &types.TransactionConflictException{}, []string{
-			"transaction", "transaction", "query", "delete k#" + keyID + " key", "delete c#cb-1 k#1",
+			"transaction", "transaction", "query", "transaction delete k#" + keyID + " key delete c#cb-1 k#1",
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -93,11 +110,11 @@ func TestCredentialsGoOnlyAfterTheTombstone(t *testing.T) {
 func TestAnIssueSentAgainFindsItsOwnSlot(t *testing.T) {
 	c := storetest.Chatbot()
 	c.Registration = "reg"
-	cred := storetest.Credential(c, time.Unix(1, 0))
+	cred, held := storetest.Credential(c, time.Unix(1, 0)), storetest.Credential(c, time.Unix(1, 0)).KeyID
 	slotTaken := func(writer func(sent string) string) func(*dynamodb.TransactWriteItemsInput) error {
 		return func(in *dynamodb.TransactWriteItemsInput) error {
 			slot := in.TransactItems[1].Put.Item
-			old := map[string]types.AttributeValue{attrKey: slot[attrKey], attrWriter: str(writer(sv(slot[attrWriter])))}
+			old := map[string]types.AttributeValue{attrKey: str(held), attrWriter: str(writer(sv(slot[attrWriter])))}
 			none := types.CancellationReason{Code: aws.String("None")}
 			return &types.TransactionCanceledException{CancellationReasons: []types.CancellationReason{
 				none, {Code: aws.String("ConditionalCheckFailed"), Item: old}, none,
@@ -106,26 +123,61 @@ func TestAnIssueSentAgainFindsItsOwnSlot(t *testing.T) {
 	}
 	mine := slotTaken(func(sent string) string { return sent })
 	theirs := slotTaken(func(string) string { return "another" })
+	// A slot naming a key item that is gone is taken over, on the condition
+	// that it still names that key and the key item is still absent.
+	takeover := func(in *dynamodb.TransactWriteItemsInput) error {
+		if len(in.TransactItems) != 4 || sv(in.TransactItems[1].Put.Item[attrSK]) != "k#1" ||
+			sv(in.TransactItems[1].Put.ExpressionAttributeValues[":stale"]) != held || sv(in.TransactItems[3].ConditionCheck.Key[attrPK]) != "k#"+held {
+			return errors.New("not a takeover of slot 1")
+		}
+		return nil
+	}
 	for _, tc := range []struct {
-		name string
-		txs  []func(*dynamodb.TransactWriteItemsInput) error
-		want error
-		sent int
+		name    string
+		txs     []func(*dynamodb.TransactWriteItemsInput) error
+		keyGone bool
+		want    error
+		sent    int
 	}{
-		{"Mine", []func(*dynamodb.TransactWriteItemsInput) error{mine}, nil, 1},
-		{"TheirsThenFree", []func(*dynamodb.TransactWriteItemsInput) error{theirs}, nil, 2},
-		{"BothTaken", []func(*dynamodb.TransactWriteItemsInput) error{theirs, theirs}, store.ErrTooMany, 2},
+		{"Mine", []func(*dynamodb.TransactWriteItemsInput) error{mine}, false, nil, 1},
+		{"TheirsThenFree", []func(*dynamodb.TransactWriteItemsInput) error{theirs}, false, nil, 2},
+		{"BothTaken", []func(*dynamodb.TransactWriteItemsInput) error{theirs, theirs}, false, store.ErrTooMany, 2},
+		{"TheirsWithoutAKeyItem", []func(*dynamodb.TransactWriteItemsInput) error{theirs, takeover}, true, nil, 2},
 		{"Conflicts", []func(*dynamodb.TransactWriteItemsInput) error{
 			fails(&types.TransactionConflictException{}), fails(&types.TransactionConflictException{}), fails(&types.TransactionConflictException{}),
-		}, store.ErrConflict, 3},
+		}, false, store.ErrConflict, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s := &scriptStub{txs: tc.txs}
+			s := &scriptStub{txs: tc.txs, keyGone: tc.keyGone}
 			err := NewRegistry(s, "maap-registry").Credentials().Issue(context.Background(), cred)
 			if !errors.Is(err, tc.want) || (err == nil) != (tc.want == nil) || len(s.calls) != tc.sent {
 				t.Fatalf("Issue = %v after %d sends", err, len(s.calls))
 			}
 		})
+	}
+}
+
+// A revoke that failed (#744 review), or one the earlier two-step delete
+// cut short after the key item, is finished by the next: the key item and
+// its slot go in one transaction, and a slot left without its key item
+// goes too. Only when neither is there is the answer ErrNotFound.
+func TestARevokeFinishesWhatAFailedOneLeft(t *testing.T) {
+	ctx := context.Background()
+	keyID := storetest.Credential(storetest.Chatbot(), time.Time{}).KeyID
+	both := "transaction delete k#" + keyID + " key delete c#cb-1 k#1"
+	for _, keyGone := range []bool{false, true} {
+		s := &scriptStub{keyID: keyID, keyGone: keyGone, txs: []func(*dynamodb.TransactWriteItemsInput) error{
+			fails(&smithy.GenericAPIError{Code: "InternalServerError"}),
+		}}
+		cs := NewRegistry(s, "maap-registry").Credentials()
+		first, again := cs.Revoke(ctx, "cb-1", keyID), cs.Revoke(ctx, "cb-1", keyID)
+		if first == nil || again != nil || !reflect.DeepEqual(s.calls, []string{"query", both, "query", both}) {
+			t.Fatalf("key gone %v: Revoke = %v, then %v; calls %q", keyGone, first, again, s.calls)
+		}
+	}
+	s := &scriptStub{keyID: storetest.Credential(storetest.Chatbot(), time.Time{}).KeyID, keyGone: true}
+	if err := NewRegistry(s, "maap-registry").Credentials().Revoke(ctx, "cb-1", keyID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Revoke of nothing = %v", err)
 	}
 }
 
