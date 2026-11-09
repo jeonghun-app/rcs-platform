@@ -240,13 +240,14 @@ that fails is an error of its own, never a refusal, and is not cached.
 
 | Cache, per task | Kept | Bound |
 |---|---|---|
-| credentials by key ID, chatbots by ID | 30 s from the read | what the registry holds; past 10,000 an insert first drops the expired |
+| credentials by key ID; chatbots by ID, or that one is gone | 30 s from the read | what the registry holds; past 10,000 the expired are dropped, at most once per 30 s |
 | unknown key IDs | 30 s | 10,000; past it the oldest is forgotten |
-| last use recorded | an hour | a credential's `last_used` is written at most hourly per task, again at the next use if the write failed |
+| last use recorded | an hour | a credential's `last_used` is written at most hourly per task, off the request's path (its own context, 5 s), and a write that failed waits for the next hour; its warning is logged at most once a minute, with how many were left out |
 
 So a revocation, a suspension, a permission change or a deletion takes
 effect on every task within 30 s (T13), and a caller trying key IDs costs at
-most one read each per 30 s; #683 adds the limits per source. The unknown
+most one read each per 30 s, concurrent lookups of one key ID sharing one
+read (with its own 5 s bound) and one place among the unknown; #683 adds the limits per source. The unknown
 key IDs take about 1 MB at their bound.
 
 ## DynamoDB `maap-registry` table
