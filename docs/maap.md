@@ -214,7 +214,8 @@ operator deletes it.
 |---|---|---|
 | `c#<chatbot ID>` | `chatbot` | The chatbot: `version` (number), `registration` (random, per registration), `uri`, `doc` (binary, the record as `internal/maap/store` encodes it), `writer`; once deleted, a tombstone holding `deleted` only |
 | `u#<chatbot URI>` | `uri` | The URI's reservation: `chatbot` (the ID), `writer` |
-| `c#<chatbot ID>` | `k#<key ID>` | Reserved for the chatbot's credentials (#710) |
+| `c#<chatbot ID>` | `k#1`, `k#2` | A credential's slot: `key` (its key ID), `writer` |
+| `k#<key ID>` | `key` | The credential: `chatbot` (the ID), `registration` (the chatbot's at issue), `digest` (binary, the secret's SHA-256), `created` and `last_used` (numbers, Unix seconds), `writer` |
 
 - **Record.** The display name (at most 128 bytes), the out-of-service text
   (512), the webhook URL (512) and whether it answered its challenge, the
@@ -247,13 +248,25 @@ operator deletes it.
 - **Deleting** a chatbot first turns its record into a tombstone, on the
   condition of the registration read, together with deleting the
   reservation, which frees the URI; then it deletes the partition's other
-  items, its credentials among them. A change at the same time does not
+  items, its credentials and their key items among them. A change at the same time does not
   stop it, and no credential goes from a chatbot that stays. A deletion
   that failed part way finishes its clean-up when called again; deleting a
   chatbot that is gone does nothing (ADR 0009 §10). **A deleted ID is never registered again**
   (lead decision on #708; `ErrDeleted`, which #709 answers 409), so nothing
   another table kept of it, or a change read before the deletion, reaches
   a new chatbot. Tombstones are kept, like the table, without TTL.
+- **Credentials** (#710). A chatbot has at most two live credentials, one
+  per slot. Issuing writes a free slot and the key item in one transaction
+  with a check that the record's `registration` is still the one read, so
+  an issue that meets a deletion either lands before the tombstone, and is
+  deleted with the partition, or fails; a tombstone has no `registration`.
+  A random `writer` token in the slot tells an issue the SDK sent again
+  from another's. A lookup by key ID reads the key item, outside the
+  partition, which is why the slot names it: deleting a slot deletes its
+  key item first. Revoking deletes the key item, which ends lookups at
+  once, then the slot, each on the condition that it is still that
+  credential's. The key ID is 26 characters of base32 (128 random bits),
+  never a `.` or a control character; only the secret's digest is stored.
 - **Errors.** A store failure is an error of its own, never "not found":
   callers answer it 503, not 404. Errors carry the operation and the AWS
   error code only.

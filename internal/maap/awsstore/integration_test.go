@@ -59,6 +59,13 @@ func TestIntegrationRegistryMeetsTheContract(t *testing.T) {
 	storetest.Run(t, func(t *testing.T) store.Registry { return NewRegistry(registryTable(t)) })
 }
 
+func TestIntegrationCredentialsMeetTheContract(t *testing.T) {
+	storetest.RunCredentials(t, func(t *testing.T) (store.Registry, store.Credentials) {
+		r := NewRegistry(registryTable(t))
+		return r, r.Credentials()
+	})
+}
+
 // The loader maap runs with reaches the table and finds it ready.
 func TestIntegrationNewReachesAReadyTable(t *testing.T) {
 	_, table := registryTable(t)
@@ -106,6 +113,13 @@ func TestIntegrationAWriteSentAgainAfterItTookEffectStands(t *testing.T) {
 	}
 	if c, err = r.Update(ctx, c, c); err != nil || c.Version != 2 {
 		t.Fatalf("Update = %+v, %v", c, err)
+	}
+	// An issue finds its own slot, and takes one only.
+	if err := r.Credentials().Issue(ctx, storetest.Credential(c, time.Unix(1, 0))); err != nil {
+		t.Fatalf("Issue = %v", err)
+	}
+	if creds, err := r.Credentials().ChatbotCredentials(ctx, c.ID); len(creds) != 1 || err != nil {
+		t.Fatalf("ChatbotCredentials = %v, %v", creds, err)
 	}
 	// A real conflict is still one.
 	stale := c
@@ -234,4 +248,139 @@ func TestIntegrationADeletionThatMeetsAnUpdateStillDeletesEverything(t *testing.
 	put(t, ddb, table, key("c#"+c.ID, "k#left"))
 	deleted()
 	deleted()
+}
+
+// failTx fails the first transaction it is sent, as a 5xx past the SDK's
+// retries or a cancelled request would.
+type failTx struct {
+	DynamoAPI
+	failed bool
+}
+
+func (f *failTx) TransactWriteItems(ctx context.Context, in *dynamodb.TransactWriteItemsInput, o ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error) {
+	if !f.failed {
+		f.failed = true
+		return nil, context.Canceled
+	}
+	return f.DynamoAPI.TransactWriteItems(ctx, in, o...)
+}
+
+// The #744 review: a revoke that failed, or a slot the earlier two-step
+// revoke left naming a key item that is gone, never keeps a chatbot from
+// its two credentials.
+func TestIntegrationAHalfDoneRevokeNeverHoldsASlot(t *testing.T) {
+	ddb, table := registryTable(t)
+	ctx := t.Context()
+	cs := NewRegistry(ddb, table).Credentials()
+	c, err := NewRegistry(ddb, table).Register(ctx, storetest.Chatbot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	creds := []store.Credential{storetest.Credential(c, time.Unix(1, 0)), storetest.Credential(c, time.Unix(2, 0))}
+	issue := func(want error) {
+		t.Helper()
+		cred := storetest.Credential(c, time.Unix(3, 0))
+		if err := cs.Issue(ctx, cred); !errors.Is(err, want) || (err == nil) != (want == nil) {
+			t.Fatalf("Issue = %v, want %v", err, want)
+		}
+		creds = append(creds, cred)
+	}
+	for _, cred := range creds {
+		if err := cs.Issue(ctx, cred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := NewRegistry(&failTx{DynamoAPI: ddb}, table).Credentials().Revoke(ctx, c.ID, creds[0].KeyID); err == nil {
+		t.Fatal("the failed revoke succeeded")
+	}
+	if err := cs.Revoke(ctx, c.ID, creds[0].KeyID); err != nil {
+		t.Fatalf("Revoke again = %v", err)
+	}
+	issue(nil)
+	issue(store.ErrTooMany)
+	// Both key items gone behind their slots' backs: the next issue takes
+	// a slot over (slot 1, creds[2]'s), and a revoke of the other key ID
+	// (creds[1], slot 2) clears its slot and succeeds.
+	for _, cred := range creds[1:3] {
+		if _, err := ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(table), Key: keyKey(cred.KeyID)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	issue(nil)
+	if err := cs.Revoke(ctx, c.ID, creds[1].KeyID); err != nil {
+		t.Fatalf("Revoke of a slot without its key item = %v", err)
+	}
+	if err := cs.Revoke(ctx, c.ID, creds[1].KeyID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("Revoke of nothing = %v", err)
+	}
+	issue(nil)
+	issue(store.ErrTooMany)
+	if got, err := cs.ChatbotCredentials(ctx, c.ID); len(got) != store.MaxCredentials || err != nil {
+		t.Fatalf("%d live, %v", len(got), err)
+	}
+	// Both slots stale, then four concurrent issues: the takeover's guard
+	// (the slot still names the stale key) lets only two win (#744 round
+	// 2), and no key item is left without a slot.
+	live, _ := cs.ChatbotCredentials(ctx, c.ID)
+	for _, cred := range live {
+		if _, err := ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(table), Key: keyKey(cred.KeyID)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	racing := make([]store.Credential, 4)
+	errs := make(chan error, len(racing))
+	for i := range racing {
+		racing[i] = storetest.Credential(c, time.Unix(4, 0))
+		go func() { errs <- cs.Issue(ctx, racing[i]) }()
+	}
+	won := 0
+	for range racing {
+		switch err := <-errs; {
+		case err == nil:
+			won++
+		case !errors.Is(err, store.ErrTooMany) && !errors.Is(err, store.ErrConflict):
+			t.Errorf("a losing Issue = %v", err)
+		}
+	}
+	kept := 0
+	for _, cred := range racing {
+		if _, err := cs.Credential(ctx, cred.KeyID); err == nil {
+			kept++
+		}
+	}
+	if got, _ := cs.ChatbotCredentials(ctx, c.ID); won != store.MaxCredentials || len(got) != won || kept != won {
+		t.Fatalf("%d issues won, %d listed, %d key items kept", won, len(got), kept)
+	}
+}
+
+// A chatbot's deletion finishes over a key item that names no chatbot
+// (#744 round 2, the tester's probe): the slot goes alone.
+func TestIntegrationADeletionFinishesOverADamagedKeyItem(t *testing.T) {
+	ddb, table := registryTable(t)
+	ctx := t.Context()
+	r := NewRegistry(ddb, table)
+	c, err := r.Register(ctx, storetest.Chatbot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := storetest.Credential(c, time.Unix(1, 0))
+	if err := r.Credentials().Issue(ctx, cred); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table), Key: keyKey(cred.KeyID), UpdateExpression: aws.String("REMOVE #chatbot"),
+		ExpressionAttributeNames: map[string]string{"#chatbot": attrChatbot},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteChatbot(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteChatbot = %v", err)
+	}
+	if got, err := r.Credentials().ChatbotCredentials(ctx, c.ID); len(got) != 0 || err != nil {
+		t.Fatalf("left: %v, %v", got, err)
+	}
+	out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: slotKey(c.ID, 1), ConsistentRead: aws.Bool(true)})
+	if err != nil || len(out.Item) != 0 {
+		t.Fatalf("the slot is left: %v, %v", out.Item, err)
+	}
 }

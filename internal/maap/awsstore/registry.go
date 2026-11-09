@@ -11,14 +11,16 @@
 //	pk c#<chatbot ID>  sk chatbot      the record: version, registration, uri, doc (store's JSON document), writer
 //	                                   or, once deleted, a tombstone: deleted
 //	pk u#<URI>         sk uri          the URI's reservation: chatbot (its ID), writer
-//	pk c#<chatbot ID>  sk k#<key ID>   reserved for the chatbot's credentials (#710)
+//	pk c#<chatbot ID>  sk k#1, k#2     a credential's slot: key (its key ID), writer
+//	pk k#<key ID>      sk key          the credential: chatbot, registration, digest, created, last_used, writer
 //
 // Register writes the record and the reservation in one transaction, each
 // on the condition that it does not exist, so one URI in normal form has
 // one chatbot (T13) and a deleted ID is not used again. Update is a
 // PutItem on the record's version, registration and URI. Every item of a
-// chatbot but its reservation is in its partition, which is what
-// DeleteChatbot deletes; it reads only the record's plain attributes, never
+// chatbot but its reservation and its credentials' key items is in its
+// partition, which is what DeleteChatbot deletes, a slot's key item with
+// it; it reads only the record's plain attributes, never
 // the document, so that a release can delete what a newer one wrote.
 //
 // Reads are strongly consistent. SDK errors are reduced to the operation
@@ -34,6 +36,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -51,6 +54,7 @@ type DynamoAPI interface {
 	DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
 	Query(context.Context, *dynamodb.QueryInput, ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
 	TransactWriteItems(context.Context, *dynamodb.TransactWriteItemsInput, ...func(*dynamodb.Options)) (*dynamodb.TransactWriteItemsOutput, error)
+	UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
 	DescribeTable(context.Context, *dynamodb.DescribeTableInput, ...func(*dynamodb.Options)) (*dynamodb.DescribeTableOutput, error)
 }
 
@@ -319,36 +323,20 @@ func (r *Registry) tombstone(ctx context.Context, id string, read map[string]typ
 }
 
 // deleteRest deletes every item of the chatbot's partition but its
-// tombstone.
+// tombstone; a credential's slot goes with its key item.
 func (r *Registry) deleteRest(ctx context.Context, id string) error {
-	in := &dynamodb.QueryInput{
-		TableName: aws.String(r.table), ConsistentRead: aws.Bool(true),
-		KeyConditionExpression:    aws.String("#pk = :pk"),
-		ProjectionExpression:      aws.String("#pk, #sk"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#sk": attrSK},
-		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str("c#" + id)},
-	}
-	if r.pageSize > 0 {
-		in.Limit = aws.Int32(r.pageSize)
-	}
-	for {
-		out, err := r.api.Query(ctx, in)
-		if err != nil {
+	return r.eachItem(ctx, id, "", func(it map[string]types.AttributeValue) error {
+		switch sk := sv(it[attrSK]); {
+		case sk == skChatbot:
+			return nil
+		case strings.HasPrefix(sk, skSlot):
+			return r.deleteSlot(ctx, id, it, true)
+		}
+		if _, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(r.table), Key: key(sv(it[attrPK]), sv(it[attrSK]))}); err != nil {
 			return sanitize("delete chatbot", err)
 		}
-		for _, it := range out.Items {
-			if sv(it[attrSK]) == skChatbot {
-				continue
-			}
-			if _, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(r.table), Key: it}); err != nil {
-				return sanitize("delete chatbot", err)
-			}
-		}
-		if len(out.LastEvaluatedKey) == 0 {
-			return nil
-		}
-		in.ExclusiveStartKey = out.LastEvaluatedKey
-	}
+		return nil
+	})
 }
 
 // cancelled returns the reasons of a cancelled transaction, nil for any

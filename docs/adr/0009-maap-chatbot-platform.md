@@ -285,6 +285,14 @@ TS 23.228 V20.1.0 and TS 29.228 V20.0.0.
      against the last `X-Forwarded-For` entry, the one the ALB writes in its
      default `append` mode. Every failure is the same 401, decided before the
      body is read, and failures are limited per source (§9).
+     *Amended on #710 (lead decision):* a lookup by key ID cannot find the
+     chatbot's partition, so the `k#<key ID>` items #708 reserved there are
+     slots, `k#1` and `k#2`, each naming its key ID, beside a key item
+     `k#<key ID>` / `key` outside the partition, which the lookup reads.
+     An issue is one transaction: a check of the record's registration, the
+     slot and the key item; a deletion deletes the key item before its
+     slot. No index, no infrastructure change (`docs/maap.md`, DynamoDB
+     `maap-registry` table).
    - **Cache.** `maap` tasks cache registry entries for at most 30 s, and an
      unknown key ID for 30 s too, at most 10,000 of them per task: revocation,
      suspension, blocks and permission changes take effect on every task within
