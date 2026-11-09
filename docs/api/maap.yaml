@@ -4,7 +4,7 @@
 # internal listener, MAAP_INTERNAL_ADDR, which only rcs-as and the operator
 # path reach and which is never on the public ALB (ADR 0009 §7). Callers and
 # their scopes are in maap-scopes.md, next to this file. Each route is
-# specified here by the PR that adds it (#708–#713, #683).
+# specified here by the PR that adds it (#709–#713, #683).
 openapi: 3.1.0
 info:
   title: maap internal API
@@ -40,20 +40,151 @@ servers:
         default: rcs.local
 security:
   - bearer: []
-paths: {}
+paths:
+  /v1/chatbots:
+    post:
+      operationId: register_chatbot
+      summary: Register a chatbot, active, with the ID the operator chose (ADR 0009 §7).
+      description: |
+        The URI is stored in internal/chatbot's normal form at
+        RCS_CHATBOT_DOMAIN, by a conditional write: one chatbot per URI.
+        The webhook URL is stored unverified. docs/maap.md (Registry) has
+        every field rule.
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/ChatbotRegistration" } } }
+      responses:
+        "201":
+          description: Registered.
+          headers:
+            Location: { schema: { type: string }, description: "/v1/chatbots/{id}" }
+          content: { application/json: { schema: { $ref: "#/components/schemas/Chatbot" } } }
+        "400": { $ref: "#/components/responses/Invalid" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/Taken" }
+        "413": { $ref: "#/components/responses/TooLarge" }
+        "415": { $ref: "#/components/responses/UnsupportedMedia" }
+        "503": { $ref: "#/components/responses/Busy" }
+  /v1/chatbots/{id}:
+    parameters:
+      - { $ref: "#/components/parameters/ChatbotID" }
+    get:
+      operationId: read_chatbot
+      summary: Read a chatbot.
+      responses:
+        "200": { $ref: "#/components/responses/Chatbot" }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500": { $ref: "#/components/responses/Unreadable" }
+        "503": { $ref: "#/components/responses/Busy" }
 components:
   securitySchemes:
     bearer:
       type: http
       scheme: bearer
       description: MAAP_OPERATOR_TOKEN or MAAP_OPERATOR_TOKEN_NEXT for the operator.
+  parameters:
+    ChatbotID:
+      name: id
+      in: path
+      required: true
+      description: An ID no chatbot can have is 404 before the registry is read.
+      schema: { type: string, pattern: "^[A-Za-z0-9_-]{1,64}$" }
   schemas:
+    # x-maxBytes bounds a string in bytes of UTF-8, as the server counts,
+    # where JSON Schema's maxLength would count characters (#741 review).
+    DisplayName:
+      type: string
+      x-maxBytes: 128
+      description: At most 128 bytes of UTF-8 (not characters), without C0 or C1 controls, DEL, default-ignorable characters (every bidi control among them), line or paragraph separators, U+2800, or white space only; ZWJ and VS16 only inside emoji, ZWNJ only between letters, tags only in a subdivision flag (docs/maap.md, Registry).
+    OutOfService:
+      type: string
+      x-maxBytes: 512
+      description: text/plain of at most 512 bytes of UTF-8 (not characters) for subscribers of a suspended chatbot; no control but tab, CR and LF, no DEL, C1 or Cf but U+200D.
+    WebhookSetting:
+      type: object
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          x-maxBytes: 512
+          description: https (http in dev and test) with a host, no userinfo, port 443 or one on MAAP_WEBHOOK_PORTS, at most 512 bytes; an IP address host must be global unicast (loopback and private allowed in dev), and a numeric host must be dotted decimal; "" for none.
+    Permissions:
+      type: object
+      additionalProperties: false
+      properties:
+        msisdn: { type: boolean, description: The chatbot sees numbers instead of aliases. }
+        start_conversations: { type: boolean, description: The chatbot may send outside the reply window; requires msisdn. }
+    Limits:
+      type: object
+      additionalProperties: false
+      description: The chatbot's bounds, each 0 (the default) up to its ADR 0009 §9 default.
+      properties:
+        sends_per_minute: { type: integer, minimum: 0, maximum: 600 }
+        sends_per_day: { type: integer, minimum: 0, maximum: 20000 }
+        starts_per_minute: { type: integer, minimum: 0, maximum: 60 }
+        starts_per_day: { type: integer, minimum: 0, maximum: 1000 }
+        sends_per_subscriber_per_minute: { type: integer, minimum: 0, maximum: 20 }
+        sends_per_subscriber_per_day: { type: integer, minimum: 0, maximum: 200 }
+        received_per_subscriber_per_minute: { type: integer, minimum: 0, maximum: 30 }
+        received_per_minute: { type: integer, minimum: 0, maximum: 6000 }
+        requests_per_minute: { type: integer, minimum: 0, maximum: 1200 }
+    Sources:
+      type: array
+      maxItems: 8
+      description: Network prefixes without host bits the chatbot's API calls may come from; none allows any.
+      items: { type: string, x-maxBytes: 43 }
+    ChatbotRegistration:
+      type: object
+      additionalProperties: false
+      required: [id, uri]
+      properties:
+        id: { type: string, pattern: "^[A-Za-z0-9_-]{1,64}$", description: Chosen by the operator; never registered again once deleted. }
+        uri: { type: string, x-maxBytes: 255, description: "At most 255 bytes: a SIP URI at RCS_CHATBOT_DOMAIN, such as sip:bot.publisher@<RCS_CHATBOT_DOMAIN>." }
+        display_name: { $ref: "#/components/schemas/DisplayName" }
+        out_of_service: { $ref: "#/components/schemas/OutOfService" }
+        webhook: { $ref: "#/components/schemas/WebhookSetting" }
+        permissions: { $ref: "#/components/schemas/Permissions" }
+        limits: { $ref: "#/components/schemas/Limits" }
+        sources: { $ref: "#/components/schemas/Sources" }
+    Chatbot:
+      type: object
+      required: [id, uri, state]
+      description: A field not set is left out. Readers ignore fields they do not know, since /v1/ grows.
+      properties:
+        id: { type: string }
+        uri: { type: string, description: The URI in normal form. }
+        display_name: { type: string }
+        out_of_service: { type: string }
+        webhook:
+          type: object
+          properties:
+            url: { type: string }
+            verified: { type: boolean, description: The URL answered its challenge (#683). }
+        permissions: { $ref: "#/components/schemas/Permissions" }
+        limits: { $ref: "#/components/schemas/Limits" }
+        sources: { type: array, items: { type: string } }
+        state: { type: string, enum: [active, suspended] }
     Error:
       type: object
       required: [error]
       properties:
         error: { type: string, description: What is wrong, without quoting the request. }
   responses:
+    Chatbot:
+      description: The chatbot.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Chatbot" } } }
+    NotFound:
+      description: No chatbot has the ID.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Taken:
+      description: The ID is registered, the URI is another chatbot's, or the ID was a deleted chatbot's; the error says which.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unreadable:
+      description: The stored chatbot is damaged, or was written by a newer release.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Invalid:
       description: The body is not strict JSON of the route's shape, or a string breaks its rule.
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
@@ -72,7 +203,7 @@ components:
       description: The body is over the route's limit (16 KiB for the operator).
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Busy:
-      description: No token is configured, or every decode slot is taken (then with Retry-After).
+      description: No token is configured; or, with Retry-After, every decode slot is taken or the registry failed (send the request again).
       headers:
         Retry-After: { schema: { type: integer, minimum: 1 } }
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }

@@ -22,8 +22,8 @@
 // the document, so that a release can delete what a newer one wrote.
 //
 // Reads are strongly consistent. SDK errors are reduced to the operation
-// and the AWS error code or the transport failure, so that no request
-// detail reaches a log.
+// and the AWS error code or the transport failure, without the endpoint's
+// address, so that no request detail reaches a log or an audit line.
 package awsstore
 
 import (
@@ -31,6 +31,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strconv"
 
@@ -391,7 +392,26 @@ func sanitize(op string, err error) error {
 	}
 	var ue *url.Error
 	if errors.As(err, &ue) {
-		return fmt.Errorf("awsstore: %s: %s", op, ue.Err.Error())
+		return fmt.Errorf("awsstore: %s: %s", op, transportFailure(ue.Err))
 	}
 	return fmt.Errorf("awsstore: %s: request failed", op)
+}
+
+// transportFailure describes a failed request without the addresses a net
+// error names (the endpoint's IP and port, a DNS server's), which the
+// audit line of a 503 would otherwise carry (#741 review).
+func transportFailure(err error) string {
+	var dns *net.DNSError
+	var op *net.OpError
+	switch {
+	case errors.As(err, &dns) && dns.IsNotFound:
+		return "lookup: no such host"
+	case errors.As(err, &dns) && dns.IsTimeout:
+		return "lookup: timeout"
+	case errors.As(err, &dns):
+		return "lookup failed"
+	case errors.As(err, &op) && op.Err != nil:
+		return op.Op + " " + op.Net + ": " + op.Err.Error()
+	}
+	return err.Error()
 }

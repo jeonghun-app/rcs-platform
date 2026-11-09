@@ -17,10 +17,17 @@ with their own credentials (ADR 0009 §7).
 
 ## Operations
 
-None yet: the operator's routes come with their tables (#708–#713), each
-added to this table and to maap.yaml by its PR. The operator's token is
-refused on every route outside its scope (403), and a path no route serves is
-404.
+| Operation | Route | Caller |
+|---|---|---|
+| `register_chatbot` | `POST /v1/chatbots` | operator |
+| `read_chatbot` | `GET /v1/chatbots/{id}` | operator |
+
+The operation is the audit line's `operation` and the metric's name
+(`api.<operation>.<status>`). Changing, suspending, resuming and deleting a
+chatbot follow (#709); the operator's other routes come with their
+tables (#710–#713), each added here and to maap.yaml by its PR. The
+operator's token is refused on every route outside its scope (403), and a
+path no route serves is 404.
 
 ## Tokens
 

@@ -48,6 +48,10 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	// The internal listener's own decode pool: #683 gives the public
 	// listener another, so that chatbots cannot take rcs-as's slots.
 	api := newInternalAPI(cfg.OperatorTokens, newDecoder(cfg.Decodes, rt.Metrics), rt)
+	api.mountChatbots(&chatbotAPI{
+		decoder: api.decoder, registry: registry, domain: cfg.ChatbotDomain,
+		rules: fieldRules{ports: cfg.WebhookPorts, allowHTTP: cfg.HTTPWebhooks, allowInternal: cfg.InternalWebhooks},
+	})
 	ln, err := d.listen("tcp", cfg.InternalAddr)
 	if err != nil {
 		return fmt.Errorf("maap: internal listener: %w", err)

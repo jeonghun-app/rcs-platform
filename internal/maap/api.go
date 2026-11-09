@@ -175,11 +175,13 @@ func (a *internalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.mux.ServeHTTP(w, r)
 }
 
-// call is one request a route serves, with the decode slot it holds.
+// call is one request a route serves, with the decode slot it holds and
+// what its handler adds to the audit line.
 type call struct {
 	w       http.ResponseWriter
 	r       *http.Request
 	release func()
+	audit   []slog.Attr
 }
 
 // releaseBody frees the call's decode slot, if it holds one. A handler
@@ -216,6 +218,7 @@ func (a *internalAPI) route(pattern, name string, allowed scope, h handler) {
 			} else {
 				attrs = append(attrs, slog.String("caller", "unauthenticated"))
 			}
+			attrs = append(attrs, c.audit...)
 			// The path, the body and the token are never logged.
 			a.log.LogAttrs(r.Context(), slog.LevelInfo, "audit: internal request", attrs...)
 			if p != nil {
@@ -265,6 +268,13 @@ func (a *internalAPI) authenticate(r *http.Request, allowed scope) (*acceptedTok
 		return tok, fail(http.StatusForbidden, "the token's caller may not use this operation")
 	}
 	return tok, nil
+}
+
+// writeJSON answers v as JSON with status.
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 // writeError answers err as {"error": "..."}. An error without an answer of
