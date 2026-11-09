@@ -174,11 +174,16 @@ func singleAddresses(c *cpim.Message) bool {
 // which a name can be made to display as another. Invalid UTF-8 becomes
 // U+FFFD. Whoever writes the quoted string still escapes the result's
 // backslashes as quoted pairs, so that its \uXXXX escapes stand as text.
-func EscapeDisplayName(name string) string {
+func EscapeDisplayName(name string) string { return escapeName(name, true) }
+
+// escapeName is EscapeDisplayName, which with quotes false leaves quote and
+// backslash as they are, for a writer that makes them quoted pairs
+// (cpim.Address.String).
+func escapeName(name string, quotes bool) string {
 	var b strings.Builder
 	for _, r := range name {
 		switch {
-		case r < 0x20, r == 0x7f, 0x80 <= r && r < 0xa0, r == '"', r == '\\', r == 0x2028, r == 0x2029,
+		case r < 0x20, r == 0x7f, 0x80 <= r && r < 0xa0, quotes && (r == '"' || r == '\\'), r == 0x2028, r == 0x2029,
 			r == 0x061c, 0x200b <= r && r <= 0x200f, 0x202a <= r && r <= 0x202e, 0x2066 <= r && r <= 0x2069:
 			fmt.Fprintf(&b, `\u%04x`, r)
 		default:

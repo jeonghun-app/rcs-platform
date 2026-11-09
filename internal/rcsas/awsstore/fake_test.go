@@ -488,9 +488,12 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		items, last := f.page(rows, rowKey, in.ExclusiveStartKey, func(map[string]dtypes.AttributeValue) bool { return true }, tableKey)
 		return &dynamodb.QueryOutput{Items: items, LastEvaluatedKey: last}, nil
 	}
-	if aws.ToString(in.ProjectionExpression) == "#sender, #author, #mode, #size, #notification, #summary, #chatbot" {
-		// recount: the whole partition, keys and the projected attributes.
-		f.recounts++
+	if aws.ToString(in.ProjectionExpression) == "#sender, #author, #mode, #size, #notification, #summary" {
+		// recount: the whole partition, keys and the projected attributes;
+		// counted once for the queue's and its chatbot messages'.
+		if strings.HasPrefix(sOf(vals[":pk"]), queuePrefix) {
+			f.recounts++
+		}
 		if !aws.ToBool(in.ConsistentRead) || aws.ToString(in.KeyConditionExpression) != "#pk = :pk" || in.FilterExpression != nil {
 			f.t.Errorf("recount query %+v", in)
 		}
@@ -498,7 +501,7 @@ func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func
 		for _, r := range f.rows {
 			if sOf(r[attrPK]) == sOf(vals[":pk"]) {
 				p := tableKey(r)
-				for _, a := range []string{attrSender, attrAuthor, attrMode, attrSize, attrNotification, attrSummary, attrChatbot} {
+				for _, a := range []string{attrSender, attrAuthor, attrMode, attrSize, attrNotification, attrSummary} {
 					if v, ok := r[a]; ok {
 						p[a] = v
 					}

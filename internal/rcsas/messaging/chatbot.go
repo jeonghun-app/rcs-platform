@@ -37,10 +37,10 @@ var errBoundaryInContent = errors.New("messaging: chatbot content holds the mult
 // configured chip-list type. Its errors are Submit's.
 //
 // The CPIM is rcs-as's own, built from these fields: nothing maap writes
-// reaches a header but through them. The stored item is marked as a
-// chatbot's, which every delivery holds until #702's delivery check exists,
-// and counts against the chatbot's share of the queue and the chatbots'
-// total.
+// reaches a header but through them. The stored item is a chatbot's
+// (store.Message.Chatbot), which no delivery reads until #702's delivery
+// check exists, and counts against the chatbot's share of the queue and
+// the chatbots' total.
 func (e *Engine) SubmitChatbot(ctx context.Context, m chatbot.BotMessage, chipListType string) error {
 	err := e.submitChatbot(ctx, m, chipListType)
 	e.counted(err, m.Recipient)
@@ -67,15 +67,16 @@ func (e *Engine) submitChatbot(ctx context.Context, m chatbot.BotMessage, chipLi
 
 // chatbotCPIM writes the CPIM of a chatbot's message (RCC.07 v13.0
 // §3.6.8.1.2, §3.6.10.1): From the chatbot's URI with the bot tags and the
-// registry name through EscapeDisplayName, so that no control character of
-// it ends a line here or in a SIP display name made from it; To the
+// registry name, its controls escaped as EscapeDisplayName escapes them so
+// that none ends a line, and its quotes and backslashes quoted pairs, so
+// that a client shows them as they are (#738 review); To the
 // subscriber; DateTime rcs-as's clock; the Message-ID maap generated, with
 // the notifications asked for; the configured content type. A chip list
 // makes it a multipart CPIM, the message first.
 func (e *Engine) chatbotCPIM(m chatbot.BotMessage, chipListType string, now time.Time) ([]byte, error) {
 	c := &cpim.Message{}
 	err := errors.Join(
-		c.Add(cpim.CoreNamespace, cpim.HeaderFrom, cpim.Address{Name: EscapeDisplayName(*m.DisplayName), URI: m.Sender + botTags}.String()),
+		c.Add(cpim.CoreNamespace, cpim.HeaderFrom, cpim.Address{Name: escapeName(*m.DisplayName, false), URI: m.Sender + botTags}.String()),
 		c.Add(cpim.CoreNamespace, cpim.HeaderTo, cpim.Address{URI: m.Recipient}.String()),
 		c.Add(cpim.CoreNamespace, cpim.HeaderDateTime, cpim.FormatDateTime(now)),
 	)

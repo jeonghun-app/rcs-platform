@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/cpim"
@@ -37,17 +39,22 @@ func botMessage(edit func(*chatbot.BotMessage)) chatbot.BotMessage {
 	return m
 }
 
-// stored submits m and returns the queue item it became, claimed.
+// stored submits m and returns the item it became, as the sweep finds
+// it: no queue read returns it.
 func (r *rig) stored(t *testing.T, m chatbot.BotMessage, chipListType string) store.Message {
 	t.Helper()
 	if err := r.e.SubmitChatbot(t.Context(), m, chipListType); err != nil {
 		t.Fatal(err)
 	}
-	ms, err := r.store.Pending(t.Context(), m.Recipient, "", r.clock.Now(), 10)
-	if err != nil || len(ms) != 1 {
-		t.Fatalf("queued %+v, %v", ms, err)
+	ex, _, err := r.store.Expired(t.Context(), r.clock.Now().Add(DefaultStoreTTL), "", 10)
+	if err != nil || len(ex) != 1 || r.queued(t, m.Recipient) != 0 {
+		t.Fatalf("stored %+v, %v, or in the queue", ex, err)
 	}
-	return ms[0]
+	q, err := r.store.Claim(t.Context(), ex[0].Recipient, ex[0].ID, "test", r.clock.Now(), r.clock.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return q
 }
 
 // headers are the CPIM message headers of q as name: value lines, in order.
@@ -82,7 +89,7 @@ func TestAChatbotsCPIMIsBuiltByRCSAs(t *testing.T) {
 	if c.ContentType() != "text/plain;charset=utf-8" || string(c.Body.Bytes()) != "hi there" {
 		t.Fatalf("content %q %q", c.ContentType(), c.Body.Bytes())
 	}
-	if !q.Chatbot || q.Anonymous || q.Sender != testBot || q.Mode != store.Standalone || q.MessageID != "m-1" ||
+	if !q.Chatbot || !store.IsChatbotID(q.ID) || q.Anonymous || q.Sender != testBot || q.Mode != store.Standalone || q.MessageID != "m-1" ||
 		!q.Enqueued.Equal(r.clock.Now()) || !q.Expires.Equal(r.clock.Now().Add(DefaultStoreTTL)) {
 		t.Fatalf("item %+v", q)
 	}
@@ -152,7 +159,8 @@ func TestContentHoldingTheBoundaryIsRefused(t *testing.T) {
 }
 
 // A display name holding CR, LF and NUL cannot add a header to the CPIM or
-// to the SIP From the SIP layer makes of it (viaPager, sipas).
+// to the SIP From the SIP layer makes of it (viaPager, sipas). Its quote
+// and backslash are quoted pairs, which a client shows as they are.
 func TestADisplayNameWithControlsKeepsOneLinePerHeader(t *testing.T) {
 	r := newRig(t, Config{})
 	q := r.stored(t, botMessage(func(m *chatbot.BotMessage) {
@@ -165,6 +173,9 @@ func TestADisplayNameWithControlsKeepsOneLinePerHeader(t *testing.T) {
 	m, err := ParseMessage(q.CPIM.Bytes(), DefaultMaxMessageSize)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if want := "Bot\\u000d\\u000aTo: <" + bob + ">\\u0000\"\\\\u202e"; m.From.Name != want {
+		t.Fatalf("the name reads %q, want %q", m.From.Name, want)
 	}
 	uri, err := sip.ParseURI(testBot)
 	if err != nil {
@@ -179,8 +190,9 @@ func TestADisplayNameWithControlsKeepsOneLinePerHeader(t *testing.T) {
 }
 
 // Each chatbot holds a sender's share of a subscriber's queue and all of
-// them a quarter together; a full share is refused as for a person, with
-// no negative notification queued for the chatbot (that is #705's).
+// them a quarter together; a full share is refused as for a person, and
+// the full quarter as a full queue, with no negative notification queued
+// for the chatbot (that is #705's).
 func TestChatbotsHoldAShareEachAndAQuarterOfAQueue(t *testing.T) {
 	r := newRig(t, Config{MaxQueueMessages: 8})
 	submit := func(bot, id string) error {
@@ -200,14 +212,14 @@ func TestChatbotsHoldAShareEachAndAQuarterOfAQueue(t *testing.T) {
 	if err := submit(otherBot, "m-3"); err != nil {
 		t.Fatal(err)
 	}
-	if err := submit("sip:third@botplatform.mnc001.mcc001.3gppnetwork.org", "m-4"); rejected(err) != ReasonQueueShareFull {
+	if err := submit("sip:third@botplatform.mnc001.mcc001.3gppnetwork.org", "m-4"); rejected(err) != ReasonQueueFull {
 		t.Fatalf("beyond the chatbots' quarter: %v", err)
 	}
 	if err := r.e.Submit(t.Context(), standalone(bob, alice, chat(t, "p-1", "hi", 0))); err != nil {
 		t.Fatalf("a person beside the full quarter: %v", err)
 	}
 	if r.queued(t, testBot)+r.queued(t, "sip:third@botplatform.mnc001.mcc001.3gppnetwork.org") != 0 ||
-		r.m.get("message.rejected.queue_share_full") != 2 {
+		r.m.get("message.rejected.queue_share_full") != 1 || r.m.get("message.rejected.queue_full") != 1 {
 		t.Fatalf("notifications queued for chatbots, or metrics %v", r.m)
 	}
 }
@@ -230,7 +242,7 @@ func TestStoredChatbotMessagesAreHeldUntilTheyExpire(t *testing.T) {
 	if d := r.d.nextPager(t); d.Sender != bob {
 		t.Fatalf("delivered %+v", d)
 	}
-	waitFor(t, "the person's message removed", func() bool { return r.queued(t, alice) == 1 })
+	waitFor(t, "the person's message removed", func() bool { return r.queued(t, alice) == 0 && r.idle() })
 	if n, err := r.e.Sweep(context.Background()); n != 0 || err != nil {
 		t.Fatalf("Sweep before the TTL = %d, %v", n, err)
 	}
@@ -254,7 +266,41 @@ func TestAChatbotsResentMessageIsTakenAndAReusedIDRefused(t *testing.T) {
 		}
 	}
 	err := r.e.SubmitChatbot(t.Context(), botMessage(func(m *chatbot.BotMessage) { m.Recipient = bob }), "")
-	if rejected(err) != ReasonMessageIDReused || r.m.get("message.resent") != 1 || r.queued(t, alice) != 2 {
+	if rejected(err) != ReasonMessageIDReused || r.m.get("message.resent") != 1 || r.m.get("message.accepted") != 2 {
 		t.Fatalf("SubmitChatbot = %v, metrics %v", err, r.m)
+	}
+}
+
+// Tester on #738: chatbot messages queued for a subscriber made every
+// registration's pass see something, so it marked a new flow, and the
+// other task's reads of that mark moved a person's IMDN off the open
+// session. No queue read sees them now: the registration marks nothing,
+// arms no retry timer, and the IMDN goes on the session.
+func TestQueuedChatbotMessagesLeaveAPersonsSessionAlone(t *testing.T) {
+	reads := &pendingCalls{}
+	r1, r2 := twoTasks(t, nil, func(s store.Store) store.Store { reads.Store = s; return reads })
+	l := r1.listen(t)
+	_, a := r1.connect(t, l, LegParams{User: alice, Peer: bob, Conversation: conv, Mode: store.Chat})
+	_, b := r1.connect(t, l, LegParams{User: bob, Peer: alice, Conversation: conv, Mode: store.Chat})
+	a.send(t, chat(t, "Xs8kLz1", "hello bob", imdn.PositiveDelivery))
+	b.next(t)
+	for i := range 3 {
+		if err := r1.e.SubmitChatbot(t.Context(), botMessage(func(m *chatbot.BotMessage) { m.MessageID = fmt.Sprint("m-", i) }), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r1.e.mu.Lock()
+	_, kicked := r1.e.recipients[alice]
+	r1.e.mu.Unlock()
+	r2.e.UserRegistered(alice, true)
+	waitFor(t, "the registration's pass", func() bool { return reads.n.Load() > 0 && r2.idle() })
+	marks, err := r2.store.Reached(t.Context(), alice, r2.clock.Now())
+	if err != nil || len(marks) != 0 || kicked || r2.m.get("delivery.registered_marked") != 0 || r2.clock.armed(DefaultRetryInterval) {
+		t.Fatalf("marks %v (%v), a pass for the chatbots' messages %v, metrics %v, or a retry timer", marks, err, kicked, r2.m)
+	}
+	rcpt := receipt(t, "Xs8kLz1", imdn.DeliveryNotification, imdn.Delivered)
+	b.send(t, rcpt)
+	if got := a.next(t); !bytes.Equal(got.Body.Bytes(), rcpt) || r1.m.get("delivery.pager")+r2.m.get("delivery.pager") != 0 {
+		t.Fatalf("alice got %q, metrics %v and %v", got.Body.Bytes(), r1.m, r2.m)
 	}
 }

@@ -1341,9 +1341,12 @@ it on (ADR 0009 §4, chatbot → subscriber step 4).
   - `From`: the chatbot's URI in normal form with the isbot and Chatbot
     application version (`#=1,#=2`) feature tags in a `Contact` URI header
     escaped as §3.2.2.6 has it (§3.6.8.1.2 item 1, §3.6.2.2), and the
-    registry display name through `EscapeDisplayName`, so that a CR, LF or
-    NUL in it never ends a header line in the CPIM or in the SIP `From`
-    made from it;
+    registry display name as a quoted string: its controls (C0, DEL, C1,
+    U+2028/2029, bidi and zero-width) escaped as `EscapeDisplayName` does,
+    so that a CR, LF or NUL never ends a header line, and its quotes and
+    backslashes quoted pairs (`\"`, `\\`, RFC 3862 §2.3), which a client
+    shows as they are. The SIP display name (#702) is made from the stored
+    name, never from the CPIM, so nothing is escaped twice;
   - `To`: the subscriber's canonical tel URI;
   - `DateTime`: `rcs-as`'s clock when it accepts the message;
   - `NS: imdn` and `imdn.Message-ID`: the ID `maap` generated, also without
@@ -1358,30 +1361,41 @@ it on (ADR 0009 §4, chatbot → subscriber step 4).
 - **Store.** It goes through the pipeline's own steps from the sent record
   on ([The pipeline](#the-pipeline) steps 5–6): the sent record when
   notifications are asked for (T10), a resend of the same Message-ID to the
-  same subscriber taken again, the same ID to another refused. The item is
-  marked as a chatbot's (`chatbot`, and `anonymous` for an anonymous
-  conversation, ADR 0009 §10), and its `enqueued` time is when `rcs-as`
-  accepted it, from which `chatbot.queue_age` (#702, #705) is measured. It
-  expires after `RCSAS_STORE_TTL`, its sent record after `RCSAS_SENT_TTL`.
+  same subscriber taken again as a second item, as for a person (the client
+  drops the copy by its Message-ID), the same ID to another refused. The
+  item is a chatbot's (`store.Message.Chatbot`, its ID starting `b-`, and
+  `anonymous` for an anonymous conversation, ADR 0009 §10), and its
+  `enqueued` time is when `rcs-as` accepted it, from which
+  `chatbot.queue_age` (#702, #705) is measured. It expires after
+  `RCSAS_STORE_TTL`, its sent record after `RCSAS_SENT_TTL`.
+- **Kept apart from the queue** (#738 review). No queue read (`Pending`,
+  `PendingHeld`) returns it, so a person's delivery or registration never
+  reads it and marks no new flow for it. In DynamoDB it has a partition
+  (`b#<len>#<recipient>`) and expiry buckets (`b#00`–`b#15`) of its own,
+  which no version before #738 reads, so none can deliver it as a
+  person's message. It counts toward the queue's size.
 - **Queue shares** (ADR 0009 §9, T10, memo D3). A chatbot is a sender with
   one share of a subscriber's queue (`1/RCSAS_QUEUE_SENDER_SHARE`, an
   eighth), and all chatbots together hold at most a quarter of its messages
   and bytes (`messaging.ChatbotsShare`), as group notifications do. A full
-  share or queue is refused as for a person. The negative notification a
-  person would get is not queued: a chatbot's goes through `maap` (#705).
-- **Held until #702.** Until the delivery check exists, every delivery
-  leaves a chatbot's message queued, with the switch on or off: the
-  messages after it, a person's included, go on, it sets no retry timer,
-  and it expires under its TTL as undeliverable, counted in
+  share is refused as for a person (`queue_share_full`); a full quarter is
+  `queue_full`, as a full queue, since it is no rule of the one sending.
+  The negative notification a person would get is not queued: a chatbot's
+  goes through `maap` (#705).
+- **Held until #702.** Until the delivery check exists nothing delivers a
+  chatbot's message, with the switch on or off: it sets no retry timer,
+  wakes no pass, and expires under its TTL as undeliverable, counted in
   `message.expired`, without a notification queued for the chatbot.
-- **Rolling update.** A task of a version without the delivery check
-  (#702) would deliver a queued chatbot message as a person's: it reads the
-  item without the `chatbot` attribute. So `RCSAS_CHATBOTS=on` needs every
-  task on a version that has the delivery check (#702); #684's runbook
-  carries it. A person's item is written as before, without the two new
-  attributes. An older task that removes a chatbot's item leaves its count
-  in the chatbots' total, which the next refusal's recount corrects, as for
-  any size.
+- **Rollout and rollback** (#684's runbook carries both):
+  - Turn `RCSAS_CHATBOTS=on` in a deploy of its own, after one that put
+    #702 on every task: a deploy's automatic rollback then lands on a
+    version that knows chatbot messages.
+  - Do not roll back below #738 until `RCSAS_STORE_TTL` has passed since
+    the switch was last on. Such a version never delivers them, but loses
+    them: unseen, still counted in the queue's size, until DynamoDB's TTL
+    deletes them, with no `failed` for the chatbot. Its recount of a queue
+    may also drop their count, so that after a roll forward the queue holds
+    up to the chatbots' quarter more until it empties.
 
 ## Settings
 

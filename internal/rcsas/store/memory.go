@@ -74,6 +74,9 @@ func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 		}
 		m.Fence = nil
 	}
+	if m.Chatbot != IsChatbotID(m.ID) {
+		return fmt.Errorf("store: enqueue: a chatbot's message needs a chatbot ID, and only it")
+	}
 	q := s.queues[m.Recipient]
 	if _, ok := q[m.ID]; ok {
 		return fmt.Errorf("store: enqueue: %w", ErrExists)
@@ -106,7 +109,7 @@ func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 	case m.InSummaryTotal() && (l.SummaryCount > 0 && summaryCount+1 > l.SummaryCount || l.SummaryBytes > 0 && summaryBytes+m.Size() > l.SummaryBytes):
 		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
 	case m.InChatbotTotal() && (l.ChatbotCount > 0 && chatbotCount+1 > l.ChatbotCount || l.ChatbotBytes > 0 && chatbotBytes+m.Size() > l.ChatbotBytes):
-		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
+		return fmt.Errorf("store: enqueue: %w", ErrQueueFull)
 	}
 	if q == nil {
 		q = map[string]Message{}
@@ -124,7 +127,7 @@ func (s *Memory) Pending(_ context.Context, recipient, after string, now time.Ti
 	defer s.mu.Unlock()
 	var out []Message
 	for _, m := range s.queues[recipient] {
-		if m.ID > after && m.Free(now) && m.Expires.After(now) {
+		if m.ID > after && m.Free(now) && m.Expires.After(now) && !m.Chatbot {
 			out = append(out, m.Clone())
 		}
 	}
@@ -142,7 +145,7 @@ func (s *Memory) PendingHeld(_ context.Context, recipient, after, owner string, 
 	var out, held []Message
 	for _, m := range s.queues[recipient] {
 		switch {
-		case m.ID <= after || !m.Expires.After(now):
+		case m.ID <= after || !m.Expires.After(now) || m.Chatbot:
 		case m.Free(now):
 			out = append(out, m.Clone())
 		case m.Owner != owner:
