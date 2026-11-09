@@ -8,7 +8,9 @@ Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 `internal/maap`, wired by `cmd/maap`. It is being built under epic #668:
 today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token; no route is mounted yet
-(#708–#713 add the operator's).
+(#709–#713 add the operator's). The [registry](#dynamodb-maap-registry-table)
+has its store and a memory backend (#708), which no route uses yet; its
+DynamoDB backend follows in the next pull request of #708.
 
 ## Listeners
 
@@ -104,3 +106,53 @@ content is checked by `chatbot.ValidateContent` instead.
 
 Metrics have the `Service` dimension only (ADR 0009 §10):
 `api.<operation>.<status>` per request and `api.decode_busy`.
+
+## DynamoDB `maap-registry` table
+
+`MAAP_REGISTRY_TABLE`, on demand with point-in-time recovery (ADR 0003),
+written by `maap`'s task role only (ADR 0009 §12); the table itself comes
+with the infrastructure (#684). Partition key `pk` and sort key `sk`, both
+strings; no index and **no TTL attribute**: a chatbot is kept until the
+operator deletes it.
+
+| `pk` | `sk` | Holds |
+|---|---|---|
+| `c#<chatbot ID>` | `chatbot` | The chatbot: `version` (number), `doc` (binary, the record as `internal/maap/store` encodes it), `writer` |
+| `u#<chatbot URI>` | `uri` | The URI's reservation: `chatbot` (the ID), `writer` |
+| `c#<chatbot ID>` | `k#<key ID>` | Reserved for the chatbot's credentials (#710) |
+
+- **Record.** The display name (at most 128 bytes), the out-of-service text
+  (512), the webhook URL (512) and whether it answered its challenge, the
+  permissions (MSISDN, starting conversations) and the state, `active` or
+  `suspended`, and these, as the lead fixed them on #708:
+  - the **ID**: 1–64 characters of letters, digits, `-` and `_`;
+  - nine **limits**, one per row of ADR 0009 §9's table that bounds a
+    chatbot (sends a minute and a day; conversations started a minute and a
+    day; sends to one subscriber a minute and a day; subscriber messages
+    from one subscriber a minute; subscriber messages a minute; requests a
+    minute), each 0 for the platform's default; the operator API keeps them
+    at or under it (#709);
+  - up to 8 **source networks**, in canonical prefix form (`192.0.2.0/24`,
+    `2001:db8::/32`: no host bits, IPv6 in its shortest form), none for any;
+  - the **URI**, which never changes: a chatbot that needs another URI is
+    deleted and registered again.
+
+  The document is strict JSON with a schema number, at most 16 KiB: a
+  reader refuses a field it does not know, so a release reads a new field
+  before any release writes it (ADR 0009 §6).
+- **One chatbot per URI** (T13). The URI is stored only in the normal form of
+  `internal/chatbot`. Registering writes the record and
+  the reservation in one transaction, each on the condition that it does not
+  exist yet, so a second chatbot with the same URI is refused ("taken", which
+  #709 answers 409).
+- **Changes** rewrite the record on the condition that its `version` is the
+  one read, so of two concurrent changes one wins and the other is refused
+  as a conflict. A random `writer` token tells a write the SDK sent again
+  after its answer was lost, which then stands, from another writer's.
+- **Deleting** a chatbot deletes every item of its partition, the record
+  last, together with the reservation, which frees the URI. A deletion that
+  failed part way is finished by calling it again; deleting a chatbot that
+  is gone does nothing (ADR 0009 §10).
+- **Errors.** A store failure is an error of its own, never "not found":
+  callers answer it 503, not 404. Errors carry the operation and the AWS
+  error code only.
