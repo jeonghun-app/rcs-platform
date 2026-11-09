@@ -4,13 +4,18 @@
 // kinds of call has its own timeout, cap on the calls in flight per task, and
 // breaker, so that a slow or failing maap is answered for at once instead of
 // stalling the subscriber's path, and a queue drain cannot starve admissions
-// (§12).
+// (§12). The caps and breakers belong to a *Client, so a task makes one and
+// every caller shares it: two would double the caps and split the breakers.
 //
 // maap is outside the SIP trust domain (§1), so its answers are untrusted:
 // they go through chatbot.DecodeEnvelope under chatbot.MaxAnswerBytes, which
-// validates them. Every call fails closed: anything but a valid answer is
-// [ErrUnavailable]. Neither a body nor the token reaches a log, and no error
-// quotes either.
+// validates them, and their headers are bounded too. Every call fails
+// closed: anything but a valid answer is [ErrUnavailable]. Neither a body
+// nor the token reaches a log, and no error quotes either.
+//
+// A caller's deadline counts against the breaker only as a deadline: a
+// context ended by cancel, as one from context.WithCancel or an
+// AfterFunc(cancel) timer, reads as a caller that gave up.
 package maapclient
 
 import (
@@ -54,17 +59,20 @@ type Metrics interface {
 // Config is what New needs. The caller reads it from rcs-as's settings.
 type Config struct {
 	// URL is maap's internal API: http or https, with no user, path, query
-	// or fragment.
-	URL *url.URL
+	// or fragment. Plain http needs a host runtime.IsPrivateHost accepts in
+	// Namespace, the Cloud Map namespace (ADR 0007 §5).
+	URL       *url.URL
+	Namespace string
 	// Token is rcs-as's bearer token for maap (ADR 0007 §3, ADR 0009 §7).
 	Token secret.Key
-	// Production applies ADR 0007 §5 as staging and prod must: plain http
-	// only to a host runtime.IsPrivateHost accepts in Namespace, the Cloud
-	// Map namespace, and, when Transport is nil, connections only to
-	// private addresses (runtime.InternalDialer).
-	Production bool
-	Namespace  string
-	// Transport sends the requests; nil means one of the client's own.
+	// Dev lifts ADR 0007 §5 for dev and test (RCS_ENV), where maap may be
+	// on loopback or a compose name: plain http to any host, connections to
+	// any address, and Transport. Its zero value keeps the rules of staging
+	// and prod, where the default transport connects only to private
+	// addresses (runtime.InternalDialer).
+	Dev bool
+	// Transport sends the requests, for tests; nil means the client's own.
+	// It needs Dev, since it bypasses the dial and header rules.
 	Transport http.RoundTripper
 	// Metrics is required. Logger nil discards; Now nil is time.Now.
 	Metrics Metrics
@@ -72,19 +80,17 @@ type Config struct {
 	Now     func() time.Time
 }
 
-// The metrics of ADR 0009 §12 and #674's operations follow-ups, which #684
-// alarms on. Their unavailable counts include full caps and open breakers.
+// Bounds of the client's own transport: the dial and TLS handshake, which
+// a request's timeout does not reach once http.Transport works for its pool
+// (the shortest call timeout), and an answer's headers, which
+// chatbot.MaxAnswerBytes does not cover and Go would read up to 10 MiB of.
 const (
-	metricAdmissionUnavailable       = "chatbot.admission_unavailable"
-	metricAdmissionLatency           = "chatbot.admission_latency"
-	metricDeliveryCheckUnavailable   = "chatbot.delivery_check_unavailable"
-	metricDeliveryCheckBreakerOpened = "chatbot.delivery_check_breaker_opened"
+	dialTimeout    = 2 * time.Second
+	maxHeaderBytes = 16 << 10
 )
 
-// dialTimeout bounds a connection's dial, which the request's own timeout
-// does not reach once http.Transport dials for its pool; it is the shortest
-// call timeout.
-const dialTimeout = 2 * time.Second
+// maxInFlight is each kind's cap on calls in flight per task (§12).
+const maxInFlight = 64
 
 // Client calls maap. Its methods are safe for concurrent use.
 type Client struct {
@@ -98,22 +104,22 @@ type Client struct {
 	admission, deliveryCheck, delivery *kind
 }
 
-// kind is one kind of call with its own bounds (ADR 0009 §12).
+// kind is one kind of call with its own bounds (ADR 0009 §12), and its own
+// metrics (#674, #747): chatbot.<name>_unavailable (every call that ended
+// unavailable, full caps and open breakers included), _cap_full,
+// _breaker_opened, and the timing _latency of each call that reached maap.
 type kind struct {
 	name    string
 	timeout time.Duration
 	slots   chan struct{}
 	breaker breaker
-	// Metrics this kind records, "" for none.
-	unavailable, latency, opened string
 }
-
-// maxInFlight is each kind's cap on calls in flight per task (§12).
-const maxInFlight = 64
 
 func newKind(name string, timeout time.Duration) *kind {
 	return &kind{name: name, timeout: timeout, slots: make(chan struct{}, maxInFlight)}
 }
+
+func (k *kind) metric(suffix string) string { return "chatbot." + k.name + suffix }
 
 // New returns a client of the maap that cfg names, or an error if cfg breaks
 // a rule above.
@@ -123,8 +129,10 @@ func New(cfg Config) (*Client, error) {
 	case u == nil || u.Scheme != "http" && u.Scheme != "https" || u.Host == "" || u.Opaque != "" ||
 		u.User != nil || u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "":
 		return nil, errors.New("maapclient: the URL is not an http or https URL without a user, path, query or fragment")
-	case cfg.Production && u.Scheme == "http" && !runtime.IsPrivateHost(u.Hostname(), cfg.Namespace):
+	case !cfg.Dev && u.Scheme == "http" && !runtime.IsPrivateInternalURL(u, cfg.Namespace):
 		return nil, errors.New("maapclient: the URL is plain http to a host that is not private (ADR 0007 §5)")
+	case !cfg.Dev && cfg.Transport != nil:
+		return nil, errors.New("maapclient: a Transport of the caller's needs Dev")
 	case cfg.Token.IsZero():
 		return nil, errors.New("maapclient: no token")
 	case cfg.Metrics == nil:
@@ -141,8 +149,6 @@ func New(cfg Config) (*Client, error) {
 		// Above the webhook's 10 s, below RCSAS_DELIVERY_TIMEOUT (§12).
 		delivery: newKind("delivery", 15*time.Second),
 	}
-	c.admission.unavailable, c.admission.latency = metricAdmissionUnavailable, metricAdmissionLatency
-	c.deliveryCheck.unavailable, c.deliveryCheck.opened = metricDeliveryCheckUnavailable, metricDeliveryCheckBreakerOpened
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
 	}
@@ -151,16 +157,18 @@ func New(cfg Config) (*Client, error) {
 	}
 	transport := cfg.Transport
 	if transport == nil {
-		dial := (&net.Dialer{Timeout: dialTimeout}).DialContext
-		if cfg.Production {
-			dial = runtime.InternalDialer{Timeout: dialTimeout}.DialContext
+		dial := runtime.InternalDialer{Timeout: dialTimeout}.DialContext
+		if cfg.Dev {
+			dial = (&net.Dialer{Timeout: dialTimeout}).DialContext
 		}
 		transport = &http.Transport{
-			Proxy:               nil,
-			DialContext:         dial,
-			ForceAttemptHTTP2:   true,
-			MaxIdleConnsPerHost: 3 * maxInFlight,
-			IdleConnTimeout:     90 * time.Second,
+			Proxy:                  nil,
+			DialContext:            dial,
+			TLSHandshakeTimeout:    dialTimeout,
+			MaxResponseHeaderBytes: maxHeaderBytes,
+			ForceAttemptHTTP2:      true,
+			MaxIdleConnsPerHost:    3 * maxInFlight,
+			IdleConnTimeout:        90 * time.Second,
 		}
 	}
 	// The token must not follow a redirect (ADR 0007 §5).
@@ -176,7 +184,7 @@ func New(cfg Config) (*Client, error) {
 // Retry-After: 5 (§12); any other error is an invalid a.
 func (c *Client) Admit(ctx context.Context, a chatbot.Admission) (chatbot.AdmissionAnswer, error) {
 	var answer chatbot.AdmissionAnswer
-	_, err := c.call(ctx, c.admission, "/v1/rcs/admissions", a, &answer)
+	_, err := c.call(ctx, c.admission, "/v1/rcs/admissions", a, &answer, nil)
 	if err != nil {
 		return chatbot.AdmissionAnswer{}, err
 	}
@@ -190,7 +198,7 @@ func (c *Client) Admit(ctx context.Context, a chatbot.Admission) (chatbot.Admiss
 // message is held; any other error is an invalid check.
 func (c *Client) CheckDelivery(ctx context.Context, check chatbot.DeliveryCheck) (chatbot.DeliveryCheckAnswer, error) {
 	var answer chatbot.DeliveryCheckAnswer
-	_, err := c.call(ctx, c.deliveryCheck, "/v1/rcs/delivery-checks", check, &answer)
+	_, err := c.call(ctx, c.deliveryCheck, "/v1/rcs/delivery-checks", check, &answer, nil)
 	if err != nil {
 		return chatbot.DeliveryCheckAnswer{}, err
 	}
@@ -207,11 +215,12 @@ const (
 	DeliveryUnavailable Delivery = iota
 	// Delivered is a 200: the webhook took it, so it is dequeued.
 	Delivered
-	// DeliveryRetry is a 503: the chatbot's webhook failed or is busy, so it
-	// is kept for retry until its TTL.
+	// DeliveryRetry is a 503 with a chatbot.DeliveryRefusal that asks for a
+	// retry: the chatbot's webhook failed or is busy, so it is kept for retry
+	// until its TTL.
 	DeliveryRetry
-	// Undeliverable is a 404: an unknown or suspended chatbot, or a blocked
-	// pair.
+	// Undeliverable is a 404 with a chatbot.DeliveryRefusal of an unknown or
+	// suspended chatbot, or a blocked pair.
 	Undeliverable
 )
 
@@ -229,10 +238,11 @@ func (c *Client) DeliverNotification(ctx context.Context, n chatbot.SubscriberNo
 }
 
 func (c *Client) deliver(ctx context.Context, path string, body, answer validator) (Delivery, error) {
-	// A 503 or 404 is about one chatbot, which maap answered for: it is not a
+	// A refusal is about one chatbot, which maap answered for: it is not a
 	// failure, so one chatbot's failing webhook does not open the breaker for
-	// every chatbot.
-	status, err := c.call(ctx, c.delivery, path, body, answer, http.StatusServiceUnavailable, http.StatusNotFound)
+	// every chatbot. A 404 or 503 without one is anything else's, and is.
+	var refusal chatbot.DeliveryRefusal
+	status, err := c.call(ctx, c.delivery, path, body, answer, &refusal)
 	switch {
 	case err != nil:
 		return DeliveryUnavailable, err
@@ -247,9 +257,10 @@ func (c *Client) deliver(ctx context.Context, path string, body, answer validato
 type validator interface{ Validate() error }
 
 // call posts body to path as a call of kind k, and returns the status of an
-// answer: a 200 decoded into answer, or one of also, whose body is not read
-// as an answer. Its errors name the kind and the cause, never a body.
-func (c *Client) call(ctx context.Context, k *kind, path string, body, answer validator, also ...int) (int, error) {
+// answer: a 200 decoded into answer, or, given a refusal to decode into, a
+// 404 or 503 that carries one for its status. Its errors name the kind and
+// the cause, never a body.
+func (c *Client) call(ctx context.Context, k *kind, path string, body, answer validator, refusal *chatbot.DeliveryRefusal) (int, error) {
 	if err := body.Validate(); err != nil {
 		return 0, fmt.Errorf("maapclient: %s request: %w", k.name, err)
 	}
@@ -257,29 +268,32 @@ func (c *Client) call(ctx context.Context, k *kind, path string, body, answer va
 	if err != nil {
 		return 0, fmt.Errorf("maapclient: %s request: %w", k.name, err)
 	}
-	status, err := c.send(ctx, k, path, data, answer, also)
-	if err != nil && k.unavailable != "" {
-		c.metrics.Count(k.unavailable, 1)
+	if err := ctx.Err(); err != nil {
+		// Nothing is sent, so this says nothing of maap: not counted.
+		return 0, fmt.Errorf("%w: %s: %w", ErrUnavailable, k.name, err)
+	}
+	status, err := c.send(ctx, k, path, data, answer, refusal)
+	if err != nil {
+		c.metrics.Count(k.metric("_unavailable"), 1)
 	}
 	return status, err
 }
 
-func (c *Client) send(ctx context.Context, k *kind, path string, data []byte, answer validator, also []int) (int, error) {
+func (c *Client) send(ctx context.Context, k *kind, path string, data []byte, answer validator, refusal *chatbot.DeliveryRefusal) (int, error) {
 	select {
 	case k.slots <- struct{}{}:
 		defer func() { <-k.slots }()
 	default:
+		c.metrics.Count(k.metric("_cap_full"), 1)
 		return 0, ErrCapFull
 	}
-	trial, ok := k.breaker.allow(c.now())
+	t, ok := k.breaker.allow(c.now())
 	if !ok {
 		return 0, ErrBreakerOpen
 	}
 	start := c.now()
-	status, cause := c.post(ctx, k, path, data, answer, also)
-	if k.latency != "" {
-		c.metrics.Timing(k.latency, c.now().Sub(start))
-	}
+	status, cause := c.post(ctx, k, path, data, answer, refusal)
+	c.metrics.Timing(k.metric("_latency"), c.now().Sub(start))
 	result := succeeded
 	switch {
 	case cause == "":
@@ -290,12 +304,12 @@ func (c *Client) send(ctx context.Context, k *kind, path string, data []byte, an
 	default:
 		result = failed
 	}
-	switch k.breaker.done(c.now(), trial, result) {
+	switch k.breaker.done(c.now(), t, result) {
 	case opened:
-		c.log.Warn("rcs-as: the maap breaker opened", slog.String("call", k.name))
-		if k.opened != "" {
-			c.metrics.Count(k.opened, 1)
-		}
+		// The cause holds a status or a field's name, never a value, and
+		// tells a maap that is down from one whose answers rcs-as refuses.
+		c.log.Warn("rcs-as: the maap breaker opened", slog.String("call", k.name), slog.String("cause", cause))
+		c.metrics.Count(k.metric("_breaker_opened"), 1)
 	case closed:
 		c.log.Info("rcs-as: the maap breaker closed", slog.String("call", k.name))
 	}
@@ -306,8 +320,9 @@ func (c *Client) send(ctx context.Context, k *kind, path string, data []byte, an
 }
 
 // post sends one request within k's timeout and reads its answer. It returns
-// the status, or why there is no valid answer.
-func (c *Client) post(ctx context.Context, k *kind, path string, data []byte, answer validator, also []int) (int, string) {
+// the status, or why there is no valid answer: "timeout", "cancelled", "no
+// answer", "status N", or "answer refused: " and the decoder's reason.
+func (c *Client) post(ctx context.Context, k *kind, path string, data []byte, answer validator, refusal *chatbot.DeliveryRefusal) (int, string) {
 	ctx, cancel := context.WithTimeout(ctx, k.timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+path, bytes.NewReader(data))
@@ -320,26 +335,38 @@ func (c *Client) post(ctx context.Context, k *kind, path string, data []byte, an
 	res, err := c.http.Do(req)
 	if err != nil {
 		// The error would name the URL; the context says enough.
-		if ctx.Err() != nil {
-			return 0, "timed out or cancelled"
-		}
-		return 0, "no answer"
+		return 0, ended(ctx, "no answer")
 	}
 	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
+	status, into := res.StatusCode, answer
+	switch {
+	case status == http.StatusOK:
+	case refusal != nil && (status == http.StatusNotFound || status == http.StatusServiceUnavailable):
+		into = refusal
+	default:
 		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, chatbot.MaxAnswerBytes))
-		for _, s := range also {
-			if res.StatusCode == s {
-				return s, ""
-			}
-		}
-		return 0, "answered " + strconv.Itoa(res.StatusCode)
+		return 0, "status " + strconv.Itoa(status)
 	}
-	if err := chatbot.DecodeEnvelope(res.Body, chatbot.MaxAnswerBytes, answer); err != nil {
-		if ctx.Err() != nil {
-			return 0, "timed out or cancelled"
-		}
+	err = chatbot.DecodeEnvelope(res.Body, chatbot.MaxAnswerBytes, into)
+	switch {
+	case err != nil && !errors.Is(err, chatbot.ErrInvalidEnvelope) && !errors.Is(err, chatbot.ErrBodyTooLarge):
+		// A read error may name an address; the context says enough.
+		return 0, ended(ctx, "answer not read")
+	case err != nil:
 		return 0, "answer refused: " + err.Error()
+	case status != http.StatusOK && refusal.Undeliverable() != (status == http.StatusNotFound):
+		return 0, "status " + strconv.Itoa(status) + " with another status's reason"
 	}
-	return http.StatusOK, ""
+	return status, ""
+}
+
+// ended names why ctx ended, or gives otherwise if it has not.
+func ended(ctx context.Context, otherwise string) string {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return "timeout"
+	case ctx.Err() != nil:
+		return "cancelled"
+	}
+	return otherwise
 }

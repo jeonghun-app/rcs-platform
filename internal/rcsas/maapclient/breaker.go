@@ -14,14 +14,23 @@ const (
 // breaker opens after breakerFailures failures in a row and then answers at
 // once for breakerOpenFor. After that it lets one call through, the trial:
 // its success closes the breaker and its failure opens it again. Only the
-// trial decides, so a call that started before the breaker opened neither
-// closes it nor opens it again when it ends.
+// trial decides: a call that started before the breaker last opened is from
+// an older cycle, and its end changes nothing, even after the trial closed
+// it (#747). Only closed breakers let other calls start, so counting the
+// openings alone tells every older call apart.
 type breaker struct {
 	mu       sync.Mutex
 	failures int // in a row
 	open     bool
 	until    time.Time
-	trial    bool // in flight
+	trial    bool   // in flight
+	cycle    uint64 // openings so far
+}
+
+// ticket is what allow gave a call, for done.
+type ticket struct {
+	cycle uint64
+	trial bool
 }
 
 type result int
@@ -40,28 +49,27 @@ const (
 	closed
 )
 
-// allow reports whether a call may go to maap at now, and whether it is the
-// trial.
-func (b *breaker) allow(now time.Time) (trial, ok bool) {
+// allow reports whether a call may go to maap at now.
+func (b *breaker) allow(now time.Time) (ticket, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch {
 	case !b.open:
-		return false, true
+		return ticket{cycle: b.cycle}, true
 	case b.trial || now.Before(b.until):
-		return false, false
+		return ticket{}, false
 	}
 	b.trial = true
-	return true, true
+	return ticket{cycle: b.cycle, trial: true}, true
 }
 
 // done records how a call allow let through ended at now.
-func (b *breaker) done(now time.Time, trial bool, r result) change {
+func (b *breaker) done(now time.Time, t ticket, r result) change {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if trial {
+	if t.trial {
 		b.trial = false
-	} else if b.open {
+	} else if t.cycle != b.cycle {
 		return unchanged
 	}
 	switch r {
@@ -80,6 +88,7 @@ func (b *breaker) done(now time.Time, trial bool, r result) change {
 	b.failures++
 	if b.failures >= breakerFailures {
 		b.open, b.until = true, now.Add(breakerOpenFor)
+		b.cycle++
 		return opened
 	}
 	return unchanged

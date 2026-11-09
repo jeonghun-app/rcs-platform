@@ -133,12 +133,44 @@ type SubscriberNotification struct {
 	Status imdn.Status `json:"status" maxbytes:"16"`
 }
 
+// The reasons of a DeliveryRefusal that ask for a retry (§4, §12): the
+// chatbot's webhook failed or timed out, or its deliveries are all in use or
+// its webhook breaker is open.
+const (
+	ReasonWebhookFailed = "webhook_failed"
+	ReasonChatbotBusy   = "chatbot_busy"
+)
+
+// DeliveryRefusal is the body of a 404 or 503 to POST /v1/rcs/messages and
+// /v1/rcs/notifications (§4, subscriber → chatbot step 5). It is what tells
+// maap's answer about one chatbot from a 404 or 503 of anything else on the
+// way, such as a mux that does not serve the path or a server too busy to
+// read the request, which rcs-as reads as maap unavailable (#747).
+type DeliveryRefusal struct {
+	// Reason is ReasonSuspended, ReasonBlocked or ReasonUnknown with a 404
+	// (undeliverable), ReasonWebhookFailed or ReasonChatbotBusy with a 503
+	// (retry).
+	Reason string `json:"reason" maxbytes:"16"`
+}
+
+// Undeliverable reports whether r is a reason for a 404 rather than a 503.
+func (r DeliveryRefusal) Undeliverable() bool { return slices.Contains(deliveryReasons, r.Reason) }
+
+// Validate checks r's fields.
+func (r DeliveryRefusal) Validate() error {
+	if !r.Undeliverable() && !slices.Contains(retryReasons, r.Reason) {
+		return invalid("reason")
+	}
+	return nil
+}
+
 // The values of each enumerated field. A new value ships in the receiver a
 // release before any sender uses it (§6).
 var (
 	chatbotStates    = []string{StateActive, StateSuspended}
 	admissionReasons = []string{ReasonBlocked, ReasonOverLimit, ReasonUnknown}
 	deliveryReasons  = []string{ReasonSuspended, ReasonBlocked, ReasonUnknown}
+	retryReasons     = []string{ReasonWebhookFailed, ReasonChatbotBusy}
 	// notificationStatuses are the statuses RFC 5438 §11.1.7 allows each
 	// kind that reaches a chatbot.
 	notificationStatuses = map[imdn.Kind][]imdn.Status{
