@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
@@ -25,6 +26,8 @@ type chatbotAPI struct {
 	// deleters are the other tables' per-chatbot deletions, which a
 	// chatbot's deletion runs after the registry's (#710–#713 add theirs).
 	deleters []store.ChatbotDeleter
+	// deleteBudget replaces the package's deleteBudget, in tests.
+	deleteBudget time.Duration
 }
 
 // mountChatbots serves cb's routes on a, for the operator only.

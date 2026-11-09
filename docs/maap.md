@@ -40,7 +40,7 @@ reported at once at start.
 | `MAAP_DECODES` | `8` | request bodies the internal listener decodes at once (see [Memory](#memory)); at least 1 |
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
 | `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
-| `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
+| `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711); refused if equal to another maap table, whose deletions would then take half of each alias |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | idempotency records and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
 
@@ -133,7 +133,7 @@ the path that no chatbot can have is 404 before the registry is read.
 | `GET /v1/chatbots/{id}` | reads it: 200 |
 | `PATCH /v1/chatbots/{id}` | sets the fields the body gives; a field left out, or null, keeps its value. `permissions` and `limits` merge field by field, as a JSON merge patch (RFC 7396): a field given replaces that one field and one left out or null keeps its value, so lowering one limit leaves the others as they are; 0 sets a limit back to its default. `webhook` is replaced whole: 200 |
 | `POST /v1/chatbots/{id}/suspend`, `.../resume` | sets the state only; a suspended chatbot keeps its record: 200 |
-| `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it: 204, also when it is gone already |
+| `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it: 204, also when it is gone already. The other tables get 20 s per request, under the listener's 30 s write timeout; past it the answer is 503 with `Retry-After: 1` (audit `deletion_unfinished`), and the operator sends the request again until 204, each going on where the last stopped |
 
 **Fields.** Each broken rule is 400, naming the field and never the value:
 
@@ -403,9 +403,18 @@ sensitive as the numbers.
   `last_used`; TTL only removes an expired alias's items later, each in its
   own time.
 - **Deletion.** Deleting a chatbot deletes each of its aliases' two items
-  together, after the registry's tombstone. A write
-  that raced the deletion leaves at most an alias of a tombstoned ID, which
-  no chatbot reads (an ID is never registered again, #708) and a repeated
-  deletion removes. A damaged item goes alone, logged with the chatbot only.
+  together, after the registry's tombstone, at most 100 aliases a second
+  (about 400 write units), so that a large chatbot does not throttle the
+  others: one request deletes about 2,000 in its 20 s, then answers 503
+  and logs how many it deleted (counts only), and the next request goes on.
+  A write that raced the deletion leaves at most an alias of a tombstoned
+  ID, which no chatbot reads (an ID is never registered again, #708); a
+  repeated deletion removes it, and otherwise its expiry and TTL do within
+  180 days. A damaged item goes alone, logged with the chatbot only.
+- **Backups.** Point-in-time recovery keeps every item for 35 days, the
+  deleted ones too: a restore brings back the aliases of chatbots deleted
+  and numbers recycled (#712) since the restore point. After a restore,
+  run those chatbot deletions and `DELETE /v1/subscribers/{tel}` again
+  (runbook, #684).
 - **Errors.** As for the registry: a store failure is never "no alias", and
   errors carry the operation and the AWS error code only.

@@ -25,13 +25,22 @@ type Subscribers struct {
 	table string
 	// pageSize bounds DeleteChatbot's query pages, for tests.
 	pageSize int32
+	// pace is the time between DeleteChatbot's transactions.
+	pace time.Duration
 }
+
+// deletePace spaces a chatbot's alias deletions: at most 100 a second,
+// about 200 write units on the chatbot's partition and 400 on the table,
+// so that a large deletion does not throttle the lookups and writes of
+// other chatbots (#753 review). A 20 s request (#709's deleteBudget)
+// deletes about 2,000.
+const deletePace = 10 * time.Millisecond
 
 var _ store.Subscribers = (*Subscribers)(nil)
 
 // NewSubscribers returns the table over api.
 func NewSubscribers(api DynamoAPI, table string) *Subscribers {
-	return &Subscribers{api: api, table: table}
+	return &Subscribers{api: api, table: table, pace: deletePace}
 }
 
 // Subscribers returns the subscribers' table over r's client.
@@ -194,11 +203,14 @@ func (s *Subscribers) Used(ctx context.Context, a store.Alias, at time.Time) err
 	update := func(k map[string]types.AttributeValue, owner, value string) types.TransactWriteItem {
 		return types.TransactWriteItem{Update: &types.Update{
 			TableName: aws.String(s.table), Key: k,
-			UpdateExpression:         aws.String("SET #used = :at, #expires = :expires"),
-			ConditionExpression:      aws.String("#owner = :owner AND #used < :at"),
+			UpdateExpression: aws.String("SET #used = :at, #expires = :expires"),
+			// Not before the use stored, nor once the alias expired: a
+			// late write never brings an expired alias back.
+			ConditionExpression:      aws.String("#owner = :owner AND #used < :at AND #used > :expired"),
 			ExpressionAttributeNames: map[string]string{"#used": attrUsed, "#expires": attrExpires, "#owner": owner},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
 				":at": num(at.Unix()), ":expires": num(at.Add(store.AliasLifetime).Unix()), ":owner": str(value),
+				":expired": num(at.Add(-store.AliasLifetime).Unix()),
 			},
 		}}
 	}
@@ -218,8 +230,20 @@ func (s *Subscribers) Used(ctx context.Context, a store.Alias, at time.Time) err
 // DeleteChatbot implements store.ChatbotDeleter. Each of the chatbot's
 // items goes with its subscriber's item, whose key names the chatbot too:
 // that item is the chatbot's whatever alias it names. A damaged one goes
-// alone, logged without its value.
+// alone, logged without its value. The transactions are spaced by pace;
+// when ctx ends first, it stops between two of them and logs how many it
+// deleted, and a later call deletes the rest.
 func (s *Subscribers) DeleteChatbot(ctx context.Context, chatbotID string) error {
+	deleted := 0
+	err := s.deleteAliases(ctx, chatbotID, &deleted)
+	if err != nil && ctx.Err() != nil {
+		slog.Info("awsstore: a chatbot's alias deletion stopped before the end",
+			slog.String("chatbot", chatbotID), slog.Int("aliases_deleted", deleted))
+	}
+	return err
+}
+
+func (s *Subscribers) deleteAliases(ctx context.Context, chatbotID string, deleted *int) error {
 	in := &dynamodb.QueryInput{
 		TableName: aws.String(s.table), ConsistentRead: aws.Bool(true),
 		KeyConditionExpression:    aws.String("#pk = :pk AND begins_with(#sk, :prefix)"),
@@ -235,9 +259,13 @@ func (s *Subscribers) DeleteChatbot(ctx context.Context, chatbotID string) error
 			return sanitize("query chatbot aliases", err)
 		}
 		for _, it := range out.Items {
+			if err := pause(ctx, *deleted, s.pace); err != nil {
+				return fmt.Errorf("awsstore: delete chatbot aliases: %w", err)
+			}
 			if err := s.deleteAlias(ctx, chatbotID, it); err != nil {
 				return err
 			}
+			*deleted++
 		}
 		if len(out.LastEvaluatedKey) == 0 {
 			return nil

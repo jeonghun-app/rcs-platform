@@ -1,8 +1,12 @@
 package maap
 
 import (
+	"cmp"
+	"context"
 	"errors"
+	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/maap/store"
 )
@@ -12,6 +16,14 @@ import (
 // adding to them, so applying it to the newer record is what the operator
 // asked; past the bound the answer is 409.
 const maxChangeAttempts = 3
+
+// deleteBudget bounds the other tables' deletions within one request,
+// under the internal listener's 30 s write timeout (#753 review: a
+// chatbot with many aliases outran it, and the operator saw a dropped
+// connection). Past it the answer is 503 with Retry-After, and the next
+// request goes on where this one stopped, since each table deletes what
+// it still finds.
+const deleteBudget = 20 * time.Second
 
 // change sets the fields the body gives (PATCH): 200 with the chatbot. The
 // ID and URI never change: a chatbot that needs another URI is deleted and
@@ -76,8 +88,9 @@ func (cb *chatbotAPI) update(c *call, id string, edit func(*store.Chatbot) error
 // remove deletes the chatbot, which frees its URI and leaves its ID never
 // to be registered again, then every item another table keeps of it: 204,
 // also for a chatbot already gone. The registry's deletion either finishes
-// or fails, and so does each table's, so a 503 part way is answered by
-// sending the request again, which finishes the rest (#708 handover).
+// or fails, and so does each table's; one that runs out of deleteBudget
+// stops between items. So a 503 part way is answered by sending the
+// request again, which goes on with the rest (#708 handover).
 func (cb *chatbotAPI) remove(c *call) error {
 	id, err := c.chatbotID()
 	if err != nil {
@@ -99,8 +112,15 @@ func (cb *chatbotAPI) remove(c *call) error {
 	if old.ID != "" {
 		c.audit = append(c.audit, store.AuditChanges(old, store.Chatbot{})...)
 	}
+	dctx, cancel := context.WithTimeout(ctx, cmp.Or(cb.deleteBudget, deleteBudget))
+	defer cancel()
 	for _, d := range cb.deleters {
-		if err := d.DeleteChatbot(ctx, id); err != nil {
+		err := d.DeleteChatbot(dctx, id)
+		switch {
+		case err != nil && errors.Is(err, context.DeadlineExceeded) && dctx.Err() != nil && ctx.Err() == nil:
+			c.audit = append(c.audit, slog.Bool("deletion_unfinished", true))
+			return &apiError{http.StatusServiceUnavailable, "the deletion is not finished; send it again", "1"}
+		case err != nil:
 			return c.storeError(err, false)
 		}
 	}

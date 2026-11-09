@@ -107,6 +107,16 @@ func Configure(s *runtime.Settings) Config {
 	if c.Decodes < 1 {
 		e.Invalid("DECODES", "must be at least 1")
 	}
+	// The tables share their key form, so with one name a chatbot's
+	// deletion in the registry would take the aliases' chatbot items and
+	// leave their subscriber items (#753 security review).
+	for _, t := range []struct{ name, value string }{
+		{"REGISTRY_TABLE", c.RegistryTable}, {"REQUESTS_TABLE", c.RequestsTable}, {"COUNTERS_TABLE", c.CountersTable},
+	} {
+		if c.SubscribersTable == t.value {
+			e.Invalid("SUBSCRIBERS_TABLE", "equal to MAAP_"+t.name)
+		}
+	}
 	c.WebhookPorts = webhookPorts(e)
 	s.ForbidInProduction(c.DynamoDBEndpoint != "", "MAAP_DYNAMODB_ENDPOINT points the registry away from DynamoDB")
 	c.OperatorTokens = operatorTokens(s)
