@@ -24,7 +24,7 @@ func TestTheWriteFloorIsSetByTheChunkTheDeadlineAndTheSendBuffer(t *testing.T) {
 	f := &flow{conn: conn, q: newSendQueue(1<<20, &queueBudget{max: 1 << 30})}
 	msg := make([]byte, 100<<10)
 	before := time.Now()
-	if err := tr.writeAll(f, msg); err != nil {
+	if err := tr.writeAll(f, msg, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	after := time.Now()
@@ -51,7 +51,7 @@ func TestAChunkThatTimesOutPartWayEndsTheWrite(t *testing.T) {
 	tr, _ := newTransport(t, Config{WriteTimeout: time.Second})
 	conn := &partialWrite{}
 	f := &flow{conn: conn, q: newSendQueue(1<<20, &queueBudget{max: 1 << 30})}
-	if err := tr.writeAll(f, make([]byte, 100<<10)); !errors.Is(err, os.ErrDeadlineExceeded) {
+	if err := tr.writeAll(f, make([]byte, 100<<10), time.Now()); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("writeAll returned %v after a chunk timed out part way, want the timeout", err)
 	}
 	if conn.writes != 2 {

@@ -1,7 +1,11 @@
 package transport
 
 import (
+	"crypto/tls"
+	"errors"
+	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,7 +49,7 @@ type sendQueue struct {
 	mu sync.Mutex
 	// bufs are the messages not yet taken by the writer; queued counts them
 	// and the batch the writer is writing, against limit.
-	bufs   [][]byte
+	bufs   []queuedMessage
 	queued int
 	limit  int
 	closed bool
@@ -62,6 +66,13 @@ type sendQueue struct {
 	wake chan struct{}
 	room chan struct{}
 	done chan struct{}
+}
+
+// queuedMessage is a message in a send queue and when it was queued, which
+// MaxQueueAge is counted from.
+type queuedMessage struct {
+	b  []byte
+	at time.Time
 }
 
 func newSendQueue(limit int, budget *queueBudget) *sendQueue {
@@ -124,12 +135,13 @@ func (q *sendQueue) tryPush(b []byte, max int, waited bool) (r pushResult) {
 	if !q.budget.reserve(len(b)) {
 		return overBudget
 	}
+	now := time.Now()
 	if q.queued == 0 {
 		// A stall is measured from when output became pending, so a queue that
 		// was merely idle, or whose writer has yet to run, does not look stalled.
-		q.progress.Store(time.Now().UnixNano())
+		q.progress.Store(now.UnixNano())
 	}
-	q.bufs = append(q.bufs, b)
+	q.bufs = append(q.bufs, queuedMessage{b, now})
 	q.queued += len(b)
 	notify(q.wake)
 	if q.queued < q.limit {
@@ -194,7 +206,7 @@ func notify(c chan struct{}) {
 }
 
 // take returns everything queued; closed reports that the writer should stop.
-func (q *sendQueue) take() (bufs [][]byte, closed bool) {
+func (q *sendQueue) take() (bufs []queuedMessage, closed bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	bufs, q.bufs = q.bufs, nil
@@ -283,13 +295,22 @@ func capSendBuffer(c net.Conn) {
 // timeout that took part of a chunk would lower the floor only about threefold,
 // since the kernel wakes a writer in steps of a third of its buffer, and would
 // let a peer that trickles keep its share of the queue budget for longer.
-func (t *Transport) writeAll(f *flow, b []byte) error {
+//
+// On a core connection the deadline is also never later than when b, queued
+// at queuedAt, has waited MaxQueueAge (chunkDeadline). A write that misses that
+// deadline returns errQueueAge.
+func (t *Transport) writeAll(f *flow, b []byte, queuedAt time.Time) error {
+	client := f.lis != nil && f.lis.clientFacing
 	for len(b) > 0 {
 		n := min(len(b), writeChunk)
-		if err := f.conn.SetWriteDeadline(time.Now().Add(t.cfg.WriteTimeout)); err != nil {
+		deadline, byAge := chunkDeadline(time.Now(), queuedAt, t.cfg.WriteTimeout, t.cfg.MaxQueueAge, client)
+		if err := f.conn.SetWriteDeadline(deadline); err != nil {
 			return err
 		}
 		if _, err := f.conn.Write(b[:n]); err != nil {
+			if byAge && errors.Is(err, os.ErrDeadlineExceeded) {
+				return fmt.Errorf("%w: %w", errQueueAge, err)
+			}
 			return err
 		}
 		f.q.progress.Store(time.Now().UnixNano())
@@ -298,10 +319,26 @@ func (t *Transport) writeAll(f *flow, b []byte) error {
 	return nil
 }
 
+// errQueueAge is a write that missed the deadline MaxQueueAge set.
+var errQueueAge = errors.New("transport: the oldest output waited longer than MaxQueueAge")
+
+// chunkDeadline is when writing the next chunk of a message queued at queuedAt
+// must end: WriteTimeout from now, or, on a core connection, when the message
+// has waited maxAge, if that is earlier; byAge reports the latter. The writer
+// writes the messages in the order they were queued, so the one it is writing
+// is the oldest output the queue holds, and this bounds its age.
+func chunkDeadline(now, queuedAt time.Time, writeTimeout, maxAge time.Duration, clientFacing bool) (deadline time.Time, byAge bool) {
+	deadline = now.Add(writeTimeout)
+	if aged := queuedAt.Add(maxAge); !clientFacing && aged.Before(deadline) {
+		return aged, true
+	}
+	return deadline, false
+}
+
 // writeLoop writes a stream flow's queue until the flow closes. A write that
 // fails, or does not get a chunk out within WriteTimeout (writeAll), closes the
 // connection, since part of a message may have been sent and the peer could not
-// find the start of the next.
+// find the start of the next. One that missed MaxQueueAge resets it.
 func (t *Transport) writeLoop(f *flow) {
 	defer t.wg.Done()
 	for range f.q.wake {
@@ -309,15 +346,43 @@ func (t *Transport) writeLoop(f *flow) {
 		if closed {
 			return
 		}
-		for _, b := range bufs {
-			if err := t.writeAll(f, b); err != nil {
-				if !f.closed.Load() {
-					t.stats.writeErrors.Add(1)
+		for _, m := range bufs {
+			if err := t.writeAll(f, m.b, m.at); err != nil {
+				if errors.Is(err, errQueueAge) {
+					t.resetStalled(f)
+				} else {
+					if !f.closed.Load() {
+						t.stats.writeErrors.Add(1)
+					}
+					t.closeFlow(f)
 				}
-				t.closeFlow(f)
 				return
 			}
-			f.q.written(len(b))
+			f.q.written(len(m.b))
 		}
 	}
+}
+
+// resetStalled ends a core connection whose oldest output waited longer than
+// MaxQueueAge (#623). It resets the connection rather than closing it: a FIN
+// would wait behind the output still in the kernel, which the peer is not
+// taking either. The log line names no peer, as Config.Logger requires.
+func (t *Transport) resetStalled(f *flow) {
+	queued := f.q.size()
+	c := f.conn
+	if tc, ok := c.(*tls.Conn); ok {
+		c = tc.NetConn()
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		tc.SetLinger(0)
+	}
+	if !t.closeFlow(f) {
+		return
+	}
+	t.stats.writeStalls.Add(1)
+	if t.cfg.Metrics != nil {
+		t.cfg.Metrics.Count(MetricWriteStalls, 1)
+	}
+	t.cfg.Logger.Warn("sip transport: reset a core connection whose oldest output waited longer than MaxQueueAge",
+		"queued_bytes", queued, "max_queue_age", t.cfg.MaxQueueAge)
 }

@@ -223,6 +223,29 @@ Every service runs at least two tasks across two AZs in production. Losing a
 through the NLB to a surviving task. Every other service is stateless apart from
 its tables.
 
+**SIP core connections and jumbo frames.** The SIP connections between
+`pcscf`, `icscf`, `scscf` and `rcs-as` stay inside the VPC, whose network
+interfaces have an MTU of 9001 by default (MSS 8949). Linux sends nothing on a
+connection whose peer's receive window is smaller than one segment, and while
+traffic comes the other way each ACK puts off the zero-window probe. Such a
+connection moves about one message a second, so it never misses the write
+timeout (#623). With jumbo frames the receive window must stay at 16 KiB or
+more; at 8 KiB the connection all but stops. That is the floor
+[msrp-relay](msrp-relay.md)'s connection toward `rcs-as` has. With an MTU of
+1500 (MSS 1448) this cannot happen: even the smallest buffer the kernel allows
+leaves a window of several segments. No service sets `SO_RCVBUF` on these
+connections, so the kernel's autotuning sizes them. Whatever stalls one, the
+SIP transport resets a core connection once the oldest output in its send
+queue has waited longer than 32 s (`transport.Config.MaxQueueAge`, 64*T1). It
+counts the reset in `transport.write_stalled` and logs a warning that names no
+peer, and the next send dials anew. The transactions on that connection time
+out either way; the reset restores the path for the requests that follow. The
+trade-off: while its 4 MiB queue is full, a core peer that reads slower than
+about 128 KiB/s loses its connection as well, where the write timeout alone
+keeps one that reads 20 KiB/s. Output that has waited that long belongs to
+transactions whose senders have already given up. Client-facing connections
+keep only the write timeout.
+
 Every table has a memory backend for unit tests and local runs; the compose stack
 ([local-stack.md](local-stack.md)) uses DynamoDB Local and S3Mock.
 

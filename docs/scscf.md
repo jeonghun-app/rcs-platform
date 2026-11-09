@@ -149,6 +149,9 @@ Alarm on a rise of these:
   `transaction.handler_panics`, in a response handler of a request scscf
   sends itself, a NOTIFY or a third-party REGISTER (#445). Each ends only
   the request or the call it was in; alarm on any;
+- `transport.write_stalled`, SIP connections reset because their oldest
+  output waited longer than 32 s ([architecture](architecture.md) §7,
+  #623); alarm on any;
 - `background.panics`, panics recovered in scscf's own background work:
   the sweeps, the metrics report, a reg event task, a first NOTIFY, a
   third-party REGISTER or an identity repair (#488). Each ends only that
