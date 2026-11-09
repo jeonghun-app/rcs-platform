@@ -84,7 +84,7 @@ func (m *MemoryRequests) Forget(_ context.Context, chatbotID, key, writer string
 	defer m.mu.Unlock()
 	k := [2]string{chatbotID, key}
 	if rec, ok := m.records[k]; ok {
-		if rec.Writer != writer {
+		if rec.Writer != writer || !rec.Pending {
 			return fmt.Errorf("store: forget request: %w", ErrConflict)
 		}
 		delete(m.records, k)

@@ -139,20 +139,28 @@ func settles(t *testing.T, r store.Requests) {
 	if err := r.Settle(ctx, rec.Chatbot, rec.Key, mine.Writer, make([]byte, store.MaxAnswerBytes+1), Now); !errors.Is(err, store.ErrInvalid) {
 		t.Fatalf("Settle of an answer over its size = %v", err)
 	}
-	// Forgotten by its writer, twice harmlessly, the key takes a request
-	// again, whose writer the first no longer is.
+	// A settled record is not forgotten, even by its writer: its request
+	// was sent, and a repeat must get its answer.
+	if err := r.Forget(ctx, rec.Chatbot, rec.Key, mine.Writer); !errors.Is(err, store.ErrConflict) {
+		t.Fatalf("Forget of a settled record = %v", err)
+	}
+	remember(t, r, rec, Now, settled, false)
+	// A pending record forgotten by its writer, twice harmlessly, lets the
+	// key take a request again, whose writer the first no longer is.
+	refused := Idempotency(rec.Chatbot)
+	first := remember(t, r, refused, Now, pending(refused, Now), true)
 	for range 2 {
-		if err := r.Forget(ctx, rec.Chatbot, rec.Key, mine.Writer); err != nil {
+		if err := r.Forget(ctx, refused.Chatbot, refused.Key, first.Writer); err != nil {
 			t.Fatalf("Forget = %v", err)
 		}
 	}
-	next := Idempotency(rec.Chatbot)
-	next.Key = rec.Key
+	next := Idempotency(refused.Chatbot)
+	next.Key = refused.Key
 	remember(t, r, next, Now, pending(next, Now), true)
-	if err := r.Forget(ctx, rec.Chatbot, rec.Key, mine.Writer); !errors.Is(err, store.ErrConflict) {
+	if err := r.Forget(ctx, refused.Chatbot, refused.Key, first.Writer); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("Forget by the old writer = %v", err)
 	}
-	if err := r.Settle(ctx, rec.Chatbot, rec.Key, mine.Writer, answer, Now); !errors.Is(err, store.ErrConflict) {
+	if err := r.Settle(ctx, refused.Chatbot, refused.Key, first.Writer, answer, Now); !errors.Is(err, store.ErrConflict) {
 		t.Fatalf("Settle by the old writer = %v", err)
 	}
 	for _, err := range []error{
