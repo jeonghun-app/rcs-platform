@@ -18,6 +18,13 @@ func TestMemoryRegistryMeetsTheContract(t *testing.T) {
 	storetest.Run(t, func(*testing.T) store.Registry { return store.NewMemoryRegistry() })
 }
 
+func TestMemoryCredentialsMeetTheContract(t *testing.T) {
+	storetest.RunCredentials(t, func(*testing.T) (store.Registry, store.Credentials) {
+		m := store.NewMemoryRegistry()
+		return m, m.Credentials()
+	})
+}
+
 func TestTheLongestChatbotRoundTrips(t *testing.T) {
 	// "<" is written as a six-byte \u escape, the most any byte takes.
 	fill := func(n int) string { return strings.Repeat("<", n) }

@@ -138,7 +138,7 @@ type Registry interface {
 func CheckChatbot(c Chatbot) error {
 	fail := func(reason string) error { return fmt.Errorf("%w: chatbot: %s", ErrInvalid, reason) }
 	switch {
-	case c.ID == "" || len(c.ID) > MaxIDBytes || strings.Trim(c.ID, idBytes) != "":
+	case !ValidID(c.ID):
 		return fail("ID is not 1–64 letters, digits, - or _")
 	case !normal(c.URI):
 		return fail("URI is not in normal form")
@@ -170,6 +170,11 @@ func CheckChatbot(c Chatbot) error {
 }
 
 const idBytes = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+
+// ValidID reports whether id has a chatbot ID's form.
+func ValidID(id string) bool {
+	return id != "" && len(id) <= MaxIDBytes && strings.Trim(id, idBytes) == ""
+}
 
 // normal reports whether uri is a chatbot URI in normal form at its own
 // host, which keeps one spelling per URI whatever RCS_CHATBOT_DOMAIN is.

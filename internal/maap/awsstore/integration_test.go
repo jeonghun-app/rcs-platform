@@ -59,6 +59,13 @@ func TestIntegrationRegistryMeetsTheContract(t *testing.T) {
 	storetest.Run(t, func(t *testing.T) store.Registry { return NewRegistry(registryTable(t)) })
 }
 
+func TestIntegrationCredentialsMeetTheContract(t *testing.T) {
+	storetest.RunCredentials(t, func(t *testing.T) (store.Registry, store.Credentials) {
+		r := NewRegistry(registryTable(t))
+		return r, r.Credentials()
+	})
+}
+
 // The loader maap runs with reaches the table and finds it ready.
 func TestIntegrationNewReachesAReadyTable(t *testing.T) {
 	_, table := registryTable(t)
@@ -106,6 +113,13 @@ func TestIntegrationAWriteSentAgainAfterItTookEffectStands(t *testing.T) {
 	}
 	if c, err = r.Update(ctx, c, c); err != nil || c.Version != 2 {
 		t.Fatalf("Update = %+v, %v", c, err)
+	}
+	// An issue finds its own slot, and takes one only.
+	if err := r.Credentials().Issue(ctx, storetest.Credential(c, time.Unix(1, 0))); err != nil {
+		t.Fatalf("Issue = %v", err)
+	}
+	if creds, err := r.Credentials().ChatbotCredentials(ctx, c.ID); len(creds) != 1 || err != nil {
+		t.Fatalf("ChatbotCredentials = %v, %v", creds, err)
 	}
 	// A real conflict is still one.
 	stale := c

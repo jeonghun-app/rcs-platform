@@ -12,9 +12,10 @@ import (
 // does, so that every unit test also exercises the codec.
 type MemoryRegistry struct {
 	mu       sync.Mutex
-	chatbots map[string]stored // by ID
-	uris     map[string]string // URI → ID
-	deleted  map[string]bool   // tombstones, by ID
+	chatbots map[string]stored     // by ID
+	uris     map[string]string     // URI → ID
+	deleted  map[string]bool       // tombstones, by ID
+	creds    map[string]Credential // by key ID
 }
 
 type stored struct {
@@ -28,7 +29,9 @@ var _ Registry = (*MemoryRegistry)(nil)
 
 // NewMemoryRegistry returns an empty registry.
 func NewMemoryRegistry() *MemoryRegistry {
-	return &MemoryRegistry{chatbots: map[string]stored{}, uris: map[string]string{}, deleted: map[string]bool{}}
+	return &MemoryRegistry{
+		chatbots: map[string]stored{}, uris: map[string]string{}, deleted: map[string]bool{}, creds: map[string]Credential{},
+	}
 }
 
 func (st stored) chatbot() (Chatbot, error) {
@@ -105,5 +108,6 @@ func (m *MemoryRegistry) DeleteChatbot(_ context.Context, id string) error {
 		delete(m.chatbots, id)
 		m.deleted[id] = true
 	}
+	m.deleteCredentials(id)
 	return nil
 }

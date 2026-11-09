@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -53,6 +54,10 @@ func (s *stubDynamo) DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...f
 	return nil, s.err
 }
 
+func (s *stubDynamo) UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	return nil, s.err
+}
+
 func (s *stubDynamo) Query(context.Context, *dynamodb.QueryInput, ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
 	return nil, s.err
 }
@@ -75,7 +80,13 @@ func TestAStoreFailureIsNeitherNotFoundNorADetailOfTheRequest(t *testing.T) {
 	_, regErr := r.Register(ctx, c)
 	c.Version = 1
 	_, updErr := r.Update(ctx, c, c)
-	for _, err := range []error{getErr, regErr, updErr, r.DeleteChatbot(ctx, c.ID)} {
+	cs, cred := r.Credentials(), storetest.Credential(c, time.Unix(1, 0))
+	_, credErr := cs.Credential(ctx, cred.KeyID)
+	_, listErr := cs.ChatbotCredentials(ctx, c.ID)
+	for _, err := range []error{
+		getErr, regErr, updErr, r.DeleteChatbot(ctx, c.ID), credErr, listErr, cs.Issue(ctx, cred),
+		cs.Revoke(ctx, c.ID, cred.KeyID), cs.Used(ctx, cred.KeyID, time.Unix(2, 0)), cs.DeleteChatbot(ctx, c.ID),
+	} {
 		if err == nil || errors.Is(err, store.ErrNotFound) || errors.Is(err, store.ErrConflict) ||
 			!strings.HasSuffix(err.Error(), ": ProvisionedThroughputExceededException") || strings.Contains(err.Error(), "bot-") {
 			t.Errorf("error %v", err)
