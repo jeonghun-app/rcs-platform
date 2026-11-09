@@ -59,6 +59,7 @@ func Run(t *testing.T, newStore func(t *testing.T) store.Store) {
 	t.Run("AGroupMessageCountsAgainstItsAuthorsShare", func(t *testing.T) { groupShares(t, newStore(t)) })
 	t.Run("RemovingAGroupNotificationFreesTheTotal", func(t *testing.T) { groupTotalFreed(t, newStore(t)) })
 	t.Run("ChatbotsHoldAShareEachAndATotalTogether", func(t *testing.T) { chatbotShares(t, newStore(t)) })
+	t.Run("AChatbotsFullShareIsToldBeforeAFullQueue", func(t *testing.T) { chatbotShareFirst(t, newStore(t)) })
 	t.Run("LongestKeysRoundTrip", func(t *testing.T) { longKeys(t, newStore(t)) })
 	t.Run("EachNotificationIsMarkedOnce", func(t *testing.T) { marks(t, newStore(t)) })
 	t.Run("ASummaryGoesOnlyOnceItsMarksAreSent", func(t *testing.T) { summaries(t, newStore(t)) })
@@ -629,6 +630,32 @@ func chatbotShares(t *testing.T, s store.Store) {
 	}
 	if got, err := s.Claim(ctx, alice, anonymous.ID, "task-a", t0, t0.Add(time.Minute)); err != nil || !got.Chatbot || !got.Anonymous {
 		t.Fatalf("the anonymous one = %+v, %v", got, err)
+	}
+}
+
+// chatbotShareFirst: a chatbot whose own share is full is told so even
+// when the queue is full too, or which of the two it heard would show
+// whether persons' messages fill the queue: whether the subscriber exists
+// (#739 security review). With room in its share, a full queue is a full
+// queue.
+func chatbotShareFirst(t *testing.T, s store.Store) {
+	ctx := context.Background()
+	l := store.Limit{Count: 3, SenderCount: 1, ChatbotCount: 3}
+	bot := func(sender, id string) store.Message {
+		m := message(alice, store.ChatbotIDPrefix+id, t0)
+		m.Sender, m.Mode, m.Chatbot = sender, store.Standalone, true
+		return m
+	}
+	for _, m := range []store.Message{bot("sip:bot1@botplatform.example.net", "0001"), message(alice, "0002", t0), message(alice, "0003", t0)} {
+		if err := s.Enqueue(ctx, m, store.Limit{Count: 3, SenderCount: 2, ChatbotCount: 3}); err != nil {
+			t.Fatalf("%s = %v", m.ID, err)
+		}
+	}
+	if err := s.Enqueue(ctx, bot("sip:bot1@botplatform.example.net", "0004"), l); !errors.Is(err, store.ErrSenderShareFull) {
+		t.Fatalf("a full share in a full queue = %v", err)
+	}
+	if err := s.Enqueue(ctx, bot("sip:bot2@botplatform.example.net", "0005"), l); !errors.Is(err, store.ErrQueueFull) {
+		t.Fatalf("another chatbot in a full queue = %v", err)
 	}
 }
 

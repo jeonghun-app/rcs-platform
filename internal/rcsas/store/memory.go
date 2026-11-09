@@ -99,10 +99,16 @@ func (s *Memory) Enqueue(_ context.Context, m Message, l Limit) error {
 			chatbotCount, chatbotBytes = chatbotCount+1, chatbotBytes+x.Size()
 		}
 	}
+	shareFull := shared && (l.SenderCount > 0 && senderCount+1 > l.SenderCount || l.SenderBytes > 0 && senderBytes+m.Size() > l.SenderBytes)
 	switch {
+	case m.Chatbot && shareFull:
+		// First for a chatbot (Limit): otherwise its full share answered
+		// queue_share_full on a queue with room and 202 on one full of
+		// persons' messages (#739 security review).
+		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
 	case l.Count > 0 && len(q)+1 > l.Count, l.Bytes > 0 && bytes+m.Size() > l.Bytes:
 		return fmt.Errorf("store: enqueue: %w", ErrQueueFull)
-	case shared && (l.SenderCount > 0 && senderCount+1 > l.SenderCount || l.SenderBytes > 0 && senderBytes+m.Size() > l.SenderBytes):
+	case shareFull:
 		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)
 	case m.InGroupTotal() && (l.GroupCount > 0 && groupCount+1 > l.GroupCount || l.GroupBytes > 0 && groupBytes+m.Size() > l.GroupBytes):
 		return fmt.Errorf("store: enqueue: %w", ErrSenderShareFull)

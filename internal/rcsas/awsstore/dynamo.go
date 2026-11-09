@@ -415,6 +415,10 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		switch {
 		case len(failed) > 0 && failed[0]:
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)
+		case m.Chatbot && len(failed) > 2 && failed[2]:
+			// A chatbot's own share, which it always has, first
+			// (store.Limit, #739 security review).
+			return fmt.Errorf("awsstore: enqueue: %w", store.ErrSenderShareFull)
 		case len(failed) > 1 && failed[1]:
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
 		}
