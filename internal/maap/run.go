@@ -28,8 +28,10 @@ type deps struct {
 	// ones do.
 	registry    store.Registry
 	credentials store.Credentials
-	// requests replaces maap-requests, with the registry only.
+	// requests and counters replace maap-requests and maap-counters, with
+	// the registry only.
 	requests store.Requests
+	counters store.Counters
 }
 
 // Run serves the internal listener, apart from the runtime's admin port
@@ -39,7 +41,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	registry, creds, requests := d.registry, d.credentials, d.requests
+	registry, creds, requests, counters := d.registry, d.credentials, d.requests, d.counters
 	if registry == nil {
 		ddb, err := awsstore.NewClient(ctx, cfg.DynamoDBEndpoint)
 		if err != nil {
@@ -48,11 +50,12 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		r := awsstore.NewRegistry(ddb, cfg.RegistryTable)
 		registry, creds = r, r.Credentials()
 		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StatusTTL)
+		counters = awsstore.NewCounters(ddb, cfg.CountersTable)
 	}
 	for _, t := range []struct {
 		name  string
 		table any
-	}{{"dynamodb-registry", registry}, {"dynamodb-requests", requests}} {
+	}{{"dynamodb-registry", registry}, {"dynamodb-requests", requests}, {"dynamodb-counters", counters}} {
 		if r, ok := t.table.(interface{ Ready(context.Context) error }); ok {
 			rt.Admin.AddReadinessCheck(t.name, r.Ready)
 		}
@@ -66,7 +69,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		// Every store of a chatbot's items is a deleter (#742 review), the
 		// credentials too, though the registry's deletion takes them with
 		// its partition already.
-		deleters: []store.ChatbotDeleter{creds, requests},
+		deleters: []store.ChatbotDeleter{creds, requests, counters},
 	})
 	api.mountCredentials(&credentialAPI{registry: registry, creds: creds, random: rand.Reader, now: time.Now})
 	ln, err := d.listen("tcp", cfg.InternalAddr)

@@ -12,14 +12,15 @@ registers, changes and deletes chatbots in the [registry](#registry) (#709)
 and issues and revokes their [credentials](#credentials-and-caches) (#710),
 kept in [DynamoDB](#dynamodb-maap-registry-table) (#708). The
 [`maap-requests`](#dynamodb-maap-requests-table) table keeps the idempotency
-records and message statuses #683's sends need (#713); #711–#713 add the operator's other routes
-and tables.
+records and message statuses #683's sends need, and
+[`maap-counters`](#dynamodb-maap-counters-table) its shared limits (#713);
+#711 and #712 add the operator's other routes and tables.
 
 ## Listeners
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
-| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry` and `maap-requests` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
+| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry`, `maap-requests` and `maap-counters` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
 | internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
@@ -43,7 +44,7 @@ reported at once at start.
 | `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
 | `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | [idempotency records](#dynamodb-maap-requests-table) and message statuses (#713) |
-| `MAAP_COUNTERS_TABLE` | `maap-counters` | the shared limit counters (#713) |
+| `MAAP_COUNTERS_TABLE` | `maap-counters` | the [shared limit counters](#dynamodb-maap-counters-table) (#713) |
 | `MAAP_STATUS_TTL` | `192h` (8 days) | how long a message's [status](#dynamodb-maap-requests-table) is kept: by default `rcs-as`'s `RCSAS_SENT_TTL` default, the longest a notification can still come (lead decision on #713; #684 sets both from one parameter); at least 24 hours, so that the answer an idempotency record replays names a status still kept |
 
 The operator's tokens are `maap`'s own settings: `hss`'s operator token,
@@ -360,3 +361,55 @@ seconds); no index. The send path that writes it is #683's.
   its TTL or a repeated deletion removes it.
 - **Logs** never carry an idempotency key; errors carry the operation and
   the AWS error code only.
+
+## DynamoDB `maap-counters` table
+
+`MAAP_COUNTERS_TABLE`, on demand with point-in-time recovery, written by
+`maap`'s task role only, like the other tables (#684 creates it). Partition key `pk` and sort key `sk`, both strings; **TTL on
+`ttl`** (number, Unix seconds); no index. The limits of ADR 0009 §9 live
+here, shared by every task; which counters a request takes is #683's.
+
+| `pk` | `sk` | Holds | Kept |
+|---|---|---|---|
+| `c#<chatbot ID>` | `m#<name>` | A chatbot's per-minute bucket: `full` (Unix nanoseconds), `ttl`, `writer` | until the bucket is full again |
+| `c#<chatbot ID>` | `d#<YYYY-MM-DD>#<name>` | A chatbot's count of a UTC day: `n`, `ttl`, `writer` | the day and an hour |
+| `n#<name>` | `m`, `d#<YYYY-MM-DD>` | The same, for a counter of all chatbots (a subscriber's from all chatbots) | the same |
+
+- **Buckets.** A per-minute bound of rate *r* is a token bucket with a burst
+  of ⌈*r*/6⌉, refilled continuously at *r* (one token every 60/*r* seconds,
+  rounded up to the nanosecond). The item holds one number, the time `full`
+  at which the bucket is full again, so a take is one conditional update and
+  never a read followed by a write: of concurrent takes, from any task, none
+  is lost and none exceeds the bucket. A take sets an idle bucket (absent, or
+  full by now) to now plus an interval, or adds an interval to a busy one
+  while it holds a token (`full` at most now plus burst − 1 intervals); a
+  refused take writes nothing and answers the time until the next token, for
+  `Retry-After`. An absent item is a full bucket, so TTL may delete it once
+  it is full again.
+- **Days.** A daily bound counts in an item per UTC day, which adds one on
+  the condition that the count is under the limit; a refused take changes
+  nothing and waits until midnight UTC.
+- **Give-back** (lead decision on #713). A request takes several counters
+  in turn; when a later one refuses, #683 gives back what the earlier ones
+  took, so that refused requests are not counted (§9). A give-back is one
+  conditional update, passed the time of the take it undoes: a bucket's
+  `full` moves an interval earlier while it is after that time, so a full
+  bucket gets nothing and a bucket never holds more than its burst; a day's
+  count goes down by one while it is above zero, in the take's day.
+- **Retries.** A random `writer` token tells an update the SDK sent again
+  after its answer was lost, so a take counts once and a give-back returns
+  one. A take never loses a
+  race to another take: only a deletion between its updates can make it
+  give up after four, which is a store failure. Every error is a store
+  failure, which #683 answers 503, never 429 (§9).
+- **Write rate.** A take costs one write, or two when the first guess
+  (idle) is wrong; a refused take one failed conditional write, which
+  DynamoDB still bills. The hottest counter, a chatbot's received messages
+  (6,000 a minute), stays near 100 takes a second, at most 200 writes a
+  second on one item (§9), under the 1,000 a partition takes. All of a
+  chatbot's counters share its partition key; DynamoDB's adaptive capacity
+  moves hot items of one key apart, which the operations review of #713
+  is asked to confirm for the sum at a chatbot's limits.
+- **Per-chatbot deletion** deletes the chatbot's partition, as in
+  `maap-requests`; counters of all chatbots are no chatbot's and stay to
+  their TTL. Counter names are never logged: they may hold a subscriber.

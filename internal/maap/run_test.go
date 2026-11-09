@@ -43,6 +43,16 @@ func (r readyRequests) Ready(context.Context) error {
 	return nil
 }
 
+// readyCounters is readyRequests for the counters table.
+type readyCounters struct {
+	*store.MemoryCounters
+	ready *atomic.Bool
+}
+
+func (r readyCounters) Ready(ctx context.Context) error {
+	return readyRequests{ready: r.ready}.Ready(ctx)
+}
+
 // deletions records the chatbots its credentials' DeleteChatbot is called
 // for.
 type deletions struct {
@@ -76,8 +86,9 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	registry := &readyRegistry{MemoryRegistry: store.NewMemoryRegistry()}
 	creds := deletions{registry.Credentials(), make(chan string, 1)}
 	requests := readyRequests{store.NewMemoryRequests(time.Hour), &registry.ready}
+	counters := readyCounters{store.NewMemoryCounters(), &registry.ready}
 	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, requests: requests, listen: func(network, _ string) (net.Listener, error) {
+		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, requests: requests, counters: counters, listen: func(network, _ string) (net.Listener, error) {
 			ln, err := net.Listen(network, "127.0.0.1:0")
 			if err == nil {
 				listening <- ln
@@ -88,7 +99,7 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	addr := (<-listening).Addr().String()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
 		if code, body := h.Get("/readyz"); code == http.StatusServiceUnavailable &&
-			strings.Contains(body, "dynamodb-registry") && strings.Contains(body, "dynamodb-requests") {
+			strings.Contains(body, "dynamodb-registry") && strings.Contains(body, "dynamodb-requests") && strings.Contains(body, "dynamodb-counters") {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -139,6 +150,10 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	if _, _, err := requests.Remember(context.Background(), rec, time.Now()); err != nil {
 		t.Fatal(err)
 	}
+	counter := storetest.Counter("cb-1")
+	if took, err := counters.TakeDay(context.Background(), counter, 1, time.Now()); !took.Taken || err != nil {
+		t.Fatal(err)
+	}
 	for _, step := range []struct {
 		method, path string
 		want         int
@@ -167,6 +182,9 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	rec.Digest[0]++
 	if _, fresh, err := requests.Remember(context.Background(), rec, time.Now()); !fresh || err != nil {
 		t.Errorf("the idempotency record was left: %v", err)
+	}
+	if took, err := counters.TakeDay(context.Background(), counter, 1, time.Now()); !took.Taken || err != nil {
+		t.Errorf("the day count was left: %+v, %v", took, err)
 	}
 
 	cancel()

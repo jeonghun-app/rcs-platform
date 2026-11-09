@@ -441,3 +441,50 @@ func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 		t.Fatalf("Ready = %v", err)
 	}
 }
+
+func TestIntegrationCountersMeetTheContract(t *testing.T) {
+	storetest.RunCounters(t, func(t *testing.T) (store.Counters, store.Counters) {
+		ddb, name := table(t, "maap-counters")
+		a, b := NewCounters(ddb, name), NewCounters(ddb, name)
+		a.pageSize, b.pageSize = 7, 7
+		return a, b
+	})
+}
+
+// Takes the SDK sent again after they took effect count once, for an idle
+// bucket's update, a busy one's and a day's, and give-backs return one.
+func TestIntegrationATakeSentAgainCountsOnce(t *testing.T) {
+	ddb, name := table(t, "maap-counters")
+	c := NewCounters(resendTable{ddb}, name)
+	counter := storetest.Counter(storetest.Chatbot().ID)
+	for i := range 11 {
+		if got, err := c.TakeMinute(t.Context(), counter, 60, storetest.Now); err != nil || got.Taken != (i < 10) {
+			t.Fatalf("minute take %d = %+v, %v", i, got, err)
+		}
+	}
+	for i := range 4 {
+		if got, err := c.TakeDay(t.Context(), counter, 3, storetest.Now); err != nil || got.Taken != (i < 3) {
+			t.Fatalf("day take %d = %+v, %v", i, got, err)
+		}
+	}
+	// A give-back sent again returns one only.
+	if err := c.GiveBackMinute(t.Context(), counter, 60, storetest.Now); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.GiveBackDay(t.Context(), counter, storetest.Now); err != nil {
+		t.Fatal(err)
+	}
+	for _, take := range []func() (store.Take, error){
+		func() (store.Take, error) { return c.TakeMinute(t.Context(), counter, 60, storetest.Now) },
+		func() (store.Take, error) { return c.TakeDay(t.Context(), counter, 3, storetest.Now) },
+	} {
+		for i := range 2 {
+			if got, err := take(); err != nil || got.Taken != (i == 0) {
+				t.Fatalf("take %d after a give-back = %+v, %v", i, got, err)
+			}
+		}
+	}
+	if err := c.Ready(t.Context()); err != nil {
+		t.Fatalf("Ready = %v", err)
+	}
+}
