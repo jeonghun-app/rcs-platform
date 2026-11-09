@@ -118,10 +118,11 @@ type Requests interface {
 	// the same writer stores the answer again. ErrNotFound if there is no
 	// live record, ErrConflict if another writer stored it.
 	Settle(ctx context.Context, chatbotID, key, writer string, answer []byte, now time.Time) error
-	// Forget deletes the record of the chatbot's key that writer stored,
-	// so that a repeat of a request refused before it was sent is checked
-	// again. It returns nil if there is none, ErrConflict if another
-	// writer stored the one there.
+	// Forget deletes the pending record of the chatbot's key that writer
+	// stored, so that a repeat of a request refused before it was sent is
+	// checked again. It returns nil if there is none, ErrConflict if
+	// another writer stored the one there or it is settled: a settled
+	// request was sent, and its repeats get its answer.
 	Forget(ctx context.Context, chatbotID, key, writer string) error
 	// DeleteChatbot deletes the chatbot's records.
 	ChatbotDeleter

@@ -154,15 +154,15 @@ func (r *Requests) Settle(ctx context.Context, chatbotID, idemKey, writer string
 }
 
 // Forget implements store.Requests: a delete on the condition that the
-// record there, if any, is the writer's.
+// record there, if any, is the writer's and still pending.
 func (r *Requests) Forget(ctx context.Context, chatbotID, idemKey, writer string) error {
 	if err := store.CheckRecordKey(chatbotID, idemKey); err != nil {
 		return err
 	}
 	_, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{
 		TableName: aws.String(r.table), Key: requestKey(chatbotID, idemKey),
-		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #w = :w"),
-		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#w": attrWriter},
+		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR (#w = :w AND attribute_exists(#pending))"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#w": attrWriter, "#pending": attrPending},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":w": str(writer)},
 	})
 	var ccf *types.ConditionalCheckFailedException
