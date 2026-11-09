@@ -6,14 +6,16 @@ the chatbot API, webhook delivery, aliases and policy limits. `rcs-as` hosts
 the chatbot PSI and builds every SIP request; `maap` has no SIP, MSRP or
 Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 `internal/maap`, wired by `cmd/maap`. It is being built under epic #668:
-today it starts with checked settings and serves its health checks.
+today it starts with checked settings, serves its health checks, and guards
+its internal listener with the operator's token; no route is mounted yet
+(#708–#713 add the operator's).
 
 ## Listeners
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
 | admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2) |
-| internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the operator API (#707, second part), `rcs-as`'s API (#683) |
+| internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
 ## Configuration
@@ -56,3 +58,40 @@ they come on, and the rule is:
 
 The default, 8, needs about 160 MB, so a task of 512 MB or more (#684 sizes
 it). Raise the cap only with the memory limit.
+
+## Internal API
+
+Specified in [api/maap.yaml](api/maap.yaml), with the callers and their
+scopes in [api/maap-scopes.md](api/maap-scopes.md). Every route is checked in
+this order, each before the request's body is read:
+
+| Status | When |
+|---|---|
+| 404 | no route serves the path, whatever the token |
+| 503 | no token is configured (dev and test only: prod requires `MAAP_OPERATOR_TOKEN`); `Retry-After` does not help |
+| 401 | no bearer token, more than one `Authorization` header, or a token not accepted, the operator's included in another scheme (`WWW-Authenticate: Bearer`) |
+| 403 | the token's caller may not use the route |
+
+Presented and accepted tokens are compared as SHA-256 digests, every accepted
+one each time, in constant time. Each request is one audit line
+(`audit: internal request`): the operation, the status, the caller and the
+token slot (`current` or `next`). Tokens, bodies and paths are never logged.
+
+A route with a body then decodes it through `chatbot.DecodeEnvelope`
+(ADR 0009 §9): operator bodies at most 16 KiB (413 above it), strict JSON (400
+for unknown fields, duplicate keys or keys differing in case, trailing data,
+or a string over its field's bound). A request that finds every one of the
+`MAAP_DECODES` slots taken gets 503 with `Retry-After: 1` at once, before its
+body is read, and counts `api.decode_busy`; the handler keeps its slot until
+it has validated what it decoded.
+
+`DecodeEnvelope` bounds each string but not what it holds. A string a handler
+writes into a SIP, CPIM or HTTP header, or a log, such as a display name, an
+out-of-service text, an idempotency key or a webhook URL, is refused first if
+it holds a C0 control or DEL, tab included (400, naming the field, never the
+value): CR LF would end a header block and a NUL may cut it short. C1
+controls are not refused, as in `internal/chatbot`'s wire types (#717). The
+content is checked by `chatbot.ValidateContent` instead.
+
+Metrics have the `Service` dimension only (ADR 0009 §10):
+`api.<operation>.<status>` per request and `api.decode_busy`.

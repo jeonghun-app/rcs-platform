@@ -1,0 +1,72 @@
+# maap internal API (internal/maap, docs/maap.md).
+#
+# The operator API, and rcs-as's /v1/rcs/* once #683 adds it, on maap's
+# internal listener, MAAP_INTERNAL_ADDR, which only rcs-as and the operator
+# path reach and which is never on the public ALB (ADR 0009 §7). Callers and
+# their scopes are in maap-scopes.md, next to this file. Each route is
+# specified here by the PR that adds it (#708–#713, #683).
+openapi: 3.1.0
+info:
+  title: maap internal API
+  version: 1.0.0
+  description: |
+    Every request needs the bearer token of a caller allowed the route
+    (maap-scopes.md). The token is checked before the body is read: a path
+    no route serves is 404; with no token configured (dev and test only)
+    every route answers 503; a missing or unknown token is 401, and a token
+    outside its scope 403.
+
+    Bodies are strict JSON (ADR 0009 §9): unknown fields, duplicate keys,
+    keys differing only in case and trailing data are refused, and each
+    string has a bound. Operator bodies are at most 16 KiB. When the task is
+    decoding as many bodies as `MAAP_DECODES` allows, a request is 503 with
+    `Retry-After: 1` before its body is read. A string that maap writes into
+    a header or a log is refused if it holds a C0 control or DEL.
+
+    Responses carry `Cache-Control: no-store`. Errors are
+    `{"error": "..."}` and never quote the request. `/v1/` only grows: a
+    rolling update runs two versions at once, and a receiver ships a new
+    field a release before any sender emits it (ADR 0009 §6).
+servers:
+  # ADR 0007 §5: plain http only to a private host, always with the
+  # caller's own bearer token.
+  - url: http://maap.{namespace}:8081
+    description: Inside the VPC only (ADR 0007), through Cloud Map
+    variables:
+      namespace:
+        default: rcs.local
+security:
+  - bearer: []
+paths: {}
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: MAAP_OPERATOR_TOKEN or MAAP_OPERATOR_TOKEN_NEXT for the operator.
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string, description: What is wrong, without quoting the request. }
+  responses:
+    Invalid:
+      description: The body is not strict JSON of the route's shape, or a string breaks its rule.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Unauthenticated:
+      description: No bearer token, or one that is not accepted.
+      headers:
+        WWW-Authenticate: { schema: { type: string, const: 'Bearer realm="maap"' } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Forbidden:
+      description: The token's caller may not use the route.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    TooLarge:
+      description: The body is over the route's limit (16 KiB for the operator).
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    Busy:
+      description: No token is configured, or every decode slot is taken (then with Retry-After).
+      headers:
+        Retry-After: { schema: { type: integer, minimum: 1 } }
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
