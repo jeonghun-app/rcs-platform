@@ -586,3 +586,49 @@ func TestOnlyTheTrialDecidesAnOpenBreaker(t *testing.T) {
 		t.Error("the call after an abandoned trial was not the next trial")
 	}
 }
+
+func TestADeliveryAnswered503Or404IsNotABreakerFailure(t *testing.T) {
+	for _, code := range []int{http.StatusServiceUnavailable, http.StatusNotFound} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			var answer atomic.Int64
+			answer.Store(int64(code))
+			c, h := newTest(t, func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(int(answer.Load()))
+				positive(w, r)
+			})
+			for _, k := range calls {
+				if k.name != "message" && k.name != "notification" {
+					continue
+				}
+				for i := range 2 * breakerFailures {
+					if err := k.call(t.Context(), c); err != nil {
+						t.Fatalf("%s %d answer %d: %v", k.name, code, i+1, err)
+					}
+				}
+			}
+			// Such an answer also ends a run of failures: after four failures,
+			// this answer and one more failure, the breaker is still closed.
+			deliver := func(status int64) (Delivery, error) {
+				answer.Store(status)
+				return c.DeliverMessage(t.Context(), message("hi"))
+			}
+			for range breakerFailures - 1 {
+				if _, err := deliver(500); !errors.Is(err, ErrUnavailable) || errors.Is(err, ErrBreakerOpen) {
+					t.Fatalf("a failure: %v", err)
+				}
+			}
+			if _, err := deliver(int64(code)); err != nil {
+				t.Fatalf("%d between failures: %v", code, err)
+			}
+			if _, err := deliver(500); errors.Is(err, ErrBreakerOpen) {
+				t.Fatalf("one failure after a %d found the breaker open", code)
+			}
+			if d, err := deliver(200); err != nil || d != Delivered {
+				t.Errorf("then a 200: %v, %v", d, err)
+			}
+			if logs := h.Logs("rcs-as: the maap breaker opened"); len(logs) != 0 {
+				t.Errorf("the breaker opened: %s", h.Output())
+			}
+		})
+	}
+}
