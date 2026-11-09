@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
@@ -191,7 +192,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 			return fmt.Errorf("rcs-as: chatbot API listener: %w", err)
 		}
 	}
-	api := chatbotapi.New(cfg.Chatbots, nil, rt.Logger, rt.Metrics).Server()
+	api := chatbotapi.New(cfg.Chatbots, chatbotAcceptor{engine, cfg.Chatbots.ContentTypes.ChipList}, rt.Logger, rt.Metrics).Server()
 	apiFailed := make(chan error, 1)
 	go func() {
 		if err := api.Serve(cl); !errors.Is(err, http.ErrServerClosed) {
@@ -234,6 +235,27 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	case err := <-apiFailed:
 		return fmt.Errorf("rcs-as: chatbot API listener: %w", err)
 	}
+}
+
+// chatbotAcceptor stores what the chatbot API lets through: messages
+// (#699); notifications wait for #706. A store failure is 503, which maap
+// retries with the same Message-ID (ADR 0009 §4); a refusal stays the
+// engine's Rejection, 403.
+type chatbotAcceptor struct {
+	engine       *messaging.Engine
+	chipListType string
+}
+
+func (a chatbotAcceptor) AcceptMessage(ctx context.Context, m chatbot.BotMessage) error {
+	err := a.engine.SubmitChatbot(ctx, m, a.chipListType)
+	if _, refused := errors.AsType[*messaging.Rejection](err); err != nil && !refused {
+		return fmt.Errorf("%w: %w", chatbotapi.ErrUnavailable, err)
+	}
+	return err
+}
+
+func (chatbotAcceptor) AcceptNotification(context.Context, chatbot.BotNotification) error {
+	return chatbotapi.ErrUnavailable
 }
 
 // linkStores lets the messages store check a group copy's fence in the
