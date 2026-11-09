@@ -641,19 +641,54 @@ func TestACancelBeforeTheAnswerEndsTheCallWith487(t *testing.T) {
 func TestACancelAfterTheAnswerChangesNothing(t *testing.T) {
 	// RFC 3261 §9.2: a CANCEL for an INVITE already answered gets 200 and
 	// no other effect.
-	s, _, flow, calls := calleeUA(t, nil)
+	//
+	// The caller sends no ACK, so on the wall clock the 200 goes again at
+	// T1 (§13.3.1.4): a loaded host let T1 pass before the check below,
+	// which took that 200 for the CANCEL's doing (#637). On a fake clock
+	// the 200 goes once.
+	clock := newFakeClock()
+	s, _, flow, calls := calleeUA(t, clock)
 	cl := s.call(t, flow)
-	d, _ := nextCall(t, calls).Accept([]byte(testAnswer))
+	in := nextCall(t, calls)
+	d, _ := in.Accept([]byte(testAnswer))
 	cl.next(t)
 	if res := cl.cancel(t); res.StatusCode != 200 {
 		t.Fatalf("CANCEL answered %d", res.StatusCode)
 	}
+	// The UA reads its connection in order and handles the CANCEL before
+	// it reads the next request, so once that request is answered
+	// whatever the CANCEL did is done and on the stand-in's side.
+	s.options(t, flow)
 	cl.none(t)
 	select {
 	case <-d.Done():
 		t.Fatal("the CANCEL ended the dialog")
+	case <-in.Cancelled():
+		t.Fatal("the CANCEL cancelled a call already answered")
 	default:
 	}
+}
+
+// options sends the UA an OPTIONS outside any dialog on flow and waits for
+// its final response.
+func (s *standIn) options(t *testing.T, flow transport.FlowID) {
+	t.Helper()
+	branch, _ := s.ids.Branch()
+	callID, _ := s.ids.CallID("")
+	req := &sip.Request{Method: "OPTIONS", URI: mustURI(t, testIMPU)}
+	for _, f := range [][2]string{
+		{"Via", "SIP/2.0/TCP standin.invalid;branch=" + branch},
+		{"Max-Forwards", "70"},
+		{"From", "<" + testPeer + ">;tag=options"},
+		{"To", "<" + testIMPU + ">"},
+		{"Call-ID", callID},
+		{"CSeq", "1 OPTIONS"},
+	} {
+		if err := req.Header.Add(f[0], f[1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.sendRequest(t, req, flow)
 }
 
 func TestACancelForNoInviteIs481(t *testing.T) {
