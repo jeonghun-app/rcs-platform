@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strconv"
 	"time"
@@ -204,7 +205,7 @@ func (c Credentials) Revoke(ctx context.Context, chatbotID, keyID string) error 
 			return nil
 		}
 		found = true
-		return c.r.deleteSlot(ctx, chatbotID, slot)
+		return c.r.deleteSlot(ctx, chatbotID, slot, false)
 	})
 	switch {
 	case err != nil:
@@ -259,7 +260,7 @@ func (c Credentials) Used(ctx context.Context, keyID string, at time.Time) error
 // but finishes a deletion that stopped part way.
 func (c Credentials) DeleteChatbot(ctx context.Context, chatbotID string) error {
 	return c.r.eachItem(ctx, chatbotID, skSlot, func(slot map[string]types.AttributeValue) error {
-		return c.r.deleteSlot(ctx, chatbotID, slot)
+		return c.r.deleteSlot(ctx, chatbotID, slot, true)
 	})
 }
 
@@ -268,13 +269,25 @@ func (c Credentials) DeleteChatbot(ctx context.Context, chatbotID string) error 
 // on the conditions that the key item is not another chatbot's (never, as
 // key IDs are random) and that the slot still names the key ID. A slot
 // without a key ID is deleted as it is.
-func (r *Registry) deleteSlot(ctx context.Context, chatbotID string, slot map[string]types.AttributeValue) error {
+//
+// A chatbot's deletion (deleting) never stops at a damaged slot (#744
+// round 2): one whose key value is no key ID, or whose key item is
+// another chatbot's or names none, goes alone, logged without its value,
+// and the key item stays. A revoke refuses to touch such a key item.
+func (r *Registry) deleteSlot(ctx context.Context, chatbotID string, slot map[string]types.AttributeValue, deleting bool) error {
 	keyID, slotKey := sv(slot[attrKey]), key(sv(slot[attrPK]), sv(slot[attrSK]))
-	if keyID == "" {
+	alone := func() error {
+		if keyID != "" {
+			slog.Warn("awsstore: a damaged credential slot was deleted without its key item",
+				slog.String("chatbot", chatbotID), slog.String("slot", sv(slot[attrSK])))
+		}
 		if _, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(r.table), Key: slotKey}); err != nil {
 			return sanitize("delete chatbot", err)
 		}
 		return nil
+	}
+	if keyID == "" || deleting && !store.ValidKeyID(keyID) {
+		return alone()
 	}
 	for attempt := 0; ; attempt++ {
 		_, err := r.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
@@ -295,6 +308,8 @@ func (r *Registry) deleteSlot(ctx context.Context, chatbotID string, slot map[st
 			},
 		})
 		switch reasons := cancelled(err); {
+		case len(reasons) == 2 && failed(reasons[0]) && deleting:
+			return alone()
 		case len(reasons) == 2 && failed(reasons[0]):
 			return fmt.Errorf("%w: a key item of another chatbot", store.ErrInvalid)
 		case len(reasons) == 2 && failed(reasons[1]):

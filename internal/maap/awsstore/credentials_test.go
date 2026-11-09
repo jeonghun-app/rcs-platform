@@ -1,8 +1,10 @@
 package awsstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -126,7 +128,10 @@ func TestAnIssueSentAgainFindsItsOwnSlot(t *testing.T) {
 	// A slot naming a key item that is gone is taken over, on the condition
 	// that it still names that key and the key item is still absent.
 	takeover := func(in *dynamodb.TransactWriteItemsInput) error {
+		// The guard is exact (#744 round 2): a condition taking any slot
+		// would let concurrent issues pass the limit.
 		if len(in.TransactItems) != 4 || sv(in.TransactItems[1].Put.Item[attrSK]) != "k#1" ||
+			aws.ToString(in.TransactItems[1].Put.ConditionExpression) != "attribute_not_exists(#pk) OR #key = :stale" ||
 			sv(in.TransactItems[1].Put.ExpressionAttributeValues[":stale"]) != held || sv(in.TransactItems[3].ConditionCheck.Key[attrPK]) != "k#"+held {
 			return errors.New("not a takeover of slot 1")
 		}
@@ -195,6 +200,48 @@ func TestARevokeFinishesWhatAFailedOneLeft(t *testing.T) {
 	})}}
 	if err := NewRegistry(s, "maap-registry").Credentials().Revoke(ctx, "cb-1", keyID); !errors.Is(err, store.ErrInvalid) {
 		t.Fatalf("Revoke over another chatbot's key item = %v", err)
+	}
+}
+
+// A chatbot's deletion never stops at a damaged slot (#744 round 2):
+// with a key item another chatbot's or naming none (the transaction's key
+// condition fails), or a key value that is no key ID, the slot goes alone,
+// logged without its value. Both deleters do so.
+func TestADeletionDeletesADamagedSlotAlone(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+	keyID := storetest.Credential(storetest.Chatbot(), time.Time{}).KeyID
+	none := types.CancellationReason{Code: aws.String("None")}
+	keyRefused := fails(&types.TransactionCanceledException{
+		CancellationReasons: []types.CancellationReason{{Code: aws.String("ConditionalCheckFailed")}, none},
+	})
+	tombstone := func(*dynamodb.TransactWriteItemsInput) error { return nil }
+	for _, tc := range []struct {
+		name, key string
+		txs       []func(*dynamodb.TransactWriteItemsInput) error
+		calls     []string
+	}{
+		{"KeyItemRefused", keyID, []func(*dynamodb.TransactWriteItemsInput) error{keyRefused},
+			[]string{"query", "transaction delete k#" + keyID + " key delete c#cb-1 k#1", "delete c#cb-1 k#1"}},
+		{"NoKeyID", strings.Repeat("x", 2100), nil, []string{"query", "delete c#cb-1 k#1"}},
+	} {
+		for _, registry := range []bool{false, true} {
+			buf.Reset()
+			s := &scriptStub{keyID: tc.key, txs: tc.txs}
+			r, want := NewRegistry(s, "maap-registry"), tc.calls
+			err := r.Credentials().DeleteChatbot(context.Background(), "cb-1")
+			if registry {
+				s.txs = append([]func(*dynamodb.TransactWriteItemsInput) error{tombstone}, tc.txs...)
+				s.calls, want = nil, append([]string{"transaction"}, tc.calls...)
+				err = r.DeleteChatbot(context.Background(), "cb-1")
+			}
+			if out := buf.String(); err != nil || !reflect.DeepEqual(s.calls, want) || !strings.Contains(out, "damaged credential slot") ||
+				strings.Contains(out, tc.key) {
+				t.Errorf("%s, registry %v: %v, calls %q, log %s", tc.name, registry, err, s.calls, out)
+			}
+		}
 	}
 }
 

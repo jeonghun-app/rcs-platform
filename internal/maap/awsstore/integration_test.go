@@ -318,4 +318,69 @@ func TestIntegrationAHalfDoneRevokeNeverHoldsASlot(t *testing.T) {
 	if got, err := cs.ChatbotCredentials(ctx, c.ID); len(got) != store.MaxCredentials || err != nil {
 		t.Fatalf("%d live, %v", len(got), err)
 	}
+	// Both slots stale, then four concurrent issues: the takeover's guard
+	// (the slot still names the stale key) lets only two win (#744 round
+	// 2), and no key item is left without a slot.
+	live, _ := cs.ChatbotCredentials(ctx, c.ID)
+	for _, cred := range live {
+		if _, err := ddb.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(table), Key: keyKey(cred.KeyID)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	racing := make([]store.Credential, 4)
+	errs := make(chan error, len(racing))
+	for i := range racing {
+		racing[i] = storetest.Credential(c, time.Unix(4, 0))
+		go func() { errs <- cs.Issue(ctx, racing[i]) }()
+	}
+	won := 0
+	for range racing {
+		switch err := <-errs; {
+		case err == nil:
+			won++
+		case !errors.Is(err, store.ErrTooMany) && !errors.Is(err, store.ErrConflict):
+			t.Errorf("a losing Issue = %v", err)
+		}
+	}
+	kept := 0
+	for _, cred := range racing {
+		if _, err := cs.Credential(ctx, cred.KeyID); err == nil {
+			kept++
+		}
+	}
+	if got, _ := cs.ChatbotCredentials(ctx, c.ID); won != store.MaxCredentials || len(got) != won || kept != won {
+		t.Fatalf("%d issues won, %d listed, %d key items kept", won, len(got), kept)
+	}
+}
+
+// A chatbot's deletion finishes over a key item that names no chatbot
+// (#744 round 2, the tester's probe): the slot goes alone.
+func TestIntegrationADeletionFinishesOverADamagedKeyItem(t *testing.T) {
+	ddb, table := registryTable(t)
+	ctx := t.Context()
+	r := NewRegistry(ddb, table)
+	c, err := r.Register(ctx, storetest.Chatbot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := storetest.Credential(c, time.Unix(1, 0))
+	if err := r.Credentials().Issue(ctx, cred); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ddb.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(table), Key: keyKey(cred.KeyID), UpdateExpression: aws.String("REMOVE #chatbot"),
+		ExpressionAttributeNames: map[string]string{"#chatbot": attrChatbot},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.DeleteChatbot(ctx, c.ID); err != nil {
+		t.Fatalf("DeleteChatbot = %v", err)
+	}
+	if got, err := r.Credentials().ChatbotCredentials(ctx, c.ID); len(got) != 0 || err != nil {
+		t.Fatalf("left: %v, %v", got, err)
+	}
+	out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: slotKey(c.ID, 1), ConsistentRead: aws.Bool(true)})
+	if err != nil || len(out.Item) != 0 {
+		t.Fatalf("the slot is left: %v, %v", out.Item, err)
+	}
 }
