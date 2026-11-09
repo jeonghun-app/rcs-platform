@@ -44,12 +44,7 @@ var (
 // ID, which is no subscriber's.
 func deletePartition(ctx context.Context, api TableAPI, table, pk, chatbotID string, pageSize int32) (err error) {
 	deleted := 0
-	defer func() {
-		if deleted > 0 || err != nil {
-			slog.Info("awsstore: chatbot deletion progress", slog.String("table", table), slog.String("chatbot", chatbotID),
-				slog.Int("deleted", deleted), slog.Bool("finished", err == nil))
-		}
-	}()
+	defer func() { logProgress(table, chatbotID, deleted, err) }()
 	in := &dynamodb.QueryInput{
 		TableName: aws.String(table), ConsistentRead: aws.Bool(true),
 		KeyConditionExpression:    aws.String("#pk = :pk"),
@@ -85,10 +80,23 @@ func deletePartition(ctx context.Context, api TableAPI, table, pk, chatbotID str
 	}
 }
 
+// logProgress logs a chatbot deletion's progress in one table: counts
+// only, and the chatbot's ID, which is no subscriber's.
+func logProgress(table, chatbotID string, deleted int, err error) {
+	if deleted > 0 || err != nil {
+		slog.Info("awsstore: chatbot deletion progress", slog.String("table", table), slog.String("chatbot", chatbotID),
+			slog.Int("deleted", deleted), slog.Bool("finished", err == nil))
+	}
+}
+
 // pace waits until batchPace after last, or returns store.ErrUnfinished
 // when the context's deadline would come within deadlineMargin of it.
-func pace(ctx context.Context, last time.Time) error {
-	start := last.Add(batchPace)
+func pace(ctx context.Context, last time.Time) error { return paceEvery(ctx, last, batchPace) }
+
+// paceEvery is pace for writes every interval apart: the alias deletions
+// of maap-subscribers, one transaction of two items each, go by their own.
+func paceEvery(ctx context.Context, last time.Time, interval time.Duration) error {
+	start := last.Add(interval)
 	if dl, ok := ctx.Deadline(); ok && dl.Sub(start) < deadlineMargin {
 		return store.ErrUnfinished
 	}

@@ -109,8 +109,9 @@ paths:
       summary: Delete a chatbot and every item another table keeps of it.
       description: |
         Frees the URI; the ID is never registered again. 204 also when the
-        chatbot is gone already. Each part either finishes or fails: after
-        a 503, send the request again, which finishes what is left.
+        chatbot is gone already. Each part either finishes or fails, and a
+        call deletes for at most 20 s: after a 503, send the request again
+        until 204; each goes on with what is left.
       responses:
         "204": { description: Deleted, or gone already. }
         "401": { $ref: "#/components/responses/Unauthenticated" }

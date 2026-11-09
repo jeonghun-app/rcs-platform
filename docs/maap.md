@@ -21,7 +21,7 @@ and #712 add the operator's other routes and tables.
 
 | Listener | Setting | Who reaches it | Serves |
 |---|---|---|---|
-| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry`, `maap-requests` and `maap-counters` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` for (#684) |
+| admin | `RCS_ADMIN_ADDR` (`:8080`) | its load balancer's health checks | `/healthz`, `/readyz`, as every service's admin port (ADR 0007 §2); `/readyz` also needs `maap-registry`, `maap-requests`, `maap-counters` and `maap-subscribers` to answer `DescribeTable` as `ACTIVE`, which the task role needs `dynamodb:DescribeTable` on each for (#684) |
 | internal | `MAAP_INTERNAL_ADDR` (`:8081`) | `rcs-as` and the operator path only, never the public ALB (ADR 0009 §7) | the [internal API](#internal-api): the operator's routes (#708–#713), `rcs-as`'s (#683) |
 | public | (#683) | the ALB, on `MAAP_PUBLIC_HOST` | the chatbot API (#683) |
 
@@ -43,7 +43,7 @@ reported at once at start.
 | `MAAP_DECODES` | `8` | request bodies the internal listener decodes at once (see [Memory](#memory)); at least 1 |
 | `MAAP_REGISTRY_TABLE` | `maap-registry` | DynamoDB table of chatbots and credentials (#708) |
 | `MAAP_DYNAMODB_ENDPOINT` | AWS | replaces the DynamoDB endpoint, for DynamoDB Local in dev stacks. *prod*: refused. `maap` has no memory store, unlike `hss` and `rcs-as`: a dev run without DynamoDB Local is never ready |
-| `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711) |
+| `MAAP_SUBSCRIBERS_TABLE` | `maap-subscribers` | aliases, conversations and blocks (#711); refused if it names the table of another maap setting, by name or by ARN, whose deletions would then take half of each alias |
 | `MAAP_REQUESTS_TABLE` | `maap-requests` | [idempotency records](#dynamodb-maap-requests-table) and message statuses (#713) |
 | `MAAP_COUNTERS_TABLE` | `maap-counters` | the [shared limit counters](#dynamodb-maap-counters-table) (#713) |
 | `MAAP_STATUS_TTL` | `192h` (8 days) | how long a message's [status](#dynamodb-maap-requests-table) is kept: by default `rcs-as`'s `RCSAS_SENT_TTL` default, the longest a notification can still come (lead decision on #713; #684 sets both from one parameter); at least 24 hours, so that the answer an idempotency record replays names a status still kept |
@@ -311,6 +311,8 @@ anonymous alias stays apart. Grant it knowing that.
   minute. Each alias used in the last hour takes one entry, about 100 bytes,
   in the task's memory. An absolute lifetime is not decided (held for the
   product owner, lead decision C on PR #674).
+- **Deletion.** Deleting a chatbot deletes its aliases, [in
+  DynamoDB](#dynamodb-maap-subscribers-table) as in memory.
 - **Logs** carry an alias only through `pii.Identity`, as `alias`.
 
 ## DynamoDB `maap-registry` table
@@ -535,3 +537,55 @@ above about 29 % average use of its peak, and chatbot traffic comes in
 campaigns; counters fail closed, so too little provisioned capacity would
 turn into 503s for every chatbot before auto scaling reacts. To be looked
 at again after a month of `ConsumedWriteCapacityUnits` (#684).
+
+## DynamoDB `maap-subscribers` table
+
+`MAAP_SUBSCRIBERS_TABLE`, on demand with point-in-time recovery (ADR 0003),
+written by `maap`'s task role only (ADR 0009 §12), from the infrastructure
+(#684) like `maap-registry`. Partition key `pk` and sort key `sk`, both
+strings; no index. **TTL attribute `expires`** (Unix seconds). It maps
+subscribers' numbers to aliases, so it is personal data (T15), as
+sensitive as the numbers.
+
+| `pk` | `sk` | Holds |
+|---|---|---|
+| `s#<tel URI>` | `a#0#<chatbot ID>`, `a#1#<chatbot ID>` | The subscriber's alias at the chatbot, normal (`0`) or anonymous (`1`): `alias` (its ID), `created`, `last_used`, `expires` |
+| `c#<chatbot ID>` | `a#<alias ID>` | The same alias by its ID: `subscriber` (the tel URI), `anonymous` (boolean), `created`, `last_used`, `expires` |
+
+- **Keys.** A subscriber is its canonical tel URI, `tel:+` and 1–15 digits
+  as `rcs-as` names a global number, so all of one number's items are in
+  its partition and recycling a number (#712) finds them without a scan;
+  #712 adds conversations and blocks there. A chatbot's aliases are in its
+  partition, which its deletion queries and a lookup by alias ID reads,
+  with the chatbot ID always given.
+- **Both items at once.** An alias's two items are written, used and
+  deleted in one transaction each. Storing writes both on the condition
+  that neither exists, or, over an expired alias, that the subscriber's
+  item still holds the alias and last use read, deleting the old alias's
+  other item in the same transaction. A write that fails its condition
+  reads again and answers what it finds, so one the SDK sent again after
+  its answer was lost gets its own alias.
+- **Retention.** `last_used` moves only forward, on both items together,
+  and `expires` is `last_used` plus 180 days. Reads judge expiry by
+  `last_used`; TTL only removes an expired alias's items later, each in its
+  own time.
+- **Deletion.** Deleting a chatbot deletes each of its aliases' two items
+  together in one transaction, after the registry's tombstone, one alias
+  every 10 ms at most (200 items a second, about 400 write units), so that
+  a large chatbot leaves the partitions it shares with others their
+  capacity, as `maap-requests` does. Like it, the deletion stops 2 s before
+  the call's 20 s budget ends, unfinished (503, call again), and logs its
+  progress (`awsstore: chatbot deletion progress`: the table, the chatbot,
+  the items deleted and whether it finished). So a call deletes at most
+  about 2,000 aliases, and the next goes on with the rest.
+  A write that raced the deletion leaves at most an alias of a tombstoned
+  ID, which no chatbot reads (an ID is never registered again, #708); a
+  repeated deletion removes it, and otherwise its expiry and TTL do within
+  180 days. A damaged item goes alone, logged with the chatbot only.
+- **Backups.** Point-in-time recovery keeps every item for 35 days, the
+  deleted ones too: a restore brings back the aliases of chatbots deleted
+  and numbers recycled (#712) since the restore point. After a restore,
+  run those chatbot deletions and `DELETE /v1/subscribers/{tel}` again
+  (runbook, #684).
+- **Errors.** As for the registry: a store failure is never "no alias", and
+  errors carry the operation and the AWS error code only.

@@ -2,10 +2,14 @@ package maap
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"maps"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -53,6 +57,16 @@ func (r readyCounters) Ready(ctx context.Context) error {
 	return readyRequests{ready: r.ready}.Ready(ctx)
 }
 
+// readySubscribers is readyRequests for the subscribers table.
+type readySubscribers struct {
+	*store.MemorySubscribers
+	ready *atomic.Bool
+}
+
+func (r readySubscribers) Ready(ctx context.Context) error {
+	return readyRequests{ready: r.ready}.Ready(ctx)
+}
+
 // deletions records the chatbots its credentials' DeleteChatbot is called
 // for.
 type deletions struct {
@@ -87,19 +101,23 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	creds := deletions{registry.Credentials(), make(chan string, 1)}
 	requests := readyRequests{store.NewMemoryRequests(time.Hour), &registry.ready}
 	counters := readyCounters{store.NewMemoryCounters(), &registry.ready}
+	subs := readySubscribers{store.NewMemorySubscribers(), &registry.ready}
 	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, requests: requests, counters: counters, listen: func(network, _ string) (net.Listener, error) {
-			ln, err := net.Listen(network, "127.0.0.1:0")
-			if err == nil {
-				listening <- ln
-			}
-			return ln, err
-		}})
+		done <- run(ctx, h.Runtime, cfg, deps{
+			registry: registry, credentials: creds, requests: requests, counters: counters, subscribers: subs,
+			listen: func(network, _ string) (net.Listener, error) {
+				ln, err := net.Listen(network, "127.0.0.1:0")
+				if err == nil {
+					listening <- ln
+				}
+				return ln, err
+			}})
 	}()
 	addr := (<-listening).Addr().String()
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
 		if code, body := h.Get("/readyz"); code == http.StatusServiceUnavailable &&
-			strings.Contains(body, "dynamodb-registry") && strings.Contains(body, "dynamodb-requests") && strings.Contains(body, "dynamodb-counters") {
+			strings.Contains(body, "dynamodb-registry") && strings.Contains(body, "dynamodb-requests") && strings.Contains(body, "dynamodb-counters") &&
+			strings.Contains(body, "dynamodb-subscribers") {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -145,9 +163,14 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	}
 	// The credential routes are mounted over the credentials given, and
 	// deleting the chatbot runs their deletion and the other tables', and
-	// leaves nothing of it.
+	// leaves nothing of it: no idempotency record, nor any alias (#742
+	// review).
 	rec := storetest.Idempotency("cb-1")
 	if _, _, err := requests.Remember(context.Background(), rec, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	alias, err := subs.Alias(context.Background(), storetest.Alias("cb-1", storetest.Subscriber, false, time.Now()))
+	if err != nil {
 		t.Fatal(err)
 	}
 	for _, step := range []struct {
@@ -179,6 +202,9 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	if _, fresh, err := requests.Remember(context.Background(), rec, time.Now()); !fresh || err != nil {
 		t.Errorf("the idempotency record was left: %v", err)
 	}
+	if _, err := subs.Resolve(context.Background(), "cb-1", alias.ID, time.Now()); !errors.Is(err, store.ErrNotFound) {
+		t.Errorf("the alias is left: %v", err)
+	}
 
 	cancel()
 	if err := <-done; err != nil {
@@ -200,7 +226,7 @@ func TestRunFailsWhenItsListenerCannotOpen(t *testing.T) {
 	}
 	h := runtimetest.New(t, "maap")
 	m := store.NewMemoryRegistry()
-	err = run(context.Background(), h.Runtime, cfg, deps{registry: m, credentials: m.Credentials(), listen: func(string, string) (net.Listener, error) {
+	err = run(context.Background(), h.Runtime, cfg, deps{registry: m, credentials: m.Credentials(), subscribers: store.NewMemorySubscribers(), listen: func(string, string) (net.Listener, error) {
 		return nil, errors.New("address in use")
 	}})
 	if err == nil {
@@ -208,5 +234,63 @@ func TestRunFailsWhenItsListenerCannotOpen(t *testing.T) {
 	}
 	if code, _ := h.Get("/readyz"); code == http.StatusOK {
 		t.Error("ready without a listener")
+	}
+}
+
+// Without stores given, Run opens every table, by the names the settings
+// give, at the endpoint they give: /readyz describes each.
+func TestRunOpensTheTablesTheSettingsName(t *testing.T) {
+	for k, v := range map[string]string{
+		"AWS_REGION": "us-east-1", "AWS_ACCESS_KEY_ID": "local", "AWS_SECRET_ACCESS_KEY": "local",
+		"AWS_EC2_METADATA_DISABLED": "true", "AWS_CONFIG_FILE": "/nonexistent", "AWS_SHARED_CREDENTIALS_FILE": "/nonexistent",
+		"HTTP_PROXY": "", "HTTPS_PROXY": "", "NO_PROXY": "*",
+	} {
+		t.Setenv(k, v)
+	}
+	var mu sync.Mutex
+	described := map[string]bool{}
+	ddb := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in struct{ TableName string }
+		if r.Header.Get("X-Amz-Target") != "DynamoDB_20120810.DescribeTable" || json.NewDecoder(r.Body).Decode(&in) != nil {
+			http.Error(w, "unexpected", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		described[in.TableName] = true
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
+		_, _ = w.Write([]byte(`{"Table":{"TableStatus":"ACTIVE"}}`))
+	}))
+	defer ddb.Close()
+	cfg, err := configure(with(devEnv, "MAAP_DYNAMODB_ENDPOINT", ddb.URL, "MAAP_REGISTRY_TABLE", "bots-x", "MAAP_SUBSCRIBERS_TABLE", "aliases-x"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := runtimetest.New(t, "maap")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- run(ctx, h.Runtime, cfg, deps{listen: func(network, _ string) (net.Listener, error) { return net.Listen(network, "127.0.0.1:0") }})
+	}()
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+		if code, _ := h.Get("/readyz"); code == http.StatusOK {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("/readyz never answered 200")
+		}
+		h.Advance(2 * time.Second)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if want := map[string]bool{"bots-x": true, "aliases-x": true, DefaultRequestsTable: true, DefaultCountersTable: true}; !maps.Equal(described, want) {
+		t.Fatalf("described %v", described)
 	}
 }

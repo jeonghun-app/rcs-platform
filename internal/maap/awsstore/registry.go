@@ -23,6 +23,20 @@
 // it; it reads only the record's plain attributes, never
 // the document, so that a release can delete what a newer one wrote.
 //
+// # maap-subscribers
+//
+// The same keys, with the TTL attribute expires (Unix seconds):
+//
+//	pk s#<tel URI>     sk a#<0|1>#<chatbot ID>  the subscriber's alias at the chatbot, 1 if anonymous: alias (its ID), created, last_used, expires
+//	pk c#<chatbot ID>  sk a#<alias ID>          the same alias by its ID: subscriber, anonymous, created, last_used, expires
+//
+// Both items of an alias are written, used and deleted in one
+// transaction, so neither is left without the other but by a write that
+// raced a chatbot's deletion, which no chatbot reads and a repeated
+// deletion removes, or by TTL, which deletes each in its own time once
+// both are expired. A subscriber's partition holds all of the number's
+// items (#712 adds conversations and blocks), a chatbot's its aliases.
+//
 // Reads are strongly consistent. SDK errors are reduced to the operation
 // and the AWS error code or the transport failure, without the endpoint's
 // address, so that no request detail reaches a log or an audit line.

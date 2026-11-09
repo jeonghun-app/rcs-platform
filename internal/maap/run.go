@@ -28,10 +28,11 @@ type deps struct {
 	// ones do.
 	registry    store.Registry
 	credentials store.Credentials
-	// requests and counters replace maap-requests and maap-counters, with
-	// the registry only.
-	requests store.Requests
-	counters store.Counters
+	// requests, counters and subscribers replace maap-requests,
+	// maap-counters and maap-subscribers, with the registry only.
+	requests    store.Requests
+	counters    store.Counters
+	subscribers store.Subscribers
 }
 
 // Run serves the internal listener, apart from the runtime's admin port
@@ -41,7 +42,7 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	registry, creds, requests, counters := d.registry, d.credentials, d.requests, d.counters
+	registry, creds, requests, counters, subs := d.registry, d.credentials, d.requests, d.counters, d.subscribers
 	if registry == nil {
 		ddb, err := awsstore.NewClient(ctx, cfg.DynamoDBEndpoint)
 		if err != nil {
@@ -51,11 +52,15 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		registry, creds = r, r.Credentials()
 		requests = awsstore.NewRequests(ddb, cfg.RequestsTable, cfg.StoreKey, cfg.StatusTTL)
 		counters = awsstore.NewCounters(ddb, cfg.CountersTable, cfg.StoreKey)
+		subs = awsstore.NewSubscribers(ddb, cfg.SubscribersTable)
 	}
 	for _, t := range []struct {
 		name  string
 		table any
-	}{{"dynamodb-registry", registry}, {"dynamodb-requests", requests}, {"dynamodb-counters", counters}} {
+	}{
+		{"dynamodb-registry", registry}, {"dynamodb-requests", requests}, {"dynamodb-counters", counters},
+		{"dynamodb-subscribers", subs},
+	} {
 		if r, ok := t.table.(interface{ Ready(context.Context) error }); ok {
 			rt.Admin.AddReadinessCheck(t.name, r.Ready)
 		}
@@ -70,7 +75,7 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 		// credentials too, though the registry's deletion takes them with
 		// its partition already; the counters, a day long at most, go by
 		// TTL alone (lead decision on #713).
-		deleters: []store.ChatbotDeleter{creds, requests},
+		deleters: []store.ChatbotDeleter{creds, requests, subs},
 	})
 	api.mountCredentials(&credentialAPI{registry: registry, creds: creds, random: rand.Reader, now: time.Now})
 	ln, err := d.listen("tcp", cfg.InternalAddr)
