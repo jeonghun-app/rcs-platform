@@ -13,8 +13,9 @@ and issues and revokes their [credentials](#credentials-and-caches) (#710),
 kept in [DynamoDB](#dynamodb-maap-registry-table) (#708). The
 [`maap-requests`](#dynamodb-maap-requests-table) table keeps the idempotency
 records and message statuses #683's sends need, and
-[`maap-counters`](#dynamodb-maap-counters-table) its shared limits (#713);
-#711 and #712 add the operator's other routes and tables.
+[`maap-counters`](#dynamodb-maap-counters-table) its shared limits (#713).
+It maps subscribers to the [aliases](#aliases) chatbots see (#711); #711
+and #712 add the operator's other routes and tables.
 
 ## Listeners
 
@@ -262,6 +263,55 @@ effect on every task within 30 s (T13), and a caller trying key IDs costs at
 most one read each per 30 s, concurrent lookups of one key ID sharing one
 read (with its own 5 s bound) and one place among the unknown; #683 adds the limits per source. The unknown
 key IDs take about 1 MB at their bound.
+
+## Aliases
+
+By default a chatbot never learns a subscriber's number (ADR 0009 §10, U1).
+It sees a **per-chatbot alias**, `sip:<alias ID>@<MAAP_ALIAS_HOST>;user=rcstk`
+(RCC.07 v13.0 §2.5.4.2, *confirmed* for v13.0, *to confirm* for the target
+edition), that only `maap` maps back (#683 calls it at admissions and
+sends; nothing calls it yet):
+
+| The chatbot has | Normal conversation | Anonymous (`Privacy: tk`) |
+|---|---|---|
+| no MSISDN permission | its alias | its anonymous alias |
+| the MSISDN permission | the number, `tel:+<E.164>` | its anonymous alias |
+
+Granting the MSISDN permission to a chatbot that had aliases lets it link
+the normal alias of each subscriber who writes again to the number; the
+anonymous alias stays apart. Grant it knowing that.
+
+- **Alias ID.** 128 bits from `crypto/rand` in base32 (RFC 4648), lower
+  case, without padding: 26 characters (the lead's decision on #711, the
+  form `internal/pii` masks, #714), whose last character can only be one
+  of `a e i m q u y 4`. An alias ID in another case, of another length or
+  with another last character is refused before any read, with a message that names
+  the rule and never the value (#683 and #712 answer it 400), and is never
+  logged: `pii.Redact` masks an ID written in one case only (#721).
+- **Nothing shared.** One subscriber has one alias per chatbot and kind of
+  conversation, each drawn on its own, so two chatbots, or one chatbot's
+  anonymous and normal conversations, cannot link the subscriber. An alias
+  resolves only at its own chatbot: it is looked up by the chatbot and the
+  alias ID together, never by the ID alone (lead decision on #711), so
+  another chatbot's alias finds nothing and no index is needed. Every
+  caller (#683, #712) passes the chatbot ID. It is stored by a
+  conditional write, so of two tasks that store one at once, one alias
+  wins and both get it.
+- **Retention.** An alias the subscriber has not used for 180 days
+  expires: it no longer resolves, and the subscriber's next message gets a
+  new one. Only the subscriber's messages are uses; a chatbot's sends to
+  the alias are not, or a chatbot alone could keep a number's alias past
+  180 days (#752 review). A reply needs a message of the subscriber in the
+  last 24 hours (ADR 0009 §9), so no conversation outlives its alias. A use
+  written after the expiry, by a slow writer, never brings an alias back. Expiry is
+  judged by comparing times at each read, never by the item's presence,
+  since DynamoDB's TTL deletes late. A task writes an alias's last use at
+  most hourly, off the request's path (its own context, 5 s); a write that
+  failed waits for the next hour, and its warning is logged at most once a
+  minute. Each alias used in the last hour takes one entry, about 100 bytes,
+  in the task's memory. An absolute lifetime is not decided (held for the
+  product owner, lead decision C on PR #674).
+- **Logs** carry an alias only through `pii.Identity`, as `alias`.
 
 ## DynamoDB `maap-registry` table
 
