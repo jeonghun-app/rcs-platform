@@ -117,6 +117,13 @@ func (r resendTable) PutItem(ctx context.Context, in *dynamodb.PutItemInput, o .
 	return r.TableAPI.PutItem(ctx, in, o...)
 }
 
+func (r resendTable) DeleteItem(ctx context.Context, in *dynamodb.DeleteItemInput, o ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
+	if _, err := r.TableAPI.DeleteItem(ctx, in, o...); err != nil {
+		return nil, err
+	}
+	return r.TableAPI.DeleteItem(ctx, in, o...)
+}
+
 func (r resendTable) UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, o ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
 	if _, err := r.TableAPI.UpdateItem(ctx, in, o...); err != nil {
 		return nil, err
@@ -409,7 +416,7 @@ func TestIntegrationADeletionFinishesOverADamagedKeyItem(t *testing.T) {
 func TestIntegrationRequestsMeetTheContract(t *testing.T) {
 	storetest.RunRequests(t, func(t *testing.T) store.Requests {
 		ddb, name := table(t, "maap-requests")
-		r := NewRequests(ddb, name, storetest.StatusTTL)
+		r := NewRequests(ddb, name, testKey, storetest.StatusTTL)
 		r.pageSize = 7 // pages that end inside a batch
 		return r
 	})
@@ -420,11 +427,13 @@ func TestIntegrationRequestsMeetTheContract(t *testing.T) {
 // still changed the status.
 func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 	ddb, name := table(t, "maap-requests")
-	r := NewRequests(resendTable{ddb}, name, storetest.StatusTTL)
+	r := NewRequests(resendTable{ddb}, name, testKey, storetest.StatusTTL)
 	rec := storetest.Idempotency(storetest.Chatbot().ID)
-	if got, fresh, err := r.Remember(t.Context(), rec, storetest.Now); err != nil || !fresh || got.MessageID != rec.MessageID {
+	got, fresh, err := r.Remember(t.Context(), rec, storetest.Now)
+	if err != nil || !fresh || got.MessageID != rec.MessageID {
 		t.Fatalf("Remember = %+v, %v, %v", got, fresh, err)
 	}
+	writer := got.Writer
 	again := rec
 	again.MessageID = storetest.MessageID()
 	if got, fresh, err := r.Remember(t.Context(), again, storetest.Now); err != nil || fresh || got.MessageID != rec.MessageID {
@@ -436,6 +445,13 @@ func TestIntegrationARememberSentAgainIsStillTheFirst(t *testing.T) {
 	}
 	if changed, err := r.Advance(t.Context(), rec.Chatbot, rec.MessageID, store.Delivered, storetest.Now); !changed || err != nil {
 		t.Fatalf("Advance = %v, %v", changed, err)
+	}
+	// A settle and a forget sent again stand.
+	if err := r.Settle(t.Context(), rec.Chatbot, rec.Key, writer, []byte("{}"), storetest.Now); err != nil {
+		t.Fatalf("Settle = %v", err)
+	}
+	if err := r.Forget(t.Context(), rec.Chatbot, rec.Key, writer); err != nil {
+		t.Fatalf("Forget = %v", err)
 	}
 	if err := r.Ready(t.Context()); err != nil {
 		t.Fatalf("Ready = %v", err)
