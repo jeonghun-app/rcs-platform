@@ -18,6 +18,7 @@ const (
 	botDomain     = "botplatform.mnc001.mcc001.3gppnetwork.org"
 	aliasHost     = "alias.mnc001.mcc001.3gppnetwork.org"
 	operatorToken = "operator-token-0123456789abcdefghijklmnopqrstuvwxyz"
+	nextToken     = "operator-next-token-0123456789abcdefghijklmnopqrstuvwxyz"
 )
 
 var devEnv = map[string]string{
@@ -66,15 +67,18 @@ func start(t *testing.T, env map[string]string) string {
 	return out.String()
 }
 
-func TestDevConfigurationIsReadWithDefaults(t *testing.T) {
+// TestTheDefaultsAreTheDocumentedOnes compares with docs/maap.md's values,
+// not the constants: 8 decodes is what the 512 MB task of the memory rule
+// is sized for, and :8081 is the port of docs/api/maap.yaml.
+func TestTheDefaultsAreTheDocumentedOnes(t *testing.T) {
 	c, err := configure(devEnv)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if c.IMSDomain != imsDomain || c.ChatbotDomain.Name() != botDomain || c.AliasHost != aliasHost || c.WebhookPorts != nil ||
-		c.InternalAddr != DefaultInternalAddr || c.Decodes != DefaultDecodes || !c.OperatorTokens.Current.IsZero() ||
-		c.RegistryTable != DefaultRegistryTable || c.SubscribersTable != DefaultSubscribersTable ||
-		c.RequestsTable != DefaultRequestsTable || c.CountersTable != DefaultCountersTable {
+		c.InternalAddr != ":8081" || c.Decodes != 8 || !c.OperatorTokens.Current.IsZero() ||
+		c.RegistryTable != "maap-registry" || c.SubscribersTable != "maap-subscribers" ||
+		c.RequestsTable != "maap-requests" || c.CountersTable != "maap-counters" {
 		t.Fatalf("config = %+v", c)
 	}
 }
@@ -104,6 +108,10 @@ func TestAliasHostIsComparedWithTheDomainsWithoutCase(t *testing.T) {
 		{"BotPlatform.mnc001.mcc001.3gppnetwork.org", imsDomain, "equal to or under RCS_CHATBOT_DOMAIN"},
 		{"A.BOTPLATFORM.mnc001.mcc001.3gppnetwork.org", imsDomain, "equal to or under RCS_CHATBOT_DOMAIN"},
 		{"alias host", imsDomain, "not a DNS name"},
+		{"10.0.0.5", imsDomain, "not a host name a SIP URI can carry"},
+		{"alias.9x", imsDomain, "not a host name a SIP URI can carry"},
+		{strings.Repeat("a.", 104) + "aliasx", imsDomain, "longer than 213 bytes"},
+		{strings.Repeat("a.", 104) + "alias", imsDomain, ""}, // 213 bytes
 		{"ALIAS.mnc001.mcc001.3gppnetwork.org", imsDomain, ""},
 		{"MNC001.mcc001.3gppnetwork.org", imsDomain, ""},                                // a parent of both
 		{"xims.mnc001.mcc001.3gppnetwork.org", "ims.mnc001.mcc001.3gppnetwork.org", ""}, // a suffix, not a label
@@ -128,40 +136,49 @@ func TestInvalidSettingsAreRefusedEverywhere(t *testing.T) {
 		{"MAAP_WEBHOOK_PORTS", "8443,0", "MAAP_WEBHOOK_PORTS: holds an item"},
 		{"MAAP_WEBHOOK_PORTS", "65536", "MAAP_WEBHOOK_PORTS: holds an item"},
 		{"MAAP_INTERNAL_ADDR", "8081", "MAAP_INTERNAL_ADDR: not host:port"},
+		{"MAAP_INTERNAL_ADDR", "127.0.0.1:99999", "MAAP_INTERNAL_ADDR: its port is not from 1 to 65535"},
+		{"MAAP_INTERNAL_ADDR", ":0", "MAAP_INTERNAL_ADDR: its port is not from 1 to 65535"},
 		{"MAAP_DECODES", "0", "MAAP_DECODES: must be at least 1"},
 		{"MAAP_OPERATOR_TOKEN", operatorToken + "\n", "MAAP_OPERATOR_TOKEN: has white space"},
+		{"MAAP_OPERATOR_TOKEN", strings.Repeat("é", 43), "MAAP_OPERATOR_TOKEN: has white space or characters outside printable ASCII"},
+		{"MAAP_OPERATOR_TOKEN", operatorToken + "\x7f", "MAAP_OPERATOR_TOKEN: has white space or characters outside printable ASCII"},
 		{"MAAP_OPERATOR_TOKEN_NEXT", "a b", "MAAP_OPERATOR_TOKEN_NEXT: has white space"},
+		{"MAAP_OPERATOR_TOKEN", "", "MAAP_OPERATOR_TOKEN_NEXT: set without MAAP_OPERATOR_TOKEN"},
+		{"MAAP_OPERATOR_TOKEN_NEXT", operatorToken, "MAAP_OPERATOR_TOKEN_NEXT: equal to MAAP_OPERATOR_TOKEN"},
 	} {
-		_, err := configure(with(devEnv, tc.name, tc.value))
+		// Both tokens are set, so that a row clearing one sees the pair.
+		_, err := configure(with(devEnv, "MAAP_OPERATOR_TOKEN", operatorToken, "MAAP_OPERATOR_TOKEN_NEXT", nextToken, tc.name, tc.value))
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s=%q: error = %v, want %q", tc.name, tc.value, err, tc.want)
 		}
 	}
 }
 
-func TestProductionRefusesTheDevelopmentDefaults(t *testing.T) {
-	if out := start(t, prodEnv); strings.Contains(out, "configuration rejected") {
-		t.Fatalf("the production configuration was refused:\n%s", out)
-	}
-	for _, tc := range []struct {
-		env  map[string]string
-		want string
-	}{
-		{with(prodEnv, "MAAP_OPERATOR_TOKEN", ""), "MAAP_OPERATOR_TOKEN is unset"},
-		{with(prodEnv, "MAAP_OPERATOR_TOKEN", strings.Repeat("a", MinTokenLength-1)), "MAAP_OPERATOR_TOKEN holds less than 256 bits"},
-		{with(prodEnv, "MAAP_OPERATOR_TOKEN", strings.Repeat("ab", 31)), "MAAP_OPERATOR_TOKEN holds less than 256 bits"},
-		{with(prodEnv, "MAAP_OPERATOR_TOKEN_NEXT", "short"), "MAAP_OPERATOR_TOKEN_NEXT holds less than 256 bits"},
-	} {
-		out := start(t, tc.env)
-		if !strings.Contains(out, "configuration rejected") || !strings.Contains(out, "refused in prod: "+tc.want) {
-			t.Errorf("want %q refused:\n%s", tc.want, out)
+func TestStagingAndProdRefuseTheDevelopmentDefaults(t *testing.T) {
+	for _, env := range []string{"staging", "prod"} {
+		base := with(prodEnv, "RCS_ENV", env)
+		for _, ok := range []string{operatorToken, strings.Repeat("z", 43), strings.Repeat("ab", 32)} {
+			if out := start(t, with(base, "MAAP_OPERATOR_TOKEN", ok)); strings.Contains(out, "configuration rejected") {
+				t.Errorf("%s: a token of %d characters was refused:\n%s", env, len(ok), out)
+			}
 		}
-		// The same values only warn in dev.
-		if dev := start(t, with(tc.env, "RCS_ENV", "dev")); strings.Contains(dev, "configuration rejected") {
-			t.Errorf("%q refused in dev:\n%s", tc.want, dev)
+		for _, tc := range []struct {
+			env  map[string]string
+			want string
+		}{
+			{with(base, "MAAP_OPERATOR_TOKEN", ""), "MAAP_OPERATOR_TOKEN is unset"},
+			{with(base, "MAAP_OPERATOR_TOKEN", strings.Repeat("z", 42)), "MAAP_OPERATOR_TOKEN holds less than 256 bits"},
+			{with(base, "MAAP_OPERATOR_TOKEN", strings.Repeat("ab", 31)+"a"), "MAAP_OPERATOR_TOKEN holds less than 256 bits"},
+			{with(base, "MAAP_OPERATOR_TOKEN_NEXT", "short"), "MAAP_OPERATOR_TOKEN_NEXT holds less than 256 bits"},
+		} {
+			out := start(t, tc.env)
+			if !strings.Contains(out, "configuration rejected") || !strings.Contains(out, "refused in "+env+": "+tc.want) {
+				t.Errorf("want %q refused in %s:\n%s", tc.want, env, out)
+			}
+			// The same values only warn in dev.
+			if dev := start(t, with(tc.env, "RCS_ENV", "dev")); strings.Contains(dev, "configuration rejected") {
+				t.Errorf("%q refused in dev:\n%s", tc.want, dev)
+			}
 		}
-	}
-	if out := start(t, with(prodEnv, "MAAP_OPERATOR_TOKEN", strings.Repeat("ab", 32))); strings.Contains(out, "configuration rejected") {
-		t.Errorf("a token of 64 hex digits was refused:\n%s", out)
 	}
 }

@@ -15,8 +15,6 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
 
-const nextToken = "operator-next-token-0123456789abcdefghijklmnopqrstuvwxyz"
-
 // otherScope stands for a caller other than the operator, such as rcs-as
 // once #683 adds it.
 const otherScope = scopeOperator << 1
