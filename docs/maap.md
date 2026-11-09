@@ -357,7 +357,8 @@ seconds); no index. The send path that writes it is #683's.
   review). Only the call that stored a record holds its writer token, and
   only it may change the record, each by one conditional write: `Settle`
   stores the answer once `rcs-as` has answered, which repeats then get;
-  `Forget` deletes the record of a request refused before it was sent, so
+  `Forget` deletes the pending record of a request refused before it was
+  sent (never a settled one, whose request was sent), so
   that a repeat is checked again rather than replayed. A repeat that finds
   the record pending is neither replayed nor sent: #683 answers 409, or 503
   to try again later. A call by any other writer is refused (a conflict).
