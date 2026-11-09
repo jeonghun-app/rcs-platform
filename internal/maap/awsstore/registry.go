@@ -236,12 +236,89 @@ func (r *Registry) Update(ctx context.Context, old, c store.Chatbot) (store.Chat
 	return decode(item)
 }
 
-// DeleteChatbot implements store.ChatbotDeleter. The record goes last,
-// turned into a tombstone on the condition of the version and registration
-// read, with its URI's reservation, so that a deletion that failed part way
-// still finds the URI when it is called again, and one that met a change
-// is refused (ErrConflict) rather than freeing a URI it did not read.
+// DeleteChatbot implements store.ChatbotDeleter. The record turns into a
+// tombstone first, on the condition of the registration read, with its
+// URI's reservation; the chatbot's other items (#710's credentials) go
+// after it. So no credential is deleted from a chatbot that stays, a
+// change meanwhile (which cannot move the URI) does not stop the deletion,
+// and a deletion that failed part way finishes its clean-up under the
+// tombstone when it is called again.
 func (r *Registry) DeleteChatbot(ctx context.Context, id string) error {
+	for attempt := 0; ; attempt++ {
+		out, err := r.api.GetItem(ctx, &dynamodb.GetItemInput{
+			TableName: aws.String(r.table), Key: chatbotKey(id), ConsistentRead: aws.Bool(true),
+			ProjectionExpression:     aws.String("#reg, #uri, #deleted"),
+			ExpressionAttributeNames: map[string]string{"#reg": attrRegistration, "#uri": attrURI, "#deleted": attrDeleted},
+		})
+		if err != nil {
+			return sanitize("delete chatbot", err)
+		}
+		if len(out.Item) == 0 {
+			return nil
+		}
+		if gone(out.Item) {
+			break
+		}
+		err = r.tombstone(ctx, id, out.Item)
+		switch {
+		case raced(err) && attempt < conflictAttempts-1:
+			continue // read again: the other write may have been a deletion
+		case raced(err):
+			return sanitize("delete chatbot", err)
+		case err != nil:
+			return err
+		}
+		break
+	}
+	return r.deleteRest(ctx, id)
+}
+
+// conflictAttempts bounds the tries of a tombstone write that keeps
+// meeting another transaction on the record.
+const conflictAttempts = 3
+
+// tombstone replaces the record read with a tombstone and deletes its
+// URI's reservation, in one transaction.
+func (r *Registry) tombstone(ctx context.Context, id string, read map[string]types.AttributeValue) error {
+	tomb := chatbotKey(id)
+	tomb[attrDeleted] = &types.AttributeValueMemberBOOL{Value: true}
+	_, err := r.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
+		ClientRequestToken: aws.String(rand.Text()),
+		TransactItems: []types.TransactWriteItem{
+			{Put: &types.Put{
+				TableName: aws.String(r.table), Item: tomb,
+				ConditionExpression:                 aws.String("#reg = :reg"),
+				ExpressionAttributeNames:            map[string]string{"#reg": attrRegistration},
+				ExpressionAttributeValues:           map[string]types.AttributeValue{":reg": str(sv(read[attrRegistration]))},
+				ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+			}},
+			{Delete: &types.Delete{
+				TableName: aws.String(r.table), Key: uriKey(sv(read[attrURI])),
+				ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #chatbot = :id"),
+				ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#chatbot": attrChatbot},
+				ExpressionAttributeValues: map[string]types.AttributeValue{":id": str(id)},
+			}},
+		},
+	})
+	switch reasons := cancelled(err); {
+	case len(reasons) == 2 && failed(reasons[0]) && gone(reasons[0].Item):
+		return nil // deleted meanwhile, by this call's resent request or another
+	case len(reasons) == 2 && failed(reasons[0]):
+		// IDs are never registered again, so the registration cannot move.
+		return fmt.Errorf("%w: the chatbot's registration changed", store.ErrInvalid)
+	case len(reasons) == 2 && failed(reasons[1]):
+		return fmt.Errorf("%w: the chatbot's URI is reserved for another", store.ErrInvalid)
+	case raced(err):
+		return err
+	case err != nil:
+		return sanitize("delete chatbot", err)
+	}
+	return nil
+}
+
+// deleteRest deletes every item of the chatbot's partition but its
+// tombstone.
+func (r *Registry) deleteRest(ctx context.Context, id string) error {
 	in := &dynamodb.QueryInput{
 		TableName: aws.String(r.table), ConsistentRead: aws.Bool(true),
 		KeyConditionExpression:    aws.String("#pk = :pk"),
@@ -266,54 +343,10 @@ func (r *Registry) DeleteChatbot(ctx context.Context, id string) error {
 			}
 		}
 		if len(out.LastEvaluatedKey) == 0 {
-			break
+			return nil
 		}
 		in.ExclusiveStartKey = out.LastEvaluatedKey
 	}
-	out, err := r.api.GetItem(ctx, &dynamodb.GetItemInput{
-		TableName: aws.String(r.table), Key: chatbotKey(id), ConsistentRead: aws.Bool(true),
-		ProjectionExpression:     aws.String("#v, #reg, #uri, #deleted"),
-		ExpressionAttributeNames: map[string]string{"#v": attrVersion, "#reg": attrRegistration, "#uri": attrURI, "#deleted": attrDeleted},
-	})
-	if err != nil {
-		return sanitize("delete chatbot", err)
-	}
-	if gone(out.Item) {
-		return nil
-	}
-	tombstone := chatbotKey(id)
-	tombstone[attrDeleted] = &types.AttributeValueMemberBOOL{Value: true}
-	_, err = r.api.TransactWriteItems(ctx, &dynamodb.TransactWriteItemsInput{
-		ClientRequestToken: aws.String(rand.Text()),
-		TransactItems: []types.TransactWriteItem{
-			{Put: &types.Put{
-				TableName: aws.String(r.table), Item: tombstone,
-				ConditionExpression:      aws.String("#v = :v AND #reg = :reg"),
-				ExpressionAttributeNames: map[string]string{"#v": attrVersion, "#reg": attrRegistration},
-				ExpressionAttributeValues: map[string]types.AttributeValue{
-					":v": out.Item[attrVersion], ":reg": str(sv(out.Item[attrRegistration])),
-				},
-				ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
-			}},
-			{Delete: &types.Delete{
-				TableName: aws.String(r.table), Key: uriKey(sv(out.Item[attrURI])),
-				ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #chatbot = :id"),
-				ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#chatbot": attrChatbot},
-				ExpressionAttributeValues: map[string]types.AttributeValue{":id": str(id)},
-			}},
-		},
-	})
-	switch reasons := cancelled(err); {
-	case len(reasons) == 2 && failed(reasons[0]) && gone(reasons[0].Item):
-		return nil // deleted meanwhile, by this call's resent request or another
-	case len(reasons) == 2 && failed(reasons[0]), raced(err):
-		return fmt.Errorf("awsstore: delete chatbot: %w", store.ErrConflict)
-	case len(reasons) == 2 && failed(reasons[1]):
-		return fmt.Errorf("%w: the chatbot's URI is reserved for another", store.ErrInvalid)
-	case err != nil:
-		return sanitize("delete chatbot", err)
-	}
-	return nil
 }
 
 // cancelled returns the reasons of a cancelled transaction, nil for any

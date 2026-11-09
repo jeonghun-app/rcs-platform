@@ -181,7 +181,7 @@ func (m *meddle) GetItem(ctx context.Context, in *dynamodb.GetItemInput, o ...fu
 	return out, err
 }
 
-func TestIntegrationADeletionThatMetAChangeIsAConflict(t *testing.T) {
+func TestIntegrationADeletionThatMeetsAnUpdateStillDeletesEverything(t *testing.T) {
 	ddb, table := registryTable(t)
 	r := NewRegistry(ddb, table)
 	ctx := t.Context()
@@ -189,18 +189,33 @@ func TestIntegrationADeletionThatMetAChangeIsAConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	put(t, ddb, table, key("c#"+c.ID, "k#one"))
+	// An update lands between the deletion's read and its tombstone.
 	m := &meddle{DynamoAPI: ddb, change: func() {
 		if _, err := r.Update(ctx, c, c); err != nil {
 			t.Error(err)
 		}
 	}}
-	if err := NewRegistry(m, table).DeleteChatbot(ctx, c.ID); !errors.Is(err, store.ErrConflict) {
-		t.Fatalf("DeleteChatbot = %v", err)
+	deleted := func() {
+		t.Helper()
+		if err := NewRegistry(m, table).DeleteChatbot(ctx, c.ID); err != nil {
+			t.Fatalf("DeleteChatbot = %v", err)
+		}
+		for _, k := range []map[string]types.AttributeValue{key("c#"+c.ID, "k#one"), key("c#"+c.ID, "k#left"), uriKey(c.URI)} {
+			out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: k, ConsistentRead: aws.Bool(true)})
+			if err != nil || len(out.Item) != 0 {
+				t.Fatalf("%v left: %v, %v", k[attrSK], out, err)
+			}
+		}
+		out, err := ddb.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(table), Key: chatbotKey(c.ID), ConsistentRead: aws.Bool(true)})
+		if err != nil || len(out.Item) != 3 || out.Item[attrDeleted] == nil {
+			t.Fatalf("not a tombstone: %v, %v", out, err)
+		}
 	}
-	if got, err := r.Chatbot(ctx, c.ID); err != nil || got.Version != 2 {
-		t.Fatalf("the change was lost: %+v, %v", got, err)
-	}
-	if err := r.DeleteChatbot(ctx, c.ID); err != nil {
-		t.Fatalf("DeleteChatbot again = %v", err)
-	}
+	deleted()
+	// A repeat finishes a clean-up that stopped under the tombstone, and is
+	// otherwise a no-op.
+	put(t, ddb, table, key("c#"+c.ID, "k#left"))
+	deleted()
+	deleted()
 }

@@ -158,11 +158,13 @@ operator deletes it.
   `registration` are the ones read and its `uri` is the chatbot's, so of two
   concurrent changes one wins and the other is refused as a conflict. A random `writer` token tells a write the SDK sent again
   after its answer was lost, which then stands, from another writer's.
-- **Deleting** a chatbot deletes every item of its partition, then turns the
-  record into a tombstone, on the condition of the version read, together
-  with deleting the reservation, which frees the URI. A deletion that failed
-  part way is finished by calling it again; deleting a chatbot that is gone
-  does nothing (ADR 0009 §10). **A deleted ID is never registered again**
+- **Deleting** a chatbot first turns its record into a tombstone, on the
+  condition of the registration read, together with deleting the
+  reservation, which frees the URI; then it deletes the partition's other
+  items, its credentials among them. A change at the same time does not
+  stop it, and no credential goes from a chatbot that stays. A deletion
+  that failed part way finishes its clean-up when called again; deleting a
+  chatbot that is gone does nothing (ADR 0009 §10). **A deleted ID is never registered again**
   (lead decision on #708; `ErrDeleted`, which #709 answers 409), so nothing
   another table kept of it, or a change read before the deletion, reaches
   a new chatbot. Tombstones are kept, like the table, without TTL.
