@@ -154,6 +154,81 @@ paths:
         "409": { $ref: "#/components/responses/Changed" }
         "500": { $ref: "#/components/responses/Unreadable" }
         "503": { $ref: "#/components/responses/Busy" }
+  /v1/chatbots/{id}/credentials:
+    parameters:
+      - { $ref: "#/components/parameters/ChatbotID" }
+    post:
+      operationId: issue_credential
+      summary: Issue the chatbot a credential (ADR 0009 §7); the answer is the only time its secret is shown.
+      description: |
+        No body. A chatbot has at most two live credentials: issue the
+        next, switch the chatbot to it, then revoke the old. Only the
+        secret's SHA-256 digest is stored, so a lost token cannot be shown
+        again: revoke it and issue another. An issue that meets the
+        chatbot's deletion is 404.
+      responses:
+        "201":
+          description: Issued.
+          content: { application/json: { schema: { $ref: "#/components/schemas/IssuedCredential" } } }
+        "400":
+          description: The drawn key ID is taken, which 128 random bits make all but impossible; issue again.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The chatbot has two live credentials, or changed meanwhile (try again); the error says which.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "500":
+          description: The stored chatbot cannot be read (damaged, or written by a newer release), or no random secret could be drawn.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503": { $ref: "#/components/responses/Busy" }
+    get:
+      operationId: list_credentials
+      summary: List the chatbot's live credentials, oldest first, without secrets.
+      responses:
+        "200":
+          description: The credentials.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [credentials]
+                properties:
+                  credentials: { type: array, maxItems: 2, items: { $ref: "#/components/schemas/Credential" } }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "500":
+          description: The stored chatbot or one of its credentials cannot be read (damaged, or written by a newer release).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503": { $ref: "#/components/responses/Busy" }
+  /v1/chatbots/{id}/credentials/{key_id}:
+    parameters:
+      - { $ref: "#/components/parameters/ChatbotID" }
+      - name: key_id
+        in: path
+        required: true
+        schema: { $ref: "#/components/schemas/KeyID" }
+    delete:
+      operationId: revoke_credential
+      summary: Revoke the credential at once in the registry; tasks stop taking it within 30 s (their cache).
+      description: Also clears a credential's place that a revoke cut short left, so that a repeat always finishes it.
+      responses:
+        "204": { description: Revoked. }
+        "401": { $ref: "#/components/responses/Unauthenticated" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404":
+          description: |
+            The chatbot has no live credential with the key ID; a malformed
+            key ID is not logged. A revoke sent again after its answer was
+            lost gets 404 too: the credential is revoked either way (the
+            list shows it), since revoking deletes it whole, in one write.
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "500":
+          description: The stored credential cannot be read (damaged, or written by a newer release).
+          content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+        "503": { $ref: "#/components/responses/Busy" }
 components:
   securitySchemes:
     bearer:
@@ -274,6 +349,27 @@ components:
         limits: { $ref: "#/components/schemas/Limits" }
         sources: { type: array, items: { type: string } }
         state: { type: string, enum: [active, suspended] }
+    KeyID:
+      type: string
+      description: 128 random bits in base32 without padding; never a "." or a control character, so it may be logged.
+      pattern: "^[A-Z2-7]{26}$"
+    IssuedCredential:
+      type: object
+      required: [key_id, token, created]
+      properties:
+        key_id: { $ref: "#/components/schemas/KeyID" }
+        token:
+          type: string
+          description: 'The chatbot sends it as `Authorization: Bearer <token>`: the key ID, ".", and the secret, 256 random bits in base64url without padding.'
+          pattern: "^[A-Z2-7]{26}\\.[A-Za-z0-9_-]{43}$"
+        created: { type: string, format: date-time }
+    Credential:
+      type: object
+      required: [key_id, created]
+      properties:
+        key_id: { $ref: "#/components/schemas/KeyID" }
+        created: { type: string, format: date-time }
+        last_used: { type: string, format: date-time, description: Left out until used; each task records a use at most hourly. }
     Error:
       type: object
       required: [error]

@@ -2,6 +2,7 @@ package maap
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,9 +23,11 @@ func Service() runtime.Service[Config] {
 // deps are what Run takes from the outside world, replaced in tests.
 type deps struct {
 	listen func(network, address string) (net.Listener, error)
-	// registry replaces maap-registry in DynamoDB; /readyz checks it if it
-	// has a Ready method, as the DynamoDB one does.
-	registry store.Registry
+	// registry and credentials replace maap-registry in DynamoDB; /readyz
+	// checks the registry if it has a Ready method, as the DynamoDB one
+	// does.
+	registry    store.Registry
+	credentials store.Credentials
 }
 
 // Run serves the internal listener, apart from the runtime's admin port
@@ -34,13 +37,13 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	registry := d.registry
+	registry, creds := d.registry, d.credentials
 	if registry == nil {
 		r, err := awsstore.New(ctx, cfg.RegistryTable, cfg.DynamoDBEndpoint)
 		if err != nil {
 			return fmt.Errorf("maap: %w", err)
 		}
-		registry = r
+		registry, creds = r, r.Credentials()
 	}
 	if r, ok := registry.(interface{ Ready(context.Context) error }); ok {
 		rt.Admin.AddReadinessCheck("dynamodb-registry", r.Ready)
@@ -51,7 +54,12 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	api.mountChatbots(&chatbotAPI{
 		decoder: api.decoder, registry: registry, domain: cfg.ChatbotDomain,
 		rules: fieldRules{ports: cfg.WebhookPorts, allowHTTP: cfg.HTTPWebhooks, allowInternal: cfg.InternalWebhooks},
+		// Every store of a chatbot's items is a deleter (#742 review), the
+		// credentials too, though the registry's deletion takes them with
+		// its partition already.
+		deleters: []store.ChatbotDeleter{creds},
 	})
+	api.mountCredentials(&credentialAPI{registry: registry, creds: creds, random: rand.Reader, now: time.Now})
 	ln, err := d.listen("tcp", cfg.InternalAddr)
 	if err != nil {
 		return fmt.Errorf("maap: internal listener: %w", err)

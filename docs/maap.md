@@ -8,8 +8,9 @@ Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 `internal/maap`, wired by `cmd/maap`. It is being built under epic #668:
 today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token, where the operator
-registers, changes and deletes chatbots in the [registry](#registry) (#709),
-kept in [DynamoDB](#dynamodb-maap-registry-table) (#708); #710–#713 add the
+registers, changes and deletes chatbots in the [registry](#registry) (#709)
+and issues and revokes their [credentials](#credentials-and-caches) (#710),
+kept in [DynamoDB](#dynamodb-maap-registry-table) (#708); #711–#713 add the
 operator's other routes.
 
 ## Listeners
@@ -201,6 +202,31 @@ after as described under [Internal API](#internal-api); a store failure adds
 transport failure, without the endpoint's address.
 `sources` is logged in full, as a structured field: a single `/32` or `/128`
 may be one person's address, so treat these lines as the other audit logs.
+
+## Credentials and caches
+
+A chatbot authenticates with a credential (ADR 0009 §7): a key ID and a
+256-bit secret from `crypto/rand`, sent as `Authorization: Bearer <key
+ID>.<secret>` (#683 reads it). The operator's routes, in
+[api/maap.yaml](api/maap.yaml):
+
+| Route | Does |
+|---|---|
+| `POST /v1/chatbots/{id}/credentials` | issues one: 201 with `key_id` and `token`, the only time the secret is shown; 409 with two live |
+| `GET /v1/chatbots/{id}/credentials` | lists the live ones by key ID, oldest first, with when each was created and last used |
+| `DELETE /v1/chatbots/{id}/credentials/{key_id}` | revokes one at once in the registry, in one write: 204, also for a place a revoke cut short left; 404 when the chatbot has none with the key ID, which a repeat of a revoke whose answer was lost gets too |
+
+- **Errors.** A stored credential this release cannot read is 500; a
+  registry or table that fails is 503 with `Retry-After: 1`.
+- **Stored.** Only the secret's SHA-256 digest, never the secret; neither
+  is in any later answer or log line. The key ID is 26 characters of
+  base32 (128 random bits), with no `.` and no control character (the
+  lead's decision on #710), so the audit line names it as `key_id`.
+- **Two at a time.** Rotation (the runbook, #684): issue the next, switch
+  the chatbot to it, check its `last_used`, then revoke the old.
+- **Deletion.** Deleting the chatbot deletes its credentials, after its
+  tombstone; an issue that meets the deletion is refused (404), since the
+  store checks the registration it read.
 
 ## DynamoDB `maap-registry` table
 

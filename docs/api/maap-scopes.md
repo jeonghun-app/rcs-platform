@@ -24,10 +24,12 @@ with their own credentials (ADR 0009 §7).
 | `change_chatbot` | `PATCH /v1/chatbots/{id}` | operator |
 | `suspend_chatbot`, `resume_chatbot` | `POST /v1/chatbots/{id}/suspend`, `.../resume` | operator |
 | `delete_chatbot` | `DELETE /v1/chatbots/{id}` | operator |
+| `issue_credential`, `list_credentials` | `POST`, `GET /v1/chatbots/{id}/credentials` | operator |
+| `revoke_credential` | `DELETE /v1/chatbots/{id}/credentials/{key_id}` | operator |
 
 The operation is the audit line's `operation` and the metric's name
 (`api.<operation>.<status>`). The operator's other routes come with their
-tables (#710–#713), each added here and to maap.yaml by its PR. The
+tables (#711–#713), each added here and to maap.yaml by its PR. The
 operator's token is refused on every route outside its scope (403), and a
 path no route serves is 404.
 

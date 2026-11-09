@@ -28,6 +28,18 @@ func (r *readyRegistry) Ready(context.Context) error {
 	return nil
 }
 
+// deletions records the chatbots its credentials' DeleteChatbot is called
+// for.
+type deletions struct {
+	store.Credentials
+	ids chan string
+}
+
+func (d deletions) DeleteChatbot(ctx context.Context, id string) error {
+	d.ids <- id
+	return d.Credentials.DeleteChatbot(ctx, id)
+}
+
 func TestServiceIsNamedForLogsAndMetrics(t *testing.T) {
 	if s := Service(); s.Name != "maap" || s.EnvPrefix != "MAAP_" {
 		t.Fatalf("Service() = %q, %q", s.Name, s.EnvPrefix)
@@ -47,8 +59,9 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	registry := &readyRegistry{MemoryRegistry: store.NewMemoryRegistry()}
+	creds := deletions{registry.Credentials(), make(chan string, 1)}
 	go func() {
-		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, listen: func(network, _ string) (net.Listener, error) {
+		done <- run(ctx, h.Runtime, cfg, deps{registry: registry, credentials: creds, listen: func(network, _ string) (net.Listener, error) {
 			ln, err := net.Listen(network, "127.0.0.1:0")
 			if err == nil {
 				listening <- ln
@@ -102,6 +115,33 @@ func TestRunServesTheRegistryAndIsReadyOnlyWithIt(t *testing.T) {
 	if _, err := registry.Chatbot(context.Background(), "cb-1"); resp.StatusCode != http.StatusCreated || err != nil {
 		t.Errorf("POST /v1/chatbots = %d, %v", resp.StatusCode, err)
 	}
+	// The credential routes are mounted over the credentials given, and
+	// deleting the chatbot runs their deletion and leaves none.
+	for _, step := range []struct {
+		method, path string
+		want         int
+	}{{"POST", "/v1/chatbots/cb-1/credentials", http.StatusCreated}, {"DELETE", "/v1/chatbots/cb-1", http.StatusNoContent}} {
+		req, _ := http.NewRequest(step.method, "http://"+addr+step.path, nil)
+		req.Header.Set("Authorization", "Bearer "+operatorToken)
+		if resp, err = client.Do(req); err != nil {
+			t.Fatal(err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != step.want {
+			t.Errorf("%s %s = %d", step.method, step.path, resp.StatusCode)
+		}
+	}
+	select {
+	case id := <-creds.ids:
+		if id != "cb-1" {
+			t.Errorf("credentials deleted for %q", id)
+		}
+	default:
+		t.Error("the deletion skipped the credentials' deleter")
+	}
+	if left, err := creds.ChatbotCredentials(context.Background(), "cb-1"); len(left) != 0 || err != nil {
+		t.Errorf("credentials left: %v, %v", left, err)
+	}
 
 	cancel()
 	if err := <-done; err != nil {
@@ -122,7 +162,8 @@ func TestRunFailsWhenItsListenerCannotOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := runtimetest.New(t, "maap")
-	err = run(context.Background(), h.Runtime, cfg, deps{registry: store.NewMemoryRegistry(), listen: func(string, string) (net.Listener, error) {
+	m := store.NewMemoryRegistry()
+	err = run(context.Background(), h.Runtime, cfg, deps{registry: m, credentials: m.Credentials(), listen: func(string, string) (net.Listener, error) {
 		return nil, errors.New("address in use")
 	}})
 	if err == nil {
