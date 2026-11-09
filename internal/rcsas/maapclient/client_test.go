@@ -210,6 +210,18 @@ func TestPositiveAndNegativeAnswersAreToldApart(t *testing.T) {
 }
 
 func TestEveryOtherAnswerIsUnavailable(t *testing.T) {
+	causes := map[string]string{
+		"502":                     "status 502",
+		"redirect":                "status 307",
+		"500 with a refusal":      "status 500",
+		"not JSON":                "answer refused: chatbot: invalid JSON envelope: not JSON",
+		"an unknown field":        "answer refused: chatbot: invalid JSON envelope: an unknown field",
+		"over MaxAnswerBytes":     "answer refused: chatbot: body over its limit",
+		"no state":                "answer refused: chatbot: invalid JSON envelope: invalid state",
+		"503 with a 404's reason": "status 503 with another status's reason",
+		"slow answer":             "timeout",
+		"slow body":               "timeout",
+	}
 	for _, tc := range []struct {
 		name    string
 		handler http.HandlerFunc
@@ -246,6 +258,8 @@ func TestEveryOtherAnswerIsUnavailable(t *testing.T) {
 		{"no deliver", status(200, `{}`), "delivery_check"},
 		{"deliver with a reason", status(200, `{"deliver":true,"reason":"blocked"}`), "delivery_check"},
 		{"an admission reason", status(200, `{"deliver":false,"reason":"over_limit"}`), "delivery_check"},
+		{"500 with a refusal", status(500, `{"reason":"webhook_failed"}`), "delivery"},
+		{"502 with a refusal", status(502, `{"reason":"webhook_failed"}`), "delivery"},
 		{"bare 503", status(503, ``), "delivery"},
 		{"bare 404", status(404, "404 page not found\n"), "delivery"},
 		{"503 with a 404's reason", status(503, `{"reason":"unknown"}`), "delivery"},
@@ -271,6 +285,17 @@ func TestEveryOtherAnswerIsUnavailable(t *testing.T) {
 					t.Fatalf("got %v, want ErrUnavailable", err)
 				}
 				expectCount(t, h, "_unavailable", k.kind, 1)
+				// Each is a breaker failure, and the opening names its cause.
+				for range breakerFailures - 1 {
+					_ = k.call(t.Context(), c)
+				}
+				logs := h.Logs("rcs-as: the maap breaker opened")
+				if err := k.call(t.Context(), c); !errors.Is(err, ErrBreakerOpen) || len(logs) != 1 {
+					t.Fatalf("after five: %v, %d openings", err, len(logs))
+				}
+				if want, ok := causes[tc.name]; ok && logs[0]["cause"] != want {
+					t.Errorf("cause %q, want %q", logs[0]["cause"], want)
+				}
 			})
 		}
 	}

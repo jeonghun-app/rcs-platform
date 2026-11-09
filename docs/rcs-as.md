@@ -1650,7 +1650,7 @@ Signals to alarm on (Phase 7):
 | `group.fanout_share_exceeded` sustained | One participant writing to a large group as fast as it may: a flood |
 | `group.rejected.rate_limited` sustained | Users creating groups or adding people faster than allowed: mass-add spam |
 | `chatbot.<kind>_breaker_opened` > 0 for 3 minutes in a row, or the failure ratio (`_unavailable` − `_cap_full`) / (`_latency.count`) above a few percent for as long (`MaapAdmissionUnavailable`, `MaapDeliveryCheckUnavailable`, `MaapDeliveryUnavailable`; thresholds in #684; no data is not breaching) | `maap` fails or answers what rcs-as refuses: admissions get 500, chatbot messages wait. A normal `maap` deploy opens each breaker at most once per task for 10 s and is over within a minute. Breakers are per task, so the count sums the tasks. Logs: `msg` = `rcs-as: the maap breaker opened` or `…closed`, `call` = the kind, `cause` = why. A `cause` of `answer refused` means roll `maap` back; nothing in rcs-as is tuned at run time, so the remedies are `RCSAS_CHATBOTS=off` or rolling `maap` back |
-| `chatbot.<kind>_cap_full` sustained while `maap` is healthy | This task makes more calls of a kind than 64 at a time: scale rcs-as out |
+| `chatbot.<kind>_cap_full` sustained while `maap` is healthy | This task makes more calls of a kind than 64 at a time. Every chatbot shares the delivery cap, so first check `maap`'s per-chatbot webhook latency and `MaapWebhookFailureRatio`: slow webhooks hold the slots, and more rcs-as tasks only give them more. Otherwise scale rcs-as out |
 
 ## Assumptions and limitations
 

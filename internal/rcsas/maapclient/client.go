@@ -246,12 +246,15 @@ func (c *Client) deliver(ctx context.Context, path string, body, answer validato
 	switch {
 	case err != nil:
 		return DeliveryUnavailable, err
+	case status == http.StatusOK:
+		return Delivered, nil
 	case status == http.StatusServiceUnavailable:
 		return DeliveryRetry, nil
 	case status == http.StatusNotFound:
 		return Undeliverable, nil
 	}
-	return Delivered, nil
+	// call returns no other status without an error; were it to, hold.
+	return DeliveryUnavailable, fmt.Errorf("%w: delivery status %d", ErrUnavailable, status)
 }
 
 type validator interface{ Validate() error }
@@ -349,8 +352,9 @@ func (c *Client) post(ctx context.Context, k *kind, path string, data []byte, an
 	}
 	err = chatbot.DecodeEnvelope(res.Body, chatbot.MaxAnswerBytes, into)
 	switch {
-	case err != nil && !errors.Is(err, chatbot.ErrInvalidEnvelope) && !errors.Is(err, chatbot.ErrBodyTooLarge):
-		// A read error may name an address; the context says enough.
+	case err != nil && (ctx.Err() != nil || !errors.Is(err, chatbot.ErrInvalidEnvelope) && !errors.Is(err, chatbot.ErrBodyTooLarge)):
+		// A read error may name an address, and once the context ended a
+		// body may read as cut short rather than fail: the context says it.
 		return 0, ended(ctx, "answer not read")
 	case err != nil:
 		return 0, "answer refused: " + err.Error()
