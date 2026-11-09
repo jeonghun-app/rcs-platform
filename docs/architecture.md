@@ -84,7 +84,8 @@ internal/
                             content checks, the strict JSON envelope decoder
   maap/                     maap service logic (ADR 0009): settings, start checks,
                             the internal listener's tokens, decode cap and checks
-  maap/store/               interfaces of maap's tables
+  maap/store/               interfaces of maap's tables, memory backends,
+                            storetest contract
   ftserver/                 ft-server service logic
   ftserver/store/           ft-server storage interfaces, memory backends,
                             storetest contract
