@@ -6,10 +6,13 @@ import (
 	"maps"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 )
 
@@ -124,6 +127,10 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		"chatbots yes":       {with(devEnv, "RCSAS_CHATBOTS", "yes"), "RCSAS_CHATBOTS"},
 		"chatbot listen":     {with(devEnv, "RCSAS_CHATBOT_LISTEN_ADDR", ":0"), "RCSAS_CHATBOT_LISTEN_ADDR"},
 		"zero decodes":       {with(devEnv, "RCSAS_CHATBOT_DECODES", "0"), "RCSAS_CHATBOT_DECODES"},
+		"zero backstop":      {with(devEnv, "RCSAS_CHATBOT_API_RATE", "0"), "RCSAS_CHATBOT_API_RATE"},
+		"sender rate high":   {with(devEnv, "RCSAS_CHATBOT_SENDER_RATE", "150001"), "RCSAS_CHATBOT_SENDER_RATE"},
+		"subscriber high":    {with(devEnv, "RCSAS_CHATBOT_SUBSCRIBER_RATE", "12001"), "RCSAS_CHATBOT_SUBSCRIBER_RATE"},
+		"api rate high":      {with(devEnv, "RCSAS_CHATBOT_API_RATE", "300001"), "RCSAS_CHATBOT_API_RATE"},
 		"token with newline": {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token\n"), "RCSAS_MAAP_TOKEN"},
 		"token with a space": {with(devEnv, "RCSAS_MAAP_TOKEN", "maap token"), "RCSAS_MAAP_TOKEN"},
 		"next with DEL":      {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-next\x7f"), "RCSAS_MAAP_TOKEN_NEXT"},
@@ -310,18 +317,22 @@ func TestTheChatbotSettingsAreRead(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := c.Chatbots
-	if c.ChatbotListenAddr != ":8081" || b.On || b.Domain.Name() != "" || !b.Tokens.Current.IsZero() || b.Decodes != 8 {
+	if c.ChatbotListenAddr != ":8081" || b.On || b.Domain.Name() != "" || !b.Tokens.Current.IsZero() || b.Decodes != 8 ||
+		b.SenderRate != (messaging.Rate{PerMinute: 1500, Burst: 250}) || b.SubscriberRate != (messaging.Rate{PerMinute: 120, Burst: 20}) ||
+		b.APIRate != (messaging.Rate{PerMinute: 3000, Burst: 500}) ||
+		!slices.Equal(b.ContentTypes.FromChatbots, chatbot.DefaultContentTypes().FromChatbots) || b.ContentTypes.ChipList != chatbot.ChipListType {
 		t.Fatalf("defaults %+v", b)
 	}
 	c, err = configure(with(devEnv, "RCS_CHATBOT_DOMAIN", "bots.example.net", "RCSAS_CHATBOTS", "on",
 		"RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-next", "RCSAS_CHATBOT_LISTEN_ADDR", "10.0.0.7:9443",
-		"RCSAS_CHATBOT_DECODES", "3"))
+		"RCSAS_CHATBOT_DECODES", "3", "RCSAS_CHATBOT_SENDER_RATE", "601", "RCSAS_CHATBOT_SUBSCRIBER_RATE", "60", "RCSAS_CHATBOT_API_RATE", "1000"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	b = c.Chatbots
 	if c.ChatbotListenAddr != "10.0.0.7:9443" || !b.On || b.Domain.Name() != "bots.example.net" || b.Decodes != 3 ||
-		b.Tokens.Current.RevealString() != "maap-token" || b.Tokens.Next.RevealString() != "maap-next" {
+		b.Tokens.Current.RevealString() != "maap-token" || b.Tokens.Next.RevealString() != "maap-next" ||
+		b.SenderRate != (messaging.Rate{PerMinute: 601, Burst: 101}) || b.SubscriberRate.Burst != 10 || b.APIRate.PerMinute != 1000 {
 		t.Fatalf("read %+v", b)
 	}
 }
@@ -388,5 +399,15 @@ func TestProductionRefusesAWeakMaapToken(t *testing.T) {
 		if got != c.refused {
 			t.Errorf("current %d, next %d bytes: refused %q, want %q:\n%s", len(c.current), len(c.next), got, c.refused, out.String())
 		}
+	}
+}
+
+// A backstop may be raised to 100 times its default and no further.
+func TestABackstopTakesUpTo100TimesItsDefault(t *testing.T) {
+	c, err := configure(with(devEnv, "RCSAS_CHATBOT_SENDER_RATE", "150000", "RCSAS_CHATBOT_SUBSCRIBER_RATE", "12000",
+		"RCSAS_CHATBOT_API_RATE", "300000"))
+	if err != nil || c.Chatbots.SenderRate.PerMinute != 150000 || c.Chatbots.SubscriberRate.PerMinute != 12000 ||
+		c.Chatbots.APIRate != (messaging.Rate{PerMinute: 300000, Burst: 50000}) {
+		t.Fatalf("%+v, %v", c.Chatbots, err)
 	}
 }

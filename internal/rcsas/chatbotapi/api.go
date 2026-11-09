@@ -7,10 +7,6 @@
 // (§9). A compromised maap can then speak for chatbots only, to subscribers
 // only, and only so fast. A request that passes every check is handed to an
 // [Acceptor].
-//
-// #698 builds it in three steps: the listener, the token and the switch;
-// the decoding of bodies; then the scope and the backstops, which are not
-// applied yet.
 package chatbotapi
 
 import (
@@ -26,9 +22,12 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
+	"github.com/jeonghun-app/rcs-platform/internal/ims/identity"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
 	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
@@ -37,6 +36,10 @@ import (
 // a chatbot's largest content and 8 KiB for the CPIM rcs-as writes around
 // it (ADR 0009 §5), so that nothing maap accepts is refused for size here.
 const MinMessageSize = chatbot.MaxContentBytes + 8<<10
+
+// maxKeys bounds the buckets of each per-key backstop, as the engine bounds
+// its own (messaging.DefaultMaxTracked).
+const maxKeys = messaging.DefaultMaxTracked
 
 // minBodyRate is the slowest a caller holding a decode slot may send its
 // body, in bytes a second; maap is in the same VPC and far faster. Without
@@ -51,8 +54,8 @@ func bodyTime(maxBytes int64) time.Duration {
 	return time.Second + time.Duration(maxBytes)*time.Second/minBodyRate
 }
 
-// Retry-After of a 503 for the switch or the acceptor, and of one for a
-// full decode cap, which frees within a second.
+// Retry-After of a 503 for the switch or the acceptor, and of a refusal
+// for a full decode cap or a backstop, which frees within a second.
 const (
 	retryUnavailable = "5"
 	retryBusy        = "1"
@@ -62,9 +65,11 @@ const (
 // now; the answer is 503 with Retry-After.
 var ErrUnavailable = errors.New("chatbotapi: unavailable")
 
-// Acceptor takes the requests that passed every check: so far, a body that
-// decoded and validated (chatbot.DecodeEnvelope). nil is 202,
-// ErrUnavailable 503 and any other error 500.
+// Acceptor takes the requests that passed every check. A message's Sender
+// is in normal form, its ContentType is the entry of the configured list it
+// matched, never maap's string, and its content has been validated; a
+// notification's Chatbot is in normal form. nil is 202, ErrUnavailable 503
+// and any other error 500.
 type Acceptor interface {
 	AcceptMessage(ctx context.Context, m chatbot.BotMessage) error
 	AcceptNotification(ctx context.Context, n chatbot.BotNotification) error
@@ -89,11 +94,17 @@ type TokenPair struct {
 type Config struct {
 	// On is the switch of ADR 0009 §12: RCSAS_CHATBOTS=on with
 	// RCS_CHATBOT_DOMAIN set. Off, an authenticated request is 503.
-	On     bool
-	Domain chatbot.Domain
-	Tokens TokenPair
+	On           bool
+	Domain       chatbot.Domain
+	Tokens       TokenPair
+	ContentTypes chatbot.ContentTypes
+	// The backstops of ADR 0009 §9, per task: each chatbot sender, one
+	// subscriber from all chatbot senders, and the whole API.
+	SenderRate, SubscriberRate, APIRate messaging.Rate
 	// Decodes bounds the bodies decoded and validated at once.
 	Decodes int
+	// Now is the backstops' clock; nil means time.Now.
+	Now func() time.Time
 }
 
 // API serves the chatbot API. It is safe for concurrent use.
@@ -102,9 +113,13 @@ type API struct {
 	acceptor Acceptor
 	tokens   []acceptedToken
 	// slots holds a token for each body being decoded (RCSAS_CHATBOT_DECODES).
-	slots   chan struct{}
-	log     *slog.Logger
-	metrics *runtime.Metrics
+	slots                       chan struct{}
+	senders, subscribers, calls *messaging.Limiter
+	// bucketsMu makes a message's check of the sender's and the
+	// subscriber's buckets one step (backstop).
+	bucketsMu sync.Mutex
+	log       *slog.Logger
+	metrics   *runtime.Metrics
 }
 
 type acceptedToken struct {
@@ -119,8 +134,14 @@ func New(cfg Config, acc Acceptor, logger *slog.Logger, m *runtime.Metrics) *API
 	if acc == nil {
 		acc = unavailable{}
 	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
 	a := &API{
 		cfg: cfg, acceptor: acc, slots: make(chan struct{}, cfg.Decodes), log: logger, metrics: m,
+		senders:     messaging.NewLimiter(cfg.SenderRate, maxKeys),
+		subscribers: messaging.NewLimiter(cfg.SubscriberRate, maxKeys),
+		calls:       messaging.NewLimiter(cfg.APIRate, 1),
 	}
 	for _, t := range []struct {
 		key  secret.Key
@@ -235,6 +256,8 @@ func (a *API) serve(c *call) *answer {
 		return &answer{status: http.StatusMethodNotAllowed, reason: "only POST is served"}
 	case !a.cfg.On:
 		return &answer{http.StatusServiceUnavailable, "the chatbot API is off", retryUnavailable}
+	case !a.calls.Allow("", a.cfg.Now(), 1):
+		return a.refuseBackstop()
 	}
 	select {
 	case a.slots <- struct{}{}:
@@ -259,7 +282,34 @@ func (a *API) message(c *call) *answer {
 	if ans := decode(c, chatbot.MaxBotMessageBytes, &m); ans != nil {
 		return ans
 	}
+	sender, ans := a.parties(m.Sender, "sender", m.Recipient, "recipient")
+	if ans != nil {
+		return ans
+	}
+	types := a.cfg.ContentTypes
+	// The entry, never maap's string, is what goes on: maap may be the one
+	// that lies (#717 security review, threat model T4, T13).
+	entry, ok := chatbot.MatchContentType(m.ContentType, types.FromChatbots)
+	switch {
+	case !ok:
+		return &answer{status: http.StatusUnsupportedMediaType, reason: "content_type is not one of the chatbot content types"}
+	case m.ChipList != "" && types.ChipList == "":
+		return &answer{status: http.StatusUnsupportedMediaType, reason: "no chip list type is accepted"}
+	}
+	// Validated here, under the decode slot: on a body of many keys it
+	// allocates more than the decoding does (#687).
+	err := chatbot.ValidateContent(entry, []byte(*m.Body))
+	if err == nil && m.ChipList != "" {
+		err = chatbot.ValidateContent(types.ChipList, []byte(m.ChipList))
+	}
+	if err != nil {
+		return &answer{status: http.StatusBadRequest, reason: err.Error()}
+	}
+	if ans := a.backstop(sender, m.Recipient); ans != nil {
+		return ans
+	}
 	c.releaseSlot()
+	m.Sender, m.ContentType = sender, entry
 	return accepted(a.acceptor.AcceptMessage(c.r.Context(), m))
 }
 
@@ -268,7 +318,17 @@ func (a *API) notification(c *call) *answer {
 	if ans := decode(c, chatbot.MaxBotNotificationBytes, &n); ans != nil {
 		return ans
 	}
+	bot, ans := a.parties(n.Chatbot, "chatbot", n.Subscriber, "subscriber")
+	if ans != nil {
+		return ans
+	}
+	// Not the subscriber's bucket: a notification is bounded by threat
+	// model T10's once per kind (ADR 0009 §9).
+	if ans := a.backstop(bot, ""); ans != nil {
+		return ans
+	}
 	c.releaseSlot()
+	n.Chatbot = bot
 	return accepted(a.acceptor.AcceptNotification(c.r.Context(), n))
 }
 
@@ -292,6 +352,56 @@ func decode(c *call, maxBytes int64, v any) *answer {
 		return &answer{status: http.StatusRequestTimeout, reason: "the body did not arrive in time"}
 	}
 	return &answer{status: http.StatusBadRequest, reason: "the body could not be read"}
+}
+
+// parties applies the field rule and then the scope (ADR 0009 §7) to the
+// two URIs of a request, and returns the chatbot's in normal form. The
+// subscriber's must be a canonical tel URI (400) unless it is in the
+// chatbot range, which is refused as a scope violation (403): a chatbot
+// URI is never a tel URI, so checking the tel form alone would answer 400
+// to it. A chatbot URI at the domain but not in normal form is 404, as at
+// every service (§2).
+func (a *API) parties(bot, botField, subscriber, subscriberField string) (string, *answer) {
+	_, err := a.cfg.Domain.Normalise(subscriber)
+	subscriberInRange := !errors.Is(err, chatbot.ErrNotChatbot)
+	if c, ok := identity.CanonicalIMPU(subscriber); !subscriberInRange && (!ok || c != subscriber || !strings.HasPrefix(c, "tel:")) {
+		return "", &answer{status: http.StatusBadRequest, reason: subscriberField + " is not a canonical tel URI"}
+	}
+	normal, err := a.cfg.Domain.Normalise(bot)
+	switch {
+	case errors.Is(err, chatbot.ErrNotNormal):
+		return "", &answer{status: http.StatusNotFound, reason: botField + " is at the chatbot domain but not in normal form"}
+	case err != nil:
+		return "", &answer{status: http.StatusForbidden, reason: botField + " is outside the chatbot range"}
+	case subscriberInRange:
+		return "", &answer{status: http.StatusForbidden, reason: subscriberField + " is in the chatbot range"}
+	}
+	return normal, nil
+}
+
+// backstop takes a token from the sender's bucket and, for a message, from
+// the subscriber's. A request one bucket refuses takes none from the other:
+// under bucketsMu nothing takes the subscriber's token between Would and
+// Allow, so a message the subscriber's bucket refuses never spends the
+// sender's (security review on #735).
+func (a *API) backstop(sender, subscriber string) *answer {
+	a.bucketsMu.Lock()
+	defer a.bucketsMu.Unlock()
+	now := a.cfg.Now()
+	ok := subscriber == "" || a.subscribers.Would(subscriber, now, 1)
+	ok = ok && a.senders.Allow(sender, now, 1)
+	if ok && (subscriber == "" || a.subscribers.Allow(subscriber, now, 1)) {
+		return nil
+	}
+	return a.refuseBackstop()
+}
+
+// refuseBackstop answers 429, which maap turns into 503 with Retry-After
+// for the chatbot; chatbot.backstop_refused opens RcsAsChatbotBackstopHit
+// (ADR 0009 §9).
+func (a *API) refuseBackstop() *answer {
+	a.metrics.Count("chatbot.backstop_refused", 1)
+	return &answer{http.StatusTooManyRequests, "over a backstop of rcs-as", retryBusy}
 }
 
 func accepted(err error) *answer {

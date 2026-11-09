@@ -10,10 +10,12 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime/runtimetest"
 	"github.com/jeonghun-app/rcs-platform/internal/secret"
 )
@@ -68,14 +70,21 @@ type env struct {
 	acc  *recorder
 }
 
-// newEnv serves the API with the switch on, on a real listener.
+// newEnv serves the API with the switch on, the defaults of docs/rcs-as.md
+// and a clock that stands still, on a real listener.
 func newEnv(t *testing.T, edit func(*Config)) *env {
 	t.Helper()
 	domain, err := chatbot.NewDomain(botDomain, imsDomain)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{On: true, Domain: domain, Tokens: TokenPair{secret.NewString(currentToken), secret.NewString(nextToken)}, Decodes: 8}
+	cfg := Config{
+		On: true, Domain: domain, ContentTypes: chatbot.DefaultContentTypes(), Decodes: 8,
+		Tokens:     TokenPair{secret.NewString(currentToken), secret.NewString(nextToken)},
+		SenderRate: messaging.Rate{PerMinute: 1500, Burst: 250}, SubscriberRate: messaging.Rate{PerMinute: 120, Burst: 20},
+		APIRate: messaging.Rate{PerMinute: 3000, Burst: 500},
+		Now:     func() time.Time { return runtimetest.Start },
+	}
 	if edit != nil {
 		edit(&cfg)
 	}
@@ -394,5 +403,160 @@ func TestTheRecorderKeepsTheFirstStatus(t *testing.T) {
 	rec.WriteHeader(http.StatusOK)
 	if _, _ = rec.Write([]byte("x")); rec.status != http.StatusServiceUnavailable {
 		t.Fatalf("status %d", rec.status)
+	}
+}
+
+func TestRequestsOutsideMaapsScopeAreRefused(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.ContentTypes.ChipList = "" })
+	for _, c := range []struct {
+		name, path, body string
+		want             int
+	}{
+		{"sender a tel URI", messagesPath, message(map[string]any{"sender": testSub}), 403},
+		{"sender at the IMS domain", messagesPath, message(map[string]any{"sender": "sip:mybot@" + imsDomain}), 403},
+		{"sender not in normal form", messagesPath, message(map[string]any{"sender": "sip:MyBot@" + botDomain}), 404},
+		{"recipient a chatbot", messagesPath, message(map[string]any{"recipient": "sip:other@" + botDomain}), 403},
+		{"recipient a SIP URI", messagesPath, message(map[string]any{"recipient": "sip:+15550100001@" + imsDomain}), 400},
+		{"recipient not canonical", messagesPath, message(map[string]any{"recipient": "tel:+1-555-0100001"}), 400},
+		{"recipient a local number", messagesPath, message(map[string]any{"recipient": "tel:0100001"}), 400},
+		{"bad recipient before bad sender", messagesPath, message(map[string]any{"sender": testSub, "recipient": "x"}), 400},
+		{"content type off the list", messagesPath, message(map[string]any{"content_type": "image/png"}), 415},
+		{"content type with another charset", messagesPath, message(map[string]any{"content_type": "text/plain;charset=latin1"}), 415},
+		{"chip list with none accepted", messagesPath, message(map[string]any{"chip_list": "{}"}), 415},
+		{"rich card that is not JSON", messagesPath, message(map[string]any{"content_type": chatbot.RichCardType, "body": "{"}), 400},
+		{"text with a NUL", messagesPath, message(map[string]any{"body": "a\x00b"}), 400},
+		{"notifying chatbot a tel URI", notesPath, notification(map[string]any{"chatbot": testSub}), 403},
+		{"notified subscriber a chatbot", notesPath, notification(map[string]any{"subscriber": testBot}), 403},
+		{"notified subscriber not a tel URI", notesPath, notification(map[string]any{"subscriber": "sip:x@" + imsDomain}), 400},
+	} {
+		if status := e.post(t, c.path, c.body); status != c.want {
+			t.Errorf("%s: %d, want %d", c.name, status, c.want)
+		}
+	}
+	if len(e.acc.messages)+len(e.acc.notifications) != 0 {
+		t.Fatal("a refused request reached the acceptor")
+	}
+}
+
+func TestEachBackstopRefusesOverItsBurst(t *testing.T) {
+	sub := func(tel string) map[string]any { return map[string]any{"recipient": tel} }
+	for _, c := range []struct {
+		name   string
+		edit   func(*Config)
+		bodies []string
+	}{
+		{"sender, messages and notifications together", func(c *Config) { c.SenderRate.Burst = 2 },
+			[]string{message(sub(testSub)), notification(nil), message(sub("tel:+15550100002"))}},
+		{"subscriber, from every chatbot", func(c *Config) { c.SubscriberRate.Burst = 2 },
+			[]string{message(nil), message(map[string]any{"sender": "sip:other@" + botDomain}), message(map[string]any{"sender": "sip:third@" + botDomain})}},
+		{"the whole API", func(c *Config) { c.APIRate.Burst = 2 },
+			[]string{message(sub(testSub)), notification(map[string]any{"chatbot": "sip:other@" + botDomain}), message(map[string]any{"sender": "sip:third@" + botDomain})}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e := newEnv(t, c.edit)
+			for i, body := range c.bodies {
+				path := messagesPath
+				if strings.Contains(body, `"kind"`) {
+					path = notesPath
+				}
+				want := 202
+				if i == 2 {
+					want = 429
+				}
+				if status, h, _ := e.do(t, "POST", path, "Bearer "+currentToken, "application/json", body); status != want || (status == 429) != (h.Get("Retry-After") == "1") {
+					t.Fatalf("request %d: %d, Retry-After %q", i, status, h.Get("Retry-After"))
+				}
+			}
+			if n, _ := e.h.Metric("chatbot.backstop_refused"); n != 1 {
+				t.Fatalf("chatbot.backstop_refused = %v", n)
+			}
+		})
+	}
+}
+
+// A message the subscriber's bucket refuses takes no token from the
+// sender's: the sender's three still carry three messages.
+func TestASubscriberRefusalLeavesTheSendersBucketAlone(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.SenderRate.Burst, c.SubscriberRate.Burst = 3, 1 })
+	for i, c := range []struct {
+		recipient string
+		want      int
+	}{{testSub, 202}, {testSub, 429}, {"tel:+15550100002", 202}, {"tel:+15550100003", 202}} {
+		if status := e.post(t, messagesPath, message(map[string]any{"recipient": c.recipient})); status != c.want {
+			t.Fatalf("message %d: %d, want %d", i, status, c.want)
+		}
+	}
+}
+
+func TestWhatPassesReachesTheAcceptorInNormalForm(t *testing.T) {
+	e := newEnv(t, nil)
+	status, h, body := e.do(t, "POST", messagesPath, "Bearer "+currentToken, "application/json", message(map[string]any{
+		"sender": testBot + ";tk=on", "content_type": "Text/Plain; Charset=UTF-8", "chip_list": `{"suggestions":[]}`}))
+	if status != 202 || strings.TrimSpace(body) != "{}" || h.Get("Cache-Control") != "no-store" {
+		t.Fatalf("message: %d %q, Cache-Control %q", status, body, h.Get("Cache-Control"))
+	}
+	if status := e.post(t, notesPath, notification(map[string]any{"chatbot": "SIP:mybot@" + botDomain})); status != 202 {
+		t.Fatalf("notification: %d", status)
+	}
+	if m := e.acc.messages; len(m) != 1 || m[0].Sender != testBot || m[0].ContentType != "text/plain;charset=utf-8" || m[0].ChipList == "" {
+		t.Fatalf("messages %+v", m)
+	}
+	if n := e.acc.notifications; len(n) != 1 || n[0].Chatbot != testBot || n[0].Subscriber != testSub {
+		t.Fatalf("notifications %+v", n)
+	}
+	if out := e.h.Output(); strings.Contains(out, "mybot") || strings.Contains(out, "0100001") || strings.Contains(out, "hi there") ||
+		strings.Contains(out, currentToken) {
+		t.Fatalf("the log holds part of a request:\n%s", out)
+	}
+}
+
+// The subscriber's bucket counts messages only: notifications are bounded
+// by T10's once per kind (ADR 0009 §9), and a message refused for its chip
+// list, which is content too, takes no token.
+func TestTheSubscribersBucketCountsAcceptedMessagesOnly(t *testing.T) {
+	e := newEnv(t, func(c *Config) { c.SubscriberRate.Burst = 1 })
+	for i, c := range []struct {
+		path, body string
+		want       int
+	}{
+		{notesPath, notification(nil), 202},
+		{notesPath, notification(nil), 202},
+		{messagesPath, message(map[string]any{"chip_list": "{"}), 400},
+		{messagesPath, message(nil), 202},
+		{messagesPath, message(nil), 429},
+	} {
+		if status := e.post(t, c.path, c.body); status != c.want {
+			t.Fatalf("request %d: %d, want %d", i, status, c.want)
+		}
+	}
+}
+
+// Under concurrent messages to one subscriber, the ones its bucket refuses
+// spend nothing of the sender's: with a sender burst of 2 and a subscriber
+// burst of 1, one message passes and the sender still has a token left.
+func TestConcurrentRefusalsLeaveTheSendersBucketAlone(t *testing.T) {
+	h := runtimetest.New(t, "rcs-as")
+	cfg := Config{
+		SenderRate: messaging.Rate{PerMinute: 60, Burst: 2}, SubscriberRate: messaging.Rate{PerMinute: 60, Burst: 1},
+		Now: func() time.Time { return runtimetest.Start },
+	}
+	for round := range 200 {
+		a := New(cfg, nil, h.Runtime.Logger, h.Runtime.Metrics)
+		start := make(chan struct{})
+		var passed atomic.Int32
+		var wg sync.WaitGroup
+		for range 16 {
+			wg.Go(func() {
+				<-start
+				if a.backstop(testBot, testSub) == nil {
+					passed.Add(1)
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+		if n := passed.Load(); n != 1 || a.backstop(testBot, "tel:+15550100002") != nil {
+			t.Fatalf("round %d: %d passed, or the sender's bucket was spent by refusals", round, n)
+		}
 	}
 }
