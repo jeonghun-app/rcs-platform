@@ -93,22 +93,24 @@ components:
       description: An ID no chatbot can have is 404 before the registry is read.
       schema: { type: string, pattern: "^[A-Za-z0-9_-]{1,64}$" }
   schemas:
+    # x-maxBytes bounds a string in bytes of UTF-8, as the server counts,
+    # where JSON Schema's maxLength would count characters (#741 review).
     DisplayName:
       type: string
-      maxLength: 128
-      description: At most 128 bytes, without C0 or C1 controls, DEL or format characters (Unicode Cf, which includes every bidi control) other than U+200D, the zero-width joiner of emoji sequences.
+      x-maxBytes: 128
+      description: At most 128 bytes of UTF-8 (not characters), without C0 or C1 controls, DEL, default-ignorable characters (every bidi control among them), line or paragraph separators, U+2800, or white space only; ZWJ and VS16 only inside emoji, ZWNJ only between letters, tags only in a subdivision flag (docs/maap.md, Registry).
     OutOfService:
       type: string
-      maxLength: 512
-      description: text/plain of at most 512 bytes for subscribers of a suspended chatbot; no control but tab, CR and LF, no DEL, C1 or Cf but U+200D.
+      x-maxBytes: 512
+      description: text/plain of at most 512 bytes of UTF-8 (not characters) for subscribers of a suspended chatbot; no control but tab, CR and LF, no DEL, C1 or Cf but U+200D.
     WebhookSetting:
       type: object
       additionalProperties: false
       properties:
         url:
           type: string
-          maxLength: 512
-          description: https (http in dev and test) with a host, no userinfo, port 443 or one on MAAP_WEBHOOK_PORTS; "" for none.
+          x-maxBytes: 512
+          description: https (http in dev and test) with a host, no userinfo, port 443 or one on MAAP_WEBHOOK_PORTS, at most 512 bytes; an IP address host must be global unicast (loopback and private allowed in dev), and a numeric host must be dotted decimal; "" for none.
     Permissions:
       type: object
       additionalProperties: false
@@ -133,14 +135,14 @@ components:
       type: array
       maxItems: 8
       description: Network prefixes without host bits the chatbot's API calls may come from; none allows any.
-      items: { type: string, maxLength: 43 }
+      items: { type: string, x-maxBytes: 43 }
     ChatbotRegistration:
       type: object
       additionalProperties: false
       required: [id, uri]
       properties:
         id: { type: string, pattern: "^[A-Za-z0-9_-]{1,64}$", description: Chosen by the operator; never registered again once deleted. }
-        uri: { type: string, maxLength: 255, description: "A SIP URI at RCS_CHATBOT_DOMAIN, such as sip:bot.publisher@<RCS_CHATBOT_DOMAIN>." }
+        uri: { type: string, x-maxBytes: 255, description: "At most 255 bytes: a SIP URI at RCS_CHATBOT_DOMAIN, such as sip:bot.publisher@<RCS_CHATBOT_DOMAIN>." }
         display_name: { $ref: "#/components/schemas/DisplayName" }
         out_of_service: { $ref: "#/components/schemas/OutOfService" }
         webhook: { $ref: "#/components/schemas/WebhookSetting" }

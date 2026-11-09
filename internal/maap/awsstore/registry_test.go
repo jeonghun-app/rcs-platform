@@ -5,7 +5,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
+	"net/url"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -154,5 +158,26 @@ func TestSDKWarningsAreRedactedAndDebugLinesDropped(t *testing.T) {
 	}
 	if n := strings.Count(out, "\n"); n != 1 {
 		t.Fatalf("%d lines, want the warning only:\n%s", n, out)
+	}
+}
+
+// A failed request names neither the endpoint's address nor a DNS
+// server's, which a 503's audit line would carry (#741 review).
+func TestATransportFailureNamesNoAddress(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want string
+	}{
+		{&net.OpError{Op: "dial", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 18901},
+			Err: os.NewSyscallError("connect", syscall.ECONNREFUSED)}, "awsstore: get chatbot: dial tcp: connect: connection refused"},
+		{&net.OpError{Op: "dial", Net: "tcp", Err: &net.DNSError{Err: "no such host", Name: "ddb.example", Server: "10.0.0.2:53", IsNotFound: true}},
+			"awsstore: get chatbot: lookup: no such host"},
+		{&net.DNSError{Err: "i/o timeout", Name: "ddb.example", Server: "10.0.0.2:53", IsTimeout: true}, "awsstore: get chatbot: lookup: timeout"},
+		{&net.DNSError{Err: "server misbehaving", Name: "ddb.example", Server: "10.0.0.2:53"}, "awsstore: get chatbot: lookup failed"},
+	} {
+		sent := &smithy.OperationError{ServiceID: "DynamoDB", OperationName: "GetItem", Err: &url.Error{Op: "Post", URL: "http://127.0.0.1:18901/", Err: tc.err}}
+		if _, err := NewRegistry(&stubDynamo{err: sent}, "maap-registry").Chatbot(context.Background(), "cb-1"); err == nil || err.Error() != tc.want {
+			t.Errorf("error %v, want %q", err, tc.want)
+		}
 	}
 }
