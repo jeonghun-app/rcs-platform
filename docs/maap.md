@@ -8,7 +8,7 @@ Diameter and reaches only `rcs-as`, over internal HTTP. Code:
 `internal/maap`, wired by `cmd/maap`. It is being built under epic #668:
 today it starts with checked settings, serves its health checks, and guards
 its internal listener with the operator's token, where the operator
-registers and reads chatbots in the [registry](#registry) (#709),
+registers, changes and deletes chatbots in the [registry](#registry) (#709),
 kept in [DynamoDB](#dynamodb-maap-registry-table) (#708); #710–#713 add the
 operator's other routes.
 
@@ -121,7 +121,7 @@ text until it is listed.
 
 ## Registry
 
-The operator's routes for chatbots (ADR 0009 §7), in
+The operator's routes for chatbots (ADR 0009 §7, §11), in
 [api/maap.yaml](api/maap.yaml). Every one is the operator's alone; an ID in
 the path that no chatbot can have is 404 before the registry is read.
 
@@ -129,15 +129,19 @@ the path that no chatbot can have is 404 before the registry is read.
 |---|---|
 | `POST /v1/chatbots` | registers a chatbot, `active`, with the ID the operator chose: 201 |
 | `GET /v1/chatbots/{id}` | reads it: 200 |
+| `PATCH /v1/chatbots/{id}` | sets the fields the body gives; a field left out, or null, keeps its value. `permissions` and `limits` merge field by field, as a JSON merge patch (RFC 7396): a field given replaces that one field and one left out or null keeps its value, so lowering one limit leaves the others as they are; 0 sets a limit back to its default. `webhook` is replaced whole: 200 |
+| `POST /v1/chatbots/{id}/suspend`, `.../resume` | sets the state only; a suspended chatbot keeps its record: 200 |
+| `DELETE /v1/chatbots/{id}` | deletes it, and every item another table keeps of it: 204, also when it is gone already |
 
 **Fields.** Each broken rule is 400, naming the field and never the value:
 
 - `id`: 1–64 letters, digits, `-` and `_`, chosen by the operator. An ID is
-  never registered again once its chatbot is deleted (#708).
+  never registered again once its chatbot is deleted.
 - `uri`: read with `internal/chatbot`'s normaliser at `RCS_CHATBOT_DOMAIN`
   and stored in its normal form (a `tk` parameter and the case of the scheme
   and host dropped). A URI at another host is refused, even in normal form
-  there, which the registry alone would take. It never changes (#708).
+  there, which the registry alone would take. It never changes: delete the
+  chatbot and register it again.
 - `display_name`: at most 128 bytes, without C0 controls or DEL, tab
   included, and without the characters with which a name shows as another
   or as blank (T13, lead decisions on #709): C1 controls; Unicode
@@ -170,8 +174,8 @@ the path that no chatbot can have is 404 before the registry is read.
   number (`127.1`, `2130706433`, `0x7f000001`), which some resolvers read as
   an IPv4 address, is refused unless it is one in dotted decimal, and a `%`
   (an IPv6 zone) is refused. A URL newly set is stored unverified, and only
-  its challenge (#683) marks it verified. What a host name resolves to is
-  checked when it is dialled (#683).
+  its challenge (#683) marks it verified; setting the same URL keeps the
+  mark. What a host name resolves to is checked when it is dialled (#683).
 - `permissions`: `msisdn`, and `start_conversations`, which requires
   `msisdn` (ADR 0009 §9).
 - `limits`: each from 0, the default, up to its default in ADR 0009 §9,
@@ -182,8 +186,13 @@ the path that no chatbot can have is 404 before the registry is read.
 
 **Errors from the registry.** 409 when the ID is taken, the URI is held by
 another chatbot, or the ID was a deleted chatbot's (the answer names which).
-A record that cannot be read, damaged or written by a newer release, is 500.
-A registry that fails is 503 with `Retry-After: 1`: send the request again.
+A change that meets another write is applied again to a fresh read, up to 3
+times, then is 409. A record that cannot be read, damaged or written by a
+newer release, is 500. A registry that fails is 503 with `Retry-After: 1`:
+send the request again. A deletion runs the registry's first, which frees the
+URI and keeps the ID from ever being registered again, then each table's;
+each either finishes or fails, so after a 503 sending it again finishes what
+is left.
 
 **Audit.** Each request's `audit: internal request` line names the chatbot
 (`chatbot`, its ID) and, for a change that was written, the values before and
