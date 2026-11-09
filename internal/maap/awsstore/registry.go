@@ -330,7 +330,7 @@ func (r *Registry) deleteRest(ctx context.Context, id string) error {
 		case sk == skChatbot:
 			return nil
 		case strings.HasPrefix(sk, skSlot):
-			return r.deleteSlot(ctx, id, it)
+			return r.deleteSlot(ctx, id, it, true)
 		}
 		if _, err := r.api.DeleteItem(ctx, &dynamodb.DeleteItemInput{TableName: aws.String(r.table), Key: key(sv(it[attrPK]), sv(it[attrSK]))}); err != nil {
 			return sanitize("delete chatbot", err)
