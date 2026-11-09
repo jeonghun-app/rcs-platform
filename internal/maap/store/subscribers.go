@@ -13,14 +13,20 @@ const AliasIDBytes = 26
 
 const aliasIDAlphabet = "abcdefghijklmnopqrstuvwxyz234567"
 
+// aliasIDFinals are the last characters 128 bits can end in: the 26th
+// character holds 3 bits and 2 zero bits of padding (RFC 4648 §6).
+const aliasIDFinals = "aeimquy4"
+
 // AliasLifetime is how long an alias lives unused (ADR 0009 §10).
 const AliasLifetime = 180 * 24 * time.Hour
 
 // ValidAliasID reports whether id has an alias ID's form, which every
-// backend checks before it reads. Upper or mixed case is refused, never
-// folded: pii.Redact masks an ID written in one case only (#721).
+// backend checks before it reads, so that an ID no alias can have costs no
+// read. Upper or mixed case is refused, never folded: pii.Redact masks an
+// ID written in one case only (#721).
 func ValidAliasID(id string) bool {
-	return len(id) == AliasIDBytes && strings.Trim(id, aliasIDAlphabet) == ""
+	return len(id) == AliasIDBytes && strings.Trim(id, aliasIDAlphabet) == "" &&
+		strings.IndexByte(aliasIDFinals, id[len(id)-1]) >= 0
 }
 
 // ValidSubscriber reports whether s is a subscriber's key: a global
@@ -69,7 +75,8 @@ type Subscribers interface {
 	// at now.
 	Resolve(ctx context.Context, chatbotID, aliasID string, now time.Time) (Alias, error)
 	// Used records at as a's last use, unless a later one is stored; an
-	// alias deleted or replaced is not written again.
+	// alias deleted or replaced, or expired at at, is not written again,
+	// so that a late write cannot bring an expired alias back.
 	Used(ctx context.Context, a Alias, at time.Time) error
 	// DeleteChatbot deletes the chatbot's aliases.
 	ChatbotDeleter

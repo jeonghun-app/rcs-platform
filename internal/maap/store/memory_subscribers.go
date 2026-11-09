@@ -72,7 +72,7 @@ func (m *MemorySubscribers) Used(_ context.Context, a Alias, at time.Time) error
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	k := kindOf(a)
-	if cur, ok := m.byKind[k]; ok && cur.ID == a.ID && cur.LastUsed.Before(Seconds(at)) {
+	if cur, ok := m.byKind[k]; ok && cur.ID == a.ID && cur.LastUsed.Before(Seconds(at)) && !cur.Expired(at) {
 		cur.LastUsed = Seconds(at)
 		m.byKind[k] = cur
 	}

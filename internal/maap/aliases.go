@@ -28,9 +28,12 @@ var aliasEncoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 var errMalformedAlias = errors.New("maap: not an alias ID: 26 characters of lower-case base32")
 
 // aliases maps subscribers to what chatbots learn of them and back (ADR
-// 0009 §10, U1), for #683's admissions and sends. It records an alias's
-// use at most once per useInterval per task, as the authenticator does a
-// credential's.
+// 0009 §10, U1), for #683's admissions and sends. Only the subscriber's
+// side uses an alias: a chatbot's sends never keep one alive, or a chatbot
+// alone could hold a number's alias past its 180 days (#752 security
+// review; a reply needs the subscriber's message of the last 24 hours,
+// §9, which is a use already). It records a use at most once per
+// useInterval per task, as the authenticator does a credential's.
 type aliases struct {
 	subs store.Subscribers
 	// host is MAAP_ALIAS_HOST, in lower case.
@@ -91,18 +94,12 @@ func (a *aliases) identifier(ctx context.Context, c store.Chatbot, subscriber st
 // resolve returns the subscriber and anonymity of the chatbot's alias with
 // the ID: errMalformedAlias for an ID not in its form, which is never
 // read; store.ErrNotFound for none, as for another chatbot's or one
-// expired.
+// expired. It is no use of the alias.
 func (a *aliases) resolve(ctx context.Context, chatbotID, aliasID string) (store.Alias, error) {
 	if !store.ValidAliasID(aliasID) {
 		return store.Alias{}, errMalformedAlias
 	}
-	now := a.now()
-	al, err := a.subs.Resolve(ctx, chatbotID, aliasID, now)
-	if err != nil {
-		return store.Alias{}, err
-	}
-	a.recordUse(ctx, al, now, false)
-	return al, nil
+	return a.subs.Resolve(ctx, chatbotID, aliasID, a.now())
 }
 
 // recordUse writes al's use at now, off the request's path, if this task
