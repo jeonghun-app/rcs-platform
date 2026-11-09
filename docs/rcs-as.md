@@ -11,10 +11,8 @@ focus (sessions, the conference event package and REFER) are served. The core
 is driven through interfaces so
 that it can be built and tested first.
 
-Chatbots (ADR 0009) are not served yet. The chatbot API that `rcs-as` will
-serve to `maap` is specified in [api/rcs-as.yaml](api/rcs-as.yaml), with its
-scope in [api/rcs-as-scopes.md](api/rcs-as-scopes.md) (#697); the listener
-comes with #698.
+Chatbots (ADR 0009) are served in part: the chatbot API's listener, token
+and switch ([Chatbot API](#chatbot-api), #698), with nothing yet behind it.
 
 The code:
 
@@ -28,6 +26,7 @@ The code:
 - `internal/rcsas/awsstore`: the DynamoDB backends of both.
 - `internal/rcsas/sipas`: the SIP layer: the proxy's `Router`, which serves
   what rcs-as terminates, and the engine's `Deliverer`.
+- `internal/rcsas/chatbotapi`: the chatbot API that `maap` calls.
 - `internal/rcsas`: the `RCSAS_` settings and the service (`cmd/rcs-as`).
 
 ## How the SIP layer drives the engine
@@ -1225,11 +1224,58 @@ Versions count per group across tasks, so a subscription that misses one sees
 the gap and refreshes for a full document. A task that stops between writing a
 change and notifying it leaves exactly such a gap.
 
+## Chatbot API
+
+`maap` hands `rcs-as` chatbots' messages and display notifications through
+`rcs-as`'s chatbot API ([ADR 0009](adr/0009-maap-chatbot-platform.md) §4,
+§12), specified in [api/rcs-as.yaml](api/rcs-as.yaml) with its scope in
+[api/rcs-as-scopes.md](api/rcs-as-scopes.md). `maap` faces the internet and
+the core does not trust it ([threat model](threat-model.md) T4), so this is
+where whatever it asks is bounded. #698 builds the API in three steps. This
+one serves the listener, the token and the switch; until bodies are decoded,
+an authenticated request with the switch on is 503.
+
+- **Listener.** `RCSAS_CHATBOT_LISTEN_ADDR` (`:8081`), plain HTTP inside the
+  VPC, apart from the SIP listener and the admin port; only `maap` reaches it
+  ([ADR 0007](adr/0007-internal-transport.md) §2). It serves with the switch
+  off too. The server allows 5 s for a request's headers, 10 s of reading and
+  30 s of writing, and 2 minutes for an idle connection; headers are at most
+  8 KiB. A stop waits up to 5 s for the requests in flight, before the engine
+  closes.
+- **Switch.** `RCSAS_CHATBOTS` is `off` by default, and is on only with
+  `RCS_CHATBOT_DOMAIN` set too (#681). Off, an authenticated request is 503
+  with `Retry-After: 5` (§12). On, `rcs-as` refuses to start without
+  `RCSAS_MAAP_TOKEN`, or with `RCSAS_MAX_MESSAGE_SIZE` below 256 KiB, the
+  room a chatbot's largest content and its CPIM need (§5).
+- **Token.** `maap` sends `Authorization: Bearer <token>`, its own token,
+  never `hss`'s (ADR 0009 §7). It is compared as a SHA-256 digest, in
+  constant time, with both `RCSAS_MAAP_TOKEN` and `RCSAS_MAAP_TOKEN_NEXT`; any
+  other token, or none, is 401 with `WWW-Authenticate`. Each is printable
+  ASCII without white space; the next one is never set without the current
+  one, or equal to it; in staging and prod each holds 256 bits (64 hex digits
+  or 43 base64url characters). Rotation, one deploy a step (ADR 0007 §4): set
+  the new token as `RCSAS_MAAP_TOKEN_NEXT`; switch `maap` to it; make it
+  `RCSAS_MAAP_TOKEN` and clear the next one. The audit line tells which of
+  the two a request used.
+- **Order of checks:** token (401) → path (404; a method other than POST is
+  405) → switch (503). The token comes first, so that a caller without one
+  learns nothing of the paths or the switch.
+- **Answers.** An error is `{"error": "<reason>"}`, which names a rule,
+  never a value, and closes the connection: most come before the body is
+  read, and the server would otherwise read up to 256 KiB of it before the
+  status line (#723 review). Every answer has `Cache-Control: no-store`.
+- **Audit.** Each request is one log line, `audit: chatbot API request`, with
+  its operation (`messages`, `notifications`, or `other`), its status, and
+  the token it used (`current`, `next` or `none`); it is written even when
+  the handler panics. Nothing of the body, the path or the token is logged.
+
 ## Settings
 
 Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 `RCS_IMS_DOMAIN`, the home domain at which a SIP URI names a telephone number
-([Who sends, and to whom](#who-sends-and-to-whom)). The `RCSAS_` settings:
+([Who sends, and to whom](#who-sends-and-to-whom)), and reads
+`RCS_CHATBOT_DOMAIN`, the host of chatbot URIs (`chatbot.LoadDomain`):
+unset, there are no chatbots. The `RCSAS_` settings:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -1251,7 +1297,7 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_SELF_URIS` | none | URIs by which notifications are routed through rcs-as (`IMDN-Route`) |
 | `RCSAS_TRUSTED_ROUTES` | none | The URIs, compared exactly, a notification may be routed through: the platform's own application servers and CSCFs, as they write themselves into `IMDN-Record-Route`. With none, no IMDN route is followed |
 | `RCSAS_IMDN_INTERMEDIARIES` | none | Identities that may send processing and failed-delivery notifications about any message |
-| `RCSAS_MAX_MESSAGE_SIZE` | `262144` (256 KiB) | Largest CPIM body. At most 389120 with `dynamodb` (one item) |
+| `RCSAS_MAX_MESSAGE_SIZE` | `262144` (256 KiB) | Largest CPIM body. At most 389120 with `dynamodb` (one item); at least 262144 with `RCSAS_CHATBOTS=on` |
 | `RCSAS_PAGER_LIMIT` | `1300` | Largest body in pager mode, both ways, and largest notification |
 | `RCSAS_MAX_QUEUE_MESSAGES` | `1000` | Messages one recipient's queue holds |
 | `RCSAS_MAX_QUEUE_BYTES` | `16777216` (16 MiB) | Bytes one recipient's queue holds. At least `RCSAS_MAX_MESSAGE_SIZE` |
@@ -1277,6 +1323,9 @@ Shared `RCS_` settings are described in `internal/runtime`. rcs-as needs
 | `RCSAS_GROUP_ADD_RATE`, `RCSAS_GROUP_ADD_BURST` | `30`, `100` or `RCSAS_GROUP_MAX_PARTICIPANTS` − 1 if more | Participants one user adds per minute, in groups it creates too. The burst must cover a full group's invitees, so that the largest group can be created at once |
 | `RCSAS_GROUP_CREATE_RATE`, `RCSAS_GROUP_CREATE_BURST` | `5`, `10` | Groups one user creates per minute |
 | `RCSAS_TASK_HEARTBEAT`, `RCSAS_TASK_LEASE`, `RCSAS_TASK_SKEW` | `5s`, `20s`, `2s` | With group chat on, how often a task beats, how far ahead each beat holds its groups, and the margin for the tasks' clocks (#121). `RCSAS_TASK_SKEW` is also the margin for another task's reached marks, with group chat on or off (#605). A task stops writing groups `RCSAS_TASK_LEASE` less `RCSAS_TASK_SKEW` after its last stored beat, and another takes them `RCSAS_TASK_SKEW` after that beat's `alive_until`. The lease must be more than the other two together |
+| `RCSAS_CHATBOTS` | `off` | The chatbot path (ADR 0009 §12), `on` or `off`; on only with `RCS_CHATBOT_DOMAIN` set ([Chatbot API](#chatbot-api)) |
+| `RCSAS_CHATBOT_LISTEN_ADDR` | `:8081` | The chatbot API's listener (TCP), which only `maap` reaches; it serves with the switch off too |
+| `RCSAS_MAAP_TOKEN`, `RCSAS_MAAP_TOKEN_NEXT` | none | `maap`'s current and next bearer token. The current one is required with the switch on; each holds 256 bits in staging and prod |
 
 A rate of `0` turns that limit off.
 
@@ -1557,6 +1606,7 @@ identifier ever appears in a metric name.
 | `iscomposing.forwarded`, `iscomposing.dropped` | Is-composing indications |
 | `msrp.accept_failed` | Failed accepts on the MSRP listener |
 | `store.failed` | Store calls that failed |
+| `chatbot.api.<operation>.<status>` | Requests to the chatbot API by operation (`messages`, `notifications`, `other`) and status |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.owner_takeover`, `group.fenced`, `group.owner_lapsed`, `task.heartbeat_failed` | Ownership (#121): groups this task took over, writes the store refused because another task had taken the group (which this task then gives up), writes refused because this task's own heartbeat had lapsed, and heartbeats that failed |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |

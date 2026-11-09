@@ -3,8 +3,8 @@
 The operations are specified in [rcs-as.yaml](rcs-as.yaml);
 [ADR 0009](../adr/0009-maap-chatbot-platform.md) §4, §6 and §7 describe the
 API. This page is the scope table ADR 0007 §3 asks for next to the API.
-Nothing serves the API yet: the listener and its token settings come with
-#698.
+`rcs-as` serves it on `RCSAS_CHATBOT_LISTEN_ADDR`, with `maap`'s tokens in
+`RCSAS_MAAP_TOKEN` and `RCSAS_MAAP_TOKEN_NEXT` ([rcs-as](../rcs-as.md#chatbot-api)).
 
 | Caller | Allowed |
 |---|---|

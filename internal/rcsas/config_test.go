@@ -121,6 +121,12 @@ func TestInvalidSettingsAreAllReported(t *testing.T) {
 		"zero incoming":      {with(devEnv, "RCSAS_MAX_INCOMING_SESSIONS_PER_USER", "0"), "RCSAS_MAX_INCOMING_SESSIONS_PER_USER"},
 		"zero subscriptions": {with(devEnv, "RCSAS_MAX_SUBSCRIPTIONS_PER_USER", "0"), "RCSAS_MAX_SUBSCRIPTIONS_PER_USER"},
 		"group chat yes":     {with(devEnv, "RCSAS_GROUP_CHAT_ENABLED", "yes"), "RCSAS_GROUP_CHAT_ENABLED"},
+		"chatbots yes":       {with(devEnv, "RCSAS_CHATBOTS", "yes"), "RCSAS_CHATBOTS"},
+		"chatbot listen":     {with(devEnv, "RCSAS_CHATBOT_LISTEN_ADDR", ":0"), "RCSAS_CHATBOT_LISTEN_ADDR"},
+		"token with newline": {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token\n"), "RCSAS_MAAP_TOKEN"},
+		"next alone":         {with(devEnv, "RCSAS_MAAP_TOKEN_NEXT", "maap-token"), "RCSAS_MAAP_TOKEN_NEXT"},
+		"next equal":         {with(devEnv, "RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-token"), "RCSAS_MAAP_TOKEN_NEXT"},
+		"bad chatbot domain": {with(devEnv, "RCS_CHATBOT_DOMAIN", "Bots.example.net"), "RCS_CHATBOT_DOMAIN"},
 	} {
 		_, err := configure(c.env)
 		if err == nil || !strings.Contains(err.Error(), c.want) {
@@ -134,7 +140,7 @@ func TestProductionRefusesTheMemoryStoreAndALocalEndpoint(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	env := with(devEnv, "RCS_ENV", "prod", "RCS_PII_HMAC_KEY", strings.Repeat("k", 32), "RCSAS_DYNAMODB_ENDPOINT", "http://ddb:8000",
-		"RCSAS_GROUP_CHAT_ENABLED", "true", "RCSAS_SIP_HOST", "10.0.0.7")
+		"RCSAS_GROUP_CHAT_ENABLED", "true", "RCSAS_SIP_HOST", "10.0.0.7", "RCSAS_MAAP_TOKEN", strings.Repeat("f", 63))
 	status := runtime.Run(ctx, runtime.Service[Config]{
 		Name: "rcs-as", EnvPrefix: EnvPrefix, Configure: Configure,
 		Run: func(context.Context, *runtime.Runtime, Config) error { return nil },
@@ -142,7 +148,8 @@ func TestProductionRefusesTheMemoryStoreAndALocalEndpoint(t *testing.T) {
 	if status != runtime.ExitFailure {
 		t.Fatalf("status = %d", status)
 	}
-	for _, want := range []string{"RCSAS_STORE=memory", "RCSAS_DYNAMODB_ENDPOINT", "RCSAS_SIP_HOST with RCSAS_GROUP_CHAT_ENABLED"} {
+	for _, want := range []string{"RCSAS_STORE=memory", "RCSAS_DYNAMODB_ENDPOINT", "RCSAS_SIP_HOST with RCSAS_GROUP_CHAT_ENABLED",
+		"RCSAS_MAAP_TOKEN holds less than 256 bits"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("refusal does not mention %q:\n%s", want, out.String())
 		}
@@ -287,6 +294,54 @@ func TestTheSIPSettingsAreRead(t *testing.T) {
 		"sip listen port 0":   {with(devEnv, "RCSAS_SIP_LISTEN_ADDR", "127.0.0.1:0"), "RCSAS_SIP_LISTEN_ADDR"},
 		"no home domain":      {with(devEnv, "RCS_IMS_DOMAIN", ""), "RCS_IMS_DOMAIN"},
 		"sip host not an IP":  {with(devEnv, "RCSAS_SIP_HOST", "rcs-as.internal"), "RCSAS_SIP_HOST"},
+	} {
+		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+func TestTheChatbotSettingsAreRead(t *testing.T) {
+	c, err := configure(devEnv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := c.Chatbots
+	if c.ChatbotListenAddr != ":8081" || b.On || b.Domain.Name() != "" || !b.Tokens.Current.IsZero() {
+		t.Fatalf("defaults %+v", b)
+	}
+	c, err = configure(with(devEnv, "RCS_CHATBOT_DOMAIN", "bots.example.net", "RCSAS_CHATBOTS", "on",
+		"RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAAP_TOKEN_NEXT", "maap-next", "RCSAS_CHATBOT_LISTEN_ADDR", "10.0.0.7:9443"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = c.Chatbots
+	if c.ChatbotListenAddr != "10.0.0.7:9443" || !b.On || b.Domain.Name() != "bots.example.net" ||
+		b.Tokens.Current.RevealString() != "maap-token" || b.Tokens.Next.RevealString() != "maap-next" {
+		t.Fatalf("read %+v", b)
+	}
+}
+
+// Without RCS_CHATBOT_DOMAIN there are no chatbots, whatever the switch
+// says (#681), and nothing the switch needs is asked for.
+func TestTheChatbotSwitchIsOffWithoutTheDomain(t *testing.T) {
+	c, err := configure(with(devEnv, "RCSAS_CHATBOTS", "on", "RCSAS_MAX_MESSAGE_SIZE", "65536"))
+	if err != nil || c.Chatbots.On {
+		t.Fatalf("on: %v, %v", c.Chatbots.On, err)
+	}
+}
+
+func TestTheChatbotSwitchNeedsMaapsTokenAnd256KiBMessages(t *testing.T) {
+	on := with(devEnv, "RCS_CHATBOT_DOMAIN", "bots.example.net", "RCSAS_CHATBOTS", "on", "RCSAS_MAAP_TOKEN", "maap-token")
+	if _, err := configure(with(on, "RCSAS_MAX_MESSAGE_SIZE", "262144")); err != nil {
+		t.Fatalf("at 256 KiB: %v", err)
+	}
+	for name, c := range map[string]struct {
+		env  map[string]string
+		want string
+	}{
+		"below 256 KiB": {with(on, "RCSAS_MAX_MESSAGE_SIZE", "262143"), "RCSAS_MAX_MESSAGE_SIZE"},
+		"no maap token": {with(on, "RCSAS_MAAP_TOKEN", ""), "RCSAS_MAAP_TOKEN"},
 	} {
 		if _, err := configure(c.env); err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%s: %v", name, err)

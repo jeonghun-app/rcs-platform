@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"strings"
 	"sync"
@@ -105,6 +106,9 @@ func startStoppableHarness(t *testing.T, cfg Config, d deps) (netip.AddrPort, ne
 		t.Fatal(err)
 	}
 	cfg.Messaging.MSRPPort, d.msrp = ml.Addr().(*net.TCPAddr).Port, ml
+	if d.chatbot == nil {
+		d.chatbot = listenLocal(t)
+	}
 	h := runtimetest.New(t, "rcs-as")
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan netip.AddrPort, 1)
@@ -584,5 +588,42 @@ func TestTheStoresAreLinkedForFencedCopies(t *testing.T) {
 		Enqueued: at, Expires: at.Add(time.Hour), Fence: &store.Fence{Group: grp.URI, Task: "task-a", Epoch: 1}}
 	if err := q.Enqueue(t.Context(), m, store.Limit{}); err != nil {
 		t.Fatalf("a fenced copy of the owner's = %v", err)
+	}
+}
+
+func listenLocal(t *testing.T) net.Listener {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+// Run serves the chatbot API on a listener of its own, with the switch
+// and maap's token it read.
+func TestRunServesTheChatbotAPIOnItsOwnListener(t *testing.T) {
+	cfg, err := configure(with(devEnv, "RCS_CHATBOT_DOMAIN", "botplatform.mnc001.mcc001.3gppnetwork.org",
+		"RCSAS_CHATBOTS", "on", "RCSAS_MAAP_TOKEN", "maap-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := listenLocal(t)
+	startRun(t, cfg, deps{chatbot: cl})
+	body := `{"sender":"sip:mybot@botplatform.mnc001.mcc001.3gppnetwork.org","display_name":"","recipient":"tel:+15550100001",
+		"message_id":"m-1","content_type":"text/plain;charset=utf-8","body":"hi",
+		"dispositions":{"positive_delivery":false,"negative_delivery":false,"display":false},"anonymous":false}`
+	for token, want := range map[string]int{"maap-token": 503, "other": 401} {
+		req, _ := http.NewRequest("POST", "http://"+cl.Addr().String()+"/v1/chatbot/messages", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("Content-Type", "application/json")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Body.Close()
+		if res.StatusCode != want {
+			t.Errorf("token %q: %d, want %d", token, res.StatusCode, want)
+		}
 	}
 }

@@ -13,12 +13,15 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/chatbotapi"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/sipas"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
+	"github.com/jeonghun-app/rcs-platform/internal/secret"
 	"github.com/jeonghun-app/rcs-platform/internal/sip"
 )
 
@@ -39,7 +42,14 @@ const (
 	DefaultSIPListenAddr = "0.0.0.0:5060"
 	DefaultTable         = "messages"
 	DefaultGroupsTable   = "groupchats"
+	// DefaultChatbotListenAddr is the chatbot API, which only maap reaches
+	// (ADR 0007 §2).
+	DefaultChatbotListenAddr = ":8081"
 )
+
+// MinTokenLength is the shortest maap token accepted in staging and prod:
+// 256 bits as 43 base64url characters (ADR 0007 §4). Hex needs 64.
+const MinTokenLength = 43
 
 // Config is rcs-as's configuration.
 type Config struct {
@@ -88,6 +98,10 @@ type Config struct {
 	// Group is the group chat focus's configuration; its Clock and Rand
 	// are left for the service to set.
 	Group group.Config
+	// ChatbotListenAddr is the chatbot API's listener (TCP), apart from SIP
+	// and admin, and Chatbots its configuration (ADR 0009 §12).
+	ChatbotListenAddr string
+	Chatbots          chatbotapi.Config
 }
 
 // Configure reads the RCSAS_ settings and refuses the ones unsafe with more
@@ -168,6 +182,7 @@ func Configure(s *runtime.Settings) Config {
 	c.HomeDomain = s.Shared.RequiredString("IMS_DOMAIN")
 	c.Namespace = s.ServiceNamespace()
 	c.Core = coreURI(s)
+	configureChatbots(s, &c)
 	service := ""
 	if c.Namespace != "" {
 		service = "rcs-as." + c.Namespace
@@ -300,6 +315,77 @@ func Configure(s *runtime.Settings) Config {
 		e.Invalid("GROUP_ADD_BURST", "smaller than a full group's invitees (RCSAS_GROUP_MAX_PARTICIPANTS - 1)")
 	}
 	return c
+}
+
+// configureChatbots reads the chatbot API's settings. The switch is on
+// only with RCSAS_CHATBOTS=on and RCS_CHATBOT_DOMAIN set: without the
+// domain there are no chatbots (#681). On, it needs maap's token, and room
+// in RCSAS_MAX_MESSAGE_SIZE for a chatbot's largest content and its CPIM
+// (ADR 0009 §5).
+func configureChatbots(s *runtime.Settings, c *Config) {
+	e := s.Env
+	domain := chatbot.LoadDomain(s.Shared, c.HomeDomain)
+	sw := e.String("CHATBOTS", "off")
+	if sw != "on" && sw != "off" {
+		e.Invalid("CHATBOTS", "must be on or off")
+	}
+	c.ChatbotListenAddr = e.String("CHATBOT_LISTEN_ADDR", DefaultChatbotListenAddr)
+	if _, port, err := net.SplitHostPort(c.ChatbotListenAddr); err != nil {
+		e.Invalid("CHATBOT_LISTEN_ADDR", "not host:port")
+	} else if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+		e.Invalid("CHATBOT_LISTEN_ADDR", "needs a port")
+	}
+	c.Chatbots = chatbotapi.Config{
+		On:     sw == "on" && domain.Name() != "",
+		Domain: domain,
+		Tokens: maapTokens(s),
+	}
+	if !c.Chatbots.On {
+		return
+	}
+	if c.Messaging.MaxMessageSize < chatbotapi.MinMessageSize {
+		e.Invalid("MAX_MESSAGE_SIZE", "below "+strconv.Itoa(chatbotapi.MinMessageSize)+" (256 KiB) with RCSAS_CHATBOTS=on")
+	}
+	if c.Chatbots.Tokens.Current.IsZero() {
+		e.Invalid("MAAP_TOKEN", "required with RCSAS_CHATBOTS=on")
+	}
+}
+
+// maapTokens reads maap's two tokens and applies ADR 0007 §4, as maap and
+// hss read theirs. Everywhere, a token is printable ASCII without white
+// space, since a header cannot carry a trailing newline from echo, and a
+// next token without a current one, or equal to it, is a rotation gone
+// wrong. In staging and prod each holds 256 bits.
+func maapTokens(s *runtime.Settings) chatbotapi.TokenPair {
+	e := s.Env
+	p := chatbotapi.TokenPair{Current: secret.NewString(e.String("MAAP_TOKEN", "")), Next: secret.NewString(e.String("MAAP_TOKEN_NEXT", ""))}
+	for _, t := range []struct {
+		name  string
+		value secret.Key
+	}{{"MAAP_TOKEN", p.Current}, {"MAAP_TOKEN_NEXT", p.Next}} {
+		v := t.value.RevealString()
+		if strings.ContainsFunc(v, func(r rune) bool { return r <= ' ' || r > '~' }) {
+			e.Invalid(t.name, "has white space or characters outside printable ASCII")
+		}
+		s.ForbidInProduction(v != "" && !strongToken(v),
+			"RCSAS_"+t.name+" holds less than 256 bits (64 hex digits or 43 base64url characters)")
+	}
+	switch {
+	case p.Current.IsZero() && !p.Next.IsZero():
+		e.Invalid("MAAP_TOKEN_NEXT", "set without RCSAS_MAAP_TOKEN")
+	case !p.Current.IsZero() && p.Current.Equal(p.Next):
+		e.Invalid("MAAP_TOKEN_NEXT", "equal to RCSAS_MAAP_TOKEN")
+	}
+	return p
+}
+
+// strongToken reports whether a token can hold 256 bits: 64 hex digits, or
+// MinTokenLength characters of a larger alphabet.
+func strongToken(v string) bool {
+	if strings.Trim(v, "0123456789abcdefABCDEF") == "" {
+		return len(v) >= 64
+	}
+	return len(v) >= MinTokenLength
 }
 
 // interfaceAddrs lists this host's addresses; tests replace it.

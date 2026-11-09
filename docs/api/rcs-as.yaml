@@ -1,6 +1,6 @@
 # rcs-as chatbot API (ADR 0009 §4, §6), which maap calls; its scope is in
 # rcs-as-scopes.md. The bodies are internal/chatbot's BotMessage and
-# BotNotification, which maap uses too. Nothing serves it before #698.
+# BotNotification, which maap uses too. rcs-as serves it from #698 on.
 openapi: 3.1.0
 info:
   title: rcs-as chatbot API
@@ -8,7 +8,9 @@ info:
   description: |
     One caller, maap, with its own bearer token (ADR 0007 §3–§5, ADR 0009
     §7). The listener is apart from SIP and admin, inside the VPC only; its
-    address and token settings are in docs/rcs-as.md once #698 adds them.
+    address and token settings are in docs/rcs-as.md. The token is checked
+    first, then the path (404) and the method (405), then RCSAS_CHATBOTS
+    (503). Every error answer closes the connection.
 
     Bodies are strict JSON (ADR 0009 §9): UTF-8, one value, at most 4 deep,
     arrays of at most 8, every string bounded as below; unknown fields,

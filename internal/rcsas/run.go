@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"net/netip"
 	"strconv"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/panics"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
+	"github.com/jeonghun-app/rcs-platform/internal/rcsas/chatbotapi"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/group"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/groupstore"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/messaging"
@@ -29,6 +31,10 @@ import (
 // alone (ADR 0007 §2).
 const sipListener = "core"
 
+// chatbotShutdown bounds how long a stop waits for the chatbot API's
+// requests in flight, about one store call each.
+const chatbotShutdown = 5 * time.Second
+
 // Service is rcs-as for runtime.Main.
 func Service() runtime.Service[Config] {
 	return runtime.Service[Config]{Name: "rcs-as", EnvPrefix: EnvPrefix, Configure: Configure, Run: Run}
@@ -43,8 +49,9 @@ type deps struct {
 	resolver proxy.Resolver
 	// listening, if set, hears the SIP listener's bound address.
 	listening func(netip.AddrPort)
-	// msrp, if set, replaces the MSRP listener.
-	msrp net.Listener
+	// msrp, if set, replaces the MSRP listener, and chatbot the chatbot
+	// API's.
+	msrp, chatbot net.Listener
 }
 
 // Run serves cfg until ctx ends.
@@ -175,13 +182,38 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 	go func() { served <- engine.Serve(serveCtx, ml) }()
 	defer func() { stopServing(); <-served }()
 
+	// maap calls here (ADR 0009 §4). The listener serves with the switch
+	// off too, to answer 503. It stops first, before the engine its
+	// acceptors (#699) store through.
+	cl := d.chatbot
+	if cl == nil {
+		if cl, err = net.Listen("tcp", cfg.ChatbotListenAddr); err != nil {
+			return fmt.Errorf("rcs-as: chatbot API listener: %w", err)
+		}
+	}
+	api := chatbotapi.New(cfg.Chatbots, rt.Logger, rt.Metrics).Server()
+	apiFailed := make(chan error, 1)
+	go func() {
+		if err := api.Serve(cl); !errors.Is(err, http.ErrServerClosed) {
+			apiFailed <- err
+		}
+	}()
+	defer func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), chatbotShutdown)
+		defer cancel()
+		if api.Shutdown(stopCtx) != nil {
+			_ = api.Close()
+		}
+	}()
+
 	runErr := make(chan error, 1)
 	go func() { runErr <- engine.Run(ctx) }()
 	if d.listening != nil {
 		d.listening(addr)
 	}
 	rt.Logger.Info("serving SIP and MSRP", slog.String("sip_addr", addr.String()),
-		slog.String("msrp_addr", ml.Addr().String()), slog.String("store", cfg.Store))
+		slog.String("msrp_addr", ml.Addr().String()), slog.String("chatbot_api_addr", cl.Addr().String()),
+		slog.Bool("chatbots", cfg.Chatbots.On), slog.String("store", cfg.Store))
 	rt.Ready()
 	select {
 	case <-ctx.Done():
@@ -199,6 +231,8 @@ func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
 			return nil
 		}
 		return fmt.Errorf("rcs-as: MSRP listener: %w", err)
+	case err := <-apiFailed:
+		return fmt.Errorf("rcs-as: chatbot API listener: %w", err)
 	}
 }
 
