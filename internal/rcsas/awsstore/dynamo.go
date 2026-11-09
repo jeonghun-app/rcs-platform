@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -61,9 +60,7 @@ const (
 	attrMarkCount    = "marks"
 	attrDateTime     = "datetime"
 	attrSummary      = "summary"
-	// attrChatbot and attrAnonymous are written only when true, so that a
-	// person's message is the item it was before chatbots (#699).
-	attrChatbot   = "chatbot"
+	// attrAnonymous, on a chatbot's message, is written only when true.
 	attrAnonymous = "anonymous"
 	// The two fields of a seen entry: the token of the attempt that set
 	// it, and the status the notification reported.
@@ -99,6 +96,12 @@ const (
 	senderSK      = "s#"
 )
 
+// chatbotPrefix keys a recipient's chatbot messages, and prefixes their
+// expiry buckets, apart from the queue: no read of a version before #738
+// covers either, so a rollback can never deliver one as a person's message
+// (#738 review).
+const chatbotPrefix = "b#"
+
 const conditionFailed = "ConditionalCheckFailedException"
 
 // Store is a store.Store in the DynamoDB messages table.
@@ -122,11 +125,33 @@ func identityKey(prefix, identity string) string {
 	return prefix + strconv.Itoa(len(identity)) + "#" + identity
 }
 
-// bucket spreads queues over the expiry index's partitions.
-func bucket(recipient string) string {
+// bucket spreads queues over the expiry index's partitions: x#NN for
+// queues, b#NN for chatbot messages.
+func bucket(recipient string, chatbot bool) string {
 	h := fnv.New32a()
 	h.Write([]byte(recipient))
-	return fmt.Sprintf("x#%02d", h.Sum32()%ExpiryBuckets)
+	return fmt.Sprintf("%s%02d", bucketPrefix(chatbot), h.Sum32()%ExpiryBuckets)
+}
+
+func bucketPrefix(chatbot bool) string {
+	if chatbot {
+		return chatbotPrefix
+	}
+	return "x#"
+}
+
+// partition is the key of recipient's queue, or of its chatbot messages.
+func partition(recipient string, chatbot bool) string {
+	if chatbot {
+		return identityKey(chatbotPrefix, recipient)
+	}
+	return identityKey(queuePrefix, recipient)
+}
+
+// queueKey is the key of the message id of recipient's, which its ID says
+// the partition of (store.IsChatbotID).
+func queueKey(recipient, id string) map[string]types.AttributeValue {
+	return key(partition(recipient, store.IsChatbotID(id)), id)
 }
 
 func key(pk, sk string) map[string]types.AttributeValue {
@@ -295,6 +320,9 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if m.CPIM.Len() > MaxCPIMSize {
 		return ErrTooLarge
 	}
+	if m.Chatbot != store.IsChatbotID(m.ID) {
+		return errors.New("awsstore: enqueue: a chatbot's message needs a chatbot ID, and only it")
+	}
 	switch {
 	case l.Bytes > 0 && m.Size() > l.Bytes:
 		return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
@@ -303,9 +331,9 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	}
 	ttl := m.Expires.Add(retention)
 	item := map[string]types.AttributeValue{
-		attrPK:           str(identityKey(queuePrefix, m.Recipient)),
+		attrPK:           str(partition(m.Recipient, m.Chatbot)),
 		attrSK:           str(m.ID),
-		attrBucket:       str(bucket(m.Recipient)),
+		attrBucket:       str(bucket(m.Recipient, m.Chatbot)),
 		attrSender:       str(m.Sender),
 		attrMode:         num(int64(m.Mode)),
 		attrNotification: &types.AttributeValueMemberBOOL{Value: m.Notification},
@@ -326,10 +354,8 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 		}
 		item[attrCPIM] = &types.AttributeValueMemberB{Value: cpim}
 	}
-	for name, v := range map[string]bool{attrChatbot: m.Chatbot, attrAnonymous: m.Anonymous} {
-		if v {
-			item[name] = &types.AttributeValueMemberBOOL{Value: true}
-		}
+	if m.Anonymous {
+		item[attrAnonymous] = &types.AttributeValueMemberBOOL{Value: true}
 	}
 	for name, v := range map[string]string{
 		attrConversation: m.Conversation, attrContribution: m.Contribution,
@@ -357,7 +383,9 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 	if m.InSummaryTotal() {
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.GroupSummaries), 1, m.Size(), l.SummaryCount, l.SummaryBytes, ttl)})
 	}
+	total := -1
 	if m.InChatbotTotal() {
+		total = len(items)
 		items = append(items, types.TransactWriteItem{Update: s.sizeUpdate(senderSizeKey(m.Recipient, store.ChatbotMessages), 1, m.Size(), l.ChatbotCount, l.ChatbotBytes, ttl)})
 	}
 	if f := m.Fence; f != nil {
@@ -389,8 +417,16 @@ func (s *Store) enqueue(ctx context.Context, m store.Message, l store.Limit) err
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrExists)
 		case len(failed) > 1 && failed[1]:
 			return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
-		case slices.Contains(failed[min(2, len(failed)):], true):
-			return fmt.Errorf("awsstore: enqueue: %w", store.ErrSenderShareFull)
+		}
+		// A share's refusal comes before the chatbots' total's, as in
+		// store.Memory.
+		for i := 2; i < len(failed); i++ {
+			if failed[i] && i != total {
+				return fmt.Errorf("awsstore: enqueue: %w", store.ErrSenderShareFull)
+			}
+		}
+		if total >= 0 && len(failed) > total && failed[total] {
+			return fmt.Errorf("awsstore: enqueue: %w", store.ErrQueueFull)
 		}
 	}
 	if err != nil {
@@ -421,8 +457,8 @@ func (s *Store) mayRecount(ctx context.Context, recipient string, now time.Time)
 
 // sharesOf are the shares a projected queue item counts against: its
 // Message.ShareKey, and GroupNotifications for a group notification.
-func sharesOf(item map[string]types.AttributeValue) []string {
-	m := projected(item)
+func sharesOf(item map[string]types.AttributeValue, chatbot bool) []string {
+	m := projected(item, chatbot)
 	var out []string
 	if k, ok := m.ShareKey(); ok {
 		out = append(out, k)
@@ -439,9 +475,10 @@ func sharesOf(item map[string]types.AttributeValue) []string {
 	return out
 }
 
-// projected is what a recount projects of a queue item.
-func projected(item map[string]types.AttributeValue) store.Message {
-	var m store.Message
+// projected is what a recount projects of a queue item, or of a chatbot's
+// message.
+func projected(item map[string]types.AttributeValue, chatbot bool) store.Message {
+	m := store.Message{Chatbot: chatbot}
 	var mode int64
 	_ = getString(item, attrSender, &m.Sender, false)
 	_ = getString(item, attrAuthor, &m.Author, false)
@@ -452,14 +489,14 @@ func projected(item map[string]types.AttributeValue) store.Message {
 	if b, ok := item[attrSummary].(*types.AttributeValueMemberBOOL); ok {
 		m.Summary = b.Value
 	}
-	m.Chatbot = flag(item, attrChatbot)
 	m.Mode = store.Mode(mode)
 	return m
 }
 
-// recount counts recipient's queue, and what each of shares holds of it
-// (Message.ShareKey, store.GroupNotifications), and sets any size item that
-// says more to what is there. It reports whether it corrected one. Each
+// recount counts recipient's queue and its chatbot messages, and what each
+// of shares holds of them (Message.ShareKey, store.GroupNotifications),
+// and sets any size item that says more to what is there. It reports
+// whether it corrected one. Each
 // correction is conditional on the size item being unchanged since it was
 // read, before the queue was: a size that moved meanwhile reflects an
 // enqueue or removal the count may have missed.
@@ -496,13 +533,14 @@ func (s *Store) recount(ctx context.Context, recipient string, shares ...string)
 		TableName:              aws.String(s.table),
 		ConsistentRead:         aws.Bool(true),
 		KeyConditionExpression: aws.String("#pk = :pk"),
-		ProjectionExpression:   aws.String("#sender, #author, #mode, #size, #notification, #summary, #chatbot"),
+		ProjectionExpression:   aws.String("#sender, #author, #mode, #size, #notification, #summary"),
 		ExpressionAttributeNames: map[string]string{
 			"#pk": attrPK, "#sender": attrSender, "#author": attrAuthor, "#mode": attrMode, "#size": attrSize, "#notification": attrNotification,
-			"#summary": attrSummary, "#chatbot": attrChatbot,
+			"#summary": attrSummary,
 		},
 		ExpressionAttributeValues: map[string]types.AttributeValue{":pk": str(identityKey(queuePrefix, recipient))},
 	}
+	chatbot := false
 	for {
 		page, err := s.api.Query(ctx, in)
 		if err != nil {
@@ -512,14 +550,20 @@ func (s *Store) recount(ctx context.Context, recipient string, shares ...string)
 			var n int64
 			_ = getNum(item, attrSize, &n)
 			all[0].now.count, all[0].now.bytes = all[0].now.count+1, all[0].now.bytes+n
-			for _, k := range sharesOf(item) {
+			for _, k := range sharesOf(item, chatbot) {
 				if c := byShare[k]; c != nil {
 					c.now.count, c.now.bytes = c.now.count+1, c.now.bytes+n
 				}
 			}
 		}
 		if len(page.LastEvaluatedKey) == 0 {
-			break
+			if chatbot {
+				break
+			}
+			// Then its chatbot messages, which count toward the queue too.
+			chatbot, in.ExclusiveStartKey = true, nil
+			in.ExpressionAttributeValues[":pk"] = str(partition(recipient, true))
+			continue
 		}
 		in.ExclusiveStartKey = page.LastEvaluatedKey
 	}
@@ -631,7 +675,7 @@ func (s *Store) pending(ctx context.Context, recipient, after, owner string, now
 
 // Claim implements store.Store.
 func (s *Store) Claim(ctx context.Context, recipient, id, owner string, now, until time.Time) (store.Message, error) {
-	k := key(identityKey(queuePrefix, recipient), id)
+	k := queueKey(recipient, id)
 	out, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:           aws.String(s.table),
 		Key:                 k,
@@ -668,7 +712,7 @@ func (s *Store) Claim(ctx context.Context, recipient, id, owner string, now, unt
 
 // Release implements store.Store.
 func (s *Store) Release(ctx context.Context, recipient, id, owner string) error {
-	k := key(identityKey(queuePrefix, recipient), id)
+	k := queueKey(recipient, id)
 	_, err := s.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:                 aws.String(s.table),
 		Key:                       k,
@@ -699,7 +743,7 @@ func (s *Store) Release(ctx context.Context, recipient, id, owner string) error 
 // Remove implements store.Store: the message and its share of the queue's
 // and its sender's sizes in one transaction.
 func (s *Store) Remove(ctx context.Context, m store.Message, owner string) error {
-	k := key(identityKey(queuePrefix, m.Recipient), m.ID)
+	k := queueKey(m.Recipient, m.ID)
 	items := []types.TransactWriteItem{
 		{Delete: &types.Delete{
 			TableName:                 aws.String(s.table),
@@ -747,7 +791,7 @@ func (s *Store) RemoveSummary(ctx context.Context, m store.Message, owner string
 }
 
 func (s *Store) removeSummary(ctx context.Context, m store.Message, owner string, marks int64) error {
-	k := key(identityKey(queuePrefix, m.Recipient), m.ID)
+	k := queueKey(m.Recipient, m.ID)
 	items := []types.TransactWriteItem{
 		{Delete: &types.Delete{
 			TableName:                 aws.String(s.table),
@@ -833,12 +877,13 @@ func (s *Store) Expired(ctx context.Context, now time.Time, cursor string, limit
 	}
 	var at expiryCursor
 	if cursor != "" {
-		if err := json.Unmarshal([]byte(cursor), &at); err != nil || at.Bucket < 0 || at.Bucket >= ExpiryBuckets {
+		if err := json.Unmarshal([]byte(cursor), &at); err != nil || at.Bucket < 0 || at.Bucket >= 2*ExpiryBuckets {
 			at = expiryCursor{} // from a different layout: start over
 		}
 	}
 	var out []store.Message
-	for ; at.Bucket < ExpiryBuckets; at = (expiryCursor{Bucket: at.Bucket + 1}) {
+	// The queues' buckets, then the chatbot messages' (bucket).
+	for ; at.Bucket < 2*ExpiryBuckets; at = (expiryCursor{Bucket: at.Bucket + 1}) {
 		in := &dynamodb.QueryInput{
 			TableName:              aws.String(s.table),
 			IndexName:              aws.String(IndexExpiry),
@@ -848,7 +893,7 @@ func (s *Store) Expired(ctx context.Context, now time.Time, cursor string, limit
 				"#xb": attrBucket, "#expires": attrExpires, "#owner": attrOwner, "#lease": attrLease,
 			},
 			ExpressionAttributeValues: map[string]types.AttributeValue{
-				":b": str(fmt.Sprintf("x#%02d", at.Bucket)), ":now": stamp(now),
+				":b": str(fmt.Sprintf("%s%02d", bucketPrefix(at.Bucket >= ExpiryBuckets), at.Bucket%ExpiryBuckets)), ":now": stamp(now),
 			},
 			ExclusiveStartKey: at.startKey(),
 		}
@@ -1077,10 +1122,13 @@ func (s *Store) UnmarkNotified(ctx context.Context, sender, messageID, mark, tok
 	return nil
 }
 
+// queueRecipient reads a queue's key, or a recipient's chatbot messages'.
 func queueRecipient(pk string) (string, bool) {
 	rest, ok := strings.CutPrefix(pk, queuePrefix)
 	if !ok {
-		return "", false
+		if rest, ok = strings.CutPrefix(pk, chatbotPrefix); !ok {
+			return "", false
+		}
 	}
 	n, recipient, ok := strings.Cut(rest, "#")
 	if !ok || n != strconv.Itoa(len(recipient)) {
@@ -1122,7 +1170,7 @@ func decodeMessage(item map[string]types.AttributeValue) (store.Message, error) 
 	if b, ok := item[attrSummary].(*types.AttributeValueMemberBOOL); ok {
 		m.Summary = b.Value
 	}
-	m.Chatbot, m.Anonymous = flag(item, attrChatbot), flag(item, attrAnonymous)
+	m.Chatbot, m.Anonymous = strings.HasPrefix(pk, chatbotPrefix), flag(item, attrAnonymous)
 	if b, ok := item[attrCPIM].(*types.AttributeValueMemberB); ok {
 		m.CPIM = content.BodyOf(b.Value)
 	} else if !m.Summary {

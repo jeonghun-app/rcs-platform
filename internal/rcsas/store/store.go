@@ -21,6 +21,7 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/content"
@@ -85,6 +86,8 @@ type Limit struct {
 	// a queue together (Message.InChatbotTotal), beside each chatbot's
 	// sender share: without a total, enough chatbots could fill a
 	// subscriber's queue between them (ADR 0009 §9, threat model T10).
+	// Past them is ErrQueueFull, as for the queue: the chatbots' part of
+	// it is full, which is no rule of the one sending.
 	ChatbotCount int
 	ChatbotBytes int64
 }
@@ -166,8 +169,13 @@ type Message struct {
 	// Chatbot marks a message a chatbot sent through maap (ADR 0009 §4):
 	// Sender is the chatbot's URI in normal form, and Enqueued the time
 	// rcs-as accepted it, from which its queue age is measured (#702).
-	// Anonymous is the conversation's anonymity flag (§10), which the
-	// delivery's tk parameter follows.
+	// Its ID starts with ChatbotIDPrefix. It is kept apart from the
+	// queue: Pending and PendingHeld never return it, so no person's
+	// delivery reads it, and a backend stores it where no read of a
+	// version before #738 looks (#738 review); Expired, Claim, Release
+	// and Remove take it as any message. It counts toward the queue's
+	// size. Anonymous is the conversation's anonymity flag (§10), which
+	// the delivery's tk parameter follows.
 	Chatbot   bool
 	Anonymous bool
 
@@ -196,6 +204,14 @@ const GroupNotifications = "#group-notifications"
 // GroupSummaries names the total of a queue's group notification
 // summaries (Limit.SummaryCount). It is not an identity, which is a URI.
 const GroupSummaries = "#group-summaries"
+
+// ChatbotIDPrefix starts the ID of every chatbot's message
+// (Message.Chatbot), and of nothing else, so that a backend can tell from
+// a recipient and an ID alone where the message is.
+const ChatbotIDPrefix = "b-"
+
+// IsChatbotID reports whether id is a chatbot's message's.
+func IsChatbotID(id string) bool { return strings.HasPrefix(id, ChatbotIDPrefix) }
 
 // ChatbotMessages names the total of all chatbots' messages in a queue
 // (Limit.ChatbotCount). It is not an identity, which is a URI.
@@ -312,13 +328,15 @@ func (s Sent) Clone() Sent {
 // holds, Remove of a message already gone, MarkNotified with the same token.
 type Store interface {
 	// Enqueue adds m, unclaimed, to its recipient's queue: ErrExists if the
-	// queue already holds m.ID, ErrQueueFull if the queue would then be
-	// beyond l, ErrSenderShareFull if what counts against m's share
-	// (Message.ShareKey), or the total of group notifications, of
-	// summaries or of chatbots' messages for one, would.
+	// queue already holds m.ID, ErrQueueFull if the queue, or for a
+	// chatbot's message the chatbots' total, would then be beyond l,
+	// ErrSenderShareFull if what counts against m's share
+	// (Message.ShareKey), or the total of group notifications or of
+	// summaries for one, would. m.Chatbot must agree with its ID
+	// (IsChatbotID).
 	Enqueue(ctx context.Context, m Message, l Limit) error
 	// Pending returns up to limit messages of recipient's queue that are
-	// free at now and not expired, oldest first, starting after the ID
+	// free at now and not expired, chatbots' aside, oldest first, starting after the ID
 	// after ("" for the start), so that a caller can page past messages it
 	// leaves queued.
 	Pending(ctx context.Context, recipient, after string, now time.Time, limit int) ([]Message, error)

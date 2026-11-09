@@ -554,6 +554,9 @@ func (e *Engine) submitMessage(ctx context.Context, o Origin, m *Message, now ti
 	if err != nil {
 		return err
 	}
+	if o.chatbot {
+		id = store.ChatbotIDPrefix + id
+	}
 	q := queued(o, id, o.CPIM.Bytes(), false, m.Request.MessageID, now, e.cfg.StoreTTL)
 	err = e.enqueue(ctx, q)
 	if errors.Is(err, store.ErrQueueFull) || errors.Is(err, store.ErrSenderShareFull) {
@@ -592,6 +595,11 @@ func (e *Engine) enqueue(ctx context.Context, q store.Message) error {
 		e.metrics.Count("message.accepted.notification", 1)
 	} else {
 		e.metrics.Count("message.accepted", 1)
+	}
+	if q.Chatbot {
+		// No delivery reads it (store.Message.Chatbot): a pass would only
+		// try the person's queue again.
+		return nil
 	}
 	e.kickNew(q)
 	return nil
