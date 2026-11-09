@@ -79,7 +79,7 @@ func newEnv(t *testing.T, edit func(*Config)) *env {
 		t.Fatal(err)
 	}
 	cfg := Config{
-		On: true, Domain: domain, ContentTypes: chatbot.DefaultContentTypes(), Decodes: 8,
+		On: true, Domain: domain, ContentTypes: chatbot.DefaultContentTypes(), Decodes: 8, Accepts: 64,
 		Tokens:     TokenPair{secret.NewString(currentToken), secret.NewString(nextToken)},
 		SenderRate: messaging.Rate{PerMinute: 1500, Burst: 250}, SubscriberRate: messaging.Rate{PerMinute: 120, Burst: 20},
 		APIRate: messaging.Rate{PerMinute: 3000, Burst: 500},

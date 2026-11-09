@@ -46,6 +46,10 @@ const (
 	// (ADR 0007 §2).
 	DefaultChatbotListenAddr = ":8081"
 	DefaultChatbotDecodes    = 8
+	// DefaultChatbotAccepts matches the 64 calls at a time ADR 0009 §12
+	// allows each call toward maap: far above the few a store call of tens
+	// of milliseconds keeps in flight at the API's 50 a second.
+	DefaultChatbotAccepts = 64
 )
 
 // The backstops of ADR 0009 §9, per task, in requests a minute.
@@ -356,8 +360,10 @@ func configureChatbots(s *runtime.Settings, c *Config) {
 		SubscriberRate: backstopRate(e, "CHATBOT_SUBSCRIBER_RATE", DefaultChatbotSubscriberRate),
 		APIRate:        backstopRate(e, "CHATBOT_API_RATE", DefaultChatbotAPIRate),
 		Decodes:        e.Int("CHATBOT_DECODES", DefaultChatbotDecodes),
+		Accepts:        e.Int("CHATBOT_ACCEPTS", DefaultChatbotAccepts),
 	}
 	positive(e, "CHATBOT_DECODES", c.Chatbots.Decodes)
+	positive(e, "CHATBOT_ACCEPTS", c.Chatbots.Accepts)
 	if !c.Chatbots.On {
 		return
 	}

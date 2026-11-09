@@ -48,7 +48,7 @@ paths:
         "202": { $ref: "#/components/responses/Accepted" }
         "400": { description: "The body breaks a rule above, `recipient` is neither a canonical tel URI nor in the chatbot range, or the content breaks ADR 0009 §5.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "401": { $ref: "#/components/responses/Unauthenticated" }
-        "403": { description: "`sender` is outside the chatbot range, or `recipient` inside it.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "403": { description: "`sender` is outside the chatbot range, or `recipient` inside it; or rcs-as refused it for a rule of the chatbot's own sending, as it refuses a person's (`refused: queue_share_full`, `refused: message_id_reused`). These `error` strings are stable. A full queue is 202, the message not stored (docs/rcs-as.md, Existence).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "404": { description: "`sender` is at RCS_CHATBOT_DOMAIN but not in normal form (ADR 0009 §2).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "408": { description: "The body did not arrive within its deadline, 1 s plus 1 s per 256 KiB of its limit (docs/rcs-as.md).", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
         "413": { description: "The body is larger than 1,496 KiB.", content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
@@ -133,5 +133,5 @@ components:
       description: "Over a backstop of ADR 0009 §9 (a chatbot sender, one subscriber for messages, or the whole API), with `Retry-After: 1`."
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Unavailable:
-      description: "RCSAS_CHATBOTS is off, RCSAS_CHATBOT_DECODES bodies are being decoded, or the store failed, with `Retry-After`."
+      description: "RCSAS_CHATBOTS is off, RCSAS_CHATBOT_DECODES bodies are being decoded, RCSAS_CHATBOT_ACCEPTS requests are being accepted, or the store failed, with `Retry-After`."
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }

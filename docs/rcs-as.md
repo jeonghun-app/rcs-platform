@@ -12,7 +12,9 @@ is driven through interfaces so
 that it can be built and tested first.
 
 Chatbots (ADR 0009) are served in part: the chatbot API with its checks
-([Chatbot API](#chatbot-api), #698), with nothing yet behind it.
+([Chatbot API](#chatbot-api), #698), and a chatbot's message stored with
+the CPIM rcs-as builds, held until the delivery check of #702 ([A chatbot's
+message](#a-chatbots-message), #699).
 
 The code:
 
@@ -1234,8 +1236,9 @@ change and notifying it leaves exactly such a gap.
 the core does not trust it ([threat model](threat-model.md) T4), so this is
 where whatever it asks is bounded (#698): a compromised `maap` can speak for
 chatbots only, to subscribers only, and only so fast. A request that passes
-every check is handed to an acceptor, which answers 503 until #699
-(messages) and #706 (notifications) bring theirs.
+every check is handed to an acceptor: a message is stored by the engine
+([A chatbot's message](#a-chatbots-message), #699); a notification is 503
+until #706.
 
 - **Listener.** `RCSAS_CHATBOT_LISTEN_ADDR` (`:8081`), plain HTTP inside the
   VPC, apart from the SIP listener and the admin port; only `maap` reaches it
@@ -1262,9 +1265,9 @@ every check is handed to an acceptor, which answers 503 until #699
 - **Order of checks:** token (401) → path (404; a method other than POST is
   405) → switch (503) → API backstop (429) → decode cap (503) → body (415,
   413, 400) → field rules (400) → scope (403, 404) → content type (415) →
-  content (400) → sender and subscriber backstops (429). The token comes
-  first, so that a caller without one learns nothing of the paths or the
-  switch.
+  content (400) → accept cap (503) → sender and subscriber backstops (429)
+  → the acceptor (202, 403, 503). The token comes first, so that a caller
+  without one learns nothing of the paths or the switch.
 - **Field rules and scope** (ADR 0009 §7). The subscriber (a message's
   `recipient`, a notification's `subscriber`) must be a canonical tel URI,
   `tel:+` and digits as `identity.CanonicalIMPU` writes it (400), unless it
@@ -1308,7 +1311,7 @@ every check is handed to an acceptor, which answers 503 until #699
   (400). The answer names the rule broken, never the value.
 - **Decode cap.** `chatbot.DecodeEnvelope` allocates about 8 bytes per input
   byte, and content validation up to about 30, so one message may take about
-  27 MB: the worst case the security review on #735 measured, a rich card
+  27 MB: the worst case the tester's report on #735 measured, a rich card
   of tens of thousands of short keys with every character a `\u` escape,
   allocated 26.7 MB, decoding and content validation together. `RCSAS_CHATBOT_DECODES` (8) bounds the bodies a task decodes
   and validates at once; a request that finds no free slot is 503 with
@@ -1321,6 +1324,44 @@ every check is handed to an acceptor, which answers 503 until #699
   and the slot is freed, so a body trickled byte by byte cannot hold a
   slot for long (#723 review). The slot is freed before the acceptor's store
   calls, and in any case when the request ends, panic or not.
+- **Accept cap.** The slot is free once the body is checked, so without a
+  bound of its own a slow store would pile requests up behind the acceptor,
+  each holding its message (#734 security review). `RCSAS_CHATBOT_ACCEPTS`
+  (64) bounds the requests, messages and notifications together, that the
+  acceptor works on at once; one past it is 503 with `Retry-After: 1` at
+  once and counts `chatbot.api.accept_busy`. Its place is taken before the
+  backstops' tokens, so a request refused for it spends none, and maap's
+  retries do not open `RcsAsChatbotBackstopHit` (#739 review). Each has
+  10 s (`acceptTimeout`), well within the 30 s `WriteTimeout`. A message's
+  store calls are bounded first by `RCSAS_STORE_TIMEOUT` (5 s, all of them
+  together), so with the default that fires and 10 s backs it; either way
+  the answer is 503. **Memory rule:** a message of the
+  largest content holds about 1 MiB while it is accepted: the decoded
+  request, the CPIM, its parsed copy and the DynamoDB request, whose body
+  writes the CPIM in base64. #699 measured 910–989 KiB each, 100 at once
+  held by a DynamoDB endpoint that never answers, heap in use after a
+  collection, three runs; the 367 KiB of #734's security review was an
+  acceptor that held the decoded request only. That is heap: #739's tester
+  saw about 1.2 MiB each of container memory, inside the rule's twofold
+  room. `RCSAS_CHATBOT_DECODES` ×
+  27 MB plus `RCSAS_CHATBOT_ACCEPTS` × 1 MiB stays under half the task's
+  memory limit: 216 MB + 64 MiB by default.
+- **Acceptor answers.** Stored is 202. A message refused for a rule of the
+  chatbot's own sending is 403, `refused: queue_share_full` (its share of
+  the queue) or `refused: message_id_reused`, as a person's message refused
+  for it is 403 ([Answers](#answers)); with the scope's, these `error`
+  strings are stable, for maap to tell them apart. A store failure is 503
+  with `Retry-After: 5`, which `maap` retries with the same Message-ID.
+- **Existence.** No answer depends on whether the recipient exists:
+  `rcs-as` cannot tell a subscriber's number from an off-net or
+  unprovisioned one here, and does not look. A full queue (`queue_full`,
+  the queue's or the chatbots' quarter) is answered 202 too and the message
+  is not stored: only a subscriber's own senders fill a queue, so a refusal
+  would tell a subscriber from a number nobody has (#739 review). #705
+  reports such a message undeliverable. The chatbot's own full share tells
+  it only of its own messages, held alike for every number until #702. A
+  number nobody has fails at delivery (#702), with no more than a generic
+  undeliverable status.
 - **Answers.** An error is `{"error": "<reason>"}`, which names a rule,
   never a value, and closes the connection: most come before the body is
   read, and the server would otherwise read up to 256 KiB of it before the
@@ -1461,6 +1502,7 @@ unset, there are no chatbots (see the table). The `RCSAS_` settings:
 | `RCSAS_CHATBOT_LISTEN_ADDR` | `:8081` | The chatbot API's listener (TCP), which only `maap` reaches; it serves with the switch off too. Port 0 is refused: `maap` reaches a fixed port |
 | `RCSAS_CHATBOT_SENDER_RATE`, `RCSAS_CHATBOT_SUBSCRIBER_RATE`, `RCSAS_CHATBOT_API_RATE` | `1500`, `120`, `3000` | The chatbot API's backstops per task, a minute: each chatbot sender, one subscriber from all chatbot senders, the whole API. The burst is a sixth, rounded up; none can be turned off: `0`, and a rate above 100 times the default, are refused |
 | `RCSAS_CHATBOT_DECODES` | `8` | Chatbot API bodies a task decodes and validates at once, about 27 MB each at worst; × 27 MB must stay under half the task's memory limit ([Chatbot API](#chatbot-api)) |
+| `RCSAS_CHATBOT_ACCEPTS` | `64` | Chatbot API requests a task's acceptor works on at once, about 1 MiB each at worst; with the decodes' share, must stay under half the task's memory limit ([Chatbot API](#chatbot-api)). `0` is refused |
 | `RCSAS_MAAP_TOKEN`, `RCSAS_MAAP_TOKEN_NEXT` | none | `maap`'s current and next bearer token. The current one is required with the switch on; each holds 256 bits in staging and prod |
 
 A rate of `0` turns that limit off, except the chatbot API's backstops
@@ -1747,6 +1789,7 @@ identifier ever appears in a metric name.
 | `chatbot.api.<operation>.<status>` | Requests to the chatbot API by operation (`messages`, `notifications`, `other`) and status |
 | `chatbot.backstop_refused` | Chatbot API requests refused 429 by a backstop; alarm `RcsAsChatbotBackstopHit` |
 | `chatbot.api.decode_busy` | Chatbot API requests answered 503 at once because `RCSAS_CHATBOT_DECODES` bodies were being decoded |
+| `chatbot.api.accept_busy` | Chatbot API requests answered 503 at once because `RCSAS_CHATBOT_ACCEPTS` requests were with the acceptor |
 | `group.created`, `group.roster_changed`, `group.update_conflict`, `group.touched` | Group lifecycle |
 | `group.owner_takeover`, `group.fenced`, `group.owner_lapsed`, `task.heartbeat_failed` | Ownership (#121): groups this task took over, writes the store refused because another task had taken the group (which this task then gives up), writes refused because this task's own heartbeat had lapsed, and heartbeats that failed |
 | `group.rejected.<reason>` | Group operations refused: `not_participant`, `not_chairman`, `too_many`, `invalid`, `rate_limited` |

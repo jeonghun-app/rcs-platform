@@ -3,6 +3,7 @@ package rcsas
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -10,9 +11,11 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/content"
 	"github.com/jeonghun-app/rcs-platform/internal/msrp"
 	"github.com/jeonghun-app/rcs-platform/internal/rcsas/awsstore"
@@ -113,7 +116,9 @@ func startStoppableHarness(t *testing.T, cfg Config, d deps) (netip.AddrPort, ne
 	ctx, cancel := context.WithCancel(context.Background())
 	listening := make(chan netip.AddrPort, 1)
 	done := make(chan error, 1)
-	d.store = store.NewMemory()
+	if d.store == nil {
+		d.store = store.NewMemory()
+	}
 	if d.groups == nil {
 		d.groups = groupstore.NewMemory()
 	}
@@ -601,8 +606,8 @@ func listenLocal(t *testing.T) net.Listener {
 }
 
 // Run serves the chatbot API on a listener of its own: maap's token is
-// checked, and a message that passes every check meets the acceptor, which
-// answers 503 until #699 brings its own.
+// checked, and a message that passes every check is stored by the engine,
+// as a chatbot's (#699); notifications answer 503 until #706.
 func TestRunServesTheChatbotAPIOnItsOwnListener(t *testing.T) {
 	cfg, err := configure(with(devEnv, "RCS_CHATBOT_DOMAIN", "botplatform.mnc001.mcc001.3gppnetwork.org",
 		"RCSAS_CHATBOTS", "on", "RCSAS_MAAP_TOKEN", "maap-token"))
@@ -610,12 +615,18 @@ func TestRunServesTheChatbotAPIOnItsOwnListener(t *testing.T) {
 		t.Fatal(err)
 	}
 	cl := listenLocal(t)
-	startRun(t, cfg, deps{chatbot: cl})
+	st := store.NewMemory()
+	startRun(t, cfg, deps{chatbot: cl, store: st})
 	body := `{"sender":"sip:mybot@botplatform.mnc001.mcc001.3gppnetwork.org","display_name":"","recipient":"tel:+15550100001",
-		"message_id":"m-1","content_type":"text/plain;charset=utf-8","body":"hi",
+		"message_id":"m-1","content_type":"text/plain;charset=utf-8","body":"hi","chip_list":"{\"suggestions\":[]}",
 		"dispositions":{"positive_delivery":false,"negative_delivery":false,"display":false},"anonymous":false}`
-	for token, want := range map[string]int{"maap-token": 503, "other": 401} {
-		req, _ := http.NewRequest("POST", "http://"+cl.Addr().String()+"/v1/chatbot/messages", strings.NewReader(body))
+	note := `{"chatbot":"sip:mybot@botplatform.mnc001.mcc001.3gppnetwork.org","subscriber":"tel:+15550100001","message_id":"m-1","kind":"display-notification"}`
+	for _, c := range []struct {
+		token, path, body string
+		want              int
+	}{{"maap-token", "messages", body, 202}, {"other", "messages", body, 401}, {"maap-token", "notifications", note, 503}} {
+		token, want := c.token, c.want
+		req, _ := http.NewRequest("POST", "http://"+cl.Addr().String()+"/v1/chatbot/"+c.path, strings.NewReader(c.body))
 		req.Header.Set("Authorization", "Bearer "+token)
 		req.Header.Set("Content-Type", "application/json")
 		res, err := http.DefaultClient.Do(req)
@@ -626,5 +637,86 @@ func TestRunServesTheChatbotAPIOnItsOwnListener(t *testing.T) {
 		if res.StatusCode != want {
 			t.Errorf("token %q: %d, want %d", token, res.StatusCode, want)
 		}
+	}
+	ms, _, err := st.Expired(t.Context(), time.Now().Add(8*24*time.Hour), "", 10)
+	if err != nil || len(ms) != 1 {
+		t.Fatalf("stored %+v, %v", ms, err)
+	}
+	ms[0], err = st.Claim(t.Context(), ms[0].Recipient, ms[0].ID, "test", time.Now(), time.Now().Add(time.Minute))
+	if err != nil || ms[0].Recipient != "tel:+15550100001" || !ms[0].Chatbot || ms[0].Sender != "sip:mybot@botplatform.mnc001.mcc001.3gppnetwork.org" ||
+		!strings.Contains(string(ms[0].CPIM.Bytes()), "Content-Type: "+chatbot.ChipListType) {
+		t.Fatalf("stored %+v, %v", ms, err)
+	}
+}
+
+// failingStore fails every Enqueue once fail is set.
+type failingStore struct {
+	*store.Memory
+	fail atomic.Bool
+}
+
+func (f *failingStore) Enqueue(ctx context.Context, m store.Message, l store.Limit) error {
+	if f.fail.Load() {
+		return errors.New("store down")
+	}
+	return f.Memory.Enqueue(ctx, m, l)
+}
+
+// The engine's answers reach maap as docs/rcs-as.md has them: the
+// chatbot's own full share is 403, as for a person; a store failure 503
+// with Retry-After, which maap retries. A subscriber's number, one nobody
+// has, and one whose queue its senders filled get the same answer, so
+// that the API tells maap nothing of which numbers exist (#739 review);
+// the last one's message is not stored.
+func TestTheChatbotAPIAnswersAsTheEngineDecides(t *testing.T) {
+	cfg, err := configure(with(devEnv, "RCS_CHATBOT_DOMAIN", "botplatform.mnc001.mcc001.3gppnetwork.org",
+		"RCSAS_CHATBOTS", "on", "RCSAS_MAAP_TOKEN", "maap-token", "RCSAS_MAX_QUEUE_MESSAGES", "8"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := listenLocal(t)
+	st := &failingStore{Memory: store.NewMemory()}
+	startRun(t, cfg, deps{chatbot: cl, store: st})
+	send := func(recipient, id string) (int, string, string) {
+		body := `{"sender":"sip:mybot@botplatform.mnc001.mcc001.3gppnetwork.org","display_name":"My Bot","recipient":"` + recipient +
+			`","message_id":"` + id + `","content_type":"text/plain;charset=utf-8","body":"hi",` +
+			`"dispositions":{"positive_delivery":true,"negative_delivery":false,"display":false},"anonymous":false}`
+		req, _ := http.NewRequest("POST", "http://"+cl.Addr().String()+"/v1/chatbot/messages", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer maap-token")
+		req.Header.Set("Content-Type", "application/json")
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		b, _ := io.ReadAll(res.Body)
+		return res.StatusCode, res.Header.Get("Retry-After"), string(b)
+	}
+	// alice has a queue already; nobody has the other number.
+	if err := st.Memory.Enqueue(t.Context(), store.Message{Recipient: "tel:+15550100001", ID: "0", Sender: "tel:+15550100002",
+		Mode: store.Standalone, CPIM: content.BodyOf([]byte("x")), Enqueued: time.Now(), Expires: time.Now().Add(time.Hour)}, store.Limit{}); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 8 {
+		if err := st.Memory.Enqueue(t.Context(), store.Message{Recipient: "tel:+15550100005", ID: fmt.Sprint(i), Sender: "tel:+15550100002",
+			Mode: store.Standalone, CPIM: content.BodyOf([]byte("x")), Enqueued: time.Now(), Expires: time.Now().Add(time.Hour)}, store.Limit{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s1, r1, b1 := send("tel:+15550100001", "m-1")
+	for i, number := range []string{"tel:+15550100003", "tel:+15550100005"} {
+		if s2, r2, b2 := send(number, fmt.Sprint("m-2-", i)); s1 != 202 || s1 != s2 || r1 != r2 || b1 != b2 {
+			t.Fatalf("a subscriber %d %q %q, %s %d %q %q", s1, r1, b1, number, s2, r2, b2)
+		}
+	}
+	if st.Len("tel:+15550100005") != 8 {
+		t.Fatalf("a message stored in a full queue")
+	}
+	if s, r, b := send("tel:+15550100001", "m-3"); s != 403 || r != "" || !strings.Contains(b, "queue_share_full") {
+		t.Fatalf("beyond the chatbot's share: %d %q %q", s, r, b)
+	}
+	st.fail.Store(true)
+	if s, r, _ := send("tel:+15550100004", "m-4"); s != 503 || r != "5" {
+		t.Fatalf("a store failure: %d %q", s, r)
 	}
 }

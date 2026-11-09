@@ -54,6 +54,12 @@ func bodyTime(maxBytes int64) time.Duration {
 	return time.Second + time.Duration(maxBytes)*time.Second/minBodyRate
 }
 
+// acceptTimeout bounds an acceptor's work on one request: its store calls,
+// well within the server's WriteTimeout, so that the answer is still
+// written. With Config.Accepts it bounds how long the memory of the
+// requests being accepted is held (docs/rcs-as.md, #734 security review).
+const acceptTimeout = 10 * time.Second
+
 // Retry-After of a 503 for the switch or the acceptor, and of a refusal
 // for a full decode cap or a backstop, which frees within a second.
 const (
@@ -69,7 +75,8 @@ var ErrUnavailable = errors.New("chatbotapi: unavailable")
 // is in normal form, its ContentType is the entry of the configured list it
 // matched, never maap's string, and its content has been validated; a
 // notification's Chatbot is in normal form. nil is 202, ErrUnavailable 503
-// and any other error 500.
+// and a *messaging.Rejection 403, which names its reason; any other error
+// is 500.
 type Acceptor interface {
 	AcceptMessage(ctx context.Context, m chatbot.BotMessage) error
 	AcceptNotification(ctx context.Context, n chatbot.BotNotification) error
@@ -101,8 +108,9 @@ type Config struct {
 	// The backstops of ADR 0009 §9, per task: each chatbot sender, one
 	// subscriber from all chatbot senders, and the whole API.
 	SenderRate, SubscriberRate, APIRate messaging.Rate
-	// Decodes bounds the bodies decoded and validated at once.
-	Decodes int
+	// Decodes bounds the bodies decoded and validated at once, and Accepts
+	// the requests the acceptor works on at once.
+	Decodes, Accepts int
 	// Now is the backstops' clock; nil means time.Now.
 	Now func() time.Time
 }
@@ -112,8 +120,10 @@ type API struct {
 	cfg      Config
 	acceptor Acceptor
 	tokens   []acceptedToken
-	// slots holds a token for each body being decoded (RCSAS_CHATBOT_DECODES).
-	slots                       chan struct{}
+	// slots holds a token for each body being decoded
+	// (RCSAS_CHATBOT_DECODES), accepts one for each request with the
+	// acceptor (RCSAS_CHATBOT_ACCEPTS).
+	slots, accepts              chan struct{}
 	senders, subscribers, calls *messaging.Limiter
 	// bucketsMu makes a message's check of the sender's and the
 	// subscriber's buckets one step (backstop).
@@ -138,7 +148,7 @@ func New(cfg Config, acc Acceptor, logger *slog.Logger, m *runtime.Metrics) *API
 		cfg.Now = time.Now
 	}
 	a := &API{
-		cfg: cfg, acceptor: acc, slots: make(chan struct{}, cfg.Decodes), log: logger, metrics: m,
+		cfg: cfg, acceptor: acc, slots: make(chan struct{}, cfg.Decodes), accepts: make(chan struct{}, cfg.Accepts), log: logger, metrics: m,
 		senders:     messaging.NewLimiter(cfg.SenderRate, maxKeys),
 		subscribers: messaging.NewLimiter(cfg.SubscriberRate, maxKeys),
 		calls:       messaging.NewLimiter(cfg.APIRate, 1),
@@ -305,12 +315,8 @@ func (a *API) message(c *call) *answer {
 	if err != nil {
 		return &answer{status: http.StatusBadRequest, reason: err.Error()}
 	}
-	if ans := a.backstop(sender, m.Recipient); ans != nil {
-		return ans
-	}
-	c.releaseSlot()
 	m.Sender, m.ContentType = sender, entry
-	return accepted(a.acceptor.AcceptMessage(c.r.Context(), m))
+	return a.accept(c, sender, m.Recipient, func(ctx context.Context) error { return a.acceptor.AcceptMessage(ctx, m) })
 }
 
 func (a *API) notification(c *call) *answer {
@@ -322,14 +328,35 @@ func (a *API) notification(c *call) *answer {
 	if ans != nil {
 		return ans
 	}
+	n.Chatbot = bot
 	// Not the subscriber's bucket: a notification is bounded by threat
 	// model T10's once per kind (ADR 0009 §9).
-	if ans := a.backstop(bot, ""); ans != nil {
+	return a.accept(c, bot, "", func(ctx context.Context) error { return a.acceptor.AcceptNotification(ctx, n) })
+}
+
+// accept takes a place under the accept cap, then the backstops' tokens
+// of sender and subscriber, and hands the call to the acceptor within
+// acceptTimeout. The decode slot is freed before the acceptor's store
+// calls, so without a cap of its own a slow store would pile up requests,
+// each holding its message, behind the acceptor (#734 security review). A
+// request past the cap is 503 at once, as for the decode cap, and spends
+// no token: otherwise maap's retries of it would empty the subscriber's
+// bucket and open RcsAsChatbotBackstopHit (#739 review).
+func (a *API) accept(c *call, sender, subscriber string, do func(context.Context) error) *answer {
+	select {
+	case a.accepts <- struct{}{}:
+		defer func() { <-a.accepts }()
+	default:
+		a.metrics.Count("chatbot.api.accept_busy", 1)
+		return &answer{http.StatusServiceUnavailable, "too many requests are being accepted", retryBusy}
+	}
+	if ans := a.backstop(sender, subscriber); ans != nil {
 		return ans
 	}
 	c.releaseSlot()
-	n.Chatbot = bot
-	return accepted(a.acceptor.AcceptNotification(c.r.Context(), n))
+	ctx, cancel := context.WithTimeout(c.r.Context(), acceptTimeout)
+	defer cancel()
+	return accepted(do(ctx))
 }
 
 // decode reads the call's body into v, which DecodeEnvelope validates.
@@ -405,11 +432,15 @@ func (a *API) refuseBackstop() *answer {
 }
 
 func accepted(err error) *answer {
-	switch {
+	switch r, refused := errors.AsType[*messaging.Rejection](err); {
 	case err == nil:
 		return nil
 	case errors.Is(err, ErrUnavailable):
 		return &answer{http.StatusServiceUnavailable, "rcs-as cannot take it now", retryUnavailable}
+	case refused:
+		// As a person's message refused for the same reason is 403
+		// (docs/rcs-as.md, Answers); the reason is a rule's name.
+		return &answer{status: http.StatusForbidden, reason: "refused: " + string(r.Reason)}
 	}
 	return &answer{status: http.StatusInternalServerError, reason: "internal error"}
 }
