@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -21,6 +22,7 @@ import (
 // TableAPI is the part of the DynamoDB client the stores of maap-requests
 // and maap-counters use; *dynamodb.Client has it.
 type TableAPI interface {
+	GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 	PutItem(context.Context, *dynamodb.PutItemInput, ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 	UpdateItem(context.Context, *dynamodb.UpdateItemInput, ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
 	DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error)
@@ -35,12 +37,16 @@ const (
 	attrMessageID = "message_id"
 	attrAnswer    = "answer"
 	attrPending   = "pending"
+	attrState     = "state"
+	attrAccepted  = "accepted"
+	attrUpdated   = "updated"
 )
 
 // Requests is a store.Requests in the maap-requests table: partition key
 // pk and sort key sk, both strings, TTL on ttl.
 //
-//	pk c#<chatbot ID>  sk i#<key>  an idempotency record: digest (an HMAC), message_id, pending or answer, created, ttl, writer
+//	pk c#<chatbot ID>  sk i#<key>         an idempotency record: digest (an HMAC), message_id, pending or answer, created, ttl, writer
+//	pk c#<chatbot ID>  sk m#<Message-ID>  a message's status: state, accepted, updated, ttl, writer
 //
 // A chatbot's items are its partition, which DeleteChatbot deletes
 // without a Scan. A write racing the deletion leaves an item under an ID
@@ -51,6 +57,7 @@ type Requests struct {
 	table string
 	// digestKey keys the HMAC kept in place of a request's digest.
 	digestKey []byte
+	statusTTL time.Duration
 	// pageSize bounds DeleteChatbot's query pages, for tests.
 	pageSize int32
 }
@@ -61,10 +68,11 @@ var _ store.Requests = (*Requests)(nil)
 // keys the digests it keeps, through a subkey of their own, so that a
 // table or backup reader cannot test guesses of a request (#749 security
 // review). Rotating it makes a repeat across the rotation another request.
-func NewRequests(api TableAPI, table string, key secret.Key) *Requests {
+// Statuses are kept for statusTTL.
+func NewRequests(api TableAPI, table string, key secret.Key, statusTTL time.Duration) *Requests {
 	sub := hmac.New(sha256.New, key.Reveal())
 	sub.Write([]byte("maap-requests digest"))
-	return &Requests{api: api, table: table, digestKey: sub.Sum(nil)}
+	return &Requests{api: api, table: table, digestKey: sub.Sum(nil), statusTTL: statusTTL}
 }
 
 func (r *Requests) keyed(digest [sha256.Size]byte) []byte {
@@ -173,6 +181,112 @@ func (r *Requests) Forget(ctx context.Context, chatbotID, idemKey, writer string
 		return sanitize("forget request", err)
 	}
 	return nil
+}
+
+func statusKey(chatbotID, messageID string) map[string]types.AttributeValue {
+	return key("c#"+chatbotID, "m#"+messageID)
+}
+
+// Accept implements store.Requests: a put on the condition that no live
+// status exists, which leaves one there as it is.
+func (r *Requests) Accept(ctx context.Context, chatbotID, messageID string, now time.Time) error {
+	if err := store.CheckStatus(store.Status{Chatbot: chatbotID, MessageID: messageID, State: store.Accepted}); err != nil {
+		return err
+	}
+	at := store.Seconds(now).Unix()
+	item := statusKey(chatbotID, messageID)
+	item[attrState], item[attrAccepted], item[attrUpdated] = str(string(store.Accepted)), num(at), num(at)
+	item[attrTTL], item[attrWriter] = num(at+int64(r.statusTTL/time.Second)), str(rand.Text())
+	_, err := r.api.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(r.table), Item: item,
+		ConditionExpression:       aws.String("attribute_not_exists(#pk) OR #ttl <= :now"),
+		ExpressionAttributeNames:  map[string]string{"#pk": attrPK, "#ttl": attrTTL},
+		ExpressionAttributeValues: map[string]types.AttributeValue{":now": num(now.Unix())},
+	})
+	var ccf *types.ConditionalCheckFailedException
+	if err != nil && !errors.As(err, &ccf) {
+		return sanitize("accept status", err)
+	}
+	return nil
+}
+
+// Status implements store.Requests.
+func (r *Requests) Status(ctx context.Context, chatbotID, messageID string, now time.Time) (store.Status, error) {
+	if !store.ValidID(chatbotID) || !store.ValidMessageID(messageID) {
+		return store.Status{}, fmt.Errorf("awsstore: get status: %w", store.ErrNotFound)
+	}
+	out, err := r.api.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(r.table), Key: statusKey(chatbotID, messageID), ConsistentRead: aws.Bool(true)})
+	if err != nil {
+		return store.Status{}, sanitize("get status", err)
+	}
+	if len(out.Item) == 0 {
+		return store.Status{}, fmt.Errorf("awsstore: get status: %w", store.ErrNotFound)
+	}
+	st, ttl, err := decodeStatus(chatbotID, messageID, out.Item)
+	switch {
+	case err != nil:
+		return store.Status{}, err
+	case ttl <= now.Unix():
+		return store.Status{}, fmt.Errorf("awsstore: get status: %w", store.ErrNotFound)
+	}
+	return st, nil
+}
+
+// Advance implements store.Requests: an update on the condition that the
+// status is live and in a state before the new one. An update the SDK
+// sent again after it took effect finds its own writer token.
+func (r *Requests) Advance(ctx context.Context, chatbotID, messageID string, state store.StatusState, now time.Time) (bool, error) {
+	if err := store.CheckAdvance(chatbotID, messageID, state); err != nil {
+		return false, err
+	}
+	writer := rand.Text()
+	values := map[string]types.AttributeValue{
+		":state": str(string(state)), ":now": num(now.Unix()), ":at": num(store.Seconds(now).Unix()), ":w": str(writer),
+	}
+	from := make([]string, len(state.Before()))
+	for i, s := range state.Before() {
+		from[i] = ":from" + strconv.Itoa(i)
+		values[from[i]] = str(string(s))
+	}
+	_, err := r.api.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName: aws.String(r.table), Key: statusKey(chatbotID, messageID),
+		UpdateExpression:                    aws.String("SET #state = :state, #updated = :at, #w = :w"),
+		ConditionExpression:                 aws.String("#ttl > :now AND #state IN (" + strings.Join(from, ", ") + ")"),
+		ExpressionAttributeNames:            map[string]string{"#state": attrState, "#updated": attrUpdated, "#w": attrWriter, "#ttl": attrTTL},
+		ExpressionAttributeValues:           values,
+		ReturnValuesOnConditionCheckFailure: types.ReturnValuesOnConditionCheckFailureAllOld,
+	})
+	var ccf *types.ConditionalCheckFailedException
+	switch {
+	case errors.As(err, &ccf):
+		ttl, _ := number(ccf.Item, attrTTL)
+		switch {
+		case sv(ccf.Item[attrWriter]) == writer:
+			return true, nil // the SDK sent again an update that had taken effect
+		case len(ccf.Item) == 0 || ttl <= now.Unix():
+			// An update makes no item: the condition fails on an absent one.
+			return false, fmt.Errorf("awsstore: advance status: %w", store.ErrNotFound)
+		}
+		return false, nil
+	case err != nil:
+		return false, sanitize("advance status", err)
+	}
+	return true, nil
+}
+
+// decodeStatus reads a stored status strictly, with its ttl.
+func decodeStatus(chatbotID, messageID string, item map[string]types.AttributeValue) (store.Status, int64, error) {
+	accepted, okA := number(item, attrAccepted)
+	updated, okU := number(item, attrUpdated)
+	ttl, okT := number(item, attrTTL)
+	st := store.Status{
+		Chatbot: chatbotID, MessageID: messageID, State: store.StatusState(text(item, attrState)),
+		Accepted: time.Unix(accepted, 0).UTC(), Updated: time.Unix(updated, 0).UTC(),
+	}
+	if err := store.CheckStatus(st); err != nil || !okA || !okU || !okT {
+		return store.Status{}, 0, fmt.Errorf("%w: a damaged status", store.ErrInvalid)
+	}
+	return st, ttl, nil
 }
 
 // decodeIdempotency reads a stored record strictly, without its writer,

@@ -8,5 +8,5 @@ import (
 )
 
 func TestMemoryRequestsMeetTheContract(t *testing.T) {
-	storetest.RunRequests(t, func(*testing.T) store.Requests { return store.NewMemoryRequests() })
+	storetest.RunRequests(t, func(*testing.T) store.Requests { return store.NewMemoryRequests(storetest.StatusTTL) })
 }

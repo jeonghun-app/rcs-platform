@@ -33,6 +33,10 @@ type tableStub struct {
 	batches int
 }
 
+func (s *tableStub) GetItem(context.Context, *dynamodb.GetItemInput, ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error) {
+	return nil, s.err
+}
+
 func (s *tableStub) DeleteItem(context.Context, *dynamodb.DeleteItemInput, ...func(*dynamodb.Options)) (*dynamodb.DeleteItemOutput, error) {
 	return nil, s.err
 }
@@ -82,7 +86,7 @@ func TestTheStoredDigestIsKeyed(t *testing.T) {
 		r := NewRequests(&tableStub{put: func(in *dynamodb.PutItemInput) error {
 			digests = append(digests, in.Item[attrDigest].(*types.AttributeValueMemberB).Value)
 			return nil
-		}}, "maap-requests", k)
+		}}, "maap-requests", k, storetest.StatusTTL)
 		if _, _, err := r.Remember(context.Background(), rec, storetest.Now); err != nil {
 			t.Fatal(err)
 		}
@@ -119,14 +123,17 @@ func captureLog(t *testing.T) *bytes.Buffer {
 func TestARequestsFailureIsNoRefusalAndNamesNoKey(t *testing.T) {
 	log := captureLog(t)
 	rec := storetest.Idempotency(storetest.Chatbot().ID)
-	r := NewRequests(&tableStub{err: &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException", Message: "key i#" + rec.Key}}, "maap-requests", testKey)
+	r := NewRequests(&tableStub{err: &smithy.GenericAPIError{Code: "ProvisionedThroughputExceededException", Message: "key i#" + rec.Key}}, "maap-requests", testKey, storetest.StatusTTL)
 	ctx := context.Background()
 	_, _, rememberErr := r.Remember(ctx, rec, storetest.Now)
+	_, statusErr := r.Status(ctx, rec.Chatbot, rec.MessageID, storetest.Now)
+	_, advanceErr := r.Advance(ctx, rec.Chatbot, rec.MessageID, store.Delivered, storetest.Now)
 	for _, err := range []error{
-		rememberErr, r.Settle(ctx, rec.Chatbot, rec.Key, "w", nil, storetest.Now), r.Forget(ctx, rec.Chatbot, rec.Key, "w"),
-		r.DeleteChatbot(ctx, rec.Chatbot),
+		rememberErr, statusErr, advanceErr, r.Accept(ctx, rec.Chatbot, rec.MessageID, storetest.Now),
+		r.Settle(ctx, rec.Chatbot, rec.Key, "w", nil, storetest.Now), r.Forget(ctx, rec.Chatbot, rec.Key, "w"), r.DeleteChatbot(ctx, rec.Chatbot),
 	} {
-		if err == nil || errors.Is(err, store.ErrKeyReused) || errors.Is(err, store.ErrInvalid) || errors.Is(err, store.ErrConflict) ||
+		if err == nil || errors.Is(err, store.ErrKeyReused) || errors.Is(err, store.ErrInvalid) || errors.Is(err, store.ErrNotFound) ||
+			errors.Is(err, store.ErrConflict) ||
 			!strings.Contains(err.Error(), "ProvisionedThroughputExceededException") || strings.Contains(err.Error(), rec.Key) {
 			t.Errorf("error = %v", err)
 		}
@@ -135,7 +142,7 @@ func TestARequestsFailureIsNoRefusalAndNamesNoKey(t *testing.T) {
 	damaged := requestKey(rec.Chatbot, rec.Key)
 	r = NewRequests(&tableStub{put: func(*dynamodb.PutItemInput) error {
 		return &types.ConditionalCheckFailedException{Item: damaged}
-	}}, "maap-requests", testKey)
+	}}, "maap-requests", testKey, storetest.StatusTTL)
 	if _, _, err := r.Remember(context.Background(), rec, storetest.Now); !errors.Is(err, store.ErrInvalid) || strings.Contains(err.Error(), rec.Key) {
 		t.Errorf("damaged record = %v", err)
 	}
@@ -157,7 +164,7 @@ func TestARememberSentAgainFindsItsOwnRecord(t *testing.T) {
 	r := NewRequests(&tableStub{put: func(in *dynamodb.PutItemInput) error {
 		sent = in.Item
 		return &types.ConditionalCheckFailedException{Item: in.Item}
-	}}, "maap-requests", testKey)
+	}}, "maap-requests", testKey, storetest.StatusTTL)
 	got, fresh, err := r.Remember(context.Background(), rec, storetest.Now)
 	if err != nil || !fresh || got.MessageID != rec.MessageID || !got.Created.Equal(storetest.Now) {
 		t.Fatalf("Remember = %+v, %v, %v", got, fresh, err)
@@ -179,13 +186,43 @@ func TestItemsCarryTheirTTL(t *testing.T) {
 		ttls = append(ttls, sv(in.Item[attrTTL]))
 		return nil
 	}}
-	r := NewRequests(s, "maap-requests", testKey)
+	r := NewRequests(s, "maap-requests", testKey, storetest.StatusTTL)
 	at := storetest.Now.Add(800 * time.Millisecond)
 	if _, _, err := r.Remember(context.Background(), storetest.Idempotency("cb-1"), at); err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{strconv.FormatInt(storetest.Now.Add(store.IdempotencyTTL).Unix(), 10)}; !slices.Equal(ttls, want) {
+	if err := r.Accept(context.Background(), "cb-1", storetest.MessageID(), at); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		strconv.FormatInt(storetest.Now.Add(store.IdempotencyTTL).Unix(), 10), strconv.FormatInt(storetest.Now.Add(storetest.StatusTTL).Unix(), 10),
+	}
+	if !slices.Equal(ttls, want) {
 		t.Fatalf("ttl = %v, want %v", ttls, want)
+	}
+}
+
+// An advance the SDK sent again after it took effect changed the status;
+// one that met a status already as far is no change.
+func TestAnAdvanceSentAgainFindsItsOwnUpdate(t *testing.T) {
+	item := statusKey("cb-1", storetest.MessageID())
+	item[attrTTL] = num(storetest.Now.Add(time.Hour).Unix())
+	s := &tableStub{}
+	r := NewRequests(s, "maap-requests", testKey, storetest.StatusTTL)
+	for _, tc := range []struct {
+		writer  func(in *dynamodb.UpdateItemInput) string
+		changed bool
+	}{
+		{func(in *dynamodb.UpdateItemInput) string { return sv(in.ExpressionAttributeValues[":w"]) }, true},
+		{func(*dynamodb.UpdateItemInput) string { return "another" }, false},
+	} {
+		s.update = func(in *dynamodb.UpdateItemInput) (*dynamodb.UpdateItemOutput, error) {
+			item[attrWriter] = str(tc.writer(in))
+			return nil, &types.ConditionalCheckFailedException{Item: item}
+		}
+		if changed, err := r.Advance(context.Background(), "cb-1", sv(item[attrSK])[2:], store.Displayed, storetest.Now); err != nil || changed != tc.changed {
+			t.Errorf("Advance = %v, %v; want %v", changed, err, tc.changed)
+		}
 	}
 }
 
@@ -214,13 +251,13 @@ func TestADeletionSendsUnprocessedItemsAgain(t *testing.T) {
 		}
 		return &dynamodb.BatchWriteItemOutput{}, nil
 	}}
-	if err := NewRequests(s, "maap-requests", testKey).DeleteChatbot(context.Background(), "cb-1"); err != nil || s.batches != 4 {
+	if err := NewRequests(s, "maap-requests", testKey, storetest.StatusTTL).DeleteChatbot(context.Background(), "cb-1"); err != nil || s.batches != 4 {
 		t.Fatalf("DeleteChatbot = %v after %d batches", err, s.batches)
 	}
 	s = &tableStub{query: query, batch: func(in *dynamodb.BatchWriteItemInput) (*dynamodb.BatchWriteItemOutput, error) {
 		return &dynamodb.BatchWriteItemOutput{UnprocessedItems: in.RequestItems}, nil
 	}}
-	if err := NewRequests(s, "maap-requests", testKey).DeleteChatbot(context.Background(), "cb-1"); err == nil || s.batches != batchAttempts {
+	if err := NewRequests(s, "maap-requests", testKey, storetest.StatusTTL).DeleteChatbot(context.Background(), "cb-1"); err == nil || s.batches != batchAttempts {
 		t.Fatalf("DeleteChatbot = %v after %d batches", err, s.batches)
 	}
 }
@@ -257,6 +294,34 @@ func FuzzDecodeIdempotency(f *testing.F) {
 	})
 }
 
+// A stored status is read strictly: an unknown state or a time that is no
+// number is damaged.
+func FuzzDecodeStatus(f *testing.F) {
+	f.Add("accepted", "1", "2", "3")
+	f.Add("", "", "", "")
+	f.Add("Delivered", "1.5", "-1", "x")
+	f.Add("accepted", "0", "00", "0")
+	f.Fuzz(func(t *testing.T, state, accepted, updated, ttl string) {
+		item := statusKey("cb-1", "0123456789abcdef0123456789abcdef")
+		item[attrState] = str(state)
+		item[attrAccepted], item[attrUpdated] = &types.AttributeValueMemberN{Value: accepted}, &types.AttributeValueMemberN{Value: updated}
+		item[attrTTL] = &types.AttributeValueMemberN{Value: ttl}
+		st, _, err := decodeStatus("cb-1", "0123456789abcdef0123456789abcdef", item)
+		if err != nil {
+			if !errors.Is(err, store.ErrInvalid) {
+				t.Fatalf("error %v", err)
+			}
+			return
+		}
+		// Numbers compare by value: "00" is 0.
+		a, _ := strconv.ParseInt(accepted, 10, 64)
+		u, _ := strconv.ParseInt(updated, 10, 64)
+		if !st.State.Valid() || string(st.State) != state || st.Accepted.Location() != time.UTC || st.Accepted.Unix() != a || st.Updated.Unix() != u {
+			t.Fatalf("decoded %+v", st)
+		}
+	})
+}
+
 // A deletion stops before its context's deadline with ErrUnfinished, at
 // most at its pace, and logs its progress as counts only.
 func TestADeletionStopsBeforeItsDeadlineAndLogsCounts(t *testing.T) {
@@ -279,7 +344,7 @@ func TestADeletionStopsBeforeItsDeadlineAndLogsCounts(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	start := time.Now()
-	err := NewRequests(s, "maap-requests", testKey).DeleteChatbot(ctx, "cb-1")
+	err := NewRequests(s, "maap-requests", testKey, storetest.StatusTTL).DeleteChatbot(ctx, "cb-1")
 	if !errors.Is(err, store.ErrUnfinished) || s.batches != 1 || time.Since(start) > 5*time.Second {
 		t.Fatalf("DeleteChatbot = %v after %d batches, %v", err, s.batches, time.Since(start))
 	}
@@ -287,13 +352,13 @@ func TestADeletionStopsBeforeItsDeadlineAndLogsCounts(t *testing.T) {
 	gone, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer stop()
 	cut := &tableStub{query: func(*dynamodb.QueryInput) (*dynamodb.QueryOutput, error) { return nil, gone.Err() }}
-	if err := NewRequests(cut, "maap-requests", testKey).DeleteChatbot(gone, "cb-1"); !errors.Is(err, store.ErrUnfinished) {
+	if err := NewRequests(cut, "maap-requests", testKey, storetest.StatusTTL).DeleteChatbot(gone, "cb-1"); !errors.Is(err, store.ErrUnfinished) {
 		t.Fatalf("DeleteChatbot past its deadline = %v", err)
 	}
 	// Without a deadline, batches keep their pace.
 	batchPace = 20 * time.Millisecond
 	start = time.Now()
-	if err := NewRequests(s, "maap-requests", testKey).DeleteChatbot(context.Background(), "cb-1"); err != nil || time.Since(start) < 20*time.Millisecond {
+	if err := NewRequests(s, "maap-requests", testKey, storetest.StatusTTL).DeleteChatbot(context.Background(), "cb-1"); err != nil || time.Since(start) < 20*time.Millisecond {
 		t.Fatalf("DeleteChatbot = %v in %v, under its pace", err, time.Since(start))
 	}
 	out := log.String()
