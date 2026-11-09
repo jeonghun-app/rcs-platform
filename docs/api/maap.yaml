@@ -12,15 +12,18 @@ info:
   description: |
     Every request needs the bearer token of a caller allowed the route
     (maap-scopes.md). The token is checked before the body is read: a path
-    no route serves is 404; with no token configured (dev and test only)
-    every route answers 503; a missing or unknown token is 401, and a token
-    outside its scope 403.
+    no route serves is 404, a method it does not take 405; with no token
+    configured (dev and test only) every route answers 503; a missing or
+    unknown token is 401, and a token outside its scope 403. Every error
+    answer carries `Connection: close`.
 
-    Bodies are strict JSON (ADR 0009 §9): unknown fields, duplicate keys,
+    Bodies are `application/json` (415 otherwise) and strict JSON (ADR 0009
+    §9): unknown fields, duplicate keys,
     keys differing only in case and trailing data are refused, and each
     string has a bound. Operator bodies are at most 16 KiB. When the task is
     decoding as many bodies as `MAAP_DECODES` allows, a request is 503 with
-    `Retry-After: 1` before its body is read. A string that maap writes into
+    `Retry-After: 1` before its body is read; one that is decoded must send
+    its body within 1 s plus 1 s per 64 KiB of its limit. A string that maap writes into
     a header or a log is refused if it holds a C0 control or DEL.
 
     Responses carry `Cache-Control: no-store`. Errors are
@@ -61,6 +64,9 @@ components:
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     Forbidden:
       description: The token's caller may not use the route.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+    UnsupportedMedia:
+      description: A body that is not application/json.
       content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
     TooLarge:
       description: The body is over the route's limit (16 KiB for the operator).

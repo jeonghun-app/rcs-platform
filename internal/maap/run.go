@@ -29,8 +29,8 @@ func Run(ctx context.Context, rt *runtime.Runtime, cfg Config) error {
 }
 
 func run(ctx context.Context, rt *runtime.Runtime, cfg Config, d deps) error {
-	// One decoder per task: #683's public listener shares it, so the cap
-	// bounds the task's memory whichever listener the bodies come on.
+	// The internal listener's own decode pool: #683 gives the public
+	// listener another, so that chatbots cannot take rcs-as's slots.
 	api := newInternalAPI(cfg.OperatorTokens, newDecoder(cfg.Decodes, rt.Metrics), rt)
 	ln, err := d.listen("tcp", cfg.InternalAddr)
 	if err != nil {

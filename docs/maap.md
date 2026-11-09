@@ -67,23 +67,29 @@ this order, each before the request's body is read:
 
 | Status | When |
 |---|---|
-| 404 | no route serves the path, whatever the token |
+| 404, 405 | no route serves the path, or not with that method, whatever the token; from the mux, with no audit line, as is the 307 to a cleaned path (`//`, `./`) |
 | 503 | no token is configured (dev and test only: prod requires `MAAP_OPERATOR_TOKEN`); `Retry-After` does not help |
 | 401 | no bearer token, more than one `Authorization` header, or a token not accepted, the operator's included in another scheme (`WWW-Authenticate: Bearer`) |
 | 403 | the token's caller may not use the route |
 
 Presented and accepted tokens are compared as SHA-256 digests, every accepted
-one each time, in constant time. Each request is one audit line
-(`audit: internal request`): the operation, the status, the caller and the
-token slot (`current` or `next`). Tokens, bodies and paths are never logged.
+one each time, in constant time. Each request a route serves is one audit
+line (`audit: internal request`), written even if its handler panics: the
+operation, the status first sent, the caller and the token slot (`current` or
+`next`). Tokens, bodies and paths are never logged. Every error answer closes
+the connection, so that a refusal is sent at once rather than after a body
+still arriving.
 
 A route with a body then decodes it through `chatbot.DecodeEnvelope`
-(ADR 0009 §9): operator bodies at most 16 KiB (413 above it), strict JSON (400
+(ADR 0009 §9): `application/json` only (415 otherwise, as `hss`), operator
+bodies at most 16 KiB (413 above it), strict JSON (400
 for unknown fields, duplicate keys or keys differing in case, trailing data,
 or a string over its field's bound). A request that finds every one of the
 `MAAP_DECODES` slots taken gets 503 with `Retry-After: 1` at once, before its
-body is read, and counts `api.decode_busy`; the handler keeps its slot until
-it has validated what it decoded.
+body is read, and counts `api.decode_busy`. A request that takes a slot has
+1 s plus a second for every 64 KiB of its limit to send its body (1.25 s for
+16 KiB), not the server's 15 s, so that a slow sender cannot hold a slot; the
+handler keeps it until it has validated what it decoded.
 
 `DecodeEnvelope` bounds each string but not what it holds. A string a handler
 writes into a SIP, CPIM or HTTP header, or a log, such as a display name, an

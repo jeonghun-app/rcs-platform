@@ -1,15 +1,18 @@
 package maap
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"mime"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jeonghun-app/rcs-platform/internal/chatbot"
 	"github.com/jeonghun-app/rcs-platform/internal/runtime"
@@ -33,6 +36,10 @@ func (s scope) String() string {
 // maxOperatorBody bounds an operator request body (ADR 0009 §9).
 const maxOperatorBody = 16 << 10
 
+// minBodyRate is the slowest a sender holding a decode slot may send its
+// body, in bytes a second; far below any caller inside the VPC.
+const minBodyRate = 64 << 10
+
 // apiError is an answer other than success. Messages say what is wrong
 // with the request without quoting it.
 type apiError struct {
@@ -45,11 +52,12 @@ func (e *apiError) Error() string { return e.message }
 
 func fail(status int, message string) error { return &apiError{status: status, message: message} }
 
-// decoder bounds the request bodies decoded and validated at once in a
-// task, across every listener: chatbot.DecodeEnvelope allocates about 8
-// bytes per input byte and chatbot.ValidateContent up to about 30, so one
-// send of #683 may take about 20 MB (#682). docs/maap.md has the rule the
-// cap and the task's memory follow.
+// decoder bounds the request bodies one listener decodes and validates at
+// once: chatbot.DecodeEnvelope allocates about 8 bytes per input byte and
+// chatbot.ValidateContent up to about 30, so one body of #683 may take
+// about 20 MB (#682). Each listener has its own, so that callers of one
+// cannot take another's slots; docs/maap.md has the rule the pools and the
+// task's memory follow.
 type decoder struct {
 	slots   chan struct{}
 	metrics *runtime.Metrics
@@ -69,30 +77,38 @@ func (d *decoder) tryAcquire() (release func(), ok bool) {
 	}
 }
 
-// decode reads r's body, at most maxBytes, into v with chatbot.DecodeEnvelope.
-// With no slot free it answers 503 with Retry-After at once, before the body
-// is read: waiting would hold the connection and its buffers, which is what
-// the cap bounds. On success the caller holds the slot until it has
-// validated what it decoded, and then calls release; on an error the slot is
-// already free.
-func (d *decoder) decode(r *http.Request, maxBytes int64, v any) (release func(), err error) {
+// decode reads c's body, application/json of at most maxBytes, into v with
+// chatbot.DecodeEnvelope. With no slot free it answers 503 with Retry-After
+// at once, before the body is read: waiting would hold the connection and
+// its buffers, which is what the cap bounds. The call holds the slot until
+// the handler calls releaseBody, once it has validated what it decoded, or
+// returns.
+func (d *decoder) decode(c *call, maxBytes int64, v any) error {
+	if ct, _, err := mime.ParseMediaType(c.r.Header.Get("Content-Type")); err != nil || ct != "application/json" {
+		return fail(http.StatusUnsupportedMediaType, "the body must be application/json")
+	}
 	release, ok := d.tryAcquire()
 	if !ok {
 		d.metrics.Count("api.decode_busy", 1)
-		return nil, &apiError{http.StatusServiceUnavailable, "too many request bodies are being read", "1"}
+		return &apiError{http.StatusServiceUnavailable, "too many request bodies are being read", "1"}
 	}
-	if err := chatbot.DecodeEnvelope(r.Body, maxBytes, v); err != nil {
-		release()
+	c.release = release
+	// Without a deadline of its own a body trickled byte by byte would hold
+	// the slot until the server's ReadTimeout (#723 review). A writer with
+	// no connection, a test recorder, cannot set one and has none to wait on.
+	_ = http.NewResponseController(c.w).SetReadDeadline(time.Now().Add(time.Second + time.Duration(maxBytes)*time.Second/minBodyRate))
+	if err := chatbot.DecodeEnvelope(c.r.Body, maxBytes, v); err != nil {
+		c.releaseBody()
 		switch {
 		case errors.Is(err, chatbot.ErrBodyTooLarge):
-			return nil, fail(http.StatusRequestEntityTooLarge, "the body is larger than "+strconv.FormatInt(maxBytes>>10, 10)+" KiB")
+			return fail(http.StatusRequestEntityTooLarge, "the body is larger than "+strconv.FormatInt(maxBytes>>10, 10)+" KiB")
 		case errors.Is(err, chatbot.ErrInvalidEnvelope):
 			// The package's errors name the rule broken, never the value.
-			return nil, fail(http.StatusBadRequest, err.Error())
+			return fail(http.StatusBadRequest, err.Error())
 		}
-		return nil, fail(http.StatusBadRequest, "the body could not be read")
+		return fail(http.StatusBadRequest, "the body could not be read")
 	}
-	return release, nil
+	return nil
 }
 
 // refuseControls refuses an envelope string that a handler writes into a
@@ -144,7 +160,8 @@ func newInternalAPI(operator TokenPair, d *decoder, rt *runtime.Runtime) *intern
 	return a
 }
 
-// ServeHTTP implements http.Handler. A path no route serves is 404.
+// ServeHTTP implements http.Handler. A path no route serves is 404, a
+// method it does not take 405, both from the mux before any token check.
 func (a *internalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h := w.Header()
 	h.Set("Cache-Control", "no-store")
@@ -152,29 +169,60 @@ func (a *internalAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.mux.ServeHTTP(w, r)
 }
 
-type handler func(w http.ResponseWriter, r *http.Request) error
+// call is one request a route serves, with the decode slot it holds.
+type call struct {
+	w       http.ResponseWriter
+	r       *http.Request
+	release func()
+}
+
+// releaseBody frees the call's decode slot, if it holds one. A handler
+// calls it once it has validated what it decoded, before slow work such as
+// a webhook call; route calls it in any case.
+func (c *call) releaseBody() {
+	if c.release != nil {
+		c.release()
+	}
+}
+
+type handler func(c *call) error
 
 // route serves h at pattern for the callers in allowed. The token is
 // checked before h runs, so before any body is read.
 func (a *internalAPI) route(pattern, name string, allowed scope, h handler) {
 	a.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-		tok, err := a.authenticate(r, allowed)
-		if err == nil {
-			err = h(rec, r)
+		rec := &statusRecorder{ResponseWriter: w}
+		c := &call{w: rec, r: r}
+		var tok *acceptedToken
+		// Deferred, so that a handler that panics frees its slot and leaves
+		// its audit line; net/http then ends the connection, as for any panic.
+		defer func() {
+			p := recover()
+			c.releaseBody()
+			status := cmp.Or(rec.status, http.StatusOK)
+			if p != nil && rec.status == 0 {
+				status = http.StatusInternalServerError
+			}
+			a.metrics.Count("api."+name+"."+strconv.Itoa(status), 1)
+			attrs := []slog.Attr{slog.String("operation", name), slog.Int("status", status)}
+			if tok != nil {
+				attrs = append(attrs, slog.String("caller", tok.scope.String()), slog.String("token", tok.slot))
+			} else {
+				attrs = append(attrs, slog.String("caller", "unauthenticated"))
+			}
+			// The path, the body and the token are never logged.
+			a.log.LogAttrs(r.Context(), slog.LevelInfo, "audit: internal request", attrs...)
+			if p != nil {
+				panic(p)
+			}
+		}()
+		var err error
+		if tok, err = a.authenticate(r, allowed); err == nil {
+			err = h(c)
 		}
 		if err != nil {
 			writeError(rec, err)
 		}
-		a.metrics.Count("api."+name+"."+strconv.Itoa(rec.status), 1)
-		attrs := []slog.Attr{slog.String("operation", name), slog.Int("status", rec.status)}
-		if tok != nil {
-			attrs = append(attrs, slog.String("caller", tok.scope.String()), slog.String("token", tok.slot))
-		} else {
-			attrs = append(attrs, slog.String("caller", "unauthenticated"))
-		}
-		// The path, the body and the token are never logged.
-		a.log.LogAttrs(r.Context(), slog.LevelInfo, "audit: internal request", attrs...)
 	})
 }
 
@@ -190,9 +238,7 @@ func (a *internalAPI) authenticate(r *http.Request, allowed scope) (*acceptedTok
 	values := r.Header.Values("Authorization")
 	var token string
 	if len(values) == 1 {
-		scheme, t, ok := strings.Cut(values[0], " ")
-		// The length check keeps EqualFold to ASCII ("K", Kelvin, folds to k).
-		if ok && len(scheme) == len("Bearer") && strings.EqualFold(scheme, "Bearer") {
+		if scheme, t, ok := strings.Cut(values[0], " "); ok && strings.EqualFold(scheme, "Bearer") {
 			token = t
 		}
 	}
@@ -217,6 +263,11 @@ func (a *internalAPI) authenticate(r *http.Request, allowed scope) (*acceptedTok
 
 // writeError answers err as {"error": "..."}. An error without an answer of
 // its own is 500; later handlers classify store failures before this.
+//
+// The answer closes the connection: most errors are answered before the
+// body is read, and net/http would otherwise read up to 256 KiB of it
+// before it writes the status line, so a body still arriving would hold the
+// answer until it ended (#723 review).
 func writeError(w http.ResponseWriter, err error) {
 	var ae *apiError
 	if !errors.As(err, &ae) {
@@ -230,18 +281,32 @@ func writeError(w http.ResponseWriter, err error) {
 		h.Set("Retry-After", ae.retryAfter)
 	}
 	h.Set("Content-Type", "application/json")
+	h.Set("Connection", "close")
 	w.WriteHeader(ae.status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": ae.message})
 }
 
-// statusRecorder keeps the status a handler answered, for the audit log
-// and the metric.
+// statusRecorder keeps the status sent, the first one written as net/http
+// does, for the audit log and the metric (0 until then).
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
-	s.status = code
+	if s.status == 0 {
+		s.status = code
+	}
 	s.ResponseWriter.WriteHeader(code)
 }
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if s.status == 0 {
+		s.status = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Unwrap lets http.ResponseController reach the connection (decode's read
+// deadline).
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
