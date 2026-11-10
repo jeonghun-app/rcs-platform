@@ -414,6 +414,38 @@ func TestAnInDialogRequestMustFollowThisPcscfsRouteForItsFlow(t *testing.T) {
 	}
 }
 
+// A client's NOTIFY inside a dialog gets the dialog's two Record-Route
+// values again, the core-facing one on top, as the request that set the
+// dialog up did: a subscriber in the core takes its route set from the
+// first NOTIFY (RFC 6665 §4.4.1), and scscf signs the hop below its own
+// value, which is then this flow, never a Record-Route value or a Contact
+// the client wrote (#550, threat model T2). Other requests inside a
+// dialog get none (TestAnInDialogRequestMustFollowThisPcscfsRouteForItsFlow).
+func TestAClientsNOTIFYInsideADialogIsRecordRoutedAgain(t *testing.T) {
+	p, _ := newTestPcscf(&testClock{t: time.Unix(1_800_000_000, 0)})
+	icscf := "<sip:10.0.130.25:5060;transport=tcp;lr>"
+	r := inDialogFrom(t, []string{clientEnt, coreEntry}, "sip:bob@198.51.100.20:5060;transport=tcp",
+		"Route: "+scscfRoute, "Record-Route: "+icscf, "Contact: <sip:10.0.130.25:5060;transport=tcp>")
+	r.Message.Method = "NOTIFY"
+	if err := r.Message.Header.Set("CSeq", "2 NOTIFY"); err != nil {
+		t.Fatal(err)
+	}
+	d := p.Route(context.Background(), r)
+	if d.Status != 0 || len(d.Targets) != 1 {
+		t.Fatalf("not forwarded: %+v", d)
+	}
+	b := prepared(t, d, r)
+	for i := len(d.RecordRoute) - 1; i >= 0; i-- {
+		if err := b.Header.Prepend("Record-Route", d.RecordRoute[i].String()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	core := r.Routed[1].String()
+	if got := b.Header.Values("Record-Route"); !slices.Equal(got, []string{core, "<" + clientEnt + ">", icscf}) {
+		t.Errorf("Record-Route %q, want the dialog's core-facing value %s on top, then the client-facing one", got, core)
+	}
+}
+
 // A dialog whose route was written without an icid gets a new one rather
 // than none; a client that changes the icid of its copy of the route,
 // which the MAC covers, gets 403 (review of #221).

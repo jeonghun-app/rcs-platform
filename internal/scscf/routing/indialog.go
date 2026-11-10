@@ -19,7 +19,8 @@ import (
 // P-CSCF's core side or of an application server, by port and transport,
 // and never the S-CSCF itself. A next hop that is the P-CSCF's public
 // address (Config.EdgeProxyPublicHosts) ends the route set, as rcsjta
-// writes one there.
+// writes one there. A NOTIFY gets the S-CSCF's Record-Route value, signed
+// as for a request that sets up a dialog.
 func (rt *Router) InDialog(_ context.Context, r *proxy.Request) proxy.Decision {
 	next := r.Message.URI
 	routes, err := r.Message.Header.Route()
@@ -46,8 +47,28 @@ func (rt *Router) InDialog(_ context.Context, r *proxy.Request) proxy.Decision {
 		// INVITE, not a hop of the dialog; the route set ends before it,
 		// and the request goes by its Request-URI.
 		rt.count("routing.in_dialog.trailing_route")
+	}
+	var rec *recorder
+	if r.Message.Method == "NOTIFY" {
+		// A subscriber takes its route set from the NOTIFY that creates
+		// its dialog, not from the 2xx to its SUBSCRIBE (RFC 6665 §4.3,
+		// §4.4.1), so the NOTIFY gets the S-CSCF's value, signed for the
+		// hop toward the notifier, where the subscriber's refresh and
+		// unsubscribe go next (#550). The recorder's rule holds as for a
+		// request that sets up a dialog: a client's NOTIFY carries
+		// pcscf's core-facing value on top (pcscf records it), so only
+		// rcs-as's, which records none, is signed for its Contact.
+		rec = rt.recorder(r.Message)
+		d.RecordRoute = []sip.Address{rt.cfg.RecordRoute}
+	}
+	if ended || rec != nil {
 		d.Prepare = func(_ context.Context, _ proxy.Target, req *sip.Request) error {
-			req.Header.Del("Route")
+			if ended {
+				req.Header.Del("Route")
+			}
+			if rec != nil {
+				return rec.prepare(req)
+			}
 			return nil
 		}
 	}

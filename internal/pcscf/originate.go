@@ -429,6 +429,16 @@ func (p *pcscf) inDialog(ctx context.Context, r *proxy.Request) proxy.Decision {
 	d.Prepare = func(_ context.Context, _ proxy.Target, req *sip.Request) error {
 		return req.Header.Set("P-Charging-Vector", p.chargingVector(icid))
 	}
+	if r.Message.Method == "NOTIFY" {
+		// A NOTIFY is record-routed again, with the dialog's values, the
+		// core-facing one on top, as the request that set the dialog up
+		// was: a subscriber in the core takes its route set from the
+		// first NOTIFY (RFC 6665 §4.4.1), and scscf signs the hop below
+		// its own value, which must be this one and never a value or a
+		// Contact the client wrote (#550, threat model T2).
+		written, _ := routeICID(*core)
+		d.RecordRoute = p.recordRoute(r.Source.Flow, core.Params.Has("ob"), written, r.Message.Header.Get("Call-ID"))
+	}
 	return p.anchorInDialog(r, d, clientSide, r.Source.Flow)
 }
 

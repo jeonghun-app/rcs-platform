@@ -79,8 +79,10 @@ port, and never to itself (`internal/scscf/routing`, #322); a client that
 names any other core address, or drops an application server's entry from
 its route set, gets 403. No host or subnet list is involved: every core task
 shares the private subnets, and task addresses change. `scscf` records, and
-signs, only requests that set up a dialog (INVITE, SUBSCRIBE, REFER), which
-`pcscf` record-routes too, so the hop toward a client is always `pcscf`'s
+signs, only requests that set up a dialog (INVITE, SUBSCRIBE, REFER) and
+NOTIFYs inside one, whose first sets a subscriber's route set (RFC 6665
+§4.4.1, #550). `pcscf` record-routes all of these too, a client's NOTIFY
+inside a dialog included, so the hop toward a client is always `pcscf`'s
 value; the sender's Contact stands in only for a core service that records
 no route, as `rcs-as` does for the requests it sends for its users. As with `pcscf`'s
 value, the binding covers the Call-ID and not the tags, so a peer can go on
